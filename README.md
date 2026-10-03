@@ -18,7 +18,7 @@
 - **Linear SSA / Three-Address Code (TAC):** Zero nested expressions (`(+ (* a b) c)`). Eliminates bracket/parenthesis balancing errors and allows causal transformer attention heads to track dependencies with forward sequential ease.
 - **Single-Token Mnemonics:** Operators and keywords (`fn`, `cst`, `add`, `mul`, `ld`, `st`, `br`, `jmp`, `ret`) map strictly to single, indivisible tokens in standard BPE vocabularies (OpenAI `cl100k`/`o200k`, Meta LLaMA 3, Google Gemini).
 - **Machine-Native Diagnostic Protocol:** Zero natural-language prose error messages. Validation failures immediately produce structured JSON diagnostics with exact instruction indices, expected types, and candidate replacement patches for single-shot agent self-repair.
-- **Universal 128-bit SIMD Primitives:** Hardware-accelerated vectorization (`v128`) supporting 4 parallel single-precision floats (`vfadd`, `vfmul`, `vfsub`, `vfdiv`), 4 parallel 32-bit integers (`viadd`, `vimul`), `splat` broadcast, and lane extraction (`extlane`). *(Architecturally designed for future extension to `v256` AVX2 and `v512` AVX-512).*
+- **Width-Generic SIMD Vectors:** Fixed `v128`/`v256`/`v512` and scalable `vx` vectors with lane-typed ops (`vadd a, b:f32`) over i8/i16/i32/i64/f32/f64 lanes, fused multiply-add, compares and bitwise select, broadcast, lane extraction, and deterministic horizontal reductions (see [Vector Types & Ops](#-vector-types--ops-air-v2)).
 - **Autonomous Dynamic Memory Management:** Built-in bare-metal heap allocator intrinsics (`alloc`, `free`) with 64-bit pointer arithmetic, allowing agents to dynamically allocate, reshape, and reclaim scratchpad buffers.
 - **Sub-10ms Bare-Metal JIT:** Direct in-memory compilation and execution via Cranelift with native C-ABI compatibility for host interop.
 - **High-Performance Memory Model:** Flat linear memory addressing (`ld`/`st`), 64-bit pointer arithmetic, and scalar numeric types (`i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`, `v128`).
@@ -74,6 +74,58 @@ fn dot(p0:ptr, p1:ptr, n:i64)->f32
   b3:
     ret acc
 ```
+
+---
+
+## 🧮 Vector Types & Ops (AIR v2)
+
+Vectors are untyped bit containers; every vector op names the lane type it works on, so one register can be read as `f32` lanes by one op and as `i32` lanes by the next.
+
+| Type | Width | Notes |
+|---|---|---|
+| `v128`, `v256`, `v512` | 128/256/512 bits | Fixed width; usable in AIR function signatures |
+| `vx` | Target maximum (at least 128 bits) | Scalable; `n = vl f32` gives its lane count. Not allowed in signatures |
+
+| Op | Syntax | Lane types |
+|---|---|---|
+| Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
+| Broadcast | `v = splat x:v512` (plain `splat x` is `v128`) | i8 to f64 |
+| Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
+| Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
+| Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
+| Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
+| Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
+| Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
+| Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
+| Lane count | `n = vl f32` | Any |
+
+Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths. The pre-v2 spellings (`vfadd`, `viadd`, `vfsum`, `visum`, `vfmax`, ...) still parse and print in canonical form.
+
+Vector-length-agnostic code processes `vl` lanes per iteration, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
+```air
+fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
+  b0:
+    va = splat a:vx
+    w = vl f32
+    jmp vloop(0:i64)
+  vloop(i:i64):
+    rest = sub n, i
+    full = ge rest, w
+    br full, vbody, tail(i)
+  vbody:
+    off = mul i, 4:i64
+    px = add x, off
+    py = add y, off
+    xv = ld px:vx
+    yv = ld py:vx
+    r = vfma va, xv, yv:f32
+    st py, r
+    i2 = add i, w
+    jmp vloop(i2)
+  # tail(j:i64): scalar loop for the last n % vl elements (see the example file)
+```
+
+**Backend support:** the Cranelift backend runs every vector program today, splitting `v256`/`v512` into 128-bit operations and treating `vx` as 128 bits. Native 256/512-bit (AVX2, AVX-512) and scalable (SVE) code generation is planned for an opt-in LLVM backend; programs written against `vl` will widen automatically.
 
 ---
 
@@ -140,7 +192,7 @@ achainsaw bench examples/fibonacci.air --iters 200
 ```
 
 ### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
-AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading:
+AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. The current format is AIRB v2 (adds the v2 vector types and ops); v1 files still load:
 ```bash
 # Assemble text AIR to compact binary bytecode (.airb)
 achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
@@ -266,7 +318,7 @@ achainsaw cpu
 }
 ```
 
-Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift currently emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available); 256/512-bit, scalable, and matrix code generation is planned for an opt-in LLVM backend.
+Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available) and runs `v256`/`v512`/`vx` programs as 128-bit operations; native 256/512-bit, scalable, and matrix code generation is planned for an opt-in LLVM backend.
 
 **Cap the ISA level** to exercise lower tiers on a more capable machine (for example, AVX2 code on an AVX-512 host). Levels: `sse`, `avx`, `avx2`, `avx512`, `amx` (x86_64) and `neon`, `sve`, `sve2`, `sme` (AArch64):
 ```bash

@@ -9,7 +9,10 @@ use crate::types::Type;
 use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"\x00AIR";
-pub const VERSION: u16 = 1;
+/// Current AIRB version. Version 2 added v256/v512/vx and lane-typed vector ops;
+/// version 1 files still decode.
+pub const VERSION: u16 = 2;
+const MIN_VERSION: u16 = 1;
 
 /// Serializes an in-memory AIR `Module` into compact AIRB binary bytes.
 ///
@@ -160,10 +163,14 @@ pub fn to_air_text(module: &Module) -> String {
                         }
                         out.push(')');
                     }
-                    Instruction::Splat { dst, src, .. } => {
+                    Instruction::Splat { dst, src, ty, .. } => {
                         out.push_str(dst);
                         out.push_str(" = splat ");
                         out.push_str(src);
+                        if *ty != Type::V128 {
+                            out.push(':');
+                            out.push_str(ty.as_str());
+                        }
                     }
                     Instruction::ExtractLane {
                         dst, vec, lane, ty, ..
@@ -228,6 +235,37 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(src);
                         out.push(':');
                         out.push_str(ty.as_str());
+                    }
+                    Instruction::VBinary {
+                        op,
+                        dst,
+                        lhs,
+                        rhs,
+                        lane,
+                        ..
+                    } => push_vector_op(&mut out, dst, op.as_str(), &[lhs, rhs], Some(*lane)),
+                    Instruction::VCmp {
+                        op,
+                        dst,
+                        lhs,
+                        rhs,
+                        lane,
+                        ..
+                    } => push_vector_op(&mut out, dst, op.as_str(), &[lhs, rhs], Some(*lane)),
+                    Instruction::VFma {
+                        dst, a, b, c, lane, ..
+                    } => push_vector_op(&mut out, dst, "vfma", &[a, b, c], Some(*lane)),
+                    Instruction::VSelect {
+                        dst,
+                        mask,
+                        then_val,
+                        else_val,
+                        ..
+                    } => push_vector_op(&mut out, dst, "vsel", &[mask, then_val, else_val], None),
+                    Instruction::VLen { dst, lane, .. } => {
+                        out.push_str(dst);
+                        out.push_str(" = vl ");
+                        out.push_str(lane.as_str());
                     }
                 }
                 out.push('\n');
@@ -298,6 +336,24 @@ pub fn to_air_text(module: &Module) -> String {
     out
 }
 
+/// Appends `dst = op r0, r1, ...[:lane]`.
+fn push_vector_op(out: &mut String, dst: &str, op: &str, regs: &[&String], lane: Option<Type>) {
+    out.push_str(dst);
+    out.push_str(" = ");
+    out.push_str(op);
+    out.push(' ');
+    for (i, r) in regs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(r);
+    }
+    if let Some(lane) = lane {
+        out.push(':');
+        out.push_str(lane.as_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Binary Encoding
 // ---------------------------------------------------------------------------
@@ -347,73 +403,14 @@ impl BinaryEncoder {
                     self.intern(bp_name);
                 }
                 for inst in &block.instructions {
-                    match inst {
-                        Instruction::AssignConst { dst, .. } => {
-                            self.intern(dst);
-                        }
-                        Instruction::Binary { dst, lhs, rhs, .. } => {
-                            self.intern(dst);
-                            self.intern(lhs);
-                            self.intern(rhs);
-                        }
-                        Instruction::Load { dst, ptr, .. } => {
-                            self.intern(dst);
-                            self.intern(ptr);
-                        }
-                        Instruction::Store { ptr, val, .. } => {
-                            self.intern(ptr);
-                            self.intern(val);
-                        }
-                        Instruction::Call {
-                            dst, func, args, ..
-                        } => {
-                            if let Some(d) = dst {
-                                self.intern(d);
-                            }
-                            self.intern(func);
-                            for a in args {
-                                self.intern(a);
-                            }
-                        }
-                        Instruction::Splat { dst, src, .. } => {
-                            self.intern(dst);
-                            self.intern(src);
-                        }
-                        Instruction::ExtractLane { dst, vec, .. } => {
-                            self.intern(dst);
-                            self.intern(vec);
-                        }
-                        Instruction::Alloc { dst, size, .. } => {
-                            self.intern(dst);
-                            self.intern(size);
-                        }
-                        Instruction::Free { ptr, .. } => {
-                            self.intern(ptr);
-                        }
-                        Instruction::Select {
-                            dst,
-                            cond,
-                            then_val,
-                            else_val,
-                            ..
-                        } => {
-                            self.intern(dst);
-                            self.intern(cond);
-                            self.intern(then_val);
-                            self.intern(else_val);
-                        }
-                        Instruction::Unary { dst, src, .. } => {
-                            self.intern(dst);
-                            self.intern(src);
-                        }
-                        Instruction::Cast { dst, src, .. } => {
-                            self.intern(dst);
-                            self.intern(src);
-                        }
-                        Instruction::VectorReduce { dst, src, .. } => {
-                            self.intern(dst);
-                            self.intern(src);
-                        }
+                    if let Some(dst) = inst.dst() {
+                        self.intern(dst);
+                    }
+                    if let Instruction::Call { func, .. } = inst {
+                        self.intern(func);
+                    }
+                    for reg in inst.operands() {
+                        self.intern(reg);
                     }
                 }
                 match &block.terminator {
@@ -618,12 +615,10 @@ impl BinaryEncoder {
                         .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
             }
-            Instruction::Splat { dst, src, .. } => {
+            Instruction::Splat { dst, src, ty, .. } => {
                 self.buf.push(0x07);
-                self.buf
-                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf
-                    .extend_from_slice(&self.string_map[src].to_le_bytes());
+                self.push_regs(&[dst, src]);
+                self.buf.push(encode_type(*ty)); // since v2
             }
             Instruction::ExtractLane {
                 dst, vec, lane, ty, ..
@@ -695,6 +690,61 @@ impl BinaryEncoder {
                     .extend_from_slice(&self.string_map[src].to_le_bytes());
                 self.buf.push(encode_type(*ty));
             }
+            Instruction::VBinary {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x20);
+                self.buf.push(encode_vbin_op(*op));
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, lhs, rhs]);
+            }
+            Instruction::VFma {
+                dst, a, b, c, lane, ..
+            } => {
+                self.buf.push(0x21);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, a, b, c]);
+            }
+            Instruction::VCmp {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x22);
+                self.buf.push(encode_vcmp_op(*op));
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, lhs, rhs]);
+            }
+            Instruction::VSelect {
+                dst,
+                mask,
+                then_val,
+                else_val,
+                ..
+            } => {
+                self.buf.push(0x23);
+                self.push_regs(&[dst, mask, then_val, else_val]);
+            }
+            Instruction::VLen { dst, lane, .. } => {
+                self.buf.push(0x24);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst]);
+            }
+        }
+    }
+
+    fn push_regs(&mut self, regs: &[&String]) {
+        for r in regs {
+            self.buf
+                .extend_from_slice(&self.string_map[r.as_str()].to_le_bytes());
         }
     }
 
@@ -765,6 +815,7 @@ struct BinaryDecoder<'a> {
     bytes: &'a [u8],
     pos: usize,
     strings: Vec<String>,
+    version: u16,
 }
 
 impl<'a> BinaryDecoder<'a> {
@@ -773,6 +824,7 @@ impl<'a> BinaryDecoder<'a> {
             bytes,
             pos: 0,
             strings: Vec::new(),
+            version: VERSION,
         }
     }
 
@@ -842,11 +894,12 @@ impl<'a> BinaryDecoder<'a> {
 
         // 2. Version
         let version = self.read_u16()?;
-        if version != VERSION {
+        if !(MIN_VERSION..=VERSION).contains(&version) {
             return Err(self.err(format!(
-                "Unsupported AIRB version: expected {VERSION}, got {version}"
+                "Unsupported AIRB version: expected {MIN_VERSION} to {VERSION}, got {version}"
             )));
         }
+        self.version = version;
 
         // Flags
         let _flags = self.read_u16()?;
@@ -995,11 +1048,23 @@ impl<'a> BinaryDecoder<'a> {
                 })
             }
             0x03 => {
-                let op = decode_binary_op(self.read_u8()?)
-                    .ok_or_else(|| self.err("Invalid binary op code in AIRB"))?;
+                let code = self.read_u8()?;
                 let dst = self.read_string()?;
                 let lhs = self.read_string()?;
                 let rhs = self.read_string()?;
+                // Codes 17-23 were the v1 `vfadd`..`vimul` ops.
+                if let Some((op, lane)) = decode_legacy_vector_op(code) {
+                    return Ok(Instruction::VBinary {
+                        op,
+                        dst,
+                        lhs,
+                        rhs,
+                        lane,
+                        span,
+                    });
+                }
+                let op = decode_binary_op(code)
+                    .ok_or_else(|| self.err("Invalid binary op code in AIRB"))?;
                 Ok(Instruction::Binary {
                     op,
                     dst,
@@ -1043,7 +1108,12 @@ impl<'a> BinaryDecoder<'a> {
             0x07 => {
                 let dst = self.read_string()?;
                 let src = self.read_string()?;
-                Ok(Instruction::Splat { dst, src, span })
+                let ty = if self.version >= 2 {
+                    self.read_vector_type()?
+                } else {
+                    Type::V128
+                };
+                Ok(Instruction::Splat { dst, src, ty, span })
             }
             0x08 => {
                 let dst = self.read_string()?;
@@ -1118,10 +1188,74 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x20 => {
+                let op = decode_vbin_op(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid vector op code in AIRB"))?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VBinary {
+                    op,
+                    dst: self.read_string()?,
+                    lhs: self.read_string()?,
+                    rhs: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x21 => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VFma {
+                    dst: self.read_string()?,
+                    a: self.read_string()?,
+                    b: self.read_string()?,
+                    c: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x22 => {
+                let op = decode_vcmp_op(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid vector compare op code in AIRB"))?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VCmp {
+                    op,
+                    dst: self.read_string()?,
+                    lhs: self.read_string()?,
+                    rhs: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x23 => Ok(Instruction::VSelect {
+                dst: self.read_string()?,
+                mask: self.read_string()?,
+                then_val: self.read_string()?,
+                else_val: self.read_string()?,
+                span,
+            }),
+            0x24 => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VLen {
+                    dst: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
             _ => Err(self.err(format!(
                 "Unknown instruction opcode tag 0x{tag:02X} in AIRB"
             ))),
         }
+    }
+
+    fn read_lane_type(&mut self) -> Result<Type, Diagnostic> {
+        decode_type(self.read_u8()?)
+            .filter(Type::is_lane)
+            .ok_or_else(|| self.err("Invalid vector lane type in AIRB"))
+    }
+
+    fn read_vector_type(&mut self) -> Result<Type, Diagnostic> {
+        decode_type(self.read_u8()?)
+            .filter(Type::is_vector)
+            .ok_or_else(|| self.err("Invalid vector type in AIRB"))
     }
 
     fn decode_terminator(&mut self) -> Result<Terminator, Diagnostic> {
@@ -1188,6 +1322,9 @@ fn encode_type(ty: Type) -> u8 {
         Type::F64 => 6,
         Type::Ptr => 7,
         Type::V128 => 8,
+        Type::V256 => 9,
+        Type::V512 => 10,
+        Type::Vx => 11,
     }
 }
 
@@ -1201,6 +1338,9 @@ fn decode_type(code: u8) -> Option<Type> {
         6 => Some(Type::F64),
         7 => Some(Type::Ptr),
         8 => Some(Type::V128),
+        9 => Some(Type::V256),
+        10 => Some(Type::V512),
+        11 => Some(Type::Vx),
         _ => None,
     }
 }
@@ -1223,13 +1363,6 @@ fn encode_binary_op(op: BinaryOp) -> u8 {
         BinaryOp::Gt => 14,
         BinaryOp::Le => 15,
         BinaryOp::Ge => 16,
-        BinaryOp::VfAdd => 17,
-        BinaryOp::VfSub => 18,
-        BinaryOp::VfMul => 19,
-        BinaryOp::VfDiv => 20,
-        BinaryOp::ViAdd => 21,
-        BinaryOp::ViSub => 22,
-        BinaryOp::ViMul => 23,
         BinaryOp::Min => 24,
         BinaryOp::Max => 25,
         BinaryOp::Umin => 26,
@@ -1262,13 +1395,6 @@ fn decode_binary_op(code: u8) -> Option<BinaryOp> {
         14 => Some(BinaryOp::Gt),
         15 => Some(BinaryOp::Le),
         16 => Some(BinaryOp::Ge),
-        17 => Some(BinaryOp::VfAdd),
-        18 => Some(BinaryOp::VfSub),
-        19 => Some(BinaryOp::VfMul),
-        20 => Some(BinaryOp::VfDiv),
-        21 => Some(BinaryOp::ViAdd),
-        22 => Some(BinaryOp::ViSub),
-        23 => Some(BinaryOp::ViMul),
         24 => Some(BinaryOp::Min),
         25 => Some(BinaryOp::Max),
         26 => Some(BinaryOp::Umin),
@@ -1302,13 +1428,6 @@ fn binary_op_to_str(op: BinaryOp) -> &'static str {
         BinaryOp::Gt => "gt",
         BinaryOp::Le => "le",
         BinaryOp::Ge => "ge",
-        BinaryOp::VfAdd => "vfadd",
-        BinaryOp::VfSub => "vfsub",
-        BinaryOp::VfMul => "vfmul",
-        BinaryOp::VfDiv => "vfdiv",
-        BinaryOp::ViAdd => "viadd",
-        BinaryOp::ViSub => "visub",
-        BinaryOp::ViMul => "vimul",
         BinaryOp::Min => "min",
         BinaryOp::Max => "max",
         BinaryOp::Umin => "umin",
@@ -1369,17 +1488,49 @@ fn decode_cast_op(code: u8) -> Option<CastOp> {
 
 fn encode_vector_reduce_op(op: VectorReduceOp) -> u8 {
     match op {
-        VectorReduceOp::VfSum => 1,
-        VectorReduceOp::VfMax => 2,
-        VectorReduceOp::ViSum => 3,
+        VectorReduceOp::Sum => 1,
+        VectorReduceOp::Max => 2,
+        VectorReduceOp::Min => 4,
     }
 }
 
 fn decode_vector_reduce_op(code: u8) -> Option<VectorReduceOp> {
     match code {
-        1 => Some(VectorReduceOp::VfSum),
-        2 => Some(VectorReduceOp::VfMax),
-        3 => Some(VectorReduceOp::ViSum),
+        // 3 was v1 `visum`, now the same `vsum` op with an i32 lane type.
+        1 | 3 => Some(VectorReduceOp::Sum),
+        2 => Some(VectorReduceOp::Max),
+        4 => Some(VectorReduceOp::Min),
         _ => None,
     }
+}
+
+/// v1 encoded `vfadd`..`vimul` as binary op codes 17-23.
+fn decode_legacy_vector_op(code: u8) -> Option<(VBinOp, Type)> {
+    let name = match code {
+        17 => "vfadd",
+        18 => "vfsub",
+        19 => "vfmul",
+        20 => "vfdiv",
+        21 => "viadd",
+        22 => "visub",
+        23 => "vimul",
+        _ => return None,
+    };
+    VBinOp::from_legacy(name)
+}
+
+fn encode_vbin_op(op: VBinOp) -> u8 {
+    VBinOp::ALL.iter().position(|o| *o == op).unwrap() as u8 + 1
+}
+
+fn decode_vbin_op(code: u8) -> Option<VBinOp> {
+    VBinOp::ALL.get((code as usize).checked_sub(1)?).copied()
+}
+
+fn encode_vcmp_op(op: VCmpOp) -> u8 {
+    VCmpOp::ALL.iter().position(|o| *o == op).unwrap() as u8 + 1
+}
+
+fn decode_vcmp_op(code: u8) -> Option<VCmpOp> {
+    VCmpOp::ALL.get((code as usize).checked_sub(1)?).copied()
 }

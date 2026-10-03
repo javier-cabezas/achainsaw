@@ -22,7 +22,8 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 
 ## Conventions
 - Errors are machine-readable `Diagnostic`s with an `ERR_*` code, span, and `context` for agent self-repair; never plain prose.
-- A language change touches lexer -> parser -> validator -> `lower.rs` -> `binary.rs` (AIRB encode/decode) -> `to_air_text`. Regenerate affected `.airb` files with `achainsaw assemble`.
+- A language change touches lexer -> parser -> validator -> `lower.rs` -> `binary.rs` (AIRB encode/decode) -> `to_air_text`. Regenerate affected `.airb` files with `achainsaw assemble`, but keep the v1 kernel `.airb` files as compatibility fixtures (`crates/achainsaw-ir/tests/vectors.rs` checks them). New AIRB opcodes bump `VERSION` in `binary.rs` and must keep older versions decoding.
+- Vector ops: lane-type rules live in `validator.rs` (`vbin_lane_types`, `VFMA_LANE_TYPES`) and apply to every backend. `crates/achainsaw-codegen/tests/vector_ops.rs` compiles every op x lane x width for x86_64 (all levels) and aarch64 and checks results against a scalar reference model; extend its `all_kernels()` and `reference()` for new ops. New v2 mnemonics are `TokenKind::VOp` so they remain valid register names outside the position after `=`.
 - `SERVER_INSTRUCTIONS` in `crates/achainsaw-cli/src/mcp.rs` is the AIR primer shown to MCP clients (Claude Code, Claude Desktop). Update it when syntax changes; `test_server_instructions_example_is_valid_air` JIT-runs its example.
 - New MCP tools: add a `handle_*` function, a `get_tools_list` entry, a `tools/call` match arm, and a unit test.
 - `.mcp.json` registers the local MCP server for Claude Code in this repo.

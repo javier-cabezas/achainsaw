@@ -126,7 +126,14 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                     Instruction::AssignConst { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Load { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::ExtractLane { dst, ty, .. } => (dst, Some(*ty)),
-                    Instruction::Splat { dst, .. } => (dst, Some(Type::V128)),
+                    Instruction::Splat { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::VBinary { dst, lhs, .. }
+                    | Instruction::VCmp { dst, lhs, .. }
+                    | Instruction::VFma { dst, a: lhs, .. }
+                    | Instruction::VSelect {
+                        dst, then_val: lhs, ..
+                    } => (dst, types.get(lhs).copied()),
+                    Instruction::VLen { dst, .. } => (dst, Some(Type::I64)),
                     Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
                     Instruction::Call {
                         dst: Some(dst),
@@ -603,7 +610,6 @@ fn fold_binary_op(
                     let ub = to_unsigned(b, bits);
                     return bool_const(ua >= ub);
                 }
-                _ => return None,
             };
             Some((Constant::Int(ty.wrap_int(res)), ty))
         }
@@ -841,86 +847,9 @@ fn substitute_instruction_operands(
     if substitutions.is_empty() {
         return;
     }
-    match inst {
-        Instruction::AssignConst { .. } => {}
-        Instruction::Binary { lhs, rhs, .. } => {
-            if let Some(new_l) = substitutions.get(lhs) {
-                *lhs = new_l.clone();
-            }
-            if let Some(new_r) = substitutions.get(rhs) {
-                *rhs = new_r.clone();
-            }
-        }
-        Instruction::Load { ptr, .. } => {
-            if let Some(new_p) = substitutions.get(ptr) {
-                *ptr = new_p.clone();
-            }
-        }
-        Instruction::Store { ptr, val, .. } => {
-            if let Some(new_p) = substitutions.get(ptr) {
-                *ptr = new_p.clone();
-            }
-            if let Some(new_v) = substitutions.get(val) {
-                *val = new_v.clone();
-            }
-        }
-        Instruction::Call { args, .. } => {
-            for arg in args {
-                if let Some(new_a) = substitutions.get(arg) {
-                    *arg = new_a.clone();
-                }
-            }
-        }
-        Instruction::Splat { src, .. } => {
-            if let Some(new_s) = substitutions.get(src) {
-                *src = new_s.clone();
-            }
-        }
-        Instruction::ExtractLane { vec, .. } => {
-            if let Some(new_v) = substitutions.get(vec) {
-                *vec = new_v.clone();
-            }
-        }
-        Instruction::Alloc { size, .. } => {
-            if let Some(new_s) = substitutions.get(size) {
-                *size = new_s.clone();
-            }
-        }
-        Instruction::Free { ptr, .. } => {
-            if let Some(new_p) = substitutions.get(ptr) {
-                *ptr = new_p.clone();
-            }
-        }
-        Instruction::Select {
-            cond,
-            then_val,
-            else_val,
-            ..
-        } => {
-            if let Some(new_c) = substitutions.get(cond) {
-                *cond = new_c.clone();
-            }
-            if let Some(new_t) = substitutions.get(then_val) {
-                *then_val = new_t.clone();
-            }
-            if let Some(new_e) = substitutions.get(else_val) {
-                *else_val = new_e.clone();
-            }
-        }
-        Instruction::Unary { src, .. } => {
-            if let Some(new_s) = substitutions.get(src) {
-                *src = new_s.clone();
-            }
-        }
-        Instruction::Cast { src, .. } => {
-            if let Some(new_s) = substitutions.get(src) {
-                *src = new_s.clone();
-            }
-        }
-        Instruction::VectorReduce { src, .. } => {
-            if let Some(new_s) = substitutions.get(src) {
-                *src = new_s.clone();
-            }
+    for reg in inst.operands_mut() {
+        if let Some(new_reg) = substitutions.get(reg.as_str()) {
+            *reg = new_reg.clone();
         }
     }
 }
@@ -1067,55 +996,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
         for block in &func.blocks {
             // Instructions
             for inst in &block.instructions {
-                match inst {
-                    Instruction::AssignConst { .. } => {}
-                    Instruction::Binary { lhs, rhs, .. } => {
-                        used.insert(lhs.clone());
-                        used.insert(rhs.clone());
-                    }
-                    Instruction::Load { ptr, .. } => {
-                        used.insert(ptr.clone());
-                    }
-                    Instruction::Store { ptr, val, .. } => {
-                        used.insert(ptr.clone());
-                        used.insert(val.clone());
-                    }
-                    Instruction::Call { args, .. } => {
-                        for a in args {
-                            used.insert(a.clone());
-                        }
-                    }
-                    Instruction::Splat { src, .. } => {
-                        used.insert(src.clone());
-                    }
-                    Instruction::ExtractLane { vec, .. } => {
-                        used.insert(vec.clone());
-                    }
-                    Instruction::Alloc { size, .. } => {
-                        used.insert(size.clone());
-                    }
-                    Instruction::Free { ptr, .. } => {
-                        used.insert(ptr.clone());
-                    }
-                    Instruction::Select {
-                        cond,
-                        then_val,
-                        else_val,
-                        ..
-                    } => {
-                        used.insert(cond.clone());
-                        used.insert(then_val.clone());
-                        used.insert(else_val.clone());
-                    }
-                    Instruction::Unary { src, .. } => {
-                        used.insert(src.clone());
-                    }
-                    Instruction::Cast { src, .. } => {
-                        used.insert(src.clone());
-                    }
-                    Instruction::VectorReduce { src, .. } => {
-                        used.insert(src.clone());
-                    }
+                for reg in inst.operands() {
+                    used.insert(reg.clone());
                 }
             }
 
@@ -1170,6 +1052,11 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 Instruction::VectorReduce { dst, .. } => used.contains(dst),
                 Instruction::Splat { dst, .. } => used.contains(dst),
                 Instruction::ExtractLane { dst, .. } => used.contains(dst),
+                Instruction::VBinary { dst, .. }
+                | Instruction::VFma { dst, .. }
+                | Instruction::VCmp { dst, .. }
+                | Instruction::VSelect { dst, .. }
+                | Instruction::VLen { dst, .. } => used.contains(dst),
 
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }

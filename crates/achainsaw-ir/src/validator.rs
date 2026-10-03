@@ -36,17 +36,9 @@ pub fn binary_result_type(
     use BinaryOp::*;
     let mismatch = |msg: String| Err(("ERR_TYPE_MISMATCH", msg));
 
-    if op.is_vector() {
-        if lhs != Type::V128 || rhs != Type::V128 {
-            return mismatch(format!(
-                "Vector op '{op:?}' requires operands of type 'v128', found '{lhs}' and '{rhs}'"
-            ));
-        }
-        return Ok(Type::V128);
-    }
-    if lhs == Type::V128 || rhs == Type::V128 {
+    if lhs.is_vector() || rhs.is_vector() {
         return mismatch(format!(
-            "Scalar op '{op:?}' cannot be applied to 'v128' (found '{lhs}' and '{rhs}'); use vfadd/vfsub/vfmul/vfdiv/viadd/visub/vimul"
+            "Scalar op '{op:?}' cannot be applied to vectors (found '{lhs}' and '{rhs}'); use a lane-typed vector op such as 'vadd a, b:f32'"
         ));
     }
 
@@ -100,6 +92,59 @@ pub fn binary_result_type(
     }
 }
 
+/// Lane types each vector binary op supports. The same table applies to every backend,
+/// so a module that validates compiles everywhere.
+pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
+    use Type::*;
+    match op {
+        VBinOp::Add | VBinOp::Sub | VBinOp::And | VBinOp::Or | VBinOp::Xor => {
+            &[I8, I16, I32, I64, F32, F64]
+        }
+        VBinOp::Mul => &[I16, I32, I64, F32, F64],
+        VBinOp::Div => &[F32, F64],
+        VBinOp::Min | VBinOp::Max => &[I8, I16, I32, F32, F64],
+    }
+}
+
+/// Lane types supported by `vfma`.
+pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
+
+fn lane_list(types: &[Type]) -> String {
+    types
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Rejects types a signature may not use. `vx` has no fixed size, so it cannot cross
+/// function boundaries; C ABIs pass 256/512-bit vectors inconsistently, so `extfn`
+/// declarations are limited to scalars and `v128`.
+fn check_signature_type(
+    ty: Type,
+    func: &str,
+    is_extern: bool,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    if ty == Type::Vx {
+        return Err(Diagnostic::error(
+            "ERR_SCALABLE_IN_SIGNATURE",
+            format!("Function '{func}' uses 'vx' in its signature; scalable vectors cannot be passed or returned, pass a pointer instead"),
+            span,
+        )
+        .with_context(serde_json::json!({ "function": func })));
+    }
+    if is_extern && matches!(ty, Type::V256 | Type::V512) {
+        return Err(Diagnostic::error(
+            "ERR_WIDE_VECTOR_IN_EXTERN",
+            format!("External function '{func}' uses '{ty}'; extfn signatures support scalars and v128 only"),
+            span,
+        )
+        .with_context(serde_json::json!({ "function": func })));
+    }
+    Ok(())
+}
+
 /// Per-function validation context.
 struct FnCtx<'a> {
     func: &'a Function,
@@ -128,6 +173,9 @@ impl Validator {
                     ext_fn.span,
                 ));
             }
+            for ty in ext_fn.params.iter().map(|(_, t)| *t).chain(ext_fn.ret_type) {
+                check_signature_type(ty, &ext_fn.name, true, ext_fn.span)?;
+            }
             let param_types = ext_fn.params.iter().map(|(_, ty)| *ty).collect();
             self.functions
                 .insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
@@ -141,6 +189,9 @@ impl Validator {
                     format!("Duplicate function name '{}'", func.name),
                     func.span,
                 ));
+            }
+            for ty in func.params.iter().map(|(_, t)| *t).chain(func.ret_type) {
+                check_signature_type(ty, &func.name, false, func.span)?;
             }
             let param_types = func.params.iter().map(|(_, ty)| *ty).collect();
             self.functions
@@ -264,7 +315,7 @@ impl Validator {
                 def_blocks.entry(name.as_str()).or_insert(&block.label);
             }
             for inst in &block.instructions {
-                if let Some(dst) = inst_dst(inst) {
+                if let Some(dst) = inst.dst() {
                     def_blocks.entry(dst).or_insert(&block.label);
                 }
             }
@@ -480,16 +531,23 @@ impl Validator {
                     Self::define(scope, defs, d, rty, *span)?;
                 }
             }
-            Instruction::Splat { dst, src, span } => {
+            Instruction::Splat { dst, src, ty, span } => {
                 let src_ty = self.check_reg(ctx, src, scope, *span)?;
-                if src_ty.lane_count().is_none() {
+                if !src_ty.is_lane() {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
                         format!("Splat operand '{src}' must be numeric scalar, found '{src_ty}'"),
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, Type::V128, *span)?;
+                if !ty.is_vector() {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("Splat width must be a vector type (v128, v256, v512, vx), found '{ty}'"),
+                        *span,
+                    ));
+                }
+                Self::define(scope, defs, dst, *ty, *span)?;
             }
             Instruction::ExtractLane {
                 dst,
@@ -498,17 +556,8 @@ impl Validator {
                 ty,
                 span,
             } => {
-                let vec_ty = self.check_reg(ctx, vec, scope, *span)?;
-                if vec_ty != Type::V128 {
-                    return Err(Diagnostic::error(
-                        "ERR_TYPE_MISMATCH",
-                        format!(
-                            "ExtractLane requires vector operand of type 'v128', found '{vec_ty}'"
-                        ),
-                        *span,
-                    ));
-                }
-                let Some(lanes) = ty.lane_count() else {
+                let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
+                let Some(lanes) = ty.lanes_in(vec_ty) else {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
                         format!("ExtractLane result type must be a numeric scalar, found '{ty}'"),
@@ -516,14 +565,17 @@ impl Validator {
                     ));
                 };
                 if *lane >= lanes {
+                    let what = if vec_ty == Type::Vx {
+                        format!("'vx' is only guaranteed {} bits, i.e. {lanes} lanes of type '{ty}'; store the vector to memory to read higher lanes", crate::types::MIN_VX_BITS)
+                    } else {
+                        format!("a '{vec_ty}' vector has {lanes} lanes of type '{ty}'")
+                    };
                     return Err(Diagnostic::error(
                         "ERR_OUT_OF_BOUNDS_LANE",
-                        format!(
-                            "ExtractLane index {lane} out of bounds: a 128-bit vector has {lanes} lanes of type '{ty}'"
-                        ),
+                        format!("ExtractLane index {lane} out of bounds: {what}"),
                         *span,
                     )
-                    .with_context(serde_json::json!({ "lane": lane, "lanes": lanes, "type": ty.as_str() })));
+                    .with_context(serde_json::json!({ "lane": lane, "lanes": lanes, "type": ty.as_str(), "vector": vec_ty.as_str() })));
                 }
                 Self::define(scope, defs, dst, *ty, *span)?;
             }
@@ -592,7 +644,7 @@ impl Validator {
                         src_ty
                     }
                     UnaryOp::Neg | UnaryOp::Abs => {
-                        if src_ty == Type::V128 || src_ty == Type::Ptr {
+                        if src_ty.is_vector() || src_ty == Type::Ptr {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
                                 format!("Operation '{op:?}' is not supported for '{src_ty}'"),
@@ -690,6 +742,13 @@ impl Validator {
                         }
                     }
                     CastOp::Bitcast => {
+                        if (src_ty.is_vector() || ty.is_vector()) && src_ty != *ty {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("bitcast cannot change vector types ('{src_ty}' -> '{ty}'); vectors are untyped, so pick the lane type on each vector op instead"),
+                                *span,
+                            ));
+                        }
                         if src_ty.byte_size() != ty.byte_size() {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
@@ -712,38 +771,161 @@ impl Validator {
                 ty,
                 span,
             } => {
-                let src_ty = self.check_reg(ctx, src, scope, *span)?;
-                if src_ty != Type::V128 {
-                    return Err(Diagnostic::error(
-                        "ERR_TYPE_MISMATCH",
-                        format!("Vector reduce requires 'v128' operand, found '{src_ty}'"),
-                        *span,
-                    ));
-                }
-                match op {
-                    VectorReduceOp::VfSum | VectorReduceOp::VfMax => {
-                        if *ty != Type::F32 {
-                            return Err(Diagnostic::error(
-                                "ERR_TYPE_MISMATCH",
-                                format!("vfsum/vfmax target type must be 'f32', found '{ty}'"),
-                                *span,
-                            ));
-                        }
-                    }
-                    VectorReduceOp::ViSum => {
-                        if *ty != Type::I32 {
-                            return Err(Diagnostic::error(
-                                "ERR_TYPE_MISMATCH",
-                                format!("visum target type must be 'i32', found '{ty}'"),
-                                *span,
-                            ));
-                        }
-                    }
-                }
+                self.check_vector(ctx, src, scope, *span)?;
+                Self::check_lane(
+                    op.as_str(),
+                    *ty,
+                    &[
+                        Type::I8,
+                        Type::I16,
+                        Type::I32,
+                        Type::I64,
+                        Type::F32,
+                        Type::F64,
+                    ],
+                    *span,
+                )?;
                 Self::define(scope, defs, dst, *ty, *span)?;
+            }
+            Instruction::VBinary {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                span,
+            } => {
+                Self::check_lane(op.as_str(), *lane, vbin_lane_types(*op), *span)?;
+                let vec_ty =
+                    self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VFma {
+                dst,
+                a,
+                b,
+                c,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vfma", *lane, VFMA_LANE_TYPES, *span)?;
+                let vec_ty = self.check_same_vectors(ctx, "vfma", &[a, b, c], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VCmp {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                span,
+            } => {
+                Self::check_lane(
+                    op.as_str(),
+                    *lane,
+                    &[
+                        Type::I8,
+                        Type::I16,
+                        Type::I32,
+                        Type::I64,
+                        Type::F32,
+                        Type::F64,
+                    ],
+                    *span,
+                )?;
+                let vec_ty =
+                    self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VSelect {
+                dst,
+                mask,
+                then_val,
+                else_val,
+                span,
+            } => {
+                let vec_ty = self.check_same_vectors(
+                    ctx,
+                    "vsel",
+                    &[mask, then_val, else_val],
+                    scope,
+                    *span,
+                )?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VLen { dst, lane, span } => {
+                Self::check_lane(
+                    "vl",
+                    *lane,
+                    &[
+                        Type::I8,
+                        Type::I16,
+                        Type::I32,
+                        Type::I64,
+                        Type::F32,
+                        Type::F64,
+                    ],
+                    *span,
+                )?;
+                Self::define(scope, defs, dst, Type::I64, *span)?;
             }
         }
         Ok(())
+    }
+
+    fn check_lane(op: &str, lane: Type, allowed: &[Type], span: Span) -> Result<(), Diagnostic> {
+        if !allowed.contains(&lane) {
+            return Err(Diagnostic::error(
+                "ERR_INVALID_LANE_TYPE",
+                format!("'{op}' does not support lane type '{lane}'; supported: {}", lane_list(allowed)),
+                span,
+            )
+            .with_context(serde_json::json!({ "op": op, "lane": lane.as_str(), "supported": allowed.iter().map(|t| t.as_str()).collect::<Vec<_>>() })));
+        }
+        Ok(())
+    }
+
+    /// Checks that `name` is a vector register and returns its type.
+    fn check_vector(
+        &self,
+        ctx: &FnCtx,
+        name: &str,
+        scope: &Visible,
+        span: Span,
+    ) -> Result<Type, Diagnostic> {
+        let ty = self.check_reg(ctx, name, scope, span)?;
+        if !ty.is_vector() {
+            return Err(Diagnostic::error(
+                "ERR_TYPE_MISMATCH",
+                format!("Operand '{name}' must be a vector (v128, v256, v512, vx), found '{ty}'"),
+                span,
+            )
+            .with_context(serde_json::json!({ "target": name, "found": ty.as_str() })));
+        }
+        Ok(ty)
+    }
+
+    /// Checks that all `regs` are vectors of one type and returns it.
+    fn check_same_vectors(
+        &self,
+        ctx: &FnCtx,
+        op: &str,
+        regs: &[&String],
+        scope: &Visible,
+        span: Span,
+    ) -> Result<Type, Diagnostic> {
+        let first = self.check_vector(ctx, regs[0], scope, span)?;
+        for r in &regs[1..] {
+            let ty = self.check_vector(ctx, r, scope, span)?;
+            if ty != first {
+                return Err(Diagnostic::error(
+                    "ERR_TYPE_MISMATCH",
+                    format!("'{op}' operands must be vectors of the same width, found '{first}' and '{ty}'"),
+                    span,
+                ));
+            }
+        }
+        Ok(first)
     }
 
     fn check_reg(
@@ -889,23 +1071,6 @@ impl Validator {
             },
         }
         Ok(())
-    }
-}
-
-fn inst_dst(inst: &Instruction) -> Option<&str> {
-    match inst {
-        Instruction::AssignConst { dst, .. }
-        | Instruction::Binary { dst, .. }
-        | Instruction::Load { dst, .. }
-        | Instruction::Splat { dst, .. }
-        | Instruction::ExtractLane { dst, .. }
-        | Instruction::Alloc { dst, .. }
-        | Instruction::Select { dst, .. }
-        | Instruction::Unary { dst, .. }
-        | Instruction::Cast { dst, .. }
-        | Instruction::VectorReduce { dst, .. } => Some(dst),
-        Instruction::Call { dst, .. } => dst.as_deref(),
-        Instruction::Store { .. } | Instruction::Free { .. } => None,
     }
 }
 

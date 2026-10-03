@@ -143,10 +143,10 @@ impl PyKernel {
                 Type::I64 => RtValue::I64(arg.extract()?),
                 Type::F32 => RtValue::F32(arg.extract()?),
                 Type::F64 => RtValue::F64(arg.extract()?),
-                Type::V128 => {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "Direct passing of v128 register arguments across Python boundary not supported; pass by pointer (ptr)",
-                    ));
+                Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "Direct passing of {ty} vector arguments across Python boundary not supported; pass by pointer (ptr)",
+                    )));
                 }
             };
             rt_args.push(rt_val);
