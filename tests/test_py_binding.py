@@ -186,6 +186,94 @@ class TestChainsawPy(unittest.TestCase):
         with self.assertRaises(ValueError):
             k.run("add", 1, 2, 3)
 
+    def test_extfn_math_intrinsics(self):
+        """Test calling pre-registered C math intrinsics (sinf, sqrtf)."""
+        import math
+        code = """extfn sinf(x:f32)->f32
+extfn sqrtf(x:f32)->f32
+fn compute_hypot_sin(x:f32)->f32
+  b0:
+    s = call sinf(x)
+    two = cst 4.0:f32
+    r = call sqrtf(two)
+    res = mul s, r
+    ret res
+"""
+        k = achainsaw.compile(code)
+        val = 1.04719755  # pi / 3
+        res = k.run("compute_hypot_sin", val)
+        expected = math.sin(val) * 2.0
+        self.assertAlmostEqual(res, expected, places=5)
+
+    def test_extfn_binary_roundtrip(self):
+        """Test AIRB assemble/disassemble and binary compilation with extfn."""
+        code = """extfn cosf(x:f32)->f32
+fn compute_cos(x:f32)->f32
+  b0:
+    c = call cosf(x)
+    ret c
+"""
+        binary = achainsaw.assemble(code)
+        disassembled = achainsaw.disassemble(binary)
+        self.assertIn("extfn cosf(x:f32)->f32", disassembled)
+
+        k = achainsaw.compile_binary(binary)
+        res = k.run("compute_cos", 0.0)
+        self.assertAlmostEqual(res, 1.0, places=5)
+
+    def test_register_custom_symbol(self):
+        """Test registering a custom C function pointer via ctypes and invoking it from IR."""
+        import ctypes
+        c_func_ty = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
+
+        def custom_fn(a, b, c):
+            return a * b + c
+
+        c_cb = c_func_ty(custom_fn)
+        cb_addr = ctypes.cast(c_cb, ctypes.c_void_p).value
+
+        achainsaw.register_symbol("py_custom_fma", cb_addr)
+
+        code = """extfn py_custom_fma(a:i32, b:i32, c:i32)->i32
+fn test_fma(x:i32, y:i32, z:i32)->i32
+  b0:
+    res = call py_custom_fma(x, y, z)
+    ret res
+"""
+        k = achainsaw.compile(code)
+        res = k.run("test_fma", 7, 8, 9)
+        self.assertEqual(res, 65)  # 7 * 8 + 9 = 65
+
+    def test_external_variable_access(self):
+        """Test accessing and modifying external variables via pointers in IR."""
+        import ctypes
+        var = ctypes.c_int32(100)
+        var_addr = ctypes.addressof(var)
+
+        code = """fn add_to_var(p:ptr, delta:i32)->i32
+  b0:
+    cur = ld p:i32
+    updated = add cur, delta
+    st p, updated
+    ret updated
+"""
+        k = achainsaw.compile(code)
+        res = k.run("add_to_var", var_addr, 25)
+        self.assertEqual(res, 125)
+        self.assertEqual(var.value, 125)
+
+    def test_load_library_and_symbol_address(self):
+        """Test library loading and symbol address querying."""
+        # Querying an existing pre-registered symbol
+        sinf_addr = achainsaw.get_symbol_address("sinf")
+        self.assertIsNotNone(sinf_addr)
+        self.assertGreater(sinf_addr, 0)
+
+        # Non-existent library raises RuntimeError
+        with self.assertRaises(RuntimeError):
+            achainsaw.load_library("non_existent_library_12345.dll")
+
 
 if __name__ == "__main__":
     unittest.main()
+

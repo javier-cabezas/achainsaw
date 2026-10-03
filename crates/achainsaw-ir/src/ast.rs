@@ -188,7 +188,16 @@ pub struct Function {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternFunction {
+    pub name: String,
+    pub params: Vec<(String, Type)>,
+    pub ret_type: Option<Type>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Module {
+    pub extern_functions: Vec<ExternFunction>,
     pub functions: Vec<Function>,
 }

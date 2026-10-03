@@ -17,6 +17,18 @@ impl Validator {
 
     pub fn validate_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
         // Collect function signatures
+        for ext_fn in &module.extern_functions {
+            if self.functions.contains_key(&ext_fn.name) {
+                return Err(Diagnostic::error(
+                    "ERR_DUPLICATE_FUNCTION",
+                    format!("Duplicate function name '{}' (already declared)", ext_fn.name),
+                    ext_fn.span,
+                ));
+            }
+            let param_types = ext_fn.params.iter().map(|(_, ty)| *ty).collect();
+            self.functions.insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
+        }
+
         for func in &module.functions {
             if self.functions.contains_key(&func.name) {
                 return Err(Diagnostic::error(

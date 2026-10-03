@@ -1,4 +1,6 @@
-use achainsaw_codegen::JitEngine;
+use achainsaw_codegen::{
+    get_global_symbol_address, load_global_library, register_global_symbol, JitEngine,
+};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
@@ -32,6 +34,10 @@ pub struct PyKernel {
 impl PyKernel {
     pub fn get_function_names(&self) -> Vec<String> {
         self.signatures.keys().cloned().collect()
+    }
+
+    pub fn lookup_symbol(&self, name: &str) -> Option<usize> {
+        self.engine.lookup_symbol(name).map(|ptr| ptr as usize)
     }
 
     #[pyo3(signature = (func_name, *args))]
@@ -172,6 +178,11 @@ fn dispatch_call(
                 f(i_vals[0], i_vals[1]);
                 Ok(py.None())
             }
+            ([Type::Ptr | Type::I64, Type::I32], None) => {
+                let f: extern "C" fn(i64, i32) = std::mem::transmute(fn_ptr);
+                f(i_vals[0], i_vals[1] as i32);
+                Ok(py.None())
+            }
             ([Type::Ptr | Type::I64, Type::F32, Type::I64 | Type::I32], None) => {
                 let f: extern "C" fn(i64, f32, i64) = std::mem::transmute(fn_ptr);
                 f(i_vals[0], f_vals[0] as f32, i_vals[1]);
@@ -192,9 +203,21 @@ fn dispatch_call(
                 let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0] as i32).into_py(py))
             }
+            ([Type::Ptr], Some(Type::I32)) => {
+                let f: extern "C" fn(i64) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(i_vals[0]).into_py(py))
+            }
+            ([Type::Ptr, Type::I32 | Type::I64], Some(Type::I32)) => {
+                let f: extern "C" fn(i64, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(i_vals[0], i_vals[1] as i32).into_py(py))
+            }
             ([Type::I32 | Type::I64, Type::I32 | Type::I64], Some(Type::I32)) => {
                 let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0] as i32, i_vals[1] as i32).into_py(py))
+            }
+            ([Type::I32 | Type::I64, Type::I32 | Type::I64, Type::I32 | Type::I64], Some(Type::I32)) => {
+                let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(i_vals[0] as i32, i_vals[1] as i32, i_vals[2] as i32).into_py(py))
             }
             ([Type::Ptr | Type::I64], Some(Type::I64)) => {
                 let f: extern "C" fn(i64) -> i64 = std::mem::transmute(fn_ptr);
@@ -206,9 +229,21 @@ fn dispatch_call(
             }
 
             // Float returns
+            ([Type::F32], Some(Type::F32)) => {
+                let f: extern "C" fn(f32) -> f32 = std::mem::transmute(fn_ptr);
+                Ok(f(f_vals[0] as f32).into_py(py))
+            }
+            ([Type::F64], Some(Type::F64)) => {
+                let f: extern "C" fn(f64) -> f64 = std::mem::transmute(fn_ptr);
+                Ok(f(f_vals[0]).into_py(py))
+            }
             ([Type::F32, Type::F32], Some(Type::F32)) => {
                 let f: extern "C" fn(f32, f32) -> f32 = std::mem::transmute(fn_ptr);
                 Ok(f(f_vals[0] as f32, f_vals[1] as f32).into_py(py))
+            }
+            ([Type::F64, Type::F64], Some(Type::F64)) => {
+                let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(fn_ptr);
+                Ok(f(f_vals[0], f_vals[1]).into_py(py))
             }
             ([Type::Ptr, Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
                 let f: extern "C" fn(*const u8, *const u8, i64) -> f32 = std::mem::transmute(fn_ptr);
@@ -220,8 +255,17 @@ fn dispatch_call(
                 let res = f(i_vals[0] as *const u8, i_vals[1]);
                 Ok(res.into_py(py))
             }
+            ([Type::Ptr], Some(Type::F32)) => {
+                let f: extern "C" fn(*const u8) -> f32 = std::mem::transmute(fn_ptr);
+                let res = f(i_vals[0] as *const u8);
+                Ok(res.into_py(py))
+            }
 
             // Pointer returns
+            ([], Some(Type::Ptr)) => {
+                let f: extern "C" fn() -> *mut u8 = std::mem::transmute(fn_ptr);
+                Ok((f() as usize).into_py(py))
+            }
             ([Type::I64 | Type::I32], Some(Type::Ptr)) => {
                 let f: extern "C" fn(i64) -> *mut u8 = std::mem::transmute(fn_ptr);
                 Ok((f(i_vals[0]) as usize).into_py(py))
@@ -332,6 +376,21 @@ pub fn compile(py: Python<'_>, source: &str) -> PyResult<PyKernel> {
 }
 
 #[pyfunction]
+pub fn register_symbol(name: &str, addr: usize) {
+    register_global_symbol(name, addr as *const u8);
+}
+
+#[pyfunction]
+pub fn load_library(path: &str) -> PyResult<()> {
+    load_global_library(path).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+#[pyfunction]
+pub fn get_symbol_address(name: &str) -> Option<usize> {
+    get_global_symbol_address(name).map(|ptr| ptr as usize)
+}
+
+#[pyfunction]
 pub fn version() -> &'static str {
     "0.1.0"
 }
@@ -345,6 +404,9 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(assemble, m)?)?;
     m.add_function(wrap_pyfunction!(disassemble, m)?)?;
     m.add_function(wrap_pyfunction!(compile_binary, m)?)?;
+    m.add_function(wrap_pyfunction!(register_symbol, m)?)?;
+    m.add_function(wrap_pyfunction!(load_library, m)?)?;
+    m.add_function(wrap_pyfunction!(get_symbol_address, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

@@ -97,15 +97,67 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_module(&mut self) -> Result<Module, Diagnostic> {
+        let mut extern_functions = Vec::new();
         let mut functions = Vec::new();
         self.skip_newlines();
 
         while self.peek_kind() != &TokenKind::Eof {
-            functions.push(self.parse_function()?);
+            if self.peek_kind() == &TokenKind::ExtFn {
+                extern_functions.push(self.parse_extern_function()?);
+            } else if self.peek_kind() == &TokenKind::Fn {
+                functions.push(self.parse_function()?);
+            } else {
+                return Err(Diagnostic::error(
+                    "ERR_UNEXPECTED_TOKEN",
+                    format!("Expected 'fn' or 'extfn', found {:?}", self.peek_kind()),
+                    self.peek().span,
+                ));
+            }
             self.skip_newlines();
         }
 
-        Ok(Module { functions })
+        Ok(Module {
+            extern_functions,
+            functions,
+        })
+    }
+
+    fn parse_extern_function(&mut self) -> Result<ExternFunction, Diagnostic> {
+        let fn_span = self.expect(TokenKind::ExtFn)?;
+        let (name, _) = self.expect_ident()?;
+
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        if self.peek_kind() != &TokenKind::RParen {
+            loop {
+                let (param_name, _) = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let param_type = self.parse_type()?;
+                params.push((param_name, param_type));
+
+                if self.peek_kind() == &TokenKind::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+
+        let mut ret_type = None;
+        if self.peek_kind() == &TokenKind::Arrow {
+            self.advance();
+            ret_type = Some(self.parse_type()?);
+        }
+
+        self.skip_newlines();
+
+        Ok(ExternFunction {
+            name,
+            params,
+            ret_type,
+            span: fn_span,
+        })
     }
 
     fn parse_function(&mut self) -> Result<Function, Diagnostic> {
@@ -139,7 +191,10 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
 
         let mut blocks = Vec::new();
-        while self.peek_kind() != &TokenKind::Fn && self.peek_kind() != &TokenKind::Eof {
+        while self.peek_kind() != &TokenKind::Fn
+            && self.peek_kind() != &TokenKind::ExtFn
+            && self.peek_kind() != &TokenKind::Eof
+        {
             blocks.push(self.parse_block()?);
             self.skip_newlines();
         }

@@ -27,6 +27,28 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, Diagnostic> {
 /// Converts an in-memory `Module` back into canonical AIR text format (disassembler).
 pub fn to_air_text(module: &Module) -> String {
     let mut out = String::new();
+    for ext_fn in &module.extern_functions {
+        out.push_str("extfn ");
+        out.push_str(&ext_fn.name);
+        out.push('(');
+        for (p_idx, (p_name, p_ty)) in ext_fn.params.iter().enumerate() {
+            if p_idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(p_name);
+            out.push(':');
+            out.push_str(p_ty.as_str());
+        }
+        out.push(')');
+        if let Some(ret_ty) = ext_fn.ret_type {
+            out.push_str("->");
+            out.push_str(ret_ty.as_str());
+        }
+        out.push('\n');
+    }
+    if !module.extern_functions.is_empty() && !module.functions.is_empty() {
+        out.push('\n');
+    }
     for (f_idx, func) in module.functions.iter().enumerate() {
         if f_idx > 0 {
             out.push('\n');
@@ -264,6 +286,12 @@ impl BinaryEncoder {
 
     fn encode(&mut self, module: &Module) {
         // Collect all strings first
+        for ext_fn in &module.extern_functions {
+            self.intern(&ext_fn.name);
+            for (p_name, _) in &ext_fn.params {
+                self.intern(p_name);
+            }
+        }
         for func in &module.functions {
             self.intern(&func.name);
             for (p_name, _) in &func.params {
@@ -365,7 +393,28 @@ impl BinaryEncoder {
             self.buf.extend_from_slice(bytes);
         }
 
-        // 3. Functions
+        // 3. Extern Functions
+        self.buf.extend_from_slice(&(module.extern_functions.len() as u32).to_le_bytes());
+        for ext_fn in &module.extern_functions {
+            let fn_name_id = self.string_map[&ext_fn.name];
+            self.buf.extend_from_slice(&fn_name_id.to_le_bytes());
+
+            self.buf.extend_from_slice(&(ext_fn.params.len() as u32).to_le_bytes());
+            for (p_name, ty) in &ext_fn.params {
+                let p_id = self.string_map[p_name];
+                self.buf.extend_from_slice(&p_id.to_le_bytes());
+                self.buf.push(encode_type(*ty));
+            }
+
+            if let Some(ret_ty) = ext_fn.ret_type {
+                self.buf.push(1);
+                self.buf.push(encode_type(ret_ty));
+            } else {
+                self.buf.push(0);
+            }
+        }
+
+        // 4. Functions
         self.buf.extend_from_slice(&(module.functions.len() as u32).to_le_bytes());
         for func in &module.functions {
             let fn_name_id = self.string_map[&func.name];
@@ -650,7 +699,39 @@ impl<'a> BinaryDecoder<'a> {
             self.strings.push(s.to_string());
         }
 
-        // 4. Functions
+        // 4. Extern Functions
+        let ext_count = self.read_u32()?;
+        let mut extern_functions = Vec::with_capacity(ext_count as usize);
+        for _ in 0..ext_count {
+            let name = self.read_string()?;
+
+            let param_count = self.read_u32()?;
+            let mut params = Vec::with_capacity(param_count as usize);
+            for _ in 0..param_count {
+                let p_name = self.read_string()?;
+                let p_ty = decode_type(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid parameter type code in AIRB"))?;
+                params.push((p_name, p_ty));
+            }
+
+            let has_ret = self.read_u8()?;
+            let ret_type = if has_ret != 0 {
+                let r_ty = decode_type(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid return type code in AIRB"))?;
+                Some(r_ty)
+            } else {
+                None
+            };
+
+            extern_functions.push(ExternFunction {
+                name,
+                params,
+                ret_type,
+                span: Span::default(),
+            });
+        }
+
+        // 5. Functions
         let func_count = self.read_u32()?;
         let mut functions = Vec::with_capacity(func_count as usize);
 
@@ -716,7 +797,10 @@ impl<'a> BinaryDecoder<'a> {
             });
         }
 
-        Ok(Module { functions })
+        Ok(Module {
+            extern_functions,
+            functions,
+        })
     }
 
     fn decode_instruction(&mut self) -> Result<Instruction, Diagnostic> {

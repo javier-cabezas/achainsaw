@@ -190,6 +190,8 @@ fn run_check(path: &Path) -> Result<serde_json::Value, Diagnostic> {
         "status": "ok",
         "functions": module.functions.iter().map(|f| &f.name).collect::<Vec<_>>(),
         "function_count": module.functions.len(),
+        "extern_functions": module.extern_functions.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        "extern_function_count": module.extern_functions.len(),
         "block_count": total_blocks,
         "instruction_count": total_instructions,
     }))

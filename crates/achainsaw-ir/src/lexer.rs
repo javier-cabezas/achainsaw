@@ -4,6 +4,7 @@ use crate::diag::Span;
 pub enum TokenKind {
     // Keywords / Instructions
     Fn,
+    ExtFn,
     Cst,
     Ld,
     St,
@@ -230,6 +231,7 @@ impl<'a> Lexer<'a> {
 
             let kind = match ident.as_str() {
                 "fn" => TokenKind::Fn,
+                "extfn" => TokenKind::ExtFn,
                 "cst" => TokenKind::Cst,
                 "ld" => TokenKind::Ld,
                 "st" => TokenKind::St,

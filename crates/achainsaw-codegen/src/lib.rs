@@ -1,6 +1,9 @@
 pub mod jit;
 
-pub use jit::{to_clif_type, JitEngine};
+pub use jit::{
+    get_global_symbol_address, load_global_library, register_global_symbol, to_clif_type,
+    JitEngine, SymbolRegistry,
+};
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +147,87 @@ fn test_heap(n:i32)->i32
         unsafe {
             let res = engine.run_i32_to_i32("test_heap", 1).expect("Run test_heap");
             assert_eq!(res, 777);
+        }
+    }
+
+    #[test]
+    fn test_jit_call_external_math_sinf() {
+        let code = r#"
+extfn sinf(x:f32)->f32
+fn compute_sin(x:f32)->f32
+  b0:
+    res = call sinf(x)
+    ret res
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let mut engine = JitEngine::new().expect("JIT init");
+        engine.compile_module(&module).expect("Compile module");
+
+        unsafe {
+            let res = engine.run_f32_to_f32("compute_sin", 0.0f32).expect("Run sin(0)");
+            assert!((res - 0.0).abs() < 1e-6);
+
+            let pi_half = std::f32::consts::FRAC_PI_2;
+            let res = engine.run_f32_to_f32("compute_sin", pi_half).expect("Run sin(pi/2)");
+            assert!((res - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_jit_custom_symbol_registration() {
+        unsafe extern "C" fn custom_multiply_add(a: i32, b: i32, c: i32) -> i32 {
+            a * b + c
+        }
+
+        let code = r#"
+extfn custom_multiply_add(a:i32, b:i32, c:i32)->i32
+fn eval_fused(x:i32, y:i32, z:i32)->i32
+  b0:
+    res = call custom_multiply_add(x, y, z)
+    ret res
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let mut engine = JitEngine::new().expect("JIT init");
+        engine.register_symbol("custom_multiply_add", custom_multiply_add as *const u8);
+        engine.compile_module(&module).expect("Compile module");
+
+        unsafe {
+            let ptr = engine.get_fn_ptr("eval_fused").expect("Found eval_fused");
+            let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(ptr);
+            let res = f(6, 7, 5);
+            assert_eq!(res, 47);
+        }
+    }
+
+    #[test]
+    fn test_jit_global_symbol_and_variable_lookup() {
+        let mut global_counter: i32 = 999;
+        let counter_ptr = &mut global_counter as *mut i32;
+
+        register_global_symbol("global_counter", counter_ptr as *const u8);
+
+        let resolved = get_global_symbol_address("global_counter");
+        assert_eq!(resolved, Some(counter_ptr as *const u8));
+
+        let code = r#"
+fn inc_global(p:ptr)->i32
+  b0:
+    val = ld p:i32
+    one = cst 1:i32
+    new_val = add val, one
+    st p, new_val
+    ret new_val
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let mut engine = JitEngine::new().expect("JIT init");
+        engine.compile_module(&module).expect("Compile module");
+
+        unsafe {
+            let ptr = engine.get_fn_ptr("inc_global").expect("Found inc_global");
+            let f: extern "C" fn(*mut i32) -> i32 = std::mem::transmute(ptr);
+            let res = f(counter_ptr);
+            assert_eq!(res, 1000);
+            assert_eq!(global_counter, 1000);
         }
     }
 }

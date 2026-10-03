@@ -63,6 +63,33 @@ fn sum_loop(n:i32)->i32
     }
 
     #[test]
+    fn test_extern_function_declaration_and_call() {
+        let code = r#"
+extfn sinf(x:f32)->f32
+extfn puts(s:ptr)->i32
+
+fn compute_wave(freq:f32)->f32
+  b0:
+    res = call sinf(freq)
+    ret res
+"#;
+        let module = parse_and_validate(code).expect("External function call should validate");
+        assert_eq!(module.extern_functions.len(), 2);
+        assert_eq!(module.extern_functions[0].name, "sinf");
+        assert_eq!(module.functions.len(), 1);
+
+        // Binary roundtrip
+        let bytes = encode_module(&module);
+        let decoded = decode_module(&bytes).expect("Should decode with extern_functions");
+        assert_eq!(decoded.extern_functions.len(), 2);
+        assert_eq!(decoded.extern_functions[0].name, "sinf");
+
+        let text = to_air_text(&decoded);
+        assert!(text.contains("extfn sinf(x:f32)->f32"));
+        assert!(text.contains("extfn puts(s:ptr)->i32"));
+    }
+
+    #[test]
     fn test_binary_encode_decode_roundtrip() {
         let code = r#"
 fn simd_scale(p:ptr, factor:f32, n:i64)

@@ -1,0 +1,13 @@
+extfn sinf(x:f32)->f32
+extfn cosf(x:f32)->f32
+extfn sqrtf(x:f32)->f32
+
+fn compute_sincos_norm(x:f32)->f32
+  b0:
+    s = call sinf(x)
+    c = call cosf(x)
+    s2 = mul s, s
+    c2 = mul c, c
+    sum = add s2, c2
+    norm = call sqrtf(sum)
+    ret norm

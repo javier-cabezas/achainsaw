@@ -10,6 +10,45 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+
+static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+static USER_LIBRARIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn register_global_symbol(name: impl Into<String>, ptr: *const u8) {
+    USER_SYMBOLS.lock().unwrap().push((name.into(), ptr as usize));
+}
+
+pub fn load_global_library(path: &str) -> Result<()> {
+    unsafe {
+        let _ = libloading::Library::new(path)?;
+    }
+    USER_LIBRARIES.lock().unwrap().push(path.to_string());
+    Ok(())
+}
+
+pub fn get_global_symbol_address(name: &str) -> Option<*const u8> {
+    if let Ok(syms) = USER_SYMBOLS.lock() {
+        for (n, addr) in syms.iter().rev() {
+            if n == name {
+                return Some(*addr as *const u8);
+            }
+        }
+    }
+    if let Ok(libs) = USER_LIBRARIES.lock() {
+        for lib_path in libs.iter().rev() {
+            unsafe {
+                if let Ok(lib) = libloading::Library::new(lib_path) {
+                    if let Ok(sym) = lib.get::<*const u8>(name.as_bytes()) {
+                        return Some(*sym);
+                    }
+                }
+            }
+        }
+    }
+    let default_reg = SymbolRegistry::new();
+    default_reg.lookup(name)
+}
 
 pub fn to_clif_type(ty: Type) -> types::Type {
     match ty {
@@ -37,12 +76,116 @@ unsafe extern "C" fn rt_free(ptr: *mut u8) {
     free(ptr)
 }
 
+pub struct SymbolRegistry {
+    custom: HashMap<String, *const u8>,
+    libraries: Vec<libloading::Library>,
+}
+
+unsafe impl Send for SymbolRegistry {}
+unsafe impl Sync for SymbolRegistry {}
+
+impl SymbolRegistry {
+    pub fn new() -> Self {
+        let mut reg = Self {
+            custom: HashMap::new(),
+            libraries: Vec::new(),
+        };
+        reg.register_default_math();
+        if let Ok(libs) = USER_LIBRARIES.lock() {
+            for lib_path in libs.iter() {
+                let _ = reg.load_library(lib_path);
+            }
+        }
+        if let Ok(syms) = USER_SYMBOLS.lock() {
+            for (name, addr) in syms.iter() {
+                reg.register(name.clone(), *addr as *const u8);
+            }
+        }
+        reg
+    }
+
+    pub fn register(&mut self, name: impl Into<String>, ptr: *const u8) {
+        self.custom.insert(name.into(), ptr);
+    }
+
+    pub fn load_library(&mut self, path: &str) -> Result<()> {
+        let lib = unsafe { libloading::Library::new(path)? };
+        self.libraries.push(lib);
+        Ok(())
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<*const u8> {
+        if let Some(&ptr) = self.custom.get(name) {
+            return Some(ptr);
+        }
+        for lib in self.libraries.iter().rev() {
+            unsafe {
+                if let Ok(sym) = lib.get::<*const u8>(name.as_bytes()) {
+                    return Some(*sym);
+                }
+            }
+        }
+        None
+    }
+
+    fn register_default_math(&mut self) {
+        unsafe extern "C" fn m_sinf(x: f32) -> f32 { x.sin() }
+        unsafe extern "C" fn m_cosf(x: f32) -> f32 { x.cos() }
+        unsafe extern "C" fn m_tanf(x: f32) -> f32 { x.tan() }
+        unsafe extern "C" fn m_sqrtf(x: f32) -> f32 { x.sqrt() }
+        unsafe extern "C" fn m_expf(x: f32) -> f32 { x.exp() }
+        unsafe extern "C" fn m_logf(x: f32) -> f32 { x.ln() }
+        unsafe extern "C" fn m_powf(x: f32, y: f32) -> f32 { x.powf(y) }
+        unsafe extern "C" fn m_fabsf(x: f32) -> f32 { x.abs() }
+        unsafe extern "C" fn m_floorf(x: f32) -> f32 { x.floor() }
+        unsafe extern "C" fn m_ceilf(x: f32) -> f32 { x.ceil() }
+        unsafe extern "C" fn m_roundf(x: f32) -> f32 { x.round() }
+
+        unsafe extern "C" fn m_sin(x: f64) -> f64 { x.sin() }
+        unsafe extern "C" fn m_cos(x: f64) -> f64 { x.cos() }
+        unsafe extern "C" fn m_tan(x: f64) -> f64 { x.tan() }
+        unsafe extern "C" fn m_sqrt(x: f64) -> f64 { x.sqrt() }
+        unsafe extern "C" fn m_exp(x: f64) -> f64 { x.exp() }
+        unsafe extern "C" fn m_log(x: f64) -> f64 { x.ln() }
+        unsafe extern "C" fn m_pow(x: f64, y: f64) -> f64 { x.powf(y) }
+        unsafe extern "C" fn m_fabs(x: f64) -> f64 { x.abs() }
+        unsafe extern "C" fn m_floor(x: f64) -> f64 { x.floor() }
+        unsafe extern "C" fn m_ceil(x: f64) -> f64 { x.ceil() }
+        unsafe extern "C" fn m_round(x: f64) -> f64 { x.round() }
+
+        self.register("sinf", m_sinf as *const u8);
+        self.register("cosf", m_cosf as *const u8);
+        self.register("tanf", m_tanf as *const u8);
+        self.register("sqrtf", m_sqrtf as *const u8);
+        self.register("expf", m_expf as *const u8);
+        self.register("logf", m_logf as *const u8);
+        self.register("powf", m_powf as *const u8);
+        self.register("fabsf", m_fabsf as *const u8);
+        self.register("floorf", m_floorf as *const u8);
+        self.register("ceilf", m_ceilf as *const u8);
+        self.register("roundf", m_roundf as *const u8);
+
+        self.register("sin", m_sin as *const u8);
+        self.register("cos", m_cos as *const u8);
+        self.register("tan", m_tan as *const u8);
+        self.register("sqrt", m_sqrt as *const u8);
+        self.register("exp", m_exp as *const u8);
+        self.register("log", m_log as *const u8);
+        self.register("pow", m_pow as *const u8);
+        self.register("fabs", m_fabs as *const u8);
+        self.register("floor", m_floor as *const u8);
+        self.register("ceil", m_ceil as *const u8);
+        self.register("round", m_round as *const u8);
+    }
+}
+
 pub struct JitEngine {
     builder_context: FunctionBuilderContext,
     ctx: cranelift_codegen::Context,
     module: JITModule,
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
+    pub registry: Arc<RwLock<SymbolRegistry>>,
 }
 
 impl JitEngine {
@@ -56,9 +199,15 @@ impl JitEngine {
             .map_err(|msg| anyhow!("Host machine not supported by Cranelift: {msg}"))?;
         let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
 
+        let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
+        let reg_lookup = Arc::clone(&registry);
+
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
         jit_builder.symbol("rt_free", rt_free as *const u8);
+        jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
+            reg_lookup.read().unwrap().lookup(name)
+        }));
 
         let mut module = JITModule::new(jit_builder);
 
@@ -79,13 +228,44 @@ impl JitEngine {
             module,
             rt_malloc_id,
             rt_free_id,
+            registry,
         })
+    }
+
+    pub fn register_symbol(&self, name: impl Into<String>, ptr: *const u8) {
+        self.registry.write().unwrap().register(name, ptr);
+    }
+
+    pub fn load_library(&self, path: &str) -> Result<()> {
+        self.registry.write().unwrap().load_library(path)
+    }
+
+    pub fn lookup_symbol(&self, name: &str) -> Option<*const u8> {
+        self.registry.read().unwrap().lookup(name)
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
         let mut func_ids = HashMap::new();
+        let mut func_returns = HashMap::new();
 
-        // 1. Declare all functions
+        // 1. Declare external functions (Linkage::Import)
+        for ext_fn in &ir_mod.extern_functions {
+            let mut sig = self.module.make_signature();
+            for (_, p_ty) in &ext_fn.params {
+                sig.params.push(AbiParam::new(to_clif_type(*p_ty)));
+            }
+            if let Some(r_ty) = ext_fn.ret_type {
+                sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
+            }
+            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
+
+            let func_id = self
+                .module
+                .declare_function(&ext_fn.name, Linkage::Import, &sig)?;
+            func_ids.insert(ext_fn.name.clone(), func_id);
+        }
+
+        // 2. Declare internal functions (Linkage::Export)
         for func in &ir_mod.functions {
             let mut sig = self.module.make_signature();
             for (_, p_ty) in &func.params {
@@ -94,6 +274,7 @@ impl JitEngine {
             if let Some(r_ty) = func.ret_type {
                 sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
             }
+            func_returns.insert(func.name.clone(), func.ret_type);
 
             let func_id = self
                 .module
@@ -101,12 +282,12 @@ impl JitEngine {
             func_ids.insert(func.name.clone(), func_id);
         }
 
-        // 2. Define each function
+        // 3. Define each function
         for func in &ir_mod.functions {
-            self.compile_function(func, &func_ids)?;
+            self.compile_function(func, &func_ids, &func_returns)?;
         }
 
-        // 3. Finalize all JIT definitions
+        // 4. Finalize all JIT definitions
         self.module.finalize_definitions()?;
         Ok(())
     }
@@ -115,6 +296,7 @@ impl JitEngine {
         &mut self,
         func: &achainsaw_ir::ast::Function,
         func_ids: &HashMap<String, FuncId>,
+        func_returns: &HashMap<String, Option<Type>>,
     ) -> Result<()> {
         let func_id = *func_ids.get(&func.name).unwrap();
 
@@ -318,17 +500,11 @@ impl JitEngine {
                         if let Some(d) = dst {
                             let results = builder.inst_results(call_inst);
                             let res_val = results[0];
-                            let func_sig = &self.module.declarations().get_function_decl(target_func_id).signature;
-                            let ret_clif_ty = func_sig.returns[0].value_type;
-                            let ret_ir_ty = match ret_clif_ty {
-                                types::I8 => Type::I8,
-                                types::I16 => Type::I16,
-                                types::I32 => Type::I32,
-                                types::I64 => Type::I64,
-                                types::F32 => Type::F32,
-                                types::F64 => Type::F64,
-                                _ => Type::I32,
-                            };
+                            let ret_ir_ty = func_returns
+                                .get(func)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(Type::I32);
                             values.insert(d.clone(), (res_val, ret_ir_ty));
                         }
                     }
@@ -452,6 +628,22 @@ impl JitEngine {
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
         let func: extern "C" fn(*const f32, *const f32, i32) -> f32 = std::mem::transmute(ptr);
         Ok(func(p0, p1, n))
+    }
+
+    pub unsafe fn run_f32_to_f32(&self, name: &str, arg: f32) -> Result<f32> {
+        let ptr = self
+            .get_fn_ptr(name)
+            .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        let func: extern "C" fn(f32) -> f32 = std::mem::transmute(ptr);
+        Ok(func(arg))
+    }
+
+    pub unsafe fn run_f64_to_f64(&self, name: &str, arg: f64) -> Result<f64> {
+        let ptr = self
+            .get_fn_ptr(name)
+            .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        let func: extern "C" fn(f64) -> f64 = std::mem::transmute(ptr);
+        Ok(func(arg))
     }
 
     pub unsafe fn run_ptr_ptr_i64_to_f32(
