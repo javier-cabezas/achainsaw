@@ -326,6 +326,23 @@ fn test_fma(x:i32, y:i32, z:i32)->i32
             # Reset memory quota to unlimited
             achainsaw.set_memory_quota(0)
 
+    def test_optimize_in_python(self):
+        """Test IR constant folding, algebraic simplification, and DCE in Python."""
+        code = """fn unoptimized_calc(x:i32)->i32
+  b0:
+    c1 = cst 10:i32
+    c2 = cst 20:i32
+    c3 = add c1, c2
+    zero = cst 0:i32
+    res = add x, zero
+    ret res
+"""
+        opt_res = achainsaw.optimize(code)
+        self.assertIsInstance(opt_res, dict)
+        self.assertGreaterEqual(opt_res.get("total_optimizations", 0), 2)
+        opt_code = opt_res.get("code", "")
+        self.assertIn("ret x", opt_code)
+
 
 if __name__ == "__main__":
     unittest.main()

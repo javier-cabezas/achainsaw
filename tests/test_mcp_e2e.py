@@ -162,6 +162,31 @@ def test_mcp_server():
     assert "ERR_OUT_OF_FUEL" in err_text
     print("[PASS] MCP tools/call air_run fuel trap enforcement")
 
+    # 9. Tool Call: air_optimize
+    unopt_air = """fn opt_me(x:i32)->i32
+  b0:
+    c1 = cst 10:i32
+    c2 = cst 20:i32
+    c3 = add c1, c2
+    zero = cst 0:i32
+    d = add x, zero
+    ret d
+"""
+    opt_res = send_req({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "air_optimize",
+            "arguments": {"code": unopt_air}
+        }
+    })
+    assert opt_res["result"]["isError"] is False
+    opt_payload = json.loads(opt_res["result"]["content"][0]["text"])
+    assert opt_payload["total_optimizations"] >= 2
+    assert "ret x" in opt_payload["code"]
+    print("[PASS] MCP tools/call air_optimize")
+
     proc.terminate()
     print("All MCP end-to-end integration tests passed!")
 

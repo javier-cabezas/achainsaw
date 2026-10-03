@@ -524,12 +524,31 @@ pub fn version() -> &'static str {
     "0.1.0"
 }
 
+#[pyfunction]
+#[pyo3(signature = (source))]
+pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
+    let mut module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
+    let stats = achainsaw_ir::opt::optimize_module(&mut module);
+    let optimized_code = to_air_text(&module);
+
+    let dict = pyo3::types::PyDict::new_bound(py);
+    dict.set_item("code", optimized_code)?;
+    dict.set_item("constants_folded", stats.constants_folded)?;
+    dict.set_item("algebraic_simplifications", stats.algebraic_simplifications)?;
+    dict.set_item("branches_folded", stats.branches_folded)?;
+    dict.set_item("dead_instructions_removed", stats.dead_instructions_removed)?;
+    dict.set_item("dead_blocks_removed", stats.dead_blocks_removed)?;
+    dict.set_item("total_optimizations", stats.total_optimizations())?;
+    Ok(dict.into_py(py))
+}
+
 #[pymodule]
 fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
     m.add("CompilationError", m.py().get_type_bound::<CompilationError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize, m)?)?;
     m.add_function(wrap_pyfunction!(assemble, m)?)?;
     m.add_function(wrap_pyfunction!(disassemble, m)?)?;
     m.add_function(wrap_pyfunction!(compile_binary, m)?)?;

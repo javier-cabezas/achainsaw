@@ -351,6 +351,36 @@ pub fn handle_air_disassemble(arguments: &Value) -> Value {
     }
 }
 
+pub fn handle_air_optimize(arguments: &Value) -> Value {
+    let code = match arguments.get("code").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return error_response("Missing required parameter 'code'"),
+    };
+    let mut module = match load_module_from_code(code) {
+        Ok(m) => m,
+        Err(diag) => return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
+            "status": "error",
+            "error_code": diag.error_code,
+            "message": diag.message
+        }))),
+    };
+
+    let stats = achainsaw_ir::opt::optimize_module(&mut module);
+    let optimized_code = to_air_text(&module);
+
+    json_tool_result(json!({
+        "status": "ok",
+        "code": optimized_code,
+        "constants_folded": stats.constants_folded,
+        "algebraic_simplifications": stats.algebraic_simplifications,
+        "branches_folded": stats.branches_folded,
+        "dead_instructions_removed": stats.dead_instructions_removed,
+        "dead_blocks_removed": stats.dead_blocks_removed,
+        "total_optimizations": stats.total_optimizations(),
+        "iterations": stats.iterations,
+    }))
+}
+
 pub fn get_tools_list() -> Value {
     json!({
         "tools": [
@@ -425,6 +455,20 @@ pub fn get_tools_list() -> Value {
                         }
                     },
                     "required": ["binary_base64"]
+                }
+            },
+            {
+                "name": "air_optimize",
+                "description": "Run IR optimization engine passes (constant folding, algebraic simplification, branch folding, dead code & block elimination).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "AIR textual IR source code or base64 encoded AIRB bytecode"
+                        }
+                    },
+                    "required": ["code"]
                 }
             }
         ]
@@ -515,6 +559,7 @@ pub fn run_mcp_server() -> Result<()> {
                     "air_run" => handle_air_run(&arguments),
                     "air_assemble" => handle_air_assemble(&arguments),
                     "air_disassemble" => handle_air_disassemble(&arguments),
+                    "air_optimize" => handle_air_optimize(&arguments),
                     unknown => error_response(&format!("Unknown tool: '{unknown}'")),
                 };
 
@@ -644,5 +689,25 @@ mod tests {
         let decompiled = disasm_json["code"].as_str().unwrap();
         assert!(decompiled.contains("fn add_five"));
         assert!(decompiled.contains("add v0, five"));
+    }
+
+    #[test]
+    fn test_mcp_air_optimize() {
+        let unopt = r#"
+        fn unoptimized(x:i32)->i32
+          b0:
+            a = cst 10:i32
+            b = cst 20:i32
+            c = add a, b
+            zero = cst 0:i32
+            d = add x, zero
+            ret d
+        "#;
+        let res = handle_air_optimize(&json!({ "code": unopt }));
+        assert_eq!(res["isError"], false);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let stats: Value = serde_json::from_str(text).unwrap();
+        assert!(stats["total_optimizations"].as_u64().unwrap() >= 2);
+        assert!(stats["code"].as_str().unwrap().contains("ret x"));
     }
 }

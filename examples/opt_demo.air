@@ -1,0 +1,12 @@
+fn demo(x:i32)->i32
+  b0:
+    c1 = cst 10:i32
+    c2 = cst 20:i32
+    c3 = add c1, c2
+    dead_val = mul c3, c1
+    zero = cst 0:i32
+    res = add x, zero
+    ret res
+  b_dead:
+    unused = cst 999:i32
+    ret unused

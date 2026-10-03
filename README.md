@@ -159,6 +159,28 @@ achainsaw mcp
 - **`air_run`**: JIT compiles and executes AIR functions with arguments, loop fuel budget, and memory quota sandboxing.
 - **`air_assemble`**: Assembles textual AIR into compact base64-encoded AIRB bytecode with compression metrics.
 - **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
+- **`air_optimize`**: Optimizes IR using constant folding, algebraic simplification, branch folding, and DCE to a fixpoint.
+
+### 7. IR Optimization Engine (`achainsaw opt`)
+Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks:
+```bash
+achainsaw opt examples/opt_demo.air --json
+```
+
+**Optimization Telemetry:**
+```json
+{
+  "status": "ok",
+  "constants_folded": 2,
+  "algebraic_simplifications": 1,
+  "branches_folded": 0,
+  "dead_instructions_removed": 6,
+  "dead_blocks_removed": 1,
+  "total_optimizations": 10,
+  "iterations": 2,
+  "code": "fn demo(x:i32)->i32\n  b0:\n    ret x\n"
+}
+```
 
 ---
 

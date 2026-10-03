@@ -82,6 +82,18 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Optimize IR module (constant folding, algebraic simplification, DCE)
+    Opt {
+        /// Path to input .air or .airb file
+        input: PathBuf,
+        /// Path to output file (defaults to printing to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Emit structured machine-readable JSON telemetry
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Run Model Context Protocol (MCP) server over standard I/O (stdio)
     Mcp,
 }
@@ -173,6 +185,32 @@ fn main() {
         Commands::Disassemble { input, output } => match run_disassemble(&input, output) {
             Ok(_) => {}
             Err(e) => eprintln!("Disassembly error: {e}"),
+        },
+        Commands::Opt { input, output, json } => match run_optimize(&input, output) {
+            Ok(stats) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                } else if stats.get("output_written").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    println!(
+                        "Optimized {} -> {} (total transformations: {})",
+                        stats["input"], stats["output"], stats["total_optimizations"]
+                    );
+                } else {
+                    print!("{}", stats["code"].as_str().unwrap_or(""));
+                }
+            }
+            Err(e) => {
+                if json {
+                    let err_json = json!({
+                        "status": "error",
+                        "error_code": "ERR_OPTIMIZE",
+                        "message": e.to_string(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+                } else {
+                    eprintln!("Optimization error: {e}");
+                }
+            }
         },
     }
 }
@@ -324,4 +362,34 @@ fn run_disassemble(input: &Path, output: Option<PathBuf>) -> Result<()> {
         print!("{text}");
     }
     Ok(())
+}
+
+fn run_optimize(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Value> {
+    let mut module = load_module(input)
+        .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
+
+    let stats = achainsaw_ir::opt::optimize_module(&mut module);
+    let optimized_code = to_air_text(&module);
+
+    let output_written = if let Some(out_path) = &output {
+        fs::write(out_path, &optimized_code)?;
+        true
+    } else {
+        false
+    };
+
+    Ok(json!({
+        "status": "ok",
+        "input": input.to_string_lossy(),
+        "output": output.map(|p| p.to_string_lossy().to_string()),
+        "output_written": output_written,
+        "constants_folded": stats.constants_folded,
+        "algebraic_simplifications": stats.algebraic_simplifications,
+        "branches_folded": stats.branches_folded,
+        "dead_instructions_removed": stats.dead_instructions_removed,
+        "dead_blocks_removed": stats.dead_blocks_removed,
+        "total_optimizations": stats.total_optimizations(),
+        "iterations": stats.iterations,
+        "code": optimized_code,
+    }))
 }
