@@ -32,10 +32,9 @@ impl AotCompiler {
         flag_builder.set("opt_level", "speed")?;
 
         let isa = if let Some(triple_str) = target_triple {
-            let triple = Triple::from_str(triple_str)
-                .map_err(|e| anyhow!("Invalid target triple: {e}"))?;
-            cranelift_codegen::isa::lookup(triple)?
-                .finish(settings::Flags::new(flag_builder))?
+            let triple =
+                Triple::from_str(triple_str).map_err(|e| anyhow!("Invalid target triple: {e}"))?;
+            cranelift_codegen::isa::lookup(triple)?.finish(settings::Flags::new(flag_builder))?
         } else {
             let isa_builder = cranelift_native::builder()
                 .map_err(|msg| anyhow!("Host machine not supported by Cranelift: {msg}"))?;
@@ -186,11 +185,7 @@ impl AotCompiler {
                         values.insert(dst.clone(), (v, *ty));
                     }
                     Instruction::Binary {
-                        op,
-                        dst,
-                        lhs,
-                        rhs,
-                        ..
+                        op, dst, lhs, rhs, ..
                     } => {
                         let (lhs_val, lhs_ty) = *values.get(lhs).unwrap();
                         let (rhs_val, _) = *values.get(rhs).unwrap();
@@ -238,23 +233,39 @@ impl AotCompiler {
                                 let c = if lhs_ty == Type::F32 || lhs_ty == Type::F64 {
                                     builder.ins().fcmp(FloatCC::GreaterThan, lhs_val, rhs_val)
                                 } else {
-                                    builder.ins().icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val)
+                                    builder
+                                        .ins()
+                                        .icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val)
                                 };
                                 (builder.ins().uextend(types::I32, c), Type::I32)
                             }
                             BinaryOp::Le => {
                                 let c = if lhs_ty == Type::F32 || lhs_ty == Type::F64 {
-                                    builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs_val, rhs_val)
+                                    builder
+                                        .ins()
+                                        .fcmp(FloatCC::LessThanOrEqual, lhs_val, rhs_val)
                                 } else {
-                                    builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs_val, rhs_val)
+                                    builder.ins().icmp(
+                                        IntCC::SignedLessThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    )
                                 };
                                 (builder.ins().uextend(types::I32, c), Type::I32)
                             }
                             BinaryOp::Ge => {
                                 let c = if lhs_ty == Type::F32 || lhs_ty == Type::F64 {
-                                    builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs_val, rhs_val)
+                                    builder.ins().fcmp(
+                                        FloatCC::GreaterThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    )
                                 } else {
-                                    builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs_val, rhs_val)
+                                    builder.ins().icmp(
+                                        IntCC::SignedGreaterThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    )
                                 };
                                 (builder.ins().uextend(types::I32, c), Type::I32)
                             }
@@ -271,18 +282,27 @@ impl AotCompiler {
                     Instruction::Load { dst, ptr, ty, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
                         let clif_ty = to_clif_type(*ty);
-                        let val = builder.ins().load(clif_ty, MemFlagsData::trusted(), ptr_val, 0);
+                        let val = builder
+                            .ins()
+                            .load(clif_ty, MemFlagsData::trusted(), ptr_val, 0);
                         values.insert(dst.clone(), (val, *ty));
                     }
                     Instruction::Store { ptr, val, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
                         let (val_val, _) = *values.get(val).unwrap();
-                        builder.ins().store(MemFlagsData::trusted(), val_val, ptr_val, 0);
+                        builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), val_val, ptr_val, 0);
                     }
-                    Instruction::Call { dst, func, args, .. } => {
+                    Instruction::Call {
+                        dst, func, args, ..
+                    } => {
                         let target_func_id = *func_ids.get(func).unwrap();
-                        let callee = self.module.declare_func_in_func(target_func_id, &mut builder.func);
-                        let arg_vals: Vec<Value> = args.iter().map(|a| values.get(a).unwrap().0).collect();
+                        let callee = self
+                            .module
+                            .declare_func_in_func(target_func_id, builder.func);
+                        let arg_vals: Vec<Value> =
+                            args.iter().map(|a| values.get(a).unwrap().0).collect();
                         let call_inst = builder.ins().call(callee, &arg_vals);
                         if let Some(d) = dst {
                             let results = builder.inst_results(call_inst);
@@ -305,21 +325,27 @@ impl AotCompiler {
                         };
                         values.insert(dst.clone(), (vec_val, Type::V128));
                     }
-                    Instruction::ExtractLane { dst, vec, lane, ty, .. } => {
+                    Instruction::ExtractLane {
+                        dst, vec, lane, ty, ..
+                    } => {
                         let (vec_val, _) = *values.get(vec).unwrap();
                         let scalar_val = builder.ins().extractlane(vec_val, *lane as u8);
                         values.insert(dst.clone(), (scalar_val, *ty));
                     }
                     Instruction::Alloc { dst, size, .. } => {
                         let (size_val, _) = *values.get(size).unwrap();
-                        let callee = self.module.declare_func_in_func(self.rt_malloc_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_malloc_id, builder.func);
                         let call_inst = builder.ins().call(callee, &[size_val]);
                         let ptr_val = builder.inst_results(call_inst)[0];
                         values.insert(dst.clone(), (ptr_val, Type::Ptr));
                     }
                     Instruction::Free { ptr, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
-                        let callee = self.module.declare_func_in_func(self.rt_free_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_free_id, builder.func);
                         builder.ins().call(callee, &[ptr_val]);
                     }
                 }
@@ -353,7 +379,9 @@ impl AotCompiler {
                         .iter()
                         .map(|a| BlockArg::Value(values.get(a).unwrap().0))
                         .collect();
-                    builder.ins().brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                    builder
+                        .ins()
+                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
                 }
                 Terminator::Ret { val, .. } => {
                     if let Some(v_name) = val {
@@ -416,8 +444,22 @@ pub fn link_shared_library(object_path: &Path, shared_path: &Path) -> Result<()>
         }
     }
 
+    // Try cc as fallback
+    let cc_res = Command::new("cc")
+        .arg("-shared")
+        .arg("-o")
+        .arg(shared_path)
+        .arg(object_path)
+        .output();
+
+    if let Ok(out) = cc_res {
+        if out.status.success() {
+            return Ok(());
+        }
+    }
+
     Err(anyhow!(
-        "Failed to link shared library: neither gcc nor clang succeeded"
+        "Failed to link shared library: neither gcc, clang, nor cc succeeded"
     ))
 }
 

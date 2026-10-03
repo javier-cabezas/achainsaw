@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "achainsaw"
+version = "0.1.0"
+description = "A compact, deterministic, agent-native intermediate representation and JIT compiler"
+readme = "README.md"
+authors = [
+    { name = "Javier Cabezas", email = "javier-cabezas@users.noreply.github.com" }
+]
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+]
+
+[tool.maturin]
+manifest-path = "crates/achainsaw-py/Cargo.toml"
+module-name = "achainsaw"
+features = ["pyo3/extension-module"]

@@ -83,11 +83,7 @@ impl PyKernel {
     }
 
     #[pyo3(signature = (*args))]
-    pub fn __call__(
-        &self,
-        py: Python<'_>,
-        args: &Bound<'_, PyTuple>,
-    ) -> PyResult<PyObject> {
+    pub fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<PyObject> {
         if !args.is_empty() {
             if let Ok(name) = args.get_item(0)?.extract::<String>() {
                 if self.signatures.contains_key(&name) {
@@ -130,7 +126,8 @@ fn dispatch_call(
                 // Try Python buffer protocol first
                 let mut view: pyo3::ffi::Py_buffer = unsafe { std::mem::zeroed() };
                 let is_buffer = unsafe {
-                    pyo3::ffi::PyObject_GetBuffer(arg.as_ptr(), &mut view, pyo3::ffi::PyBUF_SIMPLE) == 0
+                    pyo3::ffi::PyObject_GetBuffer(arg.as_ptr(), &mut view, pyo3::ffi::PyBUF_SIMPLE)
+                        == 0
                 };
 
                 if is_buffer {
@@ -234,7 +231,10 @@ fn dispatch_call(
                 f(i_vals[0], i_vals[1], i_vals[2], i_vals[3]);
                 Ok(py.None())
             }
-            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32], None) => {
+            (
+                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32],
+                None,
+            ) => {
                 let f: extern "C" fn(i64, i64, i64, i64, i64) = std::mem::transmute(fn_ptr);
                 f(i_vals[0], i_vals[1], i_vals[2], i_vals[3], i_vals[4]);
                 Ok(py.None())
@@ -261,7 +261,10 @@ fn dispatch_call(
                 let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0] as i32, i_vals[1] as i32).into_py(py))
             }
-            ([Type::I32 | Type::I64, Type::I32 | Type::I64, Type::I32 | Type::I64], Some(Type::I32)) => {
+            (
+                [Type::I32 | Type::I64, Type::I32 | Type::I64, Type::I32 | Type::I64],
+                Some(Type::I32),
+            ) => {
                 let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0] as i32, i_vals[1] as i32, i_vals[2] as i32).into_py(py))
             }
@@ -273,9 +276,19 @@ fn dispatch_call(
                 let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0], i_vals[1]).into_py(py))
             }
-            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32], Some(Type::I64)) => {
-                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, i64) -> i64 = std::mem::transmute(fn_ptr);
-                let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2] as *const u8, i_vals[3], i_vals[4]);
+            (
+                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32],
+                Some(Type::I64),
+            ) => {
+                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, i64) -> i64 =
+                    std::mem::transmute(fn_ptr);
+                let res = f(
+                    i_vals[0] as *const u8,
+                    i_vals[1] as *const u8,
+                    i_vals[2] as *const u8,
+                    i_vals[3],
+                    i_vals[4],
+                );
                 Ok(res.into_py(py))
             }
 
@@ -297,13 +310,24 @@ fn dispatch_call(
                 Ok(f(f_vals[0], f_vals[1]).into_py(py))
             }
             ([Type::Ptr, Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
-                let f: extern "C" fn(*const u8, *const u8, i64) -> f32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(*const u8, *const u8, i64) -> f32 =
+                    std::mem::transmute(fn_ptr);
                 let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2]);
                 Ok(res.into_py(py))
             }
-            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::F32], Some(Type::F32)) => {
-                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, f32) -> f32 = std::mem::transmute(fn_ptr);
-                let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2] as *const u8, i_vals[3], f_vals[0] as f32);
+            (
+                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::F32],
+                Some(Type::F32),
+            ) => {
+                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, f32) -> f32 =
+                    std::mem::transmute(fn_ptr);
+                let res = f(
+                    i_vals[0] as *const u8,
+                    i_vals[1] as *const u8,
+                    i_vals[2] as *const u8,
+                    i_vals[3],
+                    f_vals[0] as f32,
+                );
                 Ok(res.into_py(py))
             }
             ([Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
@@ -453,8 +477,8 @@ pub fn compile_binary(py: Python<'_>, bytes: &[u8]) -> PyResult<PyKernel> {
         signatures.insert(func.name.clone(), (p_types, func.ret_type));
     }
 
-    let mut engine = JitEngine::new()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let mut engine =
+        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     engine
         .compile_module(&module)
@@ -473,8 +497,8 @@ pub fn compile(py: Python<'_>, source: &str) -> PyResult<PyKernel> {
         signatures.insert(func.name.clone(), (p_types, func.ret_type));
     }
 
-    let mut engine = JitEngine::new()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let mut engine =
+        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     engine
         .compile_module(&module)
@@ -545,7 +569,10 @@ pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
 #[pymodule]
 fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
-    m.add("CompilationError", m.py().get_type_bound::<CompilationError>())?;
+    m.add(
+        "CompilationError",
+        m.py().get_type_bound::<CompilationError>(),
+    )?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;

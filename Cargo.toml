@@ -30,3 +30,11 @@ anyhow = "1.0"
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
 libloading = "0.8"
 
+[workspace.lints.rust]
+unexpected_cfgs = "allow"
+
+[workspace.lints.clippy]
+result_large_err = "allow"
+missing_safety_doc = "allow"
+useless_conversion = "allow"
+

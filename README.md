@@ -1,5 +1,9 @@
 # achainsaw
 
+[![CI](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml)
+[![Release](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+
 > **High-Performance, Token-Minimal Compiler Toolchain Designed Exclusively for AI Agents**
 
 `achainsaw` is a specialized compiler and JIT execution toolchain built from first principles for autonomous LLM agents. It completely discards human-centric syntactic sugar (no curly braces, no indentation sensitivity, no verbose keywords, no English prose compiler errors) to optimize for two uncompromising objectives:
@@ -410,23 +414,52 @@ External variables and exported global memory can be directly accessed and mutat
 
 ```
 achainsaw/
-├── Cargo.toml                  # Workspace manifest
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml              # Multi-OS matrix CI (Linux, macOS, Windows, Py 3.11-3.13)
+│   │   └── release.yml         # Automated multi-target CLI binary and PyPI wheel releases
+│   └── dependabot.yml          # Automated Cargo & GitHub Actions dependency tracking
+├── Cargo.toml                  # Workspace manifest with unified lints
+├── pyproject.toml              # Python packaging manifest with Maturin backend
 ├── crates/
-│   ├── achainsaw-ir/           # Lexer, Parser, AST, SSA Type-Checker, AIRB Binary Codec
-│   ├── achainsaw-codegen/      # Cranelift IR translator & JIT execution engine
-│   ├── achainsaw-cli/          # Agent CLI driver with structured JSON telemetry
+│   ├── achainsaw-ir/           # Lexer, Parser, AST, SSA Type-Checker, Optimizer, AIRB Codec
+│   ├── achainsaw-codegen/      # Cranelift JIT engine & AOT native object / DLL compiler
+│   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
 ├── examples/
+│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── fibonacci.air           # Branching Fibonacci kernel
 │   ├── simd_vector_dot.air     # 128-bit SIMD hardware dot product kernel
-│   ├── simd_vector_dot.airb    # Compact pre-assembled AIRB binary bytecode
-│   ├── ffi_math_intrinsics.air # FFI and C standard math intrinsics kernel
-│   └── py_numpy_simd.py        # Python zero-copy SIMD & agent self-repair demo
+│   └── ffi_math_intrinsics.air # FFI and C standard math intrinsics kernel
+├── benchmarks/
+│   └── benchmark_kernels.py    # 5,000-iteration BLAS benchmark and verification suite
 ├── tests/
-│   └── test_py_binding.py      # Comprehensive Python test suite (19/19 passing)
+│   ├── test_py_binding.py      # Python binding & buffer protocol test suite
+│   ├── test_mcp_e2e.py         # Model Context Protocol stdio integration tests
+│   └── test_aot_e2e.py         # Ahead-Of-Time DLL/shared object compilation tests
 └── README.md
 ```
+
+---
+
+## 🔄 CI/CD & Automated Quality Gates
+
+`achainsaw` enforces a rigorous, multi-platform continuous integration and delivery pipeline via GitHub Actions:
+
+- **Continuous Integration (`ci.yml`):**
+  - **Lint & Code Style:** Runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`.
+  - **Cross-Platform Rust Matrix:** Runs `cargo test --workspace` concurrently on **Ubuntu Linux**, **macOS**, and **Windows**.
+  - **Python Test Matrix:** Tests in-process bindings across **Python 3.11, 3.12, and 3.13** on Linux, macOS, and Windows.
+  - **E2E & Numerical Verification:** Automatically runs unit tests, the MCP JSON-RPC server test, AOT native compilation test, and Chainsaw-BLAS NumPy numerical accuracy verification.
+- **Automated Releases (`release.yml`):**
+  - Triggers on version tag push (`v*.*.*`).
+  - Cross-compiles standalone release CLI binaries for Linux (`x86_64-gnu`, `x86_64-musl`), Windows (`x86_64-msvc`), and macOS (`x86_64`, `aarch64` Apple Silicon).
+  - Builds optimized multi-platform binary wheels (`manylinux`, `windows-x64`, `macos-universal2`) using `maturin-action`.
+  - Generates SHA256 checksums and creates a GitHub Release with all binary and wheel assets attached.
+- **Automated Dependency Updates (`dependabot.yml`):**
+  - Weekly scans for Cargo crate dependencies.
+  - Monthly scans for GitHub Actions versions.
 
 ---
 

@@ -121,21 +121,37 @@ fn simd_scale(p:ptr, factor:f32, n:i64)
         // Verify magic and minimum size
         assert!(bytes.starts_with(b"\x00AIR"));
         println!("bytes.len() = {}, text.len() = {}", bytes.len(), code.len());
-        assert!(bytes.len() < 500, "AIRB binary should be compact: {}", bytes.len());
+        assert!(
+            bytes.len() < 500,
+            "AIRB binary should be compact: {}",
+            bytes.len()
+        );
 
         // Decode back
         let decoded_module = decode_module(&bytes).expect("Should decode AIRB cleanly");
-        assert_eq!(decoded_module.functions.len(), original_module.functions.len());
-        assert_eq!(decoded_module.functions[0].name, original_module.functions[0].name);
-        assert_eq!(decoded_module.functions[0].blocks.len(), original_module.functions[0].blocks.len());
+        assert_eq!(
+            decoded_module.functions.len(),
+            original_module.functions.len()
+        );
+        assert_eq!(
+            decoded_module.functions[0].name,
+            original_module.functions[0].name
+        );
+        assert_eq!(
+            decoded_module.functions[0].blocks.len(),
+            original_module.functions[0].blocks.len()
+        );
 
         // Validate decoded module
         let mut validator = Validator::new();
-        validator.validate_module(&decoded_module).expect("Decoded module should be valid SSA");
+        validator
+            .validate_module(&decoded_module)
+            .expect("Decoded module should be valid SSA");
 
         // Disassemble back to text and re-validate
         let disassembled_text = to_air_text(&decoded_module);
-        let roundtrip_module = parse_and_validate(&disassembled_text).expect("Disassembled text must validate");
+        let roundtrip_module =
+            parse_and_validate(&disassembled_text).expect("Disassembled text must validate");
         assert_eq!(roundtrip_module.functions[0].name, "simd_scale");
     }
 
@@ -188,5 +204,3 @@ fn fail(a:i32)->i32
         assert_eq!(err.error_code, "ERR_SSA_REDEFINITION");
     }
 }
-
-

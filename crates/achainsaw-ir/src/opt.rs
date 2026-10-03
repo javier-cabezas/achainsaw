@@ -157,10 +157,7 @@ fn run_constant_and_algebraic_pass(func: &mut Function) -> (usize, usize) {
                             simplified_count += 1;
                         }
                         AlgebraicResult::Identity(source) => {
-                            let real_source = substitutions
-                                .get(&source)
-                                .cloned()
-                                .unwrap_or(source);
+                            let real_source = substitutions.get(&source).cloned().unwrap_or(source);
                             substitutions.insert(dst, real_source);
                             simplified_count += 1;
                         }
@@ -305,12 +302,20 @@ fn fold_binary_op(
                 BinaryOp::Xor => a ^ b,
                 BinaryOp::Shl => a.wrapping_shl((*b & 63) as u32),
                 BinaryOp::Shr => a.wrapping_shr((*b & 63) as u32),
-                BinaryOp::Eq => return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Ne => return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32)),
+                BinaryOp::Eq => {
+                    return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32))
+                }
+                BinaryOp::Ne => {
+                    return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32))
+                }
                 BinaryOp::Lt => return Some((Constant::Int(if a < b { 1 } else { 0 }), Type::I32)),
                 BinaryOp::Gt => return Some((Constant::Int(if a > b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Le => return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Ge => return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32)),
+                BinaryOp::Le => {
+                    return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32))
+                }
+                BinaryOp::Ge => {
+                    return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32))
+                }
                 _ => return None,
             };
             Some((Constant::Int(res), ty))
@@ -321,12 +326,20 @@ fn fold_binary_op(
                 BinaryOp::Sub => a - b,
                 BinaryOp::Mul => a * b,
                 BinaryOp::Div => a / b,
-                BinaryOp::Eq => return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Ne => return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32)),
+                BinaryOp::Eq => {
+                    return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32))
+                }
+                BinaryOp::Ne => {
+                    return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32))
+                }
                 BinaryOp::Lt => return Some((Constant::Int(if a < b { 1 } else { 0 }), Type::I32)),
                 BinaryOp::Gt => return Some((Constant::Int(if a > b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Le => return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Ge => return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32)),
+                BinaryOp::Le => {
+                    return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32))
+                }
+                BinaryOp::Ge => {
+                    return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32))
+                }
                 _ => return None,
             };
             Some((Constant::Float(res), ty))
@@ -335,7 +348,10 @@ fn fold_binary_op(
     }
 }
 
-fn substitute_instruction_operands(inst: &mut Instruction, substitutions: &HashMap<String, String>) {
+fn substitute_instruction_operands(
+    inst: &mut Instruction,
+    substitutions: &HashMap<String, String>,
+) {
     if substitutions.is_empty() {
         return;
     }

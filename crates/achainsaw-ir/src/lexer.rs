@@ -179,7 +179,9 @@ impl<'a> Lexer<'a> {
         }
 
         // Number (integer or float, signed or unsigned)
-        if c.is_ascii_digit() || (c == '-' && self.peek_next().map_or(false, |next| next.is_ascii_digit())) {
+        if c.is_ascii_digit()
+            || (c == '-' && self.peek_next().is_some_and(|next| next.is_ascii_digit()))
+        {
             let mut num_str = String::new();
             if c == '-' {
                 num_str.push(self.advance().unwrap());
@@ -188,7 +190,10 @@ impl<'a> Lexer<'a> {
             while let Some(ch) = self.peek() {
                 if ch.is_ascii_digit() {
                     num_str.push(self.advance().unwrap());
-                } else if ch == '.' && !is_float && self.peek_next().map_or(false, |next| next.is_ascii_digit()) {
+                } else if ch == '.'
+                    && !is_float
+                    && self.peek_next().is_some_and(|next| next.is_ascii_digit())
+                {
                     is_float = true;
                     num_str.push(self.advance().unwrap());
                 } else {
@@ -204,13 +209,17 @@ impl<'a> Lexer<'a> {
             };
 
             return if is_float {
-                let val: f64 = num_str.parse().map_err(|e| format!("Invalid float {num_str}: {e}"))?;
+                let val: f64 = num_str
+                    .parse()
+                    .map_err(|e| format!("Invalid float {num_str}: {e}"))?;
                 Ok(Token {
                     kind: TokenKind::FloatLit(val),
                     span,
                 })
             } else {
-                let val: i64 = num_str.parse().map_err(|e| format!("Invalid integer {num_str}: {e}"))?;
+                let val: i64 = num_str
+                    .parse()
+                    .map_err(|e| format!("Invalid integer {num_str}: {e}"))?;
                 Ok(Token {
                     kind: TokenKind::IntLit(val),
                     span,
@@ -260,7 +269,9 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        Err(format!("Unexpected character: '{c}' at {start_line}:{start_col}"))
+        Err(format!(
+            "Unexpected character: '{c}' at {start_line}:{start_col}"
+        ))
     }
 
     pub fn tokenize_all(&mut self) -> Result<Vec<Token>, String> {

@@ -108,11 +108,7 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(ty.as_str());
                     }
                     Instruction::Binary {
-                        op,
-                        dst,
-                        lhs,
-                        rhs,
-                        ..
+                        op, dst, lhs, rhs, ..
                     } => {
                         out.push_str(dst);
                         out.push_str(" = ");
@@ -136,10 +132,7 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(val);
                     }
                     Instruction::Call {
-                        dst,
-                        func,
-                        args,
-                        ..
+                        dst, func, args, ..
                     } => {
                         if let Some(d) = dst {
                             out.push_str(d);
@@ -162,11 +155,7 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(src);
                     }
                     Instruction::ExtractLane {
-                        dst,
-                        vec,
-                        lane,
-                        ty,
-                        ..
+                        dst, vec, lane, ty, ..
                     } => {
                         out.push_str(dst);
                         out.push_str(" = extlane ");
@@ -320,7 +309,9 @@ impl BinaryEncoder {
                             self.intern(ptr);
                             self.intern(val);
                         }
-                        Instruction::Call { dst, func, args, .. } => {
+                        Instruction::Call {
+                            dst, func, args, ..
+                        } => {
                             if let Some(d) = dst {
                                 self.intern(d);
                             }
@@ -386,20 +377,24 @@ impl BinaryEncoder {
         self.buf.extend_from_slice(&0u16.to_le_bytes()); // flags
 
         // 2. String Pool
-        self.buf.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
         for s in &self.strings {
             let bytes = s.as_bytes();
-            self.buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             self.buf.extend_from_slice(bytes);
         }
 
         // 3. Extern Functions
-        self.buf.extend_from_slice(&(module.extern_functions.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(module.extern_functions.len() as u32).to_le_bytes());
         for ext_fn in &module.extern_functions {
             let fn_name_id = self.string_map[&ext_fn.name];
             self.buf.extend_from_slice(&fn_name_id.to_le_bytes());
 
-            self.buf.extend_from_slice(&(ext_fn.params.len() as u32).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(ext_fn.params.len() as u32).to_le_bytes());
             for (p_name, ty) in &ext_fn.params {
                 let p_id = self.string_map[p_name];
                 self.buf.extend_from_slice(&p_id.to_le_bytes());
@@ -415,13 +410,15 @@ impl BinaryEncoder {
         }
 
         // 4. Functions
-        self.buf.extend_from_slice(&(module.functions.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(module.functions.len() as u32).to_le_bytes());
         for func in &module.functions {
             let fn_name_id = self.string_map[&func.name];
             self.buf.extend_from_slice(&fn_name_id.to_le_bytes());
 
             // Parameters
-            self.buf.extend_from_slice(&(func.params.len() as u32).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(func.params.len() as u32).to_le_bytes());
             for (p_name, ty) in &func.params {
                 let p_id = self.string_map[p_name];
                 self.buf.extend_from_slice(&p_id.to_le_bytes());
@@ -437,13 +434,15 @@ impl BinaryEncoder {
             }
 
             // Blocks
-            self.buf.extend_from_slice(&(func.blocks.len() as u32).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(func.blocks.len() as u32).to_le_bytes());
             for block in &func.blocks {
                 let label_id = self.string_map[&block.label];
                 self.buf.extend_from_slice(&label_id.to_le_bytes());
 
                 // Block parameters
-                self.buf.extend_from_slice(&(block.params.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(block.params.len() as u32).to_le_bytes());
                 for (bp_name, ty) in &block.params {
                     let bp_id = self.string_map[bp_name];
                     self.buf.extend_from_slice(&bp_id.to_le_bytes());
@@ -451,7 +450,8 @@ impl BinaryEncoder {
                 }
 
                 // Instructions
-                self.buf.extend_from_slice(&(block.instructions.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(block.instructions.len() as u32).to_le_bytes());
                 for inst in &block.instructions {
                     self.encode_instruction(inst);
                 }
@@ -467,86 +467,95 @@ impl BinaryEncoder {
             Instruction::AssignConst { dst, val, ty, .. } => match val {
                 Constant::Int(n) => {
                     self.buf.push(0x01);
-                    self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[dst].to_le_bytes());
                     self.buf.extend_from_slice(&n.to_le_bytes());
                     self.buf.push(encode_type(*ty));
                 }
                 Constant::Float(f) => {
                     self.buf.push(0x02);
-                    self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[dst].to_le_bytes());
                     self.buf.extend_from_slice(&f.to_bits().to_le_bytes());
                     self.buf.push(encode_type(*ty));
                 }
             },
             Instruction::Binary {
-                op,
-                dst,
-                lhs,
-                rhs,
-                ..
+                op, dst, lhs, rhs, ..
             } => {
                 self.buf.push(0x03);
                 self.buf.push(encode_binary_op(*op));
-                self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[lhs].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[rhs].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[lhs].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[rhs].to_le_bytes());
             }
             Instruction::Load { dst, ptr, ty, .. } => {
                 self.buf.push(0x04);
-                self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[ptr].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[ptr].to_le_bytes());
                 self.buf.push(encode_type(*ty));
             }
             Instruction::Store { ptr, val, .. } => {
                 self.buf.push(0x05);
-                self.buf.extend_from_slice(&self.string_map[ptr].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[val].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[ptr].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[val].to_le_bytes());
             }
             Instruction::Call {
-                dst,
-                func,
-                args,
-                ..
+                dst, func, args, ..
             } => {
                 self.buf.push(0x06);
                 if let Some(d) = dst {
                     self.buf.push(1);
-                    self.buf.extend_from_slice(&self.string_map[d].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[d].to_le_bytes());
                 } else {
                     self.buf.push(0);
                 }
-                self.buf.extend_from_slice(&self.string_map[func].to_le_bytes());
-                self.buf.extend_from_slice(&(args.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[func].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(args.len() as u32).to_le_bytes());
                 for a in args {
-                    self.buf.extend_from_slice(&self.string_map[a].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
             }
             Instruction::Splat { dst, src, .. } => {
                 self.buf.push(0x07);
-                self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[src].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[src].to_le_bytes());
             }
             Instruction::ExtractLane {
-                dst,
-                vec,
-                lane,
-                ty,
-                ..
+                dst, vec, lane, ty, ..
             } => {
                 self.buf.push(0x08);
-                self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[vec].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[vec].to_le_bytes());
                 self.buf.extend_from_slice(&lane.to_le_bytes());
                 self.buf.push(encode_type(*ty));
             }
             Instruction::Alloc { dst, size, .. } => {
                 self.buf.push(0x09);
-                self.buf.extend_from_slice(&self.string_map[dst].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[size].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[size].to_le_bytes());
             }
             Instruction::Free { ptr, .. } => {
                 self.buf.push(0x0A);
-                self.buf.extend_from_slice(&self.string_map[ptr].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[ptr].to_le_bytes());
             }
         }
     }
@@ -555,10 +564,13 @@ impl BinaryEncoder {
         match term {
             Terminator::Jmp { target, args, .. } => {
                 self.buf.push(0x10);
-                self.buf.extend_from_slice(&self.string_map[target].to_le_bytes());
-                self.buf.extend_from_slice(&(args.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[target].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(args.len() as u32).to_le_bytes());
                 for a in args {
-                    self.buf.extend_from_slice(&self.string_map[a].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
             }
             Terminator::Br {
@@ -570,23 +582,31 @@ impl BinaryEncoder {
                 ..
             } => {
                 self.buf.push(0x11);
-                self.buf.extend_from_slice(&self.string_map[cond].to_le_bytes());
-                self.buf.extend_from_slice(&self.string_map[then_block].to_le_bytes());
-                self.buf.extend_from_slice(&(then_args.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[cond].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[then_block].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(then_args.len() as u32).to_le_bytes());
                 for a in then_args {
-                    self.buf.extend_from_slice(&self.string_map[a].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
-                self.buf.extend_from_slice(&self.string_map[else_block].to_le_bytes());
-                self.buf.extend_from_slice(&(else_args.len() as u32).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[else_block].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(else_args.len() as u32).to_le_bytes());
                 for a in else_args {
-                    self.buf.extend_from_slice(&self.string_map[a].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
             }
             Terminator::Ret { val, .. } => {
                 self.buf.push(0x12);
                 if let Some(v) = val {
                     self.buf.push(1);
-                    self.buf.extend_from_slice(&self.string_map[v].to_le_bytes());
+                    self.buf
+                        .extend_from_slice(&self.string_map[v].to_le_bytes());
                 } else {
                     self.buf.push(0);
                 }
@@ -850,12 +870,7 @@ impl<'a> BinaryDecoder<'a> {
                 let ptr = self.read_string()?;
                 let ty = decode_type(self.read_u8()?)
                     .ok_or_else(|| self.err("Invalid load type in AIRB"))?;
-                Ok(Instruction::Load {
-                    dst,
-                    ptr,
-                    ty,
-                    span,
-                })
+                Ok(Instruction::Load { dst, ptr, ty, span })
             }
             0x05 => {
                 let ptr = self.read_string()?;
@@ -910,7 +925,9 @@ impl<'a> BinaryDecoder<'a> {
                 let ptr = self.read_string()?;
                 Ok(Instruction::Free { ptr, span })
             }
-            _ => Err(self.err(format!("Unknown instruction opcode tag 0x{tag:02X} in AIRB"))),
+            _ => Err(self.err(format!(
+                "Unknown instruction opcode tag 0x{tag:02X} in AIRB"
+            ))),
         }
     }
 

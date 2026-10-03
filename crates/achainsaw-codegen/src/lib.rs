@@ -89,8 +89,8 @@ fn dot(p0:ptr, p1:ptr, n:i64)->f32
         let mut engine = JitEngine::new().expect("JIT init");
         engine.compile_module(&module).expect("Compile module");
 
-        let a = vec![1.0f32, 2.0f32, 3.0f32, 4.0f32];
-        let b = vec![2.0f32, 0.5f32, 1.0f32, 3.0f32];
+        let a = [1.0f32, 2.0f32, 3.0f32, 4.0f32];
+        let b = [2.0f32, 0.5f32, 1.0f32, 3.0f32];
         // dot = 1*2 + 2*0.5 + 3*1 + 4*3 = 2 + 1 + 3 + 12 = 18.0
 
         unsafe {
@@ -148,7 +148,9 @@ fn test_heap(n:i32)->i32
         engine.compile_module(&module).expect("Compile module");
 
         unsafe {
-            let res = engine.run_i32_to_i32("test_heap", 1).expect("Run test_heap");
+            let res = engine
+                .run_i32_to_i32("test_heap", 1)
+                .expect("Run test_heap");
             assert_eq!(res, 777);
         }
     }
@@ -167,11 +169,15 @@ fn compute_sin(x:f32)->f32
         engine.compile_module(&module).expect("Compile module");
 
         unsafe {
-            let res = engine.run_f32_to_f32("compute_sin", 0.0f32).expect("Run sin(0)");
+            let res = engine
+                .run_f32_to_f32("compute_sin", 0.0f32)
+                .expect("Run sin(0)");
             assert!((res - 0.0).abs() < 1e-6);
 
             let pi_half = std::f32::consts::FRAC_PI_2;
-            let res = engine.run_f32_to_f32("compute_sin", pi_half).expect("Run sin(pi/2)");
+            let res = engine
+                .run_f32_to_f32("compute_sin", pi_half)
+                .expect("Run sin(pi/2)");
             assert!((res - 1.0).abs() < 1e-6);
         }
     }
@@ -254,7 +260,11 @@ fn loop_forever(n:i32)->i32
 
         unsafe {
             let res = engine.run_i32_to_i32("loop_forever", 0);
-            assert!(res.is_err(), "Expected fuel exhaustion error, got: {:?}", res);
+            assert!(
+                res.is_err(),
+                "Expected fuel exhaustion error, got: {:?}",
+                res
+            );
             let err_msg = res.unwrap_err().to_string();
             assert!(
                 err_msg.contains("[ERR_OUT_OF_FUEL]"),
@@ -283,7 +293,9 @@ fn allocate_huge(n:i32)->ptr
         engine.set_memory_quota(10 * 1024 * 1024);
 
         unsafe {
-            let ptr = engine.get_fn_ptr("allocate_huge").expect("Found allocate_huge");
+            let ptr = engine
+                .get_fn_ptr("allocate_huge")
+                .expect("Found allocate_huge");
             reset_execution_status();
             let f: extern "C" fn(i32) -> *mut u8 = std::mem::transmute(ptr);
             let _ = f(1);

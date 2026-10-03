@@ -8,7 +8,12 @@ import os
 import subprocess
 import sys
 
-EXE_PATH = os.path.join(os.path.dirname(__file__), "..", "target", "debug", "achainsaw.exe")
+EXE_NAME = "achainsaw.exe" if sys.platform == "win32" else "achainsaw"
+EXE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "debug", EXE_NAME))
+if not os.path.exists(EXE_PATH):
+    rel_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "release", EXE_NAME))
+    if os.path.exists(rel_path):
+        EXE_PATH = rel_path
 
 
 def test_mcp_server():

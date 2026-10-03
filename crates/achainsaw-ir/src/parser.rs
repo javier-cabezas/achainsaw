@@ -326,7 +326,9 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Ret => {
                     let span = self.advance().span;
-                    let val = if self.peek_kind() != &TokenKind::Newline && self.peek_kind() != &TokenKind::Eof {
+                    let val = if self.peek_kind() != &TokenKind::Newline
+                        && self.peek_kind() != &TokenKind::Eof
+                    {
                         let (v, _) = self.expect_ident()?;
                         Some(v)
                     } else {
@@ -521,7 +523,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Op(op_name) => {
                 self.advance();
-                let op = BinaryOp::from_str(&op_name).ok_or_else(|| {
+                let op = op_name.parse::<BinaryOp>().map_err(|_| {
                     Diagnostic::error(
                         "ERR_UNKNOWN_OP",
                         format!("Unknown binary op '{op_name}'"),

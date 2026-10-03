@@ -11,7 +11,7 @@ use std::time::Instant;
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
         let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
@@ -256,11 +256,13 @@ pub fn handle_air_check(arguments: &Value) -> Value {
                 "instruction_count": total_instructions,
             }))
         }
-        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
-            "status": "error",
-            "error_code": diag.error_code,
-            "message": diag.message
-        }))),
+        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+            json!({
+                "status": "error",
+                "error_code": diag.error_code,
+                "message": diag.message
+            })
+        })),
     }
 }
 
@@ -269,9 +271,15 @@ pub fn handle_air_run(arguments: &Value) -> Value {
         Some(c) => c,
         None => return error_response("Missing required parameter 'code'"),
     };
-    let func = arguments.get("func").and_then(|v| v.as_str()).unwrap_or("main");
+    let func = arguments
+        .get("func")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
     let fuel = arguments.get("fuel").and_then(|v| v.as_u64());
-    let max_memory_mb = arguments.get("max_memory_mb").and_then(|v| v.as_u64()).map(|m| m as usize);
+    let max_memory_mb = arguments
+        .get("max_memory_mb")
+        .and_then(|v| v.as_u64())
+        .map(|m| m as usize);
     let mut args = Vec::new();
     if let Some(arr) = arguments.get("args").and_then(|v| v.as_array()) {
         for item in arr {
@@ -283,11 +291,15 @@ pub fn handle_air_run(arguments: &Value) -> Value {
 
     let module = match load_module_from_code(code) {
         Ok(m) => m,
-        Err(diag) => return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
-            "status": "error",
-            "error_code": diag.error_code,
-            "message": diag.message
-        }))),
+        Err(diag) => {
+            return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+                json!({
+                    "status": "error",
+                    "error_code": diag.error_code,
+                    "message": diag.message
+                })
+            }))
+        }
     };
 
     match execute_ir(&module, func, &args, fuel, max_memory_mb) {
@@ -318,11 +330,13 @@ pub fn handle_air_assemble(arguments: &Value) -> Value {
                 "compression_ratio": ratio,
             }))
         }
-        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
-            "status": "error",
-            "error_code": diag.error_code,
-            "message": diag.message
-        }))),
+        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+            json!({
+                "status": "error",
+                "error_code": diag.error_code,
+                "message": diag.message
+            })
+        })),
     }
 }
 
@@ -343,11 +357,13 @@ pub fn handle_air_disassemble(arguments: &Value) -> Value {
                 "code": text,
             }))
         }
-        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
-            "status": "error",
-            "error_code": diag.error_code,
-            "message": diag.message
-        }))),
+        Err(diag) => json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+            json!({
+                "status": "error",
+                "error_code": diag.error_code,
+                "message": diag.message
+            })
+        })),
     }
 }
 
@@ -358,11 +374,15 @@ pub fn handle_air_optimize(arguments: &Value) -> Value {
     };
     let mut module = match load_module_from_code(code) {
         Ok(m) => m,
-        Err(diag) => return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| json!({
-            "status": "error",
-            "error_code": diag.error_code,
-            "message": diag.message
-        }))),
+        Err(diag) => {
+            return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+                json!({
+                    "status": "error",
+                    "error_code": diag.error_code,
+                    "message": diag.message
+                })
+            }))
+        }
     };
 
     let stats = achainsaw_ir::opt::optimize_module(&mut module);
@@ -512,7 +532,7 @@ pub fn run_mcp_server() -> Result<()> {
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
         // If it's a notification without an ID, do not send a response
-        if id.is_none() || id.as_ref().map_or(false, |v| v.is_null()) {
+        if id.is_none() || id.as_ref().is_some_and(|v| v.is_null()) {
             line.clear();
             continue;
         }
@@ -552,7 +572,10 @@ pub fn run_mcp_server() -> Result<()> {
             "tools/call" => {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
 
                 let tool_res = match name {
                     "air_check" => handle_air_check(&arguments),

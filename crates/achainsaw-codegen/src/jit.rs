@@ -17,7 +17,10 @@ static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 static USER_LIBRARIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn register_global_symbol(name: impl Into<String>, ptr: *const u8) {
-    USER_SYMBOLS.lock().unwrap().push((name.into(), ptr as usize));
+    USER_SYMBOLS
+        .lock()
+        .unwrap()
+        .push((name.into(), ptr as usize));
 }
 
 pub fn load_global_library(path: &str) -> Result<()> {
@@ -199,6 +202,12 @@ pub struct SymbolRegistry {
 unsafe impl Send for SymbolRegistry {}
 unsafe impl Sync for SymbolRegistry {}
 
+impl Default for SymbolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
@@ -244,29 +253,73 @@ impl SymbolRegistry {
     }
 
     fn register_default_math(&mut self) {
-        unsafe extern "C" fn m_sinf(x: f32) -> f32 { x.sin() }
-        unsafe extern "C" fn m_cosf(x: f32) -> f32 { x.cos() }
-        unsafe extern "C" fn m_tanf(x: f32) -> f32 { x.tan() }
-        unsafe extern "C" fn m_sqrtf(x: f32) -> f32 { x.sqrt() }
-        unsafe extern "C" fn m_expf(x: f32) -> f32 { x.exp() }
-        unsafe extern "C" fn m_logf(x: f32) -> f32 { x.ln() }
-        unsafe extern "C" fn m_powf(x: f32, y: f32) -> f32 { x.powf(y) }
-        unsafe extern "C" fn m_fabsf(x: f32) -> f32 { x.abs() }
-        unsafe extern "C" fn m_floorf(x: f32) -> f32 { x.floor() }
-        unsafe extern "C" fn m_ceilf(x: f32) -> f32 { x.ceil() }
-        unsafe extern "C" fn m_roundf(x: f32) -> f32 { x.round() }
+        unsafe extern "C" fn m_sinf(x: f32) -> f32 {
+            x.sin()
+        }
+        unsafe extern "C" fn m_cosf(x: f32) -> f32 {
+            x.cos()
+        }
+        unsafe extern "C" fn m_tanf(x: f32) -> f32 {
+            x.tan()
+        }
+        unsafe extern "C" fn m_sqrtf(x: f32) -> f32 {
+            x.sqrt()
+        }
+        unsafe extern "C" fn m_expf(x: f32) -> f32 {
+            x.exp()
+        }
+        unsafe extern "C" fn m_logf(x: f32) -> f32 {
+            x.ln()
+        }
+        unsafe extern "C" fn m_powf(x: f32, y: f32) -> f32 {
+            x.powf(y)
+        }
+        unsafe extern "C" fn m_fabsf(x: f32) -> f32 {
+            x.abs()
+        }
+        unsafe extern "C" fn m_floorf(x: f32) -> f32 {
+            x.floor()
+        }
+        unsafe extern "C" fn m_ceilf(x: f32) -> f32 {
+            x.ceil()
+        }
+        unsafe extern "C" fn m_roundf(x: f32) -> f32 {
+            x.round()
+        }
 
-        unsafe extern "C" fn m_sin(x: f64) -> f64 { x.sin() }
-        unsafe extern "C" fn m_cos(x: f64) -> f64 { x.cos() }
-        unsafe extern "C" fn m_tan(x: f64) -> f64 { x.tan() }
-        unsafe extern "C" fn m_sqrt(x: f64) -> f64 { x.sqrt() }
-        unsafe extern "C" fn m_exp(x: f64) -> f64 { x.exp() }
-        unsafe extern "C" fn m_log(x: f64) -> f64 { x.ln() }
-        unsafe extern "C" fn m_pow(x: f64, y: f64) -> f64 { x.powf(y) }
-        unsafe extern "C" fn m_fabs(x: f64) -> f64 { x.abs() }
-        unsafe extern "C" fn m_floor(x: f64) -> f64 { x.floor() }
-        unsafe extern "C" fn m_ceil(x: f64) -> f64 { x.ceil() }
-        unsafe extern "C" fn m_round(x: f64) -> f64 { x.round() }
+        unsafe extern "C" fn m_sin(x: f64) -> f64 {
+            x.sin()
+        }
+        unsafe extern "C" fn m_cos(x: f64) -> f64 {
+            x.cos()
+        }
+        unsafe extern "C" fn m_tan(x: f64) -> f64 {
+            x.tan()
+        }
+        unsafe extern "C" fn m_sqrt(x: f64) -> f64 {
+            x.sqrt()
+        }
+        unsafe extern "C" fn m_exp(x: f64) -> f64 {
+            x.exp()
+        }
+        unsafe extern "C" fn m_log(x: f64) -> f64 {
+            x.ln()
+        }
+        unsafe extern "C" fn m_pow(x: f64, y: f64) -> f64 {
+            x.powf(y)
+        }
+        unsafe extern "C" fn m_fabs(x: f64) -> f64 {
+            x.abs()
+        }
+        unsafe extern "C" fn m_floor(x: f64) -> f64 {
+            x.floor()
+        }
+        unsafe extern "C" fn m_ceil(x: f64) -> f64 {
+            x.ceil()
+        }
+        unsafe extern "C" fn m_round(x: f64) -> f64 {
+            x.round()
+        }
 
         self.register("sinf", m_sinf as *const u8);
         self.register("cosf", m_cosf as *const u8);
@@ -340,7 +393,8 @@ impl JitEngine {
 
         let mut fuel_sig = module.make_signature();
         fuel_sig.returns.push(AbiParam::new(types::I32));
-        let rt_check_fuel_id = module.declare_function("rt_check_fuel", Linkage::Import, &fuel_sig)?;
+        let rt_check_fuel_id =
+            module.declare_function("rt_check_fuel", Linkage::Import, &fuel_sig)?;
 
         let ctx = module.make_context();
 
@@ -525,7 +579,9 @@ impl JitEngine {
                         };
                         values.insert(dst.clone(), (v, *ty));
                     }
-                    Instruction::Binary { op, dst, lhs, rhs, .. } => {
+                    Instruction::Binary {
+                        op, dst, lhs, rhs, ..
+                    } => {
                         let (lhs_val, lhs_ty) = *values.get(lhs).unwrap();
                         let (rhs_val, _) = *values.get(rhs).unwrap();
 
@@ -541,40 +597,65 @@ impl JitEngine {
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Ne => {
-                                    let cmp = builder.ins().fcmp(FloatCC::NotEqual, lhs_val, rhs_val);
+                                    let cmp =
+                                        builder.ins().fcmp(FloatCC::NotEqual, lhs_val, rhs_val);
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Lt => {
-                                    let cmp = builder.ins().fcmp(FloatCC::LessThan, lhs_val, rhs_val);
+                                    let cmp =
+                                        builder.ins().fcmp(FloatCC::LessThan, lhs_val, rhs_val);
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Gt => {
-                                    let cmp = builder.ins().fcmp(FloatCC::GreaterThan, lhs_val, rhs_val);
+                                    let cmp =
+                                        builder.ins().fcmp(FloatCC::GreaterThan, lhs_val, rhs_val);
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Le => {
-                                    let cmp = builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs_val, rhs_val);
+                                    let cmp = builder.ins().fcmp(
+                                        FloatCC::LessThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Ge => {
-                                    let cmp = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs_val, rhs_val);
+                                    let cmp = builder.ins().fcmp(
+                                        FloatCC::GreaterThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 _ => return Err(anyhow!("Unsupported float op {:?}", op)),
                             },
                             Type::V128 => match op {
-                                BinaryOp::VfAdd => (builder.ins().fadd(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::VfSub => (builder.ins().fsub(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::VfMul => (builder.ins().fmul(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::VfDiv => (builder.ins().fdiv(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::ViAdd => (builder.ins().iadd(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::ViSub => (builder.ins().isub(lhs_val, rhs_val), Type::V128),
-                                BinaryOp::ViMul => (builder.ins().imul(lhs_val, rhs_val), Type::V128),
+                                BinaryOp::VfAdd => {
+                                    (builder.ins().fadd(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::VfSub => {
+                                    (builder.ins().fsub(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::VfMul => {
+                                    (builder.ins().fmul(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::VfDiv => {
+                                    (builder.ins().fdiv(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::ViAdd => {
+                                    (builder.ins().iadd(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::ViSub => {
+                                    (builder.ins().isub(lhs_val, rhs_val), Type::V128)
+                                }
+                                BinaryOp::ViMul => {
+                                    (builder.ins().imul(lhs_val, rhs_val), Type::V128)
+                                }
                                 _ => return Err(anyhow!("Unsupported vector op {:?}", op)),
                             },
                             _ => {
@@ -585,67 +666,98 @@ impl JitEngine {
                                     lhs_ty
                                 };
                                 match op {
-                                    BinaryOp::Add => (builder.ins().iadd(lhs_val, rhs_val), default_res_ty),
-                                    BinaryOp::Sub => (builder.ins().isub(lhs_val, rhs_val), default_res_ty),
-                                BinaryOp::Mul => (builder.ins().imul(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Div => (builder.ins().sdiv(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Rem => (builder.ins().srem(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::And => (builder.ins().band(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Or => (builder.ins().bor(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Xor => (builder.ins().bxor(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Shl => (builder.ins().ishl(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Shr => (builder.ins().sshr(lhs_val, rhs_val), lhs_ty),
-                                BinaryOp::Eq => {
-                                    let cmp = builder.ins().icmp(IntCC::Equal, lhs_val, rhs_val);
-                                    let ext = builder.ins().uextend(types::I32, cmp);
-                                    (ext, Type::I32)
-                                }
-                                BinaryOp::Ne => {
-                                    let cmp = builder.ins().icmp(IntCC::NotEqual, lhs_val, rhs_val);
-                                    let ext = builder.ins().uextend(types::I32, cmp);
-                                    (ext, Type::I32)
-                                }
-                                BinaryOp::Lt => {
-                                    let cmp = builder.ins().icmp(IntCC::SignedLessThan, lhs_val, rhs_val);
-                                    let ext = builder.ins().uextend(types::I32, cmp);
-                                    (ext, Type::I32)
-                                }
-                                BinaryOp::Gt => {
-                                    let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val);
-                                    let ext = builder.ins().uextend(types::I32, cmp);
-                                    (ext, Type::I32)
-                                }
-                                BinaryOp::Le => {
-                                    let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs_val, rhs_val);
-                                    let ext = builder.ins().uextend(types::I32, cmp);
-                                    (ext, Type::I32)
-                                }
+                                    BinaryOp::Add => {
+                                        (builder.ins().iadd(lhs_val, rhs_val), default_res_ty)
+                                    }
+                                    BinaryOp::Sub => {
+                                        (builder.ins().isub(lhs_val, rhs_val), default_res_ty)
+                                    }
+                                    BinaryOp::Mul => (builder.ins().imul(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Div => (builder.ins().sdiv(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Rem => (builder.ins().srem(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::And => (builder.ins().band(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Or => (builder.ins().bor(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Xor => (builder.ins().bxor(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Shl => (builder.ins().ishl(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Shr => (builder.ins().sshr(lhs_val, rhs_val), lhs_ty),
+                                    BinaryOp::Eq => {
+                                        let cmp =
+                                            builder.ins().icmp(IntCC::Equal, lhs_val, rhs_val);
+                                        let ext = builder.ins().uextend(types::I32, cmp);
+                                        (ext, Type::I32)
+                                    }
+                                    BinaryOp::Ne => {
+                                        let cmp =
+                                            builder.ins().icmp(IntCC::NotEqual, lhs_val, rhs_val);
+                                        let ext = builder.ins().uextend(types::I32, cmp);
+                                        (ext, Type::I32)
+                                    }
+                                    BinaryOp::Lt => {
+                                        let cmp = builder.ins().icmp(
+                                            IntCC::SignedLessThan,
+                                            lhs_val,
+                                            rhs_val,
+                                        );
+                                        let ext = builder.ins().uextend(types::I32, cmp);
+                                        (ext, Type::I32)
+                                    }
+                                    BinaryOp::Gt => {
+                                        let cmp = builder.ins().icmp(
+                                            IntCC::SignedGreaterThan,
+                                            lhs_val,
+                                            rhs_val,
+                                        );
+                                        let ext = builder.ins().uextend(types::I32, cmp);
+                                        (ext, Type::I32)
+                                    }
+                                    BinaryOp::Le => {
+                                        let cmp = builder.ins().icmp(
+                                            IntCC::SignedLessThanOrEqual,
+                                            lhs_val,
+                                            rhs_val,
+                                        );
+                                        let ext = builder.ins().uextend(types::I32, cmp);
+                                        (ext, Type::I32)
+                                    }
                                     BinaryOp::Ge => {
-                                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs_val, rhs_val);
+                                        let cmp = builder.ins().icmp(
+                                            IntCC::SignedGreaterThanOrEqual,
+                                            lhs_val,
+                                            rhs_val,
+                                        );
                                         let ext = builder.ins().uextend(types::I32, cmp);
                                         (ext, Type::I32)
                                     }
                                     _ => return Err(anyhow!("Invalid scalar integer op {:?}", op)),
                                 }
-                            },
+                            }
                         };
                         values.insert(dst.clone(), (res_val, res_ty));
                     }
                     Instruction::Load { dst, ptr, ty, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
                         let clif_ty = to_clif_type(*ty);
-                        let val = builder.ins().load(clif_ty, MemFlagsData::trusted(), ptr_val, 0);
+                        let val = builder
+                            .ins()
+                            .load(clif_ty, MemFlagsData::trusted(), ptr_val, 0);
                         values.insert(dst.clone(), (val, *ty));
                     }
                     Instruction::Store { ptr, val, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
                         let (val_val, _) = *values.get(val).unwrap();
-                        builder.ins().store(MemFlagsData::trusted(), val_val, ptr_val, 0);
+                        builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), val_val, ptr_val, 0);
                     }
-                    Instruction::Call { dst, func, args, .. } => {
+                    Instruction::Call {
+                        dst, func, args, ..
+                    } => {
                         let target_func_id = *func_ids.get(func).unwrap();
-                        let callee = self.module.declare_func_in_func(target_func_id, &mut builder.func);
-                        let arg_vals: Vec<Value> = args.iter().map(|a| values.get(a).unwrap().0).collect();
+                        let callee = self
+                            .module
+                            .declare_func_in_func(target_func_id, builder.func);
+                        let arg_vals: Vec<Value> =
+                            args.iter().map(|a| values.get(a).unwrap().0).collect();
                         let call_inst = builder.ins().call(callee, &arg_vals);
                         if let Some(d) = dst {
                             let results = builder.inst_results(call_inst);
@@ -668,21 +780,27 @@ impl JitEngine {
                         };
                         values.insert(dst.clone(), (vec_val, Type::V128));
                     }
-                    Instruction::ExtractLane { dst, vec, lane, ty, .. } => {
+                    Instruction::ExtractLane {
+                        dst, vec, lane, ty, ..
+                    } => {
                         let (vec_val, _) = *values.get(vec).unwrap();
                         let scalar_val = builder.ins().extractlane(vec_val, *lane as u8);
                         values.insert(dst.clone(), (scalar_val, *ty));
                     }
                     Instruction::Alloc { dst, size, .. } => {
                         let (size_val, _) = *values.get(size).unwrap();
-                        let callee = self.module.declare_func_in_func(self.rt_malloc_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_malloc_id, builder.func);
                         let call_inst = builder.ins().call(callee, &[size_val]);
                         let ptr_val = builder.inst_results(call_inst)[0];
                         values.insert(dst.clone(), (ptr_val, Type::Ptr));
                     }
                     Instruction::Free { ptr, .. } => {
                         let (ptr_val, _) = *values.get(ptr).unwrap();
-                        let callee = self.module.declare_func_in_func(self.rt_free_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_free_id, builder.func);
                         builder.ins().call(callee, &[ptr_val]);
                     }
                 }
@@ -698,10 +816,14 @@ impl JitEngine {
                         .collect();
 
                     if let Some(trap_block) = fuel_trap_block {
-                        let callee = self.module.declare_func_in_func(self.rt_check_fuel_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_check_fuel_id, builder.func);
                         let call_inst = builder.ins().call(callee, &[]);
                         let is_exhausted = builder.inst_results(call_inst)[0];
-                        builder.ins().brif(is_exhausted, trap_block, &[], target_block, &arg_vals);
+                        builder
+                            .ins()
+                            .brif(is_exhausted, trap_block, &[], target_block, &arg_vals);
                     } else {
                         builder.ins().jump(target_block, &arg_vals);
                     }
@@ -727,16 +849,32 @@ impl JitEngine {
                         .collect();
 
                     if let Some(trap_block) = fuel_trap_block {
-                        let callee = self.module.declare_func_in_func(self.rt_check_fuel_id, &mut builder.func);
+                        let callee = self
+                            .module
+                            .declare_func_in_func(self.rt_check_fuel_id, builder.func);
                         let call_inst = builder.ins().call(callee, &[]);
                         let is_exhausted = builder.inst_results(call_inst)[0];
                         let normal_br_block = builder.create_block();
-                        builder.ins().brif(is_exhausted, trap_block, &[], normal_br_block, &[]);
+                        builder
+                            .ins()
+                            .brif(is_exhausted, trap_block, &[], normal_br_block, &[]);
 
                         builder.switch_to_block(normal_br_block);
-                        builder.ins().brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                        builder.ins().brif(
+                            cond_val,
+                            then_target,
+                            &then_vals,
+                            else_target,
+                            &else_vals,
+                        );
                     } else {
-                        builder.ins().brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                        builder.ins().brif(
+                            cond_val,
+                            then_target,
+                            &then_vals,
+                            else_target,
+                            &else_vals,
+                        );
                     }
                 }
                 Terminator::Ret { val, .. } => {
@@ -782,7 +920,9 @@ impl JitEngine {
     pub fn get_fn_ptr(&self, name: &str) -> Option<*const u8> {
         let func_id = self.module.get_name(name)?;
         match func_id {
-            cranelift_module::FuncOrDataId::Func(fid) => Some(self.module.get_finalized_function(fid)),
+            cranelift_module::FuncOrDataId::Func(fid) => {
+                Some(self.module.get_finalized_function(fid))
+            }
             _ => None,
         }
     }

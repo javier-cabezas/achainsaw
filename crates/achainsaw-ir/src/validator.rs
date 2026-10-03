@@ -14,19 +14,31 @@ impl Validator {
             functions: HashMap::new(),
         }
     }
+}
 
+impl Default for Validator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Validator {
     pub fn validate_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
         // Collect function signatures
         for ext_fn in &module.extern_functions {
             if self.functions.contains_key(&ext_fn.name) {
                 return Err(Diagnostic::error(
                     "ERR_DUPLICATE_FUNCTION",
-                    format!("Duplicate function name '{}' (already declared)", ext_fn.name),
+                    format!(
+                        "Duplicate function name '{}' (already declared)",
+                        ext_fn.name
+                    ),
                     ext_fn.span,
                 ));
             }
             let param_types = ext_fn.params.iter().map(|(_, ty)| *ty).collect();
-            self.functions.insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
+            self.functions
+                .insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
         }
 
         for func in &module.functions {
@@ -38,7 +50,8 @@ impl Validator {
                 ));
             }
             let param_types = func.params.iter().map(|(_, ty)| *ty).collect();
-            self.functions.insert(func.name.clone(), (param_types, func.ret_type));
+            self.functions
+                .insert(func.name.clone(), (param_types, func.ret_type));
         }
 
         // Validate each function
@@ -57,7 +70,10 @@ impl Validator {
             if !block_names.insert(block.label.clone()) {
                 return Err(Diagnostic::error(
                     "ERR_DUPLICATE_BLOCK",
-                    format!("Duplicate block label '{}' in function '{}'", block.label, func.name),
+                    format!(
+                        "Duplicate block label '{}' in function '{}'",
+                        block.label, func.name
+                    ),
                     block.span,
                 ));
             }
@@ -85,7 +101,10 @@ impl Validator {
                 if reg_types.contains_key(p_name) {
                     return Err(Diagnostic::error(
                         "ERR_SSA_REDEFINITION",
-                        format!("Register '{p_name}' re-defined in block '{}' (violates SSA)", block.label),
+                        format!(
+                            "Register '{p_name}' re-defined in block '{}' (violates SSA)",
+                            block.label
+                        ),
                         block.span,
                     ));
                 }
@@ -123,28 +142,40 @@ impl Validator {
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 match (val, ty) {
-                    (Constant::Int(_), Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr) => {}
+                    (
+                        Constant::Int(_),
+                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr,
+                    ) => {}
                     (Constant::Float(_), Type::F32 | Type::F64) => {}
                     _ => {
                         return Err(Diagnostic::error(
                             "ERR_TYPE_MISMATCH",
                             format!("Constant value does not match specified type '{ty}'"),
                             *span,
-                        ).with_instruction_index(inst_idx));
+                        )
+                        .with_instruction_index(inst_idx));
                     }
                 }
                 reg_types.insert(dst.clone(), *ty);
             }
-            Instruction::Binary { op, dst, lhs, rhs, span } => {
+            Instruction::Binary {
+                op,
+                dst,
+                lhs,
+                rhs,
+                span,
+            } => {
                 if reg_types.contains_key(dst) {
                     return Err(Diagnostic::error(
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
 
                 let lhs_ty = self.check_reg(lhs, reg_types, *span, inst_idx)?;
@@ -190,15 +221,19 @@ impl Validator {
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 let ptr_ty = self.check_reg(ptr, reg_types, *span, inst_idx)?;
                 if ptr_ty != Type::Ptr {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
-                        format!("Load pointer operand '{ptr}' must be of type 'ptr', found '{ptr_ty}'"),
+                        format!(
+                            "Load pointer operand '{ptr}' must be of type 'ptr', found '{ptr_ty}'"
+                        ),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 reg_types.insert(dst.clone(), *ty);
             }
@@ -207,27 +242,41 @@ impl Validator {
                 if ptr_ty != Type::Ptr {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
-                        format!("Store target pointer '{ptr}' must be of type 'ptr', found '{ptr_ty}'"),
+                        format!(
+                            "Store target pointer '{ptr}' must be of type 'ptr', found '{ptr_ty}'"
+                        ),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 self.check_reg(val, reg_types, *span, inst_idx)?;
             }
-            Instruction::Call { dst, func, args, span } => {
+            Instruction::Call {
+                dst,
+                func,
+                args,
+                span,
+            } => {
                 let (param_types, ret_type) = self.functions.get(func).ok_or_else(|| {
                     Diagnostic::error(
                         "ERR_UNDEFINED_FUNCTION",
                         format!("Call to undefined function '{func}'"),
                         *span,
-                    ).with_instruction_index(inst_idx)
+                    )
+                    .with_instruction_index(inst_idx)
                 })?;
 
                 if args.len() != param_types.len() {
                     return Err(Diagnostic::error(
                         "ERR_ARITY_MISMATCH",
-                        format!("Function '{func}' expects {} arguments, received {}", param_types.len(), args.len()),
+                        format!(
+                            "Function '{func}' expects {} arguments, received {}",
+                            param_types.len(),
+                            args.len()
+                        ),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
 
                 for (arg, &expected_ty) in args.iter().zip(param_types) {
@@ -247,14 +296,16 @@ impl Validator {
                             "ERR_SSA_REDEFINITION",
                             format!("Register '{d}' assigned multiple times (violates SSA)"),
                             *span,
-                        ).with_instruction_index(inst_idx));
+                        )
+                        .with_instruction_index(inst_idx));
                     }
                     let rty = ret_type.ok_or_else(|| {
                         Diagnostic::error(
                             "ERR_VOID_ASSIGNMENT",
                             format!("Function '{func}' does not return a value"),
                             *span,
-                        ).with_instruction_index(inst_idx)
+                        )
+                        .with_instruction_index(inst_idx)
                     })?;
                     reg_types.insert(d.clone(), rty);
                 }
@@ -265,40 +316,56 @@ impl Validator {
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 let src_ty = self.check_reg(src, reg_types, *span, inst_idx)?;
-                if !matches!(src_ty, Type::F32 | Type::F64 | Type::I32 | Type::I64 | Type::I16 | Type::I8) {
+                if !matches!(
+                    src_ty,
+                    Type::F32 | Type::F64 | Type::I32 | Type::I64 | Type::I16 | Type::I8
+                ) {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
                         format!("Splat operand '{src}' must be numeric scalar, found '{src_ty}'"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 reg_types.insert(dst.clone(), Type::V128);
             }
-            Instruction::ExtractLane { dst, vec, lane, ty, span } => {
+            Instruction::ExtractLane {
+                dst,
+                vec,
+                lane,
+                ty,
+                span,
+            } => {
                 if reg_types.contains_key(dst) {
                     return Err(Diagnostic::error(
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 let vec_ty = self.check_reg(vec, reg_types, *span, inst_idx)?;
                 if vec_ty != Type::V128 {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
-                        format!("ExtractLane requires vector operand of type 'v128', found '{vec_ty}'"),
+                        format!(
+                            "ExtractLane requires vector operand of type 'v128', found '{vec_ty}'"
+                        ),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 if *lane >= 16 {
                     return Err(Diagnostic::error(
                         "ERR_OUT_OF_BOUNDS_LANE",
                         format!("ExtractLane index {lane} out of bounds for 128-bit vector"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 reg_types.insert(dst.clone(), *ty);
             }
@@ -308,7 +375,8 @@ impl Validator {
                         "ERR_SSA_REDEFINITION",
                         format!("Register '{dst}' assigned multiple times (violates SSA)"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 let size_ty = self.check_reg(size, reg_types, *span, inst_idx)?;
                 if size_ty != Type::I64 && size_ty != Type::I32 {
@@ -316,7 +384,8 @@ impl Validator {
                         "ERR_TYPE_MISMATCH",
                         format!("Alloc size must be i64 or i32, found '{size_ty}'"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
                 reg_types.insert(dst.clone(), Type::Ptr);
             }
@@ -327,7 +396,8 @@ impl Validator {
                         "ERR_TYPE_MISMATCH",
                         format!("Free target must be of type 'ptr', found '{ptr_ty}'"),
                         *span,
-                    ).with_instruction_index(inst_idx));
+                    )
+                    .with_instruction_index(inst_idx));
                 }
             }
         }
@@ -379,7 +449,11 @@ impl Validator {
                 if args.len() != expected_params.len() {
                     return Err(Diagnostic::error(
                         "ERR_ARITY_MISMATCH",
-                        format!("Block '{target}' expects {} arguments, received {}", expected_params.len(), args.len()),
+                        format!(
+                            "Block '{target}' expects {} arguments, received {}",
+                            expected_params.len(),
+                            args.len()
+                        ),
                         *span,
                     ));
                 }
@@ -407,7 +481,9 @@ impl Validator {
                 if cond_ty != Type::I32 {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
-                        format!("Branch condition '{cond}' must be i32 (boolean), found '{cond_ty}'"),
+                        format!(
+                            "Branch condition '{cond}' must be i32 (boolean), found '{cond_ty}'"
+                        ),
                         *span,
                     ));
                 }
@@ -422,7 +498,11 @@ impl Validator {
                 if then_args.len() != then_expected.len() {
                     return Err(Diagnostic::error(
                         "ERR_ARITY_MISMATCH",
-                        format!("Block '{then_block}' expects {} arguments, received {}", then_expected.len(), then_args.len()),
+                        format!(
+                            "Block '{then_block}' expects {} arguments, received {}",
+                            then_expected.len(),
+                            then_args.len()
+                        ),
                         *span,
                     ));
                 }
@@ -447,7 +527,11 @@ impl Validator {
                 if else_args.len() != else_expected.len() {
                     return Err(Diagnostic::error(
                         "ERR_ARITY_MISMATCH",
-                        format!("Block '{else_block}' expects {} arguments, received {}", else_expected.len(), else_args.len()),
+                        format!(
+                            "Block '{else_block}' expects {} arguments, received {}",
+                            else_expected.len(),
+                            else_args.len()
+                        ),
                         *span,
                     ));
                 }

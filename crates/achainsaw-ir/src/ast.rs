@@ -36,8 +36,16 @@ pub enum BinaryOp {
     ViMul,
 }
 
+impl std::str::FromStr for BinaryOp {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str_opt(s).ok_or(())
+    }
+}
+
 impl BinaryOp {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "add" => Some(BinaryOp::Add),
             "sub" => Some(BinaryOp::Sub),
@@ -69,12 +77,7 @@ impl BinaryOp {
     pub fn is_comparison(&self) -> bool {
         matches!(
             self,
-            BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Gt
-                | BinaryOp::Le
-                | BinaryOp::Ge
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
         )
     }
 

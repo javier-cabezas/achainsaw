@@ -183,7 +183,10 @@ fn main() {
                 } else {
                     println!(
                         "Assembled {} ({} bytes) -> {} ({} bytes)",
-                        stats["input"], stats["source_bytes"], stats["output"], stats["binary_bytes"]
+                        stats["input"],
+                        stats["source_bytes"],
+                        stats["output"],
+                        stats["binary_bytes"]
                     );
                 }
             }
@@ -204,11 +207,19 @@ fn main() {
             Ok(_) => {}
             Err(e) => eprintln!("Disassembly error: {e}"),
         },
-        Commands::Opt { input, output, json } => match run_optimize(&input, output) {
+        Commands::Opt {
+            input,
+            output,
+            json,
+        } => match run_optimize(&input, output) {
             Ok(stats) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
-                } else if stats.get("output_written").and_then(|v| v.as_bool()).unwrap_or(false) {
+                } else if stats
+                    .get("output_written")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     println!(
                         "Optimized {} -> {} (total transformations: {})",
                         stats["input"], stats["output"], stats["total_optimizations"]
@@ -265,7 +276,11 @@ fn main() {
 
 fn load_module(path: &Path) -> Result<Module, Diagnostic> {
     let bytes = fs::read(path).map_err(|e| {
-        Diagnostic::error("ERR_FILE_IO", format!("Could not read file: {e}"), Default::default())
+        Diagnostic::error(
+            "ERR_FILE_IO",
+            format!("Could not read file: {e}"),
+            Default::default(),
+        )
     })?;
 
     if bytes.starts_with(b"\x00AIR") {
@@ -275,7 +290,11 @@ fn load_module(path: &Path) -> Result<Module, Diagnostic> {
         Ok(module)
     } else {
         let source = std::str::from_utf8(&bytes).map_err(|e| {
-            Diagnostic::error("ERR_INVALID_UTF8", format!("Source not valid UTF-8: {e}"), Default::default())
+            Diagnostic::error(
+                "ERR_INVALID_UTF8",
+                format!("Source not valid UTF-8: {e}"),
+                Default::default(),
+            )
         })?;
         parse_and_validate(source)
     }
