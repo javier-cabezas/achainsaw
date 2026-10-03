@@ -416,9 +416,15 @@ impl AotCompiler {
 }
 
 pub fn link_shared_library(object_path: &Path, shared_path: &Path) -> Result<()> {
+    let shared_arg = if cfg!(target_os = "macos") {
+        "-dynamiclib"
+    } else {
+        "-shared"
+    };
+
     // Try gcc first
     let gcc_res = Command::new("gcc")
-        .arg("-shared")
+        .arg(shared_arg)
         .arg("-o")
         .arg(shared_path)
         .arg(object_path)
@@ -432,7 +438,7 @@ pub fn link_shared_library(object_path: &Path, shared_path: &Path) -> Result<()>
 
     // Try clang as fallback
     let clang_res = Command::new("clang")
-        .arg("-shared")
+        .arg(shared_arg)
         .arg("-o")
         .arg(shared_path)
         .arg(object_path)
@@ -446,7 +452,7 @@ pub fn link_shared_library(object_path: &Path, shared_path: &Path) -> Result<()>
 
     // Try cc as fallback
     let cc_res = Command::new("cc")
-        .arg("-shared")
+        .arg(shared_arg)
         .arg("-o")
         .arg(shared_path)
         .arg(object_path)

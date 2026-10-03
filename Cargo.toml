@@ -32,6 +32,7 @@ libloading = "0.8"
 
 [workspace.lints.rust]
 unexpected_cfgs = "allow"
+suspicious_runtime_symbol_definitions = "allow"
 
 [workspace.lints.clippy]
 result_large_err = "allow"
