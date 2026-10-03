@@ -148,6 +148,18 @@ achainsaw run examples/simd_vector_dot.airb --func simd_dot --args 1 --json
 achainsaw disassemble examples/simd_vector_dot.airb
 ```
 
+### 6. Model Context Protocol (MCP) Server (`achainsaw mcp`)
+`achainsaw` includes a native Model Context Protocol (MCP) server communicating over JSON-RPC 2.0 stdio, exposing compiler tools directly to LLM agents and IDE assistants:
+```bash
+achainsaw mcp
+```
+
+**Exposed MCP Tools:**
+- **`air_check`**: Validates AIR textual IR or base64 AIRB bytecode syntax and SSA invariants. Returns structured diagnostic metrics or error payloads with line/column pointers and self-repair hints.
+- **`air_run`**: JIT compiles and executes AIR functions with arguments, loop fuel budget, and memory quota sandboxing.
+- **`air_assemble`**: Assembles textual AIR into compact base64-encoded AIRB bytecode with compression metrics.
+- **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
+
 ---
 
 ## 🐍 Python Host Integration (`achainsaw-py`)

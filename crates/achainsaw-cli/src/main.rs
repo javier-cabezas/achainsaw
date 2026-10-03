@@ -10,6 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod mcp;
+
 #[derive(ClapParser)]
 #[command(name = "achainsaw")]
 #[command(about = "High-performance agent-native toolchain & JIT compiler", long_about = None)]
@@ -79,12 +81,21 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Run Model Context Protocol (MCP) server over standard I/O (stdio)
+    Mcp,
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Mcp => {
+            if let Err(e) = mcp::run_mcp_server() {
+                eprintln!("MCP server error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Check { path, json } => {
             let res = run_check(&path);
             if json {
