@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::diag::Span;
 use crate::types::Type;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -24,12 +23,23 @@ impl OptimizationStats {
     }
 }
 
+/// Return types of every callable (externs and module functions), by name.
+type Signatures = HashMap<String, Option<Type>>;
+
 /// Optimizes an entire IR module in-place, returning summary statistics.
 pub fn optimize_module(module: &mut Module) -> OptimizationStats {
     let mut total_stats = OptimizationStats::default();
 
+    let mut sigs: Signatures = HashMap::new();
+    for ext in &module.extern_functions {
+        sigs.insert(ext.name.clone(), ext.ret_type);
+    }
+    for func in &module.functions {
+        sigs.insert(func.name.clone(), func.ret_type);
+    }
+
     for func in &mut module.functions {
-        let stats = optimize_function(func);
+        let stats = optimize_function_with(func, &sigs);
         total_stats.constants_folded += stats.constants_folded;
         total_stats.algebraic_simplifications += stats.algebraic_simplifications;
         total_stats.branches_folded += stats.branches_folded;
@@ -42,7 +52,14 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
 }
 
 /// Optimizes a single IR function to a fixpoint.
+///
+/// Without module context the result types of `call` instructions are unknown, so
+/// optimizations that depend on them are skipped. Prefer [`optimize_module`].
 pub fn optimize_function(func: &mut Function) -> OptimizationStats {
+    optimize_function_with(func, &HashMap::new())
+}
+
+fn optimize_function_with(func: &mut Function, sigs: &Signatures) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
     let max_iters = 16;
 
@@ -51,7 +68,7 @@ pub fn optimize_function(func: &mut Function) -> OptimizationStats {
         let mut changed = false;
 
         // 1. Constant folding & propagation + Algebraic simplification
-        let (folded, simplified) = run_constant_and_algebraic_pass(func);
+        let (folded, simplified) = run_constant_and_algebraic_pass(func, sigs);
         if folded > 0 || simplified > 0 {
             stats.constants_folded += folded;
             stats.algebraic_simplifications += simplified;
@@ -73,7 +90,7 @@ pub fn optimize_function(func: &mut Function) -> OptimizationStats {
         }
 
         // 4. Dead Code Elimination (DCE)
-        let dce = run_dead_code_elimination(func);
+        let dce = run_dead_code_elimination(func, sigs);
         if dce > 0 {
             stats.dead_instructions_removed += dce;
             changed = true;
@@ -87,8 +104,63 @@ pub fn optimize_function(func: &mut Function) -> OptimizationStats {
     stats
 }
 
+/// Infers the type of every register in `func` (parameters, block parameters and
+/// instruction results). Registers whose type cannot be determined are omitted.
+fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> {
+    let mut types: HashMap<String, Type> = HashMap::new();
+    for (name, ty) in &func.params {
+        types.insert(name.clone(), *ty);
+    }
+    for block in &func.blocks {
+        for (name, ty) in &block.params {
+            types.insert(name.clone(), *ty);
+        }
+    }
+
+    // Block order is not dominance order, so iterate until nothing new is learned.
+    for _ in 0..=func.blocks.len() {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let (dst, ty) = match inst {
+                    Instruction::AssignConst { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::Load { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::ExtractLane { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::Splat { dst, .. } => (dst, Some(Type::V128)),
+                    Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
+                    Instruction::Call {
+                        dst: Some(dst),
+                        func,
+                        ..
+                    } => (dst, sigs.get(func).copied().flatten()),
+                    Instruction::Binary {
+                        op, dst, lhs, rhs, ..
+                    } => {
+                        let ty = match (types.get(lhs), types.get(rhs)) {
+                            (Some(l), Some(r)) => crate::validator::binary_result_type(*op, *l, *r).ok(),
+                            _ => None,
+                        };
+                        (dst, ty)
+                    }
+                    _ => continue,
+                };
+                if let Some(ty) = ty {
+                    if types.insert(dst.clone(), ty).is_none() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    types
+}
+
 /// Runs constant folding, constant propagation, and algebraic simplification.
-fn run_constant_and_algebraic_pass(func: &mut Function) -> (usize, usize) {
+fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (usize, usize) {
+    let reg_types = infer_reg_types(func, sigs);
     let mut constants: HashMap<String, (Constant, Type)> = HashMap::new();
     let mut substitutions: HashMap<String, String> = HashMap::new();
     let mut folded_count = 0;
@@ -103,34 +175,50 @@ fn run_constant_and_algebraic_pass(func: &mut Function) -> (usize, usize) {
         }
     }
 
-    // Now scan and simplify instructions
-    for block in &mut func.blocks {
-        for inst in &mut block.instructions {
-            // Apply variable substitutions to operands
-            substitute_instruction_operands(inst, &substitutions);
+    // Block order is not dominance order, so a substitution discovered late may still
+    // need to be applied to earlier blocks. Rescan until no new substitution appears.
+    loop {
+        let substitutions_before = substitutions.len();
 
-            let binary_info = match inst {
-                Instruction::AssignConst { dst, val, ty, .. } => {
-                    constants.insert(dst.clone(), (val.clone(), *ty));
-                    None
-                }
-                Instruction::Binary {
-                    op,
-                    dst,
-                    lhs,
-                    rhs,
-                    span,
-                } => Some((*op, dst.clone(), lhs.clone(), rhs.clone(), *span)),
-                _ => None,
-            };
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                // Apply variable substitutions to operands
+                substitute_instruction_operands(inst, &substitutions);
 
-            if let Some((op, dst, lhs, rhs, span)) = binary_info {
-                // Try full constant folding if both operands are constants
-                let lhs_c = constants.get(&lhs).cloned();
-                let rhs_c = constants.get(&rhs).cloned();
+                let binary_info = match inst {
+                    Instruction::AssignConst { dst, val, ty, .. } => {
+                        constants.insert(dst.clone(), (val.clone(), *ty));
+                        None
+                    }
+                    Instruction::Binary {
+                        op,
+                        dst,
+                        lhs,
+                        rhs,
+                        span,
+                    } => Some((*op, dst.clone(), lhs.clone(), rhs.clone(), *span)),
+                    _ => None,
+                };
 
-                if let (Some((c1, ty1)), Some((c2, _ty2))) = (lhs_c, rhs_c) {
-                    if let Some((folded_const, folded_ty)) = fold_binary_op(op, &c1, &c2, ty1) {
+                let Some((op, dst, lhs, rhs, span)) = binary_info else {
+                    continue;
+                };
+
+                // Without both operand types we cannot prove any rewrite is type-correct.
+                let (Some(&lhs_ty), Some(&rhs_ty)) = (reg_types.get(&lhs), reg_types.get(&rhs))
+                else {
+                    continue;
+                };
+                let Ok(res_ty) = crate::validator::binary_result_type(op, lhs_ty, rhs_ty) else {
+                    continue;
+                };
+
+                // Full constant folding if both operands are constants
+                if let (Some((c1, _)), Some((c2, _))) = (constants.get(&lhs), constants.get(&rhs)) {
+                    if let Some((folded_const, folded_ty)) =
+                        fold_binary_op(op, c1, lhs_ty, c2, rhs_ty)
+                    {
+                        debug_assert_eq!(folded_ty, res_ty);
                         *inst = Instruction::AssignConst {
                             dst: dst.clone(),
                             val: folded_const.clone(),
@@ -143,8 +231,10 @@ fn run_constant_and_algebraic_pass(func: &mut Function) -> (usize, usize) {
                     }
                 }
 
-                // Try algebraic simplification if one operand is a constant or both are identical
-                if let Some(res) = simplify_algebraic(op, &dst, &lhs, &rhs, &constants, span) {
+                // Algebraic simplification
+                if let Some(res) =
+                    simplify_algebraic(op, &lhs, &rhs, &constants, &reg_types, res_ty)
+                {
                     match res {
                         AlgebraicResult::Constant(c, ty) => {
                             *inst = Instruction::AssignConst {
@@ -158,16 +248,21 @@ fn run_constant_and_algebraic_pass(func: &mut Function) -> (usize, usize) {
                         }
                         AlgebraicResult::Identity(source) => {
                             let real_source = substitutions.get(&source).cloned().unwrap_or(source);
-                            substitutions.insert(dst, real_source);
-                            simplified_count += 1;
+                            if substitutions.insert(dst, real_source).is_none() {
+                                simplified_count += 1;
+                            }
                         }
                     }
                 }
             }
+
+            // Substitute terminator operands
+            substitute_terminator_operands(&mut block.terminator, &substitutions);
         }
 
-        // Substitute terminator operands
-        substitute_terminator_operands(&mut block.terminator, &substitutions);
+        if substitutions.len() == substitutions_before {
+            break;
+        }
     }
 
     (folded_count, simplified_count)
@@ -178,171 +273,225 @@ enum AlgebraicResult {
     Identity(String),
 }
 
+/// Algebraic identities. Only rewrites that provably preserve both the value and the
+/// result type `res_ty` are returned; floating-point values are never simplified
+/// (`x - x` is NaN for NaN/inf, `x * 0` is NaN for inf, `x + 0` loses `-0.0`).
 fn simplify_algebraic(
     op: BinaryOp,
-    _dst: &str,
     lhs: &str,
     rhs: &str,
     constants: &HashMap<String, (Constant, Type)>,
-    _span: Span,
+    reg_types: &HashMap<String, Type>,
+    res_ty: Type,
 ) -> Option<AlgebraicResult> {
+    // Only integer/pointer results are eligible.
+    if !(res_ty.is_int() || res_ty == Type::Ptr) {
+        return None;
+    }
+
     let lhs_c = constants.get(lhs);
     let rhs_c = constants.get(rhs);
 
-    match op {
+    let identity = |source: &str| -> Option<AlgebraicResult> {
+        if reg_types.get(source) == Some(&res_ty) {
+            Some(AlgebraicResult::Identity(source.to_string()))
+        } else {
+            None
+        }
+    };
+    let zero = |ty: Type| -> Option<AlgebraicResult> {
+        if ty == res_ty && res_ty.is_int() {
+            Some(AlgebraicResult::Constant(Constant::Int(0), ty))
+        } else {
+            None
+        }
+    };
+    let is_int_const = |c: Option<&(Constant, Type)>, v: i64| -> bool {
+        matches!(c, Some((Constant::Int(n), ty)) if ty.wrap_int(*n) == v)
+    };
+
+    let result = match op {
         // x + 0 -> x, 0 + x -> x
         BinaryOp::Add => {
-            if let Some((Constant::Int(0), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
-            }
-            if let Some((Constant::Int(0), _)) = lhs_c {
-                return Some(AlgebraicResult::Identity(rhs.to_string()));
+            if is_int_const(rhs_c, 0) {
+                identity(lhs)
+            } else if is_int_const(lhs_c, 0) {
+                identity(rhs)
+            } else {
+                None
             }
         }
         // x - 0 -> x, x - x -> 0
         BinaryOp::Sub => {
-            if let Some((Constant::Int(0), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
-            }
-            if lhs == rhs {
-                let ty = lhs_c.map(|(_, t)| *t).unwrap_or(Type::I32);
-                return Some(AlgebraicResult::Constant(Constant::Int(0), ty));
+            if is_int_const(rhs_c, 0) {
+                identity(lhs)
+            } else if lhs == rhs {
+                reg_types.get(lhs).copied().and_then(zero)
+            } else {
+                None
             }
         }
         // x * 1 -> x, 1 * x -> x, x * 0 -> 0, 0 * x -> 0
         BinaryOp::Mul => {
-            if let Some((Constant::Int(1), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
-            }
-            if let Some((Constant::Int(1), _)) = lhs_c {
-                return Some(AlgebraicResult::Identity(rhs.to_string()));
-            }
-            if let Some((Constant::Int(0), ty)) = rhs_c {
-                return Some(AlgebraicResult::Constant(Constant::Int(0), *ty));
-            }
-            if let Some((Constant::Int(0), ty)) = lhs_c {
-                return Some(AlgebraicResult::Constant(Constant::Int(0), *ty));
+            if is_int_const(rhs_c, 1) {
+                identity(lhs)
+            } else if is_int_const(lhs_c, 1) {
+                identity(rhs)
+            } else if is_int_const(rhs_c, 0) {
+                rhs_c.and_then(|(_, ty)| zero(*ty))
+            } else if is_int_const(lhs_c, 0) {
+                lhs_c.and_then(|(_, ty)| zero(*ty))
+            } else {
+                None
             }
         }
         // x / 1 -> x
         BinaryOp::Div => {
-            if let Some((Constant::Int(1), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
+            if is_int_const(rhs_c, 1) {
+                identity(lhs)
+            } else {
+                None
             }
         }
-        // x & 0 -> 0, 0 & x -> 0
+        // x & 0 -> 0, 0 & x -> 0, x & x -> x
         BinaryOp::And => {
-            if let Some((Constant::Int(0), ty)) = rhs_c {
-                return Some(AlgebraicResult::Constant(Constant::Int(0), *ty));
-            }
-            if let Some((Constant::Int(0), ty)) = lhs_c {
-                return Some(AlgebraicResult::Constant(Constant::Int(0), *ty));
-            }
-            if lhs == rhs {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
+            if is_int_const(rhs_c, 0) {
+                rhs_c.and_then(|(_, ty)| zero(*ty))
+            } else if is_int_const(lhs_c, 0) {
+                lhs_c.and_then(|(_, ty)| zero(*ty))
+            } else if lhs == rhs {
+                identity(lhs)
+            } else {
+                None
             }
         }
-        // x | 0 -> x, 0 | x -> x
+        // x | 0 -> x, 0 | x -> x, x | x -> x
         BinaryOp::Or => {
-            if let Some((Constant::Int(0), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
-            }
-            if let Some((Constant::Int(0), _)) = lhs_c {
-                return Some(AlgebraicResult::Identity(rhs.to_string()));
-            }
-            if lhs == rhs {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
+            if is_int_const(rhs_c, 0) {
+                identity(lhs)
+            } else if is_int_const(lhs_c, 0) {
+                identity(rhs)
+            } else if lhs == rhs {
+                identity(lhs)
+            } else {
+                None
             }
         }
         // x ^ 0 -> x, 0 ^ x -> x, x ^ x -> 0
         BinaryOp::Xor => {
-            if let Some((Constant::Int(0), _)) = rhs_c {
-                return Some(AlgebraicResult::Identity(lhs.to_string()));
-            }
-            if let Some((Constant::Int(0), _)) = lhs_c {
-                return Some(AlgebraicResult::Identity(rhs.to_string()));
-            }
-            if lhs == rhs {
-                let ty = lhs_c.map(|(_, t)| *t).unwrap_or(Type::I32);
-                return Some(AlgebraicResult::Constant(Constant::Int(0), ty));
+            if is_int_const(rhs_c, 0) {
+                identity(lhs)
+            } else if is_int_const(lhs_c, 0) {
+                identity(rhs)
+            } else if lhs == rhs {
+                reg_types.get(lhs).copied().and_then(zero)
+            } else {
+                None
             }
         }
-        _ => {}
-    }
-
-    None
+        _ => None,
+    };
+    result
 }
 
+/// Folds `op` over two constants of types `ty1`/`ty2` with the exact semantics the
+/// code generators implement (two's-complement wrapping at the declared width,
+/// shift amounts masked to the width, f32 arithmetic performed in f32).
+/// Returns `None` when folding could hide a runtime error (division by zero, overflow).
 fn fold_binary_op(
     op: BinaryOp,
     c1: &Constant,
+    ty1: Type,
     c2: &Constant,
-    ty: Type,
+    ty2: Type,
 ) -> Option<(Constant, Type)> {
+    let bool_const = |b: bool| Some((Constant::Int(b as i64), Type::I32));
+
     match (c1, c2) {
         (Constant::Int(a), Constant::Int(b)) => {
+            // Pointer arithmetic and mixed-type forms are left to the code generator.
+            if ty1 != ty2 || !ty1.is_int() {
+                return None;
+            }
+            let ty = ty1;
+            let bits = ty.int_bits()?;
+            let a = ty.wrap_int(*a);
+            let b = ty.wrap_int(*b);
+            let min = if bits == 64 {
+                i64::MIN
+            } else {
+                -(1i64 << (bits - 1))
+            };
+            let shift = (b as u32) & (bits - 1);
+
             let res = match op {
-                BinaryOp::Add => a.wrapping_add(*b),
-                BinaryOp::Sub => a.wrapping_sub(*b),
-                BinaryOp::Mul => a.wrapping_mul(*b),
+                BinaryOp::Add => a.wrapping_add(b),
+                BinaryOp::Sub => a.wrapping_sub(b),
+                BinaryOp::Mul => a.wrapping_mul(b),
                 BinaryOp::Div => {
-                    if *b == 0 {
+                    if b == 0 || (a == min && b == -1) {
                         return None;
                     }
-                    a.checked_div(*b)?
+                    a / b
                 }
                 BinaryOp::Rem => {
-                    if *b == 0 {
+                    if b == 0 || (a == min && b == -1) {
                         return None;
                     }
-                    a.checked_rem(*b)?
+                    a % b
                 }
                 BinaryOp::And => a & b,
                 BinaryOp::Or => a | b,
                 BinaryOp::Xor => a ^ b,
-                BinaryOp::Shl => a.wrapping_shl((*b & 63) as u32),
-                BinaryOp::Shr => a.wrapping_shr((*b & 63) as u32),
-                BinaryOp::Eq => {
-                    return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Ne => {
-                    return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Lt => return Some((Constant::Int(if a < b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Gt => return Some((Constant::Int(if a > b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Le => {
-                    return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Ge => {
-                    return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32))
-                }
+                BinaryOp::Shl => a.wrapping_shl(shift),
+                BinaryOp::Shr => a >> shift,
+                BinaryOp::Eq => return bool_const(a == b),
+                BinaryOp::Ne => return bool_const(a != b),
+                BinaryOp::Lt => return bool_const(a < b),
+                BinaryOp::Gt => return bool_const(a > b),
+                BinaryOp::Le => return bool_const(a <= b),
+                BinaryOp::Ge => return bool_const(a >= b),
                 _ => return None,
             };
-            Some((Constant::Int(res), ty))
+            Some((Constant::Int(ty.wrap_int(res)), ty))
         }
         (Constant::Float(a), Constant::Float(b)) => {
-            let res = match op {
-                BinaryOp::Add => a + b,
-                BinaryOp::Sub => a - b,
-                BinaryOp::Mul => a * b,
-                BinaryOp::Div => a / b,
-                BinaryOp::Eq => {
-                    return Some((Constant::Int(if a == b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Ne => {
-                    return Some((Constant::Int(if a != b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Lt => return Some((Constant::Int(if a < b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Gt => return Some((Constant::Int(if a > b { 1 } else { 0 }), Type::I32)),
-                BinaryOp::Le => {
-                    return Some((Constant::Int(if a <= b { 1 } else { 0 }), Type::I32))
-                }
-                BinaryOp::Ge => {
-                    return Some((Constant::Int(if a >= b { 1 } else { 0 }), Type::I32))
-                }
-                _ => return None,
-            };
-            Some((Constant::Float(res), ty))
+            if ty1 != ty2 || !ty1.is_float() {
+                return None;
+            }
+            if ty1 == Type::F32 {
+                let (a, b) = (*a as f32, *b as f32);
+                let res = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Eq => return bool_const(a == b),
+                    BinaryOp::Ne => return bool_const(a != b),
+                    BinaryOp::Lt => return bool_const(a < b),
+                    BinaryOp::Gt => return bool_const(a > b),
+                    BinaryOp::Le => return bool_const(a <= b),
+                    BinaryOp::Ge => return bool_const(a >= b),
+                    _ => return None,
+                };
+                Some((Constant::Float(res as f64), Type::F32))
+            } else {
+                let (a, b) = (*a, *b);
+                let res = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Eq => return bool_const(a == b),
+                    BinaryOp::Ne => return bool_const(a != b),
+                    BinaryOp::Lt => return bool_const(a < b),
+                    BinaryOp::Gt => return bool_const(a > b),
+                    BinaryOp::Le => return bool_const(a <= b),
+                    BinaryOp::Ge => return bool_const(a >= b),
+                    _ => return None,
+                };
+                Some((Constant::Float(res), Type::F64))
+            }
         }
         _ => None,
     }
@@ -540,7 +689,7 @@ fn run_dead_block_elimination(func: &mut Function) -> usize {
 }
 
 /// Dead Code Elimination: removes pure instructions whose destination is never used.
-fn run_dead_code_elimination(func: &mut Function) -> usize {
+fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
     let mut total_removed = 0;
 
     loop {
@@ -612,15 +761,23 @@ fn run_dead_code_elimination(func: &mut Function) -> usize {
             }
         }
 
-        // Remove pure instructions whose destination is NOT in `used`
+        // Remove pure instructions whose destination is NOT in `used`.
+        // Integer div/rem raise runtime errors (zero divisor, MIN / -1), so they are
+        // observable even when unused; they are kept unless provably float.
+        let reg_types = infer_reg_types(func, sigs);
         let mut pass_removed = 0;
         for block in &mut func.blocks {
             let before_len = block.instructions.len();
             block.instructions.retain(|inst| match inst {
                 Instruction::AssignConst { dst, .. } => used.contains(dst),
-                Instruction::Binary { dst, .. } => used.contains(dst),
+                Instruction::Binary { op, dst, lhs, .. } => {
+                    let can_trap = matches!(op, BinaryOp::Div | BinaryOp::Rem)
+                        && !reg_types.get(lhs).is_some_and(|t| t.is_float());
+                    used.contains(dst) || can_trap
+                }
                 Instruction::Splat { dst, .. } => used.contains(dst),
                 Instruction::ExtractLane { dst, .. } => used.contains(dst),
+
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }
                 | Instruction::Store { .. }

@@ -42,7 +42,7 @@ class TestAotCompilation(unittest.TestCase):
         env = os.environ.copy()
         local_mingw = r"C:\Users\Javier\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
         if os.path.isdir(local_mingw):
-            env["PATH"] = local_mingw + ";" + env.get("PATH", "")
+            env["PATH"] = os.pathsep.join([local_mingw, env.get("PATH", "")])
 
         out_o = os.path.abspath(os.path.join(os.path.dirname(__file__), "test_fib_shared.o"))
 

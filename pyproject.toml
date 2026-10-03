@@ -11,12 +11,11 @@ authors = [
     { name = "Javier Cabezas", email = "javier-cabezas@users.noreply.github.com" }
 ]
 license = { text = "MIT OR Apache-2.0" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

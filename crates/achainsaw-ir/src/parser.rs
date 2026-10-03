@@ -12,9 +12,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str) -> Result<Self, Diagnostic> {
         let mut lexer = Lexer::new(source);
-        let tokens = lexer
-            .tokenize_all()
-            .map_err(|e| Diagnostic::error("ERR_LEXICAL", e, Span::default()))?;
+        let tokens = lexer.tokenize_all()?;
         Ok(Self {
             _source: source,
             tokens,
@@ -41,6 +39,22 @@ impl<'a> Parser<'a> {
     fn skip_newlines(&mut self) {
         while self.peek_kind() == &TokenKind::Newline {
             self.advance();
+        }
+    }
+
+    /// Statements (instructions and terminators) must end at a line break or EOF.
+    fn expect_eol(&mut self) -> Result<(), Diagnostic> {
+        match self.peek_kind() {
+            TokenKind::Newline => {
+                self.skip_newlines();
+                Ok(())
+            }
+            TokenKind::Eof => Ok(()),
+            other => Err(Diagnostic::error(
+                "ERR_EXPECTED_NEWLINE",
+                format!("Expected end of line after statement, found {other:?}"),
+                self.peek().span,
+            )),
         }
     }
 
@@ -83,7 +97,7 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(Diagnostic::error(
                         "ERR_UNKNOWN_TYPE",
-                        format!("Unknown type: '{s}'. Expected one of: i8, i16, i32, i64, f32, f64, ptr"),
+                        format!("Unknown type: '{s}'. Expected one of: i8, i16, i32, i64, f32, f64, ptr, v128"),
                         self.peek().span,
                     ))
                 }
@@ -93,6 +107,53 @@ impl<'a> Parser<'a> {
                 format!("Expected type, found {:?}", self.peek_kind()),
                 self.peek().span,
             )),
+        }
+    }
+
+    /// Parses `name:type, name:type, ...` up to (not including) the closing `)`.
+    fn parse_typed_params(&mut self) -> Result<Vec<(String, Type)>, Diagnostic> {
+        let mut params = Vec::new();
+        if self.peek_kind() != &TokenKind::RParen {
+            loop {
+                let (name, _) = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                params.push((name, ty));
+                if self.peek_kind() == &TokenKind::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(params)
+    }
+
+    /// Parses `(a, b, c)`, where the parentheses are required.
+    fn parse_paren_idents(&mut self) -> Result<Vec<String>, Diagnostic> {
+        self.expect(TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if self.peek_kind() != &TokenKind::RParen {
+            loop {
+                let (arg, _) = self.expect_ident()?;
+                args.push(arg);
+                if self.peek_kind() == &TokenKind::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(args)
+    }
+
+    /// Parses `(a, b, c)` if present, otherwise returns an empty list.
+    fn parse_optional_paren_idents(&mut self) -> Result<Vec<String>, Diagnostic> {
+        if self.peek_kind() == &TokenKind::LParen {
+            self.parse_paren_idents()
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -122,26 +183,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_extern_function(&mut self) -> Result<ExternFunction, Diagnostic> {
-        let fn_span = self.expect(TokenKind::ExtFn)?;
+    fn parse_signature(
+        &mut self,
+    ) -> Result<(String, Vec<(String, Type)>, Option<Type>), Diagnostic> {
         let (name, _) = self.expect_ident()?;
-
         self.expect(TokenKind::LParen)?;
-        let mut params = Vec::new();
-        if self.peek_kind() != &TokenKind::RParen {
-            loop {
-                let (param_name, _) = self.expect_ident()?;
-                self.expect(TokenKind::Colon)?;
-                let param_type = self.parse_type()?;
-                params.push((param_name, param_type));
-
-                if self.peek_kind() == &TokenKind::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
+        let params = self.parse_typed_params()?;
         self.expect(TokenKind::RParen)?;
 
         let mut ret_type = None;
@@ -149,7 +196,12 @@ impl<'a> Parser<'a> {
             self.advance();
             ret_type = Some(self.parse_type()?);
         }
+        Ok((name, params, ret_type))
+    }
 
+    fn parse_extern_function(&mut self) -> Result<ExternFunction, Diagnostic> {
+        let fn_span = self.expect(TokenKind::ExtFn)?;
+        let (name, params, ret_type) = self.parse_signature()?;
         self.skip_newlines();
 
         Ok(ExternFunction {
@@ -162,32 +214,7 @@ impl<'a> Parser<'a> {
 
     fn parse_function(&mut self) -> Result<Function, Diagnostic> {
         let fn_span = self.expect(TokenKind::Fn)?;
-        let (name, _) = self.expect_ident()?;
-
-        self.expect(TokenKind::LParen)?;
-        let mut params = Vec::new();
-        if self.peek_kind() != &TokenKind::RParen {
-            loop {
-                let (param_name, _) = self.expect_ident()?;
-                self.expect(TokenKind::Colon)?;
-                let param_type = self.parse_type()?;
-                params.push((param_name, param_type));
-
-                if self.peek_kind() == &TokenKind::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RParen)?;
-
-        let mut ret_type = None;
-        if self.peek_kind() == &TokenKind::Arrow {
-            self.advance();
-            ret_type = Some(self.parse_type()?);
-        }
-
+        let (name, params, ret_type) = self.parse_signature()?;
         self.skip_newlines();
 
         let mut blocks = Vec::new();
@@ -228,20 +255,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if self.peek_kind() == &TokenKind::LParen {
             self.advance();
-            if self.peek_kind() != &TokenKind::RParen {
-                loop {
-                    let (p_name, _) = self.expect_ident()?;
-                    self.expect(TokenKind::Colon)?;
-                    let p_type = self.parse_type()?;
-                    params.push((p_name, p_type));
-
-                    if self.peek_kind() == &TokenKind::Comma {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
+            params = self.parse_typed_params()?;
             self.expect(TokenKind::RParen)?;
         }
 
@@ -256,23 +270,8 @@ impl<'a> Parser<'a> {
                 TokenKind::Jmp => {
                     let span = self.advance().span;
                     let (target, _) = self.expect_ident()?;
-                    let mut args = Vec::new();
-                    if self.peek_kind() == &TokenKind::LParen {
-                        self.advance();
-                        if self.peek_kind() != &TokenKind::RParen {
-                            loop {
-                                let (arg, _) = self.expect_ident()?;
-                                args.push(arg);
-                                if self.peek_kind() == &TokenKind::Comma {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        self.expect(TokenKind::RParen)?;
-                    }
-                    self.skip_newlines();
+                    let args = self.parse_optional_paren_idents()?;
+                    self.expect_eol()?;
                     break Terminator::Jmp { target, args, span };
                 }
                 TokenKind::Br => {
@@ -280,41 +279,11 @@ impl<'a> Parser<'a> {
                     let (cond, _) = self.expect_ident()?;
                     self.expect(TokenKind::Comma)?;
                     let (then_block, _) = self.expect_ident()?;
-                    let mut then_args = Vec::new();
-                    if self.peek_kind() == &TokenKind::LParen {
-                        self.advance();
-                        if self.peek_kind() != &TokenKind::RParen {
-                            loop {
-                                let (arg, _) = self.expect_ident()?;
-                                then_args.push(arg);
-                                if self.peek_kind() == &TokenKind::Comma {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        self.expect(TokenKind::RParen)?;
-                    }
+                    let then_args = self.parse_optional_paren_idents()?;
                     self.expect(TokenKind::Comma)?;
                     let (else_block, _) = self.expect_ident()?;
-                    let mut else_args = Vec::new();
-                    if self.peek_kind() == &TokenKind::LParen {
-                        self.advance();
-                        if self.peek_kind() != &TokenKind::RParen {
-                            loop {
-                                let (arg, _) = self.expect_ident()?;
-                                else_args.push(arg);
-                                if self.peek_kind() == &TokenKind::Comma {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        self.expect(TokenKind::RParen)?;
-                    }
-                    self.skip_newlines();
+                    let else_args = self.parse_optional_paren_idents()?;
+                    self.expect_eol()?;
                     break Terminator::Br {
                         cond,
                         then_block,
@@ -334,8 +303,15 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    self.skip_newlines();
+                    self.expect_eol()?;
                     break Terminator::Ret { val, span };
+                }
+                TokenKind::Eof => {
+                    return Err(Diagnostic::error(
+                        "ERR_MISSING_TERMINATOR",
+                        format!("Block '{label}' ends without a terminator (jmp, br or ret)"),
+                        self.peek().span,
+                    ));
                 }
                 _ => {
                     // Regular instruction
@@ -362,7 +338,7 @@ impl<'a> Parser<'a> {
             let (ptr, _) = self.expect_ident()?;
             self.expect(TokenKind::Comma)?;
             let (val, _) = self.expect_ident()?;
-            self.skip_newlines();
+            self.expect_eol()?;
             return Ok(Instruction::Store { ptr, val, span });
         }
 
@@ -370,7 +346,7 @@ impl<'a> Parser<'a> {
         if first_tok.kind == TokenKind::Free {
             let span = self.advance().span;
             let (ptr, _) = self.expect_ident()?;
-            self.skip_newlines();
+            self.expect_eol()?;
             return Ok(Instruction::Free { ptr, span });
         }
 
@@ -378,21 +354,8 @@ impl<'a> Parser<'a> {
         if first_tok.kind == TokenKind::Call {
             let span = self.advance().span;
             let (func, _) = self.expect_ident()?;
-            self.expect(TokenKind::LParen)?;
-            let mut args = Vec::new();
-            if self.peek_kind() != &TokenKind::RParen {
-                loop {
-                    let (arg, _) = self.expect_ident()?;
-                    args.push(arg);
-                    if self.peek_kind() == &TokenKind::Comma {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            self.expect(TokenKind::RParen)?;
-            self.skip_newlines();
+            let args = self.parse_paren_idents()?;
+            self.expect_eol()?;
             return Ok(Instruction::Call {
                 dst: None,
                 func,
@@ -408,16 +371,22 @@ impl<'a> Parser<'a> {
         match self.peek_kind().clone() {
             TokenKind::Cst => {
                 self.advance();
-                let val = match self.peek_kind() {
+                let val = match self.peek_kind().clone() {
                     TokenKind::IntLit(n) => {
-                        let val = Constant::Int(*n);
                         self.advance();
-                        val
+                        Constant::Int(n)
                     }
                     TokenKind::FloatLit(f) => {
-                        let val = Constant::Float(*f);
                         self.advance();
-                        val
+                        Constant::Float(f)
+                    }
+                    TokenKind::Ident(name) if name == "inf" => {
+                        self.advance();
+                        Constant::Float(f64::INFINITY)
+                    }
+                    TokenKind::Ident(name) if name == "nan" => {
+                        self.advance();
+                        Constant::Float(f64::NAN)
                     }
                     _ => {
                         return Err(Diagnostic::error(
@@ -429,7 +398,7 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_type()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::AssignConst {
                     dst,
                     val,
@@ -442,7 +411,7 @@ impl<'a> Parser<'a> {
                 let (ptr, _) = self.expect_ident()?;
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_type()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::Load {
                     dst,
                     ptr,
@@ -453,21 +422,8 @@ impl<'a> Parser<'a> {
             TokenKind::Call => {
                 self.advance();
                 let (func, _) = self.expect_ident()?;
-                self.expect(TokenKind::LParen)?;
-                let mut args = Vec::new();
-                if self.peek_kind() != &TokenKind::RParen {
-                    loop {
-                        let (arg, _) = self.expect_ident()?;
-                        args.push(arg);
-                        if self.peek_kind() == &TokenKind::Comma {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                self.expect(TokenKind::RParen)?;
-                self.skip_newlines();
+                let args = self.parse_paren_idents()?;
+                self.expect_eol()?;
                 Ok(Instruction::Call {
                     dst: Some(dst),
                     func,
@@ -478,7 +434,7 @@ impl<'a> Parser<'a> {
             TokenKind::Alloc => {
                 self.advance();
                 let (size, _) = self.expect_ident()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::Alloc {
                     dst,
                     size,
@@ -488,7 +444,7 @@ impl<'a> Parser<'a> {
             TokenKind::Splat => {
                 self.advance();
                 let (src, _) = self.expect_ident()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::Splat {
                     dst,
                     src,
@@ -500,7 +456,13 @@ impl<'a> Parser<'a> {
                 let (vec, _) = self.expect_ident()?;
                 self.expect(TokenKind::Comma)?;
                 let lane = match self.peek_kind() {
-                    TokenKind::IntLit(n) => *n as u32,
+                    TokenKind::IntLit(n) => u32::try_from(*n).map_err(|_| {
+                        Diagnostic::error(
+                            "ERR_EXPECTED_LANE_INDEX",
+                            format!("Lane index {n} is out of range"),
+                            self.peek().span,
+                        )
+                    })?,
                     _ => {
                         return Err(Diagnostic::error(
                             "ERR_EXPECTED_LANE_INDEX",
@@ -512,7 +474,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_type()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::ExtractLane {
                     dst,
                     vec,
@@ -533,7 +495,7 @@ impl<'a> Parser<'a> {
                 let (lhs, _) = self.expect_ident()?;
                 self.expect(TokenKind::Comma)?;
                 let (rhs, _) = self.expect_ident()?;
-                self.skip_newlines();
+                self.expect_eol()?;
                 Ok(Instruction::Binary {
                     op,
                     dst,

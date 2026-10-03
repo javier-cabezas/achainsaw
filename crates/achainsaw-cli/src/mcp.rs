@@ -1,4 +1,4 @@
-use achainsaw_codegen::JitEngine;
+use achainsaw_codegen::{JitEngine, RtValue};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::{
     decode_module, encode_module, parse_and_validate, to_air_text, Module, Type, Validator,
@@ -83,6 +83,21 @@ pub fn execute_ir(
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
 ) -> Result<Value> {
+    const ALLOWED_EXTERNALS: &[&str] = &[
+        "sinf", "cosf", "tanf", "sqrtf", "expf", "logf", "powf", "fabsf", "floorf", "ceilf",
+        "roundf", "sin", "cos", "tan", "sqrt", "exp", "log", "pow", "fabs", "floor", "ceil",
+        "round",
+    ];
+
+    for ext in &module.extern_functions {
+        if !ALLOWED_EXTERNALS.contains(&ext.name.as_str()) {
+            return Err(anyhow!(
+                "[ERR_UNAUTHORIZED_EXTERN] External function '{}' is not permitted by MCP security allowlist",
+                ext.name
+            ));
+        }
+    }
+
     let func = module
         .functions
         .iter()
@@ -91,101 +106,46 @@ pub fn execute_ir(
 
     let t1 = Instant::now();
     let mut engine = JitEngine::new()?;
-    if let Some(f) = fuel {
-        engine.set_fuel(Some(f));
-    }
+    // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
+    let effective_fuel = fuel.or(Some(1_000_000));
+    engine.set_fuel(effective_fuel);
+
     if let Some(mb) = max_memory_mb {
         engine.set_memory_quota(mb * 1024 * 1024);
     }
     engine.compile_module(module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
-    let func_ptr = engine
-        .get_fn_ptr(func_name)
-        .ok_or_else(|| anyhow!("Function pointer for '{func_name}' not found"))?;
+    let mut rt_args = Vec::with_capacity(func.params.len());
+    for (i, (_, p_ty)) in func.params.iter().enumerate() {
+        let val_num = args.get(i).copied().unwrap_or(0.0);
+        let rt_val = match p_ty {
+            Type::I8 => RtValue::I8(val_num as i8),
+            Type::I16 => RtValue::I16(val_num as i16),
+            Type::I32 => RtValue::I32(val_num as i32),
+            Type::I64 => RtValue::I64(val_num as i64),
+            Type::Ptr => RtValue::Ptr(val_num as usize),
+            Type::F32 => RtValue::F32(val_num as f32),
+            Type::F64 => RtValue::F64(val_num),
+            Type::V128 => return Err(anyhow!("Cannot pass v128 register directly via MCP")),
+        };
+        rt_args.push(rt_val);
+    }
 
     let t2 = Instant::now();
-    achainsaw_codegen::reset_execution_status();
-
-    let res_val: Value = unsafe {
-        match (func.params.len(), func.ret_type) {
-            (0, None) => {
-                let f: extern "C" fn() = std::mem::transmute(func_ptr);
-                f();
-                json!(null)
-            }
-            (0, Some(Type::I32)) => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::I64)) => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::F32)) => {
-                let f: extern "C" fn() -> f32 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::F64)) => {
-                let f: extern "C" fn() -> f64 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (1, Some(Type::I32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i32;
-                let f: extern "C" fn(i32) -> i32 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::I64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i64;
-                let f: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::F32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as f32;
-                let f: extern "C" fn(f32) -> f32 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::F64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0);
-                let f: extern "C" fn(f64) -> f64 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (2, Some(Type::I32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i32;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as i32;
-                let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::I64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i64;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as i64;
-                let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::F32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as f32;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as f32;
-                let f: extern "C" fn(f32, f32) -> f32 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::F64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0);
-                let arg1 = args.get(1).copied().unwrap_or(0.0);
-                let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            _ => {
-                return Err(anyhow!(
-                    "Function signature ({:?} params -> {:?}) not directly invokable via standard MCP runner",
-                    func.params.len(),
-                    func.ret_type
-                ));
-            }
-        }
-    };
-
-    achainsaw_codegen::check_execution_status()?;
+    let res_rt = unsafe { engine.call_typed(func_name, &rt_args)? };
     let exec_time_us = t2.elapsed().as_micros();
+
+    let res_val = match res_rt {
+        Some(RtValue::I8(n)) => json!(n),
+        Some(RtValue::I16(n)) => json!(n),
+        Some(RtValue::I32(n)) => json!(n),
+        Some(RtValue::I64(n)) => json!(n),
+        Some(RtValue::Ptr(p)) => json!(p),
+        Some(RtValue::F32(f)) => json!(f),
+        Some(RtValue::F64(f)) => json!(f),
+        None => json!(null),
+    };
 
     Ok(json!({
         "status": "ok",
@@ -319,7 +279,20 @@ pub fn handle_air_assemble(arguments: &Value) -> Value {
     };
     match parse_and_validate(code) {
         Ok(module) => {
-            let binary = encode_module(&module);
+            let binary = match encode_module(&module) {
+                Ok(b) => b,
+                Err(diag) => {
+                    return json_tool_error(
+                        serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+                            json!({
+                                "status": "error",
+                                "error_code": diag.error_code,
+                                "message": diag.message
+                            })
+                        }),
+                    );
+                }
+            };
             let b64 = b64_encode(&binary);
             let ratio = (binary.len() as f64) / (code.len().max(1) as f64);
             json_tool_result(json!({

@@ -191,8 +191,11 @@ def test_mcp_server():
     assert opt_payload["total_optimizations"] >= 2
     assert "ret x" in opt_payload["code"]
     print("[PASS] MCP tools/call air_optimize")
-
     proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
     print("All MCP end-to-end integration tests passed!")
 
 

@@ -1,11 +1,13 @@
 pub mod aot;
 pub mod jit;
+pub mod lower;
 
+pub use lower::{to_clif_type, lower_function, RtValue};
 pub use aot::{link_shared_library, AotCompiler};
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
     get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,
-    set_execution_fuel, set_memory_quota, to_clif_type, ExecutionStatus, JitEngine, SymbolRegistry,
+    set_execution_fuel, set_memory_quota, ExecutionStatus, JitEngine, SymbolRegistry,
 };
 
 #[cfg(test)]

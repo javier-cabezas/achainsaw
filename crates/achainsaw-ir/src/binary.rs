@@ -12,11 +12,15 @@ pub const MAGIC: &[u8; 4] = b"\x00AIR";
 pub const VERSION: u16 = 1;
 
 /// Serializes an in-memory AIR `Module` into compact AIRB binary bytes.
-pub fn encode_module(module: &Module) -> Vec<u8> {
+///
+/// Fails with `ERR_AIRB_STRING_TOO_LONG` if an identifier exceeds the format's
+/// 65535-byte limit (it used to be silently truncated, corrupting the module).
+pub fn encode_module(module: &Module) -> Result<Vec<u8>, Diagnostic> {
     let mut encoder = BinaryEncoder::new();
-    encoder.encode(module);
-    encoder.finish()
+    encoder.encode(module)?;
+    Ok(encoder.finish())
 }
+
 
 /// Deserializes AIRB binary bytes into an in-memory `Module`.
 pub fn decode_module(bytes: &[u8]) -> Result<Module, Diagnostic> {
@@ -97,7 +101,15 @@ pub fn to_air_text(module: &Module) -> String {
                         match val {
                             Constant::Int(n) => out.push_str(&n.to_string()),
                             Constant::Float(f) => {
-                                if f.fract() == 0.0 {
+                                if f.is_nan() {
+                                    out.push_str("nan");
+                                } else if f.is_infinite() {
+                                    if f.is_sign_negative() {
+                                        out.push_str("-inf");
+                                    } else {
+                                        out.push_str("inf");
+                                    }
+                                } else if f.fract() == 0.0 {
                                     out.push_str(&format!("{f:.1}"));
                                 } else {
                                     out.push_str(&f.to_string());
@@ -273,7 +285,7 @@ impl BinaryEncoder {
         }
     }
 
-    fn encode(&mut self, module: &Module) {
+    fn encode(&mut self, module: &Module) -> Result<(), Diagnostic> {
         // Collect all strings first
         for ext_fn in &module.extern_functions {
             self.intern(&ext_fn.name);
@@ -381,6 +393,17 @@ impl BinaryEncoder {
             .extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
         for s in &self.strings {
             let bytes = s.as_bytes();
+            if bytes.len() > u16::MAX as usize {
+                return Err(Diagnostic::error(
+                    "ERR_AIRB_STRING_TOO_LONG",
+                    format!(
+                        "Identifier '{}' length {} exceeds AIRB limit of 65535 bytes",
+                        s,
+                        bytes.len()
+                    ),
+                    Span::default(),
+                ));
+            }
             self.buf
                 .extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             self.buf.extend_from_slice(bytes);
@@ -460,6 +483,7 @@ impl BinaryEncoder {
                 self.encode_terminator(&block.terminator);
             }
         }
+        Ok(())
     }
 
     fn encode_instruction(&mut self, inst: &Instruction) {
@@ -642,6 +666,10 @@ impl<'a> BinaryDecoder<'a> {
         Diagnostic::error("ERR_INVALID_AIRB", msg, Span::default())
     }
 
+    fn safe_capacity(&self, count: u32) -> usize {
+        (count as usize).min(self.bytes.len().saturating_sub(self.pos))
+    }
+
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], Diagnostic> {
         if self.pos + n > self.bytes.len() {
             return Err(self.err("Unexpected end of AIRB binary stream"));
@@ -711,6 +739,7 @@ impl<'a> BinaryDecoder<'a> {
 
         // 3. String Pool
         let string_count = self.read_u32()?;
+        self.strings.reserve(self.safe_capacity(string_count));
         for _ in 0..string_count {
             let len = self.read_u16()? as usize;
             let str_bytes = self.read_bytes(len)?;
@@ -721,12 +750,12 @@ impl<'a> BinaryDecoder<'a> {
 
         // 4. Extern Functions
         let ext_count = self.read_u32()?;
-        let mut extern_functions = Vec::with_capacity(ext_count as usize);
+        let mut extern_functions = Vec::with_capacity(self.safe_capacity(ext_count));
         for _ in 0..ext_count {
             let name = self.read_string()?;
 
             let param_count = self.read_u32()?;
-            let mut params = Vec::with_capacity(param_count as usize);
+            let mut params = Vec::with_capacity(self.safe_capacity(param_count));
             for _ in 0..param_count {
                 let p_name = self.read_string()?;
                 let p_ty = decode_type(self.read_u8()?)
@@ -753,13 +782,13 @@ impl<'a> BinaryDecoder<'a> {
 
         // 5. Functions
         let func_count = self.read_u32()?;
-        let mut functions = Vec::with_capacity(func_count as usize);
+        let mut functions = Vec::with_capacity(self.safe_capacity(func_count));
 
         for _ in 0..func_count {
             let name = self.read_string()?;
 
             let param_count = self.read_u32()?;
-            let mut params = Vec::with_capacity(param_count as usize);
+            let mut params = Vec::with_capacity(self.safe_capacity(param_count));
             for _ in 0..param_count {
                 let p_name = self.read_string()?;
                 let p_ty = decode_type(self.read_u8()?)
@@ -777,13 +806,13 @@ impl<'a> BinaryDecoder<'a> {
             };
 
             let block_count = self.read_u32()?;
-            let mut blocks = Vec::with_capacity(block_count as usize);
+            let mut blocks = Vec::with_capacity(self.safe_capacity(block_count));
 
             for _ in 0..block_count {
                 let label = self.read_string()?;
 
                 let bp_count = self.read_u32()?;
-                let mut bp_params = Vec::with_capacity(bp_count as usize);
+                let mut bp_params = Vec::with_capacity(self.safe_capacity(bp_count));
                 for _ in 0..bp_count {
                     let bp_name = self.read_string()?;
                     let bp_ty = decode_type(self.read_u8()?)
@@ -792,7 +821,7 @@ impl<'a> BinaryDecoder<'a> {
                 }
 
                 let inst_count = self.read_u32()?;
-                let mut instructions = Vec::with_capacity(inst_count as usize);
+                let mut instructions = Vec::with_capacity(self.safe_capacity(inst_count));
                 for _ in 0..inst_count {
                     instructions.push(self.decode_instruction()?);
                 }
@@ -886,7 +915,7 @@ impl<'a> BinaryDecoder<'a> {
                 };
                 let func = self.read_string()?;
                 let arg_count = self.read_u32()?;
-                let mut args = Vec::with_capacity(arg_count as usize);
+                let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
                 for _ in 0..arg_count {
                     args.push(self.read_string()?);
                 }
@@ -938,7 +967,7 @@ impl<'a> BinaryDecoder<'a> {
             0x10 => {
                 let target = self.read_string()?;
                 let arg_count = self.read_u32()?;
-                let mut args = Vec::with_capacity(arg_count as usize);
+                let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
                 for _ in 0..arg_count {
                     args.push(self.read_string()?);
                 }
@@ -948,13 +977,13 @@ impl<'a> BinaryDecoder<'a> {
                 let cond = self.read_string()?;
                 let then_block = self.read_string()?;
                 let then_count = self.read_u32()?;
-                let mut then_args = Vec::with_capacity(then_count as usize);
+                let mut then_args = Vec::with_capacity(self.safe_capacity(then_count));
                 for _ in 0..then_count {
                     then_args.push(self.read_string()?);
                 }
                 let else_block = self.read_string()?;
                 let else_count = self.read_u32()?;
-                let mut else_args = Vec::with_capacity(else_count as usize);
+                let mut else_args = Vec::with_capacity(self.safe_capacity(else_count));
                 for _ in 0..else_count {
                     else_args.push(self.read_string()?);
                 }
