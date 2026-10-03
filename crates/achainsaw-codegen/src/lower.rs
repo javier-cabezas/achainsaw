@@ -1,4 +1,6 @@
-use achainsaw_ir::ast::{BinaryOp, Constant, Function, Instruction, Terminator};
+use achainsaw_ir::ast::{
+    BinaryOp, CastOp, Constant, Function, Instruction, Terminator, UnaryOp, VectorReduceOp,
+};
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -162,6 +164,8 @@ pub fn lower_function<M: ClifModule>(
                                 let ext = builder.ins().uextend(types::I32, cmp);
                                 (ext, Type::I32)
                             }
+                            BinaryOp::Min => (builder.ins().fmin(lhs_val, rhs_val), lhs_ty),
+                            BinaryOp::Max => (builder.ins().fmax(lhs_val, rhs_val), lhs_ty),
                             _ => return Err(anyhow!("Unsupported float op {:?}", op)),
                         },
                         Type::V128 => match op {
@@ -292,6 +296,56 @@ pub fn lower_function<M: ClifModule>(
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
+                                BinaryOp::Min => (builder.ins().smin(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Max => (builder.ins().smax(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Umin => (builder.ins().umin(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Umax => (builder.ins().umax(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Ushr => (builder.ins().ushr(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Ult => {
+                                    let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, lhs_val, rhs_val);
+                                    let ext = builder.ins().uextend(types::I32, cmp);
+                                    (ext, Type::I32)
+                                }
+                                BinaryOp::Ugt => {
+                                    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThan, lhs_val, rhs_val);
+                                    let ext = builder.ins().uextend(types::I32, cmp);
+                                    (ext, Type::I32)
+                                }
+                                BinaryOp::Ule => {
+                                    let cmp = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, lhs_val, rhs_val);
+                                    let ext = builder.ins().uextend(types::I32, cmp);
+                                    (ext, Type::I32)
+                                }
+                                BinaryOp::Uge => {
+                                    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_val, rhs_val);
+                                    let ext = builder.ins().uextend(types::I32, cmp);
+                                    (ext, Type::I32)
+                                }
+                                BinaryOp::Udiv | BinaryOp::Urem => {
+                                    let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, 0);
+                                    let safe_block = builder.create_block();
+                                    let bad_block = builder.create_block();
+                                    let merge_block = builder.create_block();
+                                    builder.append_block_param(merge_block, clif_ty);
+
+                                    builder.ins().brif(is_zero, bad_block, &[], safe_block, &[]);
+
+                                    builder.switch_to_block(safe_block);
+                                    let op_res = match op {
+                                        BinaryOp::Udiv => builder.ins().udiv(lhs_val, rhs_val),
+                                        BinaryOp::Urem => builder.ins().urem(lhs_val, rhs_val),
+                                        _ => unreachable!(),
+                                    };
+                                    builder.ins().jump(merge_block, &[BlockArg::Value(op_res)]);
+
+                                    builder.switch_to_block(bad_block);
+                                    let zero_res = builder.ins().iconst(clif_ty, 0);
+                                    builder.ins().jump(merge_block, &[BlockArg::Value(zero_res)]);
+
+                                    builder.switch_to_block(merge_block);
+                                    let res = builder.block_params(merge_block)[0];
+                                    (res, lhs_ty)
+                                }
                                 _ => return Err(anyhow!("Invalid scalar integer op {:?}", op)),
                             }
                         }
@@ -392,6 +446,112 @@ pub fn lower_function<M: ClifModule>(
                     let (ptr_val, _) = *values.get(ptr).unwrap();
                     let callee = module.declare_func_in_func(config.rt_free_id, builder.func);
                     builder.ins().call(callee, &[ptr_val]);
+                }
+                Instruction::Select {
+                    dst,
+                    cond,
+                    then_val,
+                    else_val,
+                    ..
+                } => {
+                    let (cond_val, _) = *values.get(cond).unwrap();
+                    let (then_v, then_ty) = *values.get(then_val).unwrap();
+                    let (else_v, _) = *values.get(else_val).unwrap();
+                    let cmp = builder.ins().icmp_imm_s(IntCC::NotEqual, cond_val, 0);
+                    let res = builder.ins().select(cmp, then_v, else_v);
+                    values.insert(dst.clone(), (res, then_ty));
+                }
+                Instruction::Unary { op, dst, src, .. } => {
+                    let (src_val, src_ty) = *values.get(src).unwrap();
+                    let res = match op {
+                        UnaryOp::Neg => {
+                            if src_ty.is_float() {
+                                builder.ins().fneg(src_val)
+                            } else {
+                                builder.ins().ineg(src_val)
+                            }
+                        }
+                        UnaryOp::Abs => {
+                            if src_ty.is_float() {
+                                builder.ins().fabs(src_val)
+                            } else {
+                                let neg = builder.ins().ineg(src_val);
+                                builder.ins().smax(src_val, neg)
+                            }
+                        }
+                        UnaryOp::Sqrt => builder.ins().sqrt(src_val),
+                    };
+                    values.insert(dst.clone(), (res, src_ty));
+                }
+                Instruction::Cast {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    ..
+                } => {
+                    let (src_val, _) = *values.get(src).unwrap();
+                    let clif_target_ty = to_clif_type(*ty);
+                    let res = match op {
+                        CastOp::Itof => builder.ins().fcvt_from_sint(clif_target_ty, src_val),
+                        CastOp::Ftoi => {
+                            if *ty == Type::I8 || *ty == Type::I16 {
+                                let i32_val = builder.ins().fcvt_to_sint_sat(types::I32, src_val);
+                                builder.ins().ireduce(clif_target_ty, i32_val)
+                            } else {
+                                builder.ins().fcvt_to_sint_sat(clif_target_ty, src_val)
+                            }
+                        }
+                        CastOp::Sext => builder.ins().sextend(clif_target_ty, src_val),
+                        CastOp::Zext => builder.ins().uextend(clif_target_ty, src_val),
+                        CastOp::Trunc => builder.ins().ireduce(clif_target_ty, src_val),
+                        CastOp::Fext => builder.ins().fpromote(types::F64, src_val),
+                        CastOp::Ftrunc => builder.ins().fdemote(types::F32, src_val),
+                        CastOp::Bitcast => {
+                            builder.ins().bitcast(clif_target_ty, bitcast_flags(), src_val)
+                        }
+                    };
+                    values.insert(dst.clone(), (res, *ty));
+                }
+                Instruction::VectorReduce {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    ..
+                } => {
+                    let (src_val, _) = *values.get(src).unwrap();
+                    let res = match op {
+                        VectorReduceOp::VfSum => {
+                            let l0 = builder.ins().extractlane(src_val, 0);
+                            let l1 = builder.ins().extractlane(src_val, 1);
+                            let l2 = builder.ins().extractlane(src_val, 2);
+                            let l3 = builder.ins().extractlane(src_val, 3);
+                            let s01 = builder.ins().fadd(l0, l1);
+                            let s23 = builder.ins().fadd(l2, l3);
+                            builder.ins().fadd(s01, s23)
+                        }
+                        VectorReduceOp::VfMax => {
+                            let l0 = builder.ins().extractlane(src_val, 0);
+                            let l1 = builder.ins().extractlane(src_val, 1);
+                            let l2 = builder.ins().extractlane(src_val, 2);
+                            let l3 = builder.ins().extractlane(src_val, 3);
+                            let m01 = builder.ins().fmax(l0, l1);
+                            let m23 = builder.ins().fmax(l2, l3);
+                            builder.ins().fmax(m01, m23)
+                        }
+                        VectorReduceOp::ViSum => {
+                            let vi = builder.ins().bitcast(types::I32X4, bitcast_flags(), src_val);
+                            let l0 = builder.ins().extractlane(vi, 0);
+                            let l1 = builder.ins().extractlane(vi, 1);
+                            let l2 = builder.ins().extractlane(vi, 2);
+                            let l3 = builder.ins().extractlane(vi, 3);
+                            let s01 = builder.ins().iadd(l0, l1);
+                            let s23 = builder.ins().iadd(l2, l3);
+                            builder.ins().iadd(s01, s23)
+                        }
+                    };
+                    values.insert(dst.clone(), (res, *ty));
                 }
             }
         }

@@ -20,6 +20,12 @@ pub enum TokenKind {
     // Operators
     Op(String),
 
+    // Phase 4 Keywords
+    Select,
+    Cast(crate::ast::CastOp),
+    Unary(crate::ast::UnaryOp),
+    VectorReduce(crate::ast::VectorReduceOp),
+
     // Symbols
     Colon,
     Comma,
@@ -305,9 +311,26 @@ impl<'a> Lexer<'a> {
                 "extlane" => TokenKind::Extlane,
                 "alloc" => TokenKind::Alloc,
                 "free" => TokenKind::Free,
+                "select" => TokenKind::Select,
+                "itof" => TokenKind::Cast(crate::ast::CastOp::Itof),
+                "ftoi" => TokenKind::Cast(crate::ast::CastOp::Ftoi),
+                "sext" => TokenKind::Cast(crate::ast::CastOp::Sext),
+                "zext" => TokenKind::Cast(crate::ast::CastOp::Zext),
+                "trunc" => TokenKind::Cast(crate::ast::CastOp::Trunc),
+                "fext" => TokenKind::Cast(crate::ast::CastOp::Fext),
+                "ftrunc" => TokenKind::Cast(crate::ast::CastOp::Ftrunc),
+                "bitcast" => TokenKind::Cast(crate::ast::CastOp::Bitcast),
+                "sqrt" => TokenKind::Unary(crate::ast::UnaryOp::Sqrt),
+                "neg" => TokenKind::Unary(crate::ast::UnaryOp::Neg),
+                "abs" => TokenKind::Unary(crate::ast::UnaryOp::Abs),
+                "vfsum" => TokenKind::VectorReduce(crate::ast::VectorReduceOp::VfSum),
+                "vfmax" => TokenKind::VectorReduce(crate::ast::VectorReduceOp::VfMax),
+                "visum" => TokenKind::VectorReduce(crate::ast::VectorReduceOp::ViSum),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
                 | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "vfadd" | "vfsub" | "vfmul"
-                | "vfdiv" | "viadd" | "visub" | "vimul" => TokenKind::Op(ident),
+                | "vfdiv" | "viadd" | "visub" | "vimul"
+                | "min" | "max" | "umin" | "umax" | "udiv" | "urem" | "ushr"
+                | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),
                 _ => TokenKind::Ident(ident),
             };
 

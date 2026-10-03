@@ -73,15 +73,16 @@ pub fn binary_result_type(
     let ty = lhs;
     match ty {
         Type::Ptr => match op {
-            Eq | Ne | Lt | Gt | Le | Ge => Ok(Type::I32),
+            Eq | Ne | Lt | Gt | Le | Ge | Ult | Ugt | Ule | Uge => Ok(Type::I32),
             Sub => Ok(Type::I64), // pointer difference in bytes
+            Umin | Umax => Ok(Type::Ptr),
             _ => Err((
                 "ERR_INVALID_PTR_OP",
                 format!("Invalid pointer operation '{op:?}' on two 'ptr' values"),
             )),
         },
         Type::F32 | Type::F64 => match op {
-            Add | Sub | Mul | Div => Ok(ty),
+            Add | Sub | Mul | Div | Min | Max => Ok(ty),
             Eq | Ne | Lt | Gt | Le | Ge => Ok(Type::I32),
             _ => Err((
                 "ERR_INVALID_OP_FOR_TYPE",
@@ -541,6 +542,203 @@ impl Validator {
                     ));
                 }
             }
+            Instruction::Select {
+                dst,
+                cond,
+                then_val,
+                else_val,
+                span,
+            } => {
+                let cond_ty = self.check_reg(ctx, cond, scope, *span)?;
+                if !matches!(cond_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("Select condition must be an integer, found '{cond_ty}'"),
+                        *span,
+                    ));
+                }
+                let then_ty = self.check_reg(ctx, then_val, scope, *span)?;
+                let else_ty = self.check_reg(ctx, else_val, scope, *span)?;
+                if then_ty != else_ty {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!(
+                            "Select alternatives must have matching types, found '{then_ty}' and '{else_ty}'"
+                        ),
+                        *span,
+                    ));
+                }
+                Self::define(scope, defs, dst, then_ty, *span)?;
+            }
+            Instruction::Unary {
+                op,
+                dst,
+                src,
+                span,
+            } => {
+                let src_ty = self.check_reg(ctx, src, scope, *span)?;
+                let out_ty = match op {
+                    UnaryOp::Sqrt => {
+                        if !matches!(src_ty, Type::F32 | Type::F64) {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("Sqrt operand must be float (f32 or f64), found '{src_ty}'"),
+                                *span,
+                            ));
+                        }
+                        src_ty
+                    }
+                    UnaryOp::Neg | UnaryOp::Abs => {
+                        if src_ty == Type::V128 || src_ty == Type::Ptr {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("Operation '{op:?}' is not supported for '{src_ty}'"),
+                                *span,
+                            ));
+                        }
+                        src_ty
+                    }
+                };
+                Self::define(scope, defs, dst, out_ty, *span)?;
+            }
+            Instruction::Cast {
+                op,
+                dst,
+                src,
+                ty,
+                span,
+            } => {
+                let src_ty = self.check_reg(ctx, src, scope, *span)?;
+                match op {
+                    CastOp::Itof => {
+                        if !matches!(src_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+                            || !matches!(ty, Type::F32 | Type::F64)
+                        {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "itof requires integer source and float destination, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Ftoi => {
+                        if !matches!(src_ty, Type::F32 | Type::F64)
+                            || !matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+                        {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "ftoi requires float source and integer destination, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Sext | CastOp::Zext => {
+                        let src_bits = src_ty.bit_width().unwrap_or(0);
+                        let dst_bits = ty.bit_width().unwrap_or(0);
+                        if !matches!(src_ty, Type::I8 | Type::I16 | Type::I32)
+                            || !matches!(ty, Type::I16 | Type::I32 | Type::I64)
+                            || dst_bits <= src_bits
+                        {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "Extension requires widening integer conversion, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Trunc => {
+                        let src_bits = src_ty.bit_width().unwrap_or(0);
+                        let dst_bits = ty.bit_width().unwrap_or(0);
+                        if !matches!(src_ty, Type::I16 | Type::I32 | Type::I64)
+                            || !matches!(ty, Type::I8 | Type::I16 | Type::I32)
+                            || dst_bits >= src_bits
+                        {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "Truncation requires narrowing integer conversion, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Fext => {
+                        if src_ty != Type::F32 || *ty != Type::F64 {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("fext requires f32 -> f64, found '{src_ty}' -> '{ty}'"),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Ftrunc => {
+                        if src_ty != Type::F64 || *ty != Type::F32 {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("ftrunc requires f64 -> f32, found '{src_ty}' -> '{ty}'"),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Bitcast => {
+                        if src_ty.byte_size() != ty.byte_size() {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "bitcast requires source and target of identical size, found '{src_ty}' ({}B) -> '{ty}' ({}B)",
+                                    src_ty.byte_size(),
+                                    ty.byte_size()
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                }
+                Self::define(scope, defs, dst, *ty, *span)?;
+            }
+            Instruction::VectorReduce {
+                op,
+                dst,
+                src,
+                ty,
+                span,
+            } => {
+                let src_ty = self.check_reg(ctx, src, scope, *span)?;
+                if src_ty != Type::V128 {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("Vector reduce requires 'v128' operand, found '{src_ty}'"),
+                        *span,
+                    ));
+                }
+                match op {
+                    VectorReduceOp::VfSum | VectorReduceOp::VfMax => {
+                        if *ty != Type::F32 {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("vfsum/vfmax target type must be 'f32', found '{ty}'"),
+                                *span,
+                            ));
+                        }
+                    }
+                    VectorReduceOp::ViSum => {
+                        if *ty != Type::I32 {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!("visum target type must be 'i32', found '{ty}'"),
+                                *span,
+                            ));
+                        }
+                    }
+                }
+                Self::define(scope, defs, dst, *ty, *span)?;
+            }
         }
         Ok(())
     }
@@ -696,7 +894,11 @@ fn inst_dst(inst: &Instruction) -> Option<&str> {
         | Instruction::Load { dst, .. }
         | Instruction::Splat { dst, .. }
         | Instruction::ExtractLane { dst, .. }
-        | Instruction::Alloc { dst, .. } => Some(dst),
+        | Instruction::Alloc { dst, .. }
+        | Instruction::Select { dst, .. }
+        | Instruction::Unary { dst, .. }
+        | Instruction::Cast { dst, .. }
+        | Instruction::VectorReduce { dst, .. } => Some(dst),
         Instruction::Call { dst, .. } => dst.as_deref(),
         Instruction::Store { .. } | Instruction::Free { .. } => None,
     }

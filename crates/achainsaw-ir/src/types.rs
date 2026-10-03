@@ -41,6 +41,28 @@ impl Type {
         }
     }
 
+    /// Total bit width of any type.
+    pub fn bit_width(&self) -> Option<u32> {
+        match self {
+            Type::I8 => Some(8),
+            Type::I16 => Some(16),
+            Type::I32 | Type::F32 => Some(32),
+            Type::I64 | Type::F64 | Type::Ptr => Some(64),
+            Type::V128 => Some(128),
+        }
+    }
+
+    /// Size in bytes in memory or registers.
+    pub fn byte_size(&self) -> usize {
+        match self {
+            Type::I8 => 1,
+            Type::I16 => 2,
+            Type::I32 | Type::F32 => 4,
+            Type::I64 | Type::F64 | Type::Ptr => 8,
+            Type::V128 => 16,
+        }
+    }
+
     pub fn is_int(&self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
     }

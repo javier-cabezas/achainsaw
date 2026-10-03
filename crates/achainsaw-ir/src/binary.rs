@@ -186,6 +186,50 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str("free ");
                         out.push_str(ptr);
                     }
+                    Instruction::Select {
+                        dst,
+                        cond,
+                        then_val,
+                        else_val,
+                        ..
+                    } => {
+                        out.push_str(dst);
+                        out.push_str(" = select ");
+                        out.push_str(cond);
+                        out.push_str(", ");
+                        out.push_str(then_val);
+                        out.push_str(", ");
+                        out.push_str(else_val);
+                    }
+                    Instruction::Unary { op, dst, src, .. } => {
+                        out.push_str(dst);
+                        out.push_str(" = ");
+                        out.push_str(op.as_str());
+                        out.push(' ');
+                        out.push_str(src);
+                    }
+                    Instruction::Cast {
+                        op, dst, src, ty, ..
+                    } => {
+                        out.push_str(dst);
+                        out.push_str(" = ");
+                        out.push_str(op.as_str());
+                        out.push(' ');
+                        out.push_str(src);
+                        out.push(':');
+                        out.push_str(ty.as_str());
+                    }
+                    Instruction::VectorReduce {
+                        op, dst, src, ty, ..
+                    } => {
+                        out.push_str(dst);
+                        out.push_str(" = ");
+                        out.push_str(op.as_str());
+                        out.push(' ');
+                        out.push_str(src);
+                        out.push(':');
+                        out.push_str(ty.as_str());
+                    }
                 }
                 out.push('\n');
             }
@@ -346,6 +390,30 @@ impl BinaryEncoder {
                         }
                         Instruction::Free { ptr, .. } => {
                             self.intern(ptr);
+                        }
+                        Instruction::Select {
+                            dst,
+                            cond,
+                            then_val,
+                            else_val,
+                            ..
+                        } => {
+                            self.intern(dst);
+                            self.intern(cond);
+                            self.intern(then_val);
+                            self.intern(else_val);
+                        }
+                        Instruction::Unary { dst, src, .. } => {
+                            self.intern(dst);
+                            self.intern(src);
+                        }
+                        Instruction::Cast { dst, src, .. } => {
+                            self.intern(dst);
+                            self.intern(src);
+                        }
+                        Instruction::VectorReduce { dst, src, .. } => {
+                            self.intern(dst);
+                            self.intern(src);
                         }
                     }
                 }
@@ -580,6 +648,53 @@ impl BinaryEncoder {
                 self.buf.push(0x0A);
                 self.buf
                     .extend_from_slice(&self.string_map[ptr].to_le_bytes());
+            }
+            Instruction::Select {
+                dst,
+                cond,
+                then_val,
+                else_val,
+                ..
+            } => {
+                self.buf.push(0x0B);
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[cond].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[then_val].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[else_val].to_le_bytes());
+            }
+            Instruction::Unary { op, dst, src, .. } => {
+                self.buf.push(0x0C);
+                self.buf.push(encode_unary_op(*op));
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[src].to_le_bytes());
+            }
+            Instruction::Cast {
+                op, dst, src, ty, ..
+            } => {
+                self.buf.push(0x0D);
+                self.buf.push(encode_cast_op(*op));
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[src].to_le_bytes());
+                self.buf.push(encode_type(*ty));
+            }
+            Instruction::VectorReduce {
+                op, dst, src, ty, ..
+            } => {
+                self.buf.push(0x0E);
+                self.buf.push(encode_vector_reduce_op(*op));
+                self.buf
+                    .extend_from_slice(&self.string_map[dst].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&self.string_map[src].to_le_bytes());
+                self.buf.push(encode_type(*ty));
             }
         }
     }
@@ -954,6 +1069,56 @@ impl<'a> BinaryDecoder<'a> {
                 let ptr = self.read_string()?;
                 Ok(Instruction::Free { ptr, span })
             }
+            0x0B => {
+                let dst = self.read_string()?;
+                let cond = self.read_string()?;
+                let then_val = self.read_string()?;
+                let else_val = self.read_string()?;
+                Ok(Instruction::Select {
+                    dst,
+                    cond,
+                    then_val,
+                    else_val,
+                    span,
+                })
+            }
+            0x0C => {
+                let op = decode_unary_op(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid unary op code in AIRB"))?;
+                let dst = self.read_string()?;
+                let src = self.read_string()?;
+                Ok(Instruction::Unary { op, dst, src, span })
+            }
+            0x0D => {
+                let op = decode_cast_op(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid cast op code in AIRB"))?;
+                let dst = self.read_string()?;
+                let src = self.read_string()?;
+                let ty = decode_type(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid cast target type in AIRB"))?;
+                Ok(Instruction::Cast {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    span,
+                })
+            }
+            0x0E => {
+                let op = decode_vector_reduce_op(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid vector reduce op code in AIRB"))?;
+                let dst = self.read_string()?;
+                let src = self.read_string()?;
+                let ty = decode_type(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid vector reduce target type in AIRB"))?;
+                Ok(Instruction::VectorReduce {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    span,
+                })
+            }
             _ => Err(self.err(format!(
                 "Unknown instruction opcode tag 0x{tag:02X} in AIRB"
             ))),
@@ -1066,6 +1231,17 @@ fn encode_binary_op(op: BinaryOp) -> u8 {
         BinaryOp::ViAdd => 21,
         BinaryOp::ViSub => 22,
         BinaryOp::ViMul => 23,
+        BinaryOp::Min => 24,
+        BinaryOp::Max => 25,
+        BinaryOp::Umin => 26,
+        BinaryOp::Umax => 27,
+        BinaryOp::Udiv => 28,
+        BinaryOp::Urem => 29,
+        BinaryOp::Ushr => 30,
+        BinaryOp::Ult => 31,
+        BinaryOp::Ugt => 32,
+        BinaryOp::Ule => 33,
+        BinaryOp::Uge => 34,
     }
 }
 
@@ -1094,6 +1270,17 @@ fn decode_binary_op(code: u8) -> Option<BinaryOp> {
         21 => Some(BinaryOp::ViAdd),
         22 => Some(BinaryOp::ViSub),
         23 => Some(BinaryOp::ViMul),
+        24 => Some(BinaryOp::Min),
+        25 => Some(BinaryOp::Max),
+        26 => Some(BinaryOp::Umin),
+        27 => Some(BinaryOp::Umax),
+        28 => Some(BinaryOp::Udiv),
+        29 => Some(BinaryOp::Urem),
+        30 => Some(BinaryOp::Ushr),
+        31 => Some(BinaryOp::Ult),
+        32 => Some(BinaryOp::Ugt),
+        33 => Some(BinaryOp::Ule),
+        34 => Some(BinaryOp::Uge),
         _ => None,
     }
 }
@@ -1123,5 +1310,77 @@ fn binary_op_to_str(op: BinaryOp) -> &'static str {
         BinaryOp::ViAdd => "viadd",
         BinaryOp::ViSub => "visub",
         BinaryOp::ViMul => "vimul",
+        BinaryOp::Min => "min",
+        BinaryOp::Max => "max",
+        BinaryOp::Umin => "umin",
+        BinaryOp::Umax => "umax",
+        BinaryOp::Udiv => "udiv",
+        BinaryOp::Urem => "urem",
+        BinaryOp::Ushr => "ushr",
+        BinaryOp::Ult => "ult",
+        BinaryOp::Ugt => "ugt",
+        BinaryOp::Ule => "ule",
+        BinaryOp::Uge => "uge",
+    }
+}
+
+fn encode_unary_op(op: UnaryOp) -> u8 {
+    match op {
+        UnaryOp::Sqrt => 1,
+        UnaryOp::Neg => 2,
+        UnaryOp::Abs => 3,
+    }
+}
+
+fn decode_unary_op(code: u8) -> Option<UnaryOp> {
+    match code {
+        1 => Some(UnaryOp::Sqrt),
+        2 => Some(UnaryOp::Neg),
+        3 => Some(UnaryOp::Abs),
+        _ => None,
+    }
+}
+
+fn encode_cast_op(op: CastOp) -> u8 {
+    match op {
+        CastOp::Itof => 1,
+        CastOp::Ftoi => 2,
+        CastOp::Sext => 3,
+        CastOp::Zext => 4,
+        CastOp::Trunc => 5,
+        CastOp::Fext => 6,
+        CastOp::Ftrunc => 7,
+        CastOp::Bitcast => 8,
+    }
+}
+
+fn decode_cast_op(code: u8) -> Option<CastOp> {
+    match code {
+        1 => Some(CastOp::Itof),
+        2 => Some(CastOp::Ftoi),
+        3 => Some(CastOp::Sext),
+        4 => Some(CastOp::Zext),
+        5 => Some(CastOp::Trunc),
+        6 => Some(CastOp::Fext),
+        7 => Some(CastOp::Ftrunc),
+        8 => Some(CastOp::Bitcast),
+        _ => None,
+    }
+}
+
+fn encode_vector_reduce_op(op: VectorReduceOp) -> u8 {
+    match op {
+        VectorReduceOp::VfSum => 1,
+        VectorReduceOp::VfMax => 2,
+        VectorReduceOp::ViSum => 3,
+    }
+}
+
+fn decode_vector_reduce_op(code: u8) -> Option<VectorReduceOp> {
+    match code {
+        1 => Some(VectorReduceOp::VfSum),
+        2 => Some(VectorReduceOp::VfMax),
+        3 => Some(VectorReduceOp::ViSum),
+        _ => None,
     }
 }

@@ -142,6 +142,10 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                         };
                         (dst, ty)
                     }
+                    Instruction::Select { dst, then_val, .. } => (dst, types.get(then_val).copied()),
+                    Instruction::Unary { dst, src, .. } => (dst, types.get(src).copied()),
+                    Instruction::Cast { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::VectorReduce { dst, ty, .. } => (dst, Some(*ty)),
                     _ => continue,
                 };
                 if let Some(ty) = ty {
@@ -185,10 +189,10 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                 // Apply variable substitutions to operands
                 substitute_instruction_operands(inst, &substitutions);
 
-                let binary_info = match inst {
+                match inst {
                     Instruction::AssignConst { dst, val, ty, .. } => {
                         constants.insert(dst.clone(), (val.clone(), *ty));
-                        None
+                        continue;
                     }
                     Instruction::Binary {
                         op,
@@ -196,63 +200,134 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                         lhs,
                         rhs,
                         span,
-                    } => Some((*op, dst.clone(), lhs.clone(), rhs.clone(), *span)),
-                    _ => None,
-                };
-
-                let Some((op, dst, lhs, rhs, span)) = binary_info else {
-                    continue;
-                };
-
-                // Without both operand types we cannot prove any rewrite is type-correct.
-                let (Some(&lhs_ty), Some(&rhs_ty)) = (reg_types.get(&lhs), reg_types.get(&rhs))
-                else {
-                    continue;
-                };
-                let Ok(res_ty) = crate::validator::binary_result_type(op, lhs_ty, rhs_ty) else {
-                    continue;
-                };
-
-                // Full constant folding if both operands are constants
-                if let (Some((c1, _)), Some((c2, _))) = (constants.get(&lhs), constants.get(&rhs)) {
-                    if let Some((folded_const, folded_ty)) =
-                        fold_binary_op(op, c1, lhs_ty, c2, rhs_ty)
-                    {
-                        debug_assert_eq!(folded_ty, res_ty);
-                        *inst = Instruction::AssignConst {
-                            dst: dst.clone(),
-                            val: folded_const.clone(),
-                            ty: folded_ty,
-                            span,
+                    } => {
+                        let (op, dst, lhs, rhs, span) = (*op, dst.clone(), lhs.clone(), rhs.clone(), *span);
+                        let (Some(&lhs_ty), Some(&rhs_ty)) = (reg_types.get(&lhs), reg_types.get(&rhs)) else {
+                            continue;
                         };
-                        constants.insert(dst, (folded_const, folded_ty));
-                        folded_count += 1;
-                        continue;
-                    }
-                }
+                        let Ok(res_ty) = crate::validator::binary_result_type(op, lhs_ty, rhs_ty) else {
+                            continue;
+                        };
 
-                // Algebraic simplification
-                if let Some(res) =
-                    simplify_algebraic(op, &lhs, &rhs, &constants, &reg_types, res_ty)
-                {
-                    match res {
-                        AlgebraicResult::Constant(c, ty) => {
-                            *inst = Instruction::AssignConst {
-                                dst: dst.clone(),
-                                val: c.clone(),
-                                ty,
-                                span,
-                            };
-                            constants.insert(dst, (c, ty));
-                            simplified_count += 1;
+                        // Full constant folding if both operands are constants
+                        if let (Some((c1, _)), Some((c2, _))) = (constants.get(&lhs), constants.get(&rhs)) {
+                            if let Some((folded_const, folded_ty)) = fold_binary_op(op, c1, lhs_ty, c2, rhs_ty) {
+                                debug_assert_eq!(folded_ty, res_ty);
+                                *inst = Instruction::AssignConst {
+                                    dst: dst.clone(),
+                                    val: folded_const.clone(),
+                                    ty: folded_ty,
+                                    span,
+                                };
+                                constants.insert(dst, (folded_const, folded_ty));
+                                folded_count += 1;
+                                continue;
+                            }
                         }
-                        AlgebraicResult::Identity(source) => {
-                            let real_source = substitutions.get(&source).cloned().unwrap_or(source);
-                            if substitutions.insert(dst, real_source).is_none() {
-                                simplified_count += 1;
+
+                        // Algebraic simplification
+                        if let Some(res) = simplify_algebraic(op, &lhs, &rhs, &constants, &reg_types, res_ty) {
+                            match res {
+                                AlgebraicResult::Constant(c, ty) => {
+                                    *inst = Instruction::AssignConst {
+                                        dst: dst.clone(),
+                                        val: c.clone(),
+                                        ty,
+                                        span,
+                                    };
+                                    constants.insert(dst, (c, ty));
+                                    simplified_count += 1;
+                                }
+                                AlgebraicResult::Identity(source) => {
+                                    let real_source = substitutions.get(&source).cloned().unwrap_or(source);
+                                    if substitutions.insert(dst, real_source).is_none() {
+                                        simplified_count += 1;
+                                    }
+                                }
                             }
                         }
                     }
+                    Instruction::Unary { op, dst, src, span } => {
+                        let (op, dst, src, span) = (*op, dst.clone(), src.clone(), *span);
+                        let Some(&src_ty) = reg_types.get(&src) else {
+                            continue;
+                        };
+                        if let Some((c, _)) = constants.get(&src) {
+                            if let Some((folded_const, folded_ty)) = fold_unary_op(op, c, src_ty) {
+                                *inst = Instruction::AssignConst {
+                                    dst: dst.clone(),
+                                    val: folded_const.clone(),
+                                    ty: folded_ty,
+                                    span,
+                                };
+                                constants.insert(dst, (folded_const, folded_ty));
+                                folded_count += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    Instruction::Cast {
+                        op,
+                        dst,
+                        src,
+                        ty,
+                        span,
+                    } => {
+                        let (op, dst, src, target_ty, span) = (*op, dst.clone(), src.clone(), *ty, *span);
+                        let Some(&src_ty) = reg_types.get(&src) else {
+                            continue;
+                        };
+                        if let Some((c, _)) = constants.get(&src) {
+                            if let Some((folded_const, folded_ty)) = fold_cast_op(op, c, src_ty, target_ty) {
+                                *inst = Instruction::AssignConst {
+                                    dst: dst.clone(),
+                                    val: folded_const.clone(),
+                                    ty: folded_ty,
+                                    span,
+                                };
+                                constants.insert(dst, (folded_const, folded_ty));
+                                folded_count += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    Instruction::Select {
+                        dst,
+                        cond,
+                        then_val,
+                        else_val,
+                        span,
+                    } => {
+                        let (dst, cond, then_val, else_val, span) =
+                            (dst.clone(), cond.clone(), then_val.clone(), else_val.clone(), *span);
+                        if then_val == else_val {
+                            let real_source = substitutions.get(&then_val).cloned().unwrap_or(then_val);
+                            if substitutions.insert(dst, real_source).is_none() {
+                                simplified_count += 1;
+                            }
+                            continue;
+                        }
+                        if let Some((Constant::Int(c), _)) = constants.get(&cond) {
+                            let chosen = if *c != 0 { then_val } else { else_val };
+                            if let Some((c_val, c_ty)) = constants.get(&chosen) {
+                                *inst = Instruction::AssignConst {
+                                    dst: dst.clone(),
+                                    val: c_val.clone(),
+                                    ty: *c_ty,
+                                    span,
+                                };
+                                constants.insert(dst, (c_val.clone(), *c_ty));
+                                folded_count += 1;
+                            } else {
+                                let real_source = substitutions.get(&chosen).cloned().unwrap_or(chosen);
+                                if substitutions.insert(dst, real_source).is_none() {
+                                    simplified_count += 1;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -451,6 +526,58 @@ fn fold_binary_op(
                 BinaryOp::Gt => return bool_const(a > b),
                 BinaryOp::Le => return bool_const(a <= b),
                 BinaryOp::Ge => return bool_const(a >= b),
+                BinaryOp::Min => a.min(b),
+                BinaryOp::Max => a.max(b),
+                BinaryOp::Umin => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    ua.min(ub) as i64
+                }
+                BinaryOp::Umax => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    ua.max(ub) as i64
+                }
+                BinaryOp::Udiv => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    if ub == 0 {
+                        return None;
+                    }
+                    (ua / ub) as i64
+                }
+                BinaryOp::Urem => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    if ub == 0 {
+                        return None;
+                    }
+                    (ua % ub) as i64
+                }
+                BinaryOp::Ushr => {
+                    let ua = to_unsigned(a, bits);
+                    (ua >> shift) as i64
+                }
+                BinaryOp::Ult => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    return bool_const(ua < ub);
+                }
+                BinaryOp::Ugt => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    return bool_const(ua > ub);
+                }
+                BinaryOp::Ule => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    return bool_const(ua <= ub);
+                }
+                BinaryOp::Uge => {
+                    let ua = to_unsigned(a, bits);
+                    let ub = to_unsigned(b, bits);
+                    return bool_const(ua >= ub);
+                }
                 _ => return None,
             };
             Some((Constant::Int(ty.wrap_int(res)), ty))
@@ -472,6 +599,8 @@ fn fold_binary_op(
                     BinaryOp::Gt => return bool_const(a > b),
                     BinaryOp::Le => return bool_const(a <= b),
                     BinaryOp::Ge => return bool_const(a >= b),
+                    BinaryOp::Min => a.min(b),
+                    BinaryOp::Max => a.max(b),
                     _ => return None,
                 };
                 Some((Constant::Float(res as f64), Type::F32))
@@ -488,9 +617,174 @@ fn fold_binary_op(
                     BinaryOp::Gt => return bool_const(a > b),
                     BinaryOp::Le => return bool_const(a <= b),
                     BinaryOp::Ge => return bool_const(a >= b),
+                    BinaryOp::Min => a.min(b),
+                    BinaryOp::Max => a.max(b),
                     _ => return None,
                 };
                 Some((Constant::Float(res), Type::F64))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn to_unsigned(v: i64, bits: u32) -> u64 {
+    if bits == 64 {
+        v as u64
+    } else {
+        (v as u64) & ((1u64 << bits) - 1)
+    }
+}
+
+fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)> {
+    match c {
+        Constant::Int(n) => {
+            if !ty.is_int() {
+                return None;
+            }
+            let bits = ty.int_bits()?;
+            let val = ty.wrap_int(*n);
+            let min = if bits == 64 {
+                i64::MIN
+            } else {
+                -(1i64 << (bits - 1))
+            };
+            let res = match op {
+                UnaryOp::Neg => val.wrapping_neg(),
+                UnaryOp::Abs => {
+                    if val == min {
+                        return None;
+                    }
+                    val.abs()
+                }
+                UnaryOp::Sqrt => return None,
+            };
+            Some((Constant::Int(ty.wrap_int(res)), ty))
+        }
+        Constant::Float(f) => {
+            if !ty.is_float() {
+                return None;
+            }
+            if ty == Type::F32 {
+                let f = *f as f32;
+                let res = match op {
+                    UnaryOp::Neg => -f,
+                    UnaryOp::Abs => f.abs(),
+                    UnaryOp::Sqrt => {
+                        if f < 0.0 {
+                            return None;
+                        }
+                        f.sqrt()
+                    }
+                };
+                Some((Constant::Float(res as f64), Type::F32))
+            } else {
+                let f = *f;
+                let res = match op {
+                    UnaryOp::Neg => -f,
+                    UnaryOp::Abs => f.abs(),
+                    UnaryOp::Sqrt => {
+                        if f < 0.0 {
+                            return None;
+                        }
+                        f.sqrt()
+                    }
+                };
+                Some((Constant::Float(res), Type::F64))
+            }
+        }
+    }
+}
+
+fn fold_cast_op(op: CastOp, c: &Constant, src_ty: Type, target_ty: Type) -> Option<(Constant, Type)> {
+    match (op, c) {
+        (CastOp::Itof, Constant::Int(n)) => {
+            let val = src_ty.wrap_int(*n);
+            if target_ty == Type::F32 {
+                Some((Constant::Float((val as f32) as f64), Type::F32))
+            } else if target_ty == Type::F64 {
+                Some((Constant::Float(val as f64), Type::F64))
+            } else {
+                None
+            }
+        }
+        (CastOp::Ftoi, Constant::Float(f)) => {
+            if !target_ty.is_int() {
+                return None;
+            }
+            let f = if src_ty == Type::F32 { *f as f32 as f64 } else { *f };
+            let bits = target_ty.int_bits()?;
+            let (min, max) = if bits == 64 {
+                (i64::MIN, i64::MAX)
+            } else {
+                (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+            };
+            let int_val = if f.is_nan() {
+                0
+            } else if f <= min as f64 {
+                min
+            } else if f >= max as f64 {
+                max
+            } else {
+                f as i64
+            };
+            Some((Constant::Int(target_ty.wrap_int(int_val)), target_ty))
+        }
+        (CastOp::Sext, Constant::Int(n)) => {
+            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? <= src_ty.int_bits()? {
+                return None;
+            }
+            let val = src_ty.wrap_int(*n);
+            Some((Constant::Int(target_ty.wrap_int(val)), target_ty))
+        }
+        (CastOp::Zext, Constant::Int(n)) => {
+            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? <= src_ty.int_bits()? {
+                return None;
+            }
+            let bits = src_ty.int_bits()?;
+            let uval = to_unsigned(*n, bits) as i64;
+            Some((Constant::Int(target_ty.wrap_int(uval)), target_ty))
+        }
+        (CastOp::Trunc, Constant::Int(n)) => {
+            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? >= src_ty.int_bits()? {
+                return None;
+            }
+            Some((Constant::Int(target_ty.wrap_int(*n)), target_ty))
+        }
+        (CastOp::Fext, Constant::Float(f)) => {
+            if src_ty == Type::F32 && target_ty == Type::F64 {
+                Some((Constant::Float((*f as f32) as f64), Type::F64))
+            } else {
+                None
+            }
+        }
+        (CastOp::Ftrunc, Constant::Float(f)) => {
+            if src_ty == Type::F64 && target_ty == Type::F32 {
+                Some((Constant::Float((*f as f32) as f64), Type::F32))
+            } else {
+                None
+            }
+        }
+        (CastOp::Bitcast, Constant::Int(n)) => {
+            if src_ty == Type::I32 && target_ty == Type::F32 {
+                let f = f32::from_bits(*n as u32);
+                Some((Constant::Float(f as f64), Type::F32))
+            } else if src_ty == Type::I64 && target_ty == Type::F64 {
+                let f = f64::from_bits(*n as u64);
+                Some((Constant::Float(f), Type::F64))
+            } else {
+                None
+            }
+        }
+        (CastOp::Bitcast, Constant::Float(f)) => {
+            if src_ty == Type::F32 && target_ty == Type::I32 {
+                let bits = (*f as f32).to_bits() as i32 as i64;
+                Some((Constant::Int(target_ty.wrap_int(bits)), Type::I32))
+            } else if src_ty == Type::F64 && target_ty == Type::I64 {
+                let bits = f.to_bits() as i64;
+                Some((Constant::Int(bits), Type::I64))
+            } else {
+                None
             }
         }
         _ => None,
@@ -552,6 +846,37 @@ fn substitute_instruction_operands(
         Instruction::Free { ptr, .. } => {
             if let Some(new_p) = substitutions.get(ptr) {
                 *ptr = new_p.clone();
+            }
+        }
+        Instruction::Select {
+            cond,
+            then_val,
+            else_val,
+            ..
+        } => {
+            if let Some(new_c) = substitutions.get(cond) {
+                *cond = new_c.clone();
+            }
+            if let Some(new_t) = substitutions.get(then_val) {
+                *then_val = new_t.clone();
+            }
+            if let Some(new_e) = substitutions.get(else_val) {
+                *else_val = new_e.clone();
+            }
+        }
+        Instruction::Unary { src, .. } => {
+            if let Some(new_s) = substitutions.get(src) {
+                *src = new_s.clone();
+            }
+        }
+        Instruction::Cast { src, .. } => {
+            if let Some(new_s) = substitutions.get(src) {
+                *src = new_s.clone();
+            }
+        }
+        Instruction::VectorReduce { src, .. } => {
+            if let Some(new_s) = substitutions.get(src) {
+                *src = new_s.clone();
             }
         }
     }
@@ -729,6 +1054,25 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                     Instruction::Free { ptr, .. } => {
                         used.insert(ptr.clone());
                     }
+                    Instruction::Select {
+                        cond,
+                        then_val,
+                        else_val,
+                        ..
+                    } => {
+                        used.insert(cond.clone());
+                        used.insert(then_val.clone());
+                        used.insert(else_val.clone());
+                    }
+                    Instruction::Unary { src, .. } => {
+                        used.insert(src.clone());
+                    }
+                    Instruction::Cast { src, .. } => {
+                        used.insert(src.clone());
+                    }
+                    Instruction::VectorReduce { src, .. } => {
+                        used.insert(src.clone());
+                    }
                 }
             }
 
@@ -771,10 +1115,16 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
             block.instructions.retain(|inst| match inst {
                 Instruction::AssignConst { dst, .. } => used.contains(dst),
                 Instruction::Binary { op, dst, lhs, .. } => {
-                    let can_trap = matches!(op, BinaryOp::Div | BinaryOp::Rem)
-                        && !reg_types.get(lhs).is_some_and(|t| t.is_float());
+                    let can_trap = matches!(
+                        op,
+                        BinaryOp::Div | BinaryOp::Rem | BinaryOp::Udiv | BinaryOp::Urem
+                    ) && !reg_types.get(lhs).is_some_and(|t| t.is_float());
                     used.contains(dst) || can_trap
                 }
+                Instruction::Select { dst, .. } => used.contains(dst),
+                Instruction::Unary { dst, .. } => used.contains(dst),
+                Instruction::Cast { dst, .. } => used.contains(dst),
+                Instruction::VectorReduce { dst, .. } => used.contains(dst),
                 Instruction::Splat { dst, .. } => used.contains(dst),
                 Instruction::ExtractLane { dst, .. } => used.contains(dst),
 

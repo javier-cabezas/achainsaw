@@ -7,6 +7,7 @@ pub struct Parser<'a> {
     _source: &'a str,
     tokens: Vec<Token>,
     cursor: usize,
+    imm_counter: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -17,6 +18,7 @@ impl<'a> Parser<'a> {
             _source: source,
             tokens,
             cursor: 0,
+            imm_counter: 0,
         })
     }
 
@@ -129,13 +131,94 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Parses `(a, b, c)`, where the parentheses are required.
-    fn parse_paren_idents(&mut self) -> Result<Vec<String>, Diagnostic> {
+    fn parse_operand(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+        fallback_ty: Option<Type>,
+    ) -> Result<String, Diagnostic> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::IntLit(n) => {
+                self.advance();
+                let ty = if self.peek_kind() == &TokenKind::Colon {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    fallback_ty.unwrap_or(Type::I64)
+                };
+                let imm_reg = format!("__imm_{}", self.imm_counter);
+                self.imm_counter += 1;
+                instructions.push(Instruction::AssignConst {
+                    dst: imm_reg.clone(),
+                    val: Constant::Int(n),
+                    ty,
+                    span: tok.span,
+                });
+                Ok(imm_reg)
+            }
+            TokenKind::FloatLit(f) => {
+                self.advance();
+                let ty = if self.peek_kind() == &TokenKind::Colon {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    fallback_ty.unwrap_or(Type::F32)
+                };
+                let imm_reg = format!("__imm_{}", self.imm_counter);
+                self.imm_counter += 1;
+                instructions.push(Instruction::AssignConst {
+                    dst: imm_reg.clone(),
+                    val: Constant::Float(f),
+                    ty,
+                    span: tok.span,
+                });
+                Ok(imm_reg)
+            }
+            TokenKind::Ident(ref name) if name == "inf" || name == "nan" => {
+                let name = name.clone();
+                self.advance();
+                let val = if name == "inf" {
+                    Constant::Float(f64::INFINITY)
+                } else {
+                    Constant::Float(f64::NAN)
+                };
+                let ty = if self.peek_kind() == &TokenKind::Colon {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    fallback_ty.unwrap_or(Type::F32)
+                };
+                let imm_reg = format!("__imm_{}", self.imm_counter);
+                self.imm_counter += 1;
+                instructions.push(Instruction::AssignConst {
+                    dst: imm_reg.clone(),
+                    val,
+                    ty,
+                    span: tok.span,
+                });
+                Ok(imm_reg)
+            }
+            TokenKind::Ident(name) => {
+                self.advance();
+                Ok(name)
+            }
+            other => Err(Diagnostic::error(
+                "ERR_EXPECTED_OPERAND",
+                format!("Expected register name or immediate constant, found {other:?}"),
+                tok.span,
+            )),
+        }
+    }
+
+    fn parse_paren_operands(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Vec<String>, Diagnostic> {
         self.expect(TokenKind::LParen)?;
         let mut args = Vec::new();
         if self.peek_kind() != &TokenKind::RParen {
             loop {
-                let (arg, _) = self.expect_ident()?;
+                let arg = self.parse_operand(instructions, None)?;
                 args.push(arg);
                 if self.peek_kind() == &TokenKind::Comma {
                     self.advance();
@@ -148,10 +231,12 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    /// Parses `(a, b, c)` if present, otherwise returns an empty list.
-    fn parse_optional_paren_idents(&mut self) -> Result<Vec<String>, Diagnostic> {
+    fn parse_optional_paren_operands(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Vec<String>, Diagnostic> {
         if self.peek_kind() == &TokenKind::LParen {
-            self.parse_paren_idents()
+            self.parse_paren_operands(instructions)
         } else {
             Ok(Vec::new())
         }
@@ -270,19 +355,19 @@ impl<'a> Parser<'a> {
                 TokenKind::Jmp => {
                     let span = self.advance().span;
                     let (target, _) = self.expect_ident()?;
-                    let args = self.parse_optional_paren_idents()?;
+                    let args = self.parse_optional_paren_operands(&mut instructions)?;
                     self.expect_eol()?;
                     break Terminator::Jmp { target, args, span };
                 }
                 TokenKind::Br => {
                     let span = self.advance().span;
-                    let (cond, _) = self.expect_ident()?;
+                    let cond = self.parse_operand(&mut instructions, Some(Type::I32))?;
                     self.expect(TokenKind::Comma)?;
                     let (then_block, _) = self.expect_ident()?;
-                    let then_args = self.parse_optional_paren_idents()?;
+                    let then_args = self.parse_optional_paren_operands(&mut instructions)?;
                     self.expect(TokenKind::Comma)?;
                     let (else_block, _) = self.expect_ident()?;
-                    let else_args = self.parse_optional_paren_idents()?;
+                    let else_args = self.parse_optional_paren_operands(&mut instructions)?;
                     self.expect_eol()?;
                     break Terminator::Br {
                         cond,
@@ -298,8 +383,7 @@ impl<'a> Parser<'a> {
                     let val = if self.peek_kind() != &TokenKind::Newline
                         && self.peek_kind() != &TokenKind::Eof
                     {
-                        let (v, _) = self.expect_ident()?;
-                        Some(v)
+                        Some(self.parse_operand(&mut instructions, None)?)
                     } else {
                         None
                     };
@@ -315,7 +399,8 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Regular instruction
-                    instructions.push(self.parse_instruction()?);
+                    let inst = self.parse_instruction(&mut instructions)?;
+                    instructions.push(inst);
                 }
             }
         };
@@ -329,7 +414,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_instruction(&mut self) -> Result<Instruction, Diagnostic> {
+    fn parse_instruction(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Instruction, Diagnostic> {
         let first_tok = self.peek().clone();
 
         // Check if store: st ptr, val
@@ -337,7 +425,7 @@ impl<'a> Parser<'a> {
             let span = self.advance().span;
             let (ptr, _) = self.expect_ident()?;
             self.expect(TokenKind::Comma)?;
-            let (val, _) = self.expect_ident()?;
+            let val = self.parse_operand(instructions, None)?;
             self.expect_eol()?;
             return Ok(Instruction::Store { ptr, val, span });
         }
@@ -354,7 +442,7 @@ impl<'a> Parser<'a> {
         if first_tok.kind == TokenKind::Call {
             let span = self.advance().span;
             let (func, _) = self.expect_ident()?;
-            let args = self.parse_paren_idents()?;
+            let args = self.parse_paren_operands(instructions)?;
             self.expect_eol()?;
             return Ok(Instruction::Call {
                 dst: None,
@@ -422,7 +510,7 @@ impl<'a> Parser<'a> {
             TokenKind::Call => {
                 self.advance();
                 let (func, _) = self.expect_ident()?;
-                let args = self.parse_paren_idents()?;
+                let args = self.parse_paren_operands(instructions)?;
                 self.expect_eol()?;
                 Ok(Instruction::Call {
                     dst: Some(dst),
@@ -433,7 +521,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Alloc => {
                 self.advance();
-                let (size, _) = self.expect_ident()?;
+                let size = self.parse_operand(instructions, Some(Type::I64))?;
                 self.expect_eol()?;
                 Ok(Instruction::Alloc {
                     dst,
@@ -443,7 +531,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Splat => {
                 self.advance();
-                let (src, _) = self.expect_ident()?;
+                let src = self.parse_operand(instructions, None)?;
                 self.expect_eol()?;
                 Ok(Instruction::Splat {
                     dst,
@@ -483,8 +571,62 @@ impl<'a> Parser<'a> {
                     span: dst_span,
                 })
             }
-            TokenKind::Op(op_name) => {
+            TokenKind::Select => {
                 self.advance();
+                let cond = self.parse_operand(instructions, Some(Type::I32))?;
+                self.expect(TokenKind::Comma)?;
+                let then_val = self.parse_operand(instructions, None)?;
+                self.expect(TokenKind::Comma)?;
+                let else_val = self.parse_operand(instructions, None)?;
+                self.expect_eol()?;
+                Ok(Instruction::Select {
+                    dst,
+                    cond,
+                    then_val,
+                    else_val,
+                    span: dst_span,
+                })
+            }
+            TokenKind::Cast(op) => {
+                self.advance();
+                let src = self.parse_operand(instructions, None)?;
+                self.expect(TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                self.expect_eol()?;
+                Ok(Instruction::Cast {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    span: dst_span,
+                })
+            }
+            TokenKind::Unary(op) => {
+                self.advance();
+                let src = self.parse_operand(instructions, None)?;
+                self.expect_eol()?;
+                Ok(Instruction::Unary {
+                    op,
+                    dst,
+                    src,
+                    span: dst_span,
+                })
+            }
+            TokenKind::VectorReduce(op) => {
+                self.advance();
+                let src = self.parse_operand(instructions, Some(Type::V128))?;
+                self.expect(TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                self.expect_eol()?;
+                Ok(Instruction::VectorReduce {
+                    op,
+                    dst,
+                    src,
+                    ty,
+                    span: dst_span,
+                })
+            }
+            TokenKind::Op(op_name) => {
                 let op = op_name.parse::<BinaryOp>().map_err(|_| {
                     Diagnostic::error(
                         "ERR_UNKNOWN_OP",
@@ -492,9 +634,10 @@ impl<'a> Parser<'a> {
                         dst_span,
                     )
                 })?;
-                let (lhs, _) = self.expect_ident()?;
+                self.advance();
+                let lhs = self.parse_operand(instructions, None)?;
                 self.expect(TokenKind::Comma)?;
-                let (rhs, _) = self.expect_ident()?;
+                let rhs = self.parse_operand(instructions, None)?;
                 self.expect_eol()?;
                 Ok(Instruction::Binary {
                     op,
@@ -506,7 +649,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(Diagnostic::error(
                 "ERR_EXPECTED_RVALUE",
-                format!("Expected cst, ld, call, alloc, splat, extlane, or binary op after '=', found {:?}", self.peek_kind()),
+                format!("Expected cst, ld, call, alloc, splat, extlane, select, cast, unary, or binary op after '=', found {:?}", self.peek_kind()),
                 self.peek().span,
             )),
         }
