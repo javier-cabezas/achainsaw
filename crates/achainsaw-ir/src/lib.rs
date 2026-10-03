@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod binary;
 pub mod diag;
 pub mod lexer;
 pub mod parser;
@@ -6,6 +7,7 @@ pub mod types;
 pub mod validator;
 
 pub use ast::*;
+pub use binary::{decode_module, encode_module, to_air_text};
 pub use diag::{Diagnostic, Span};
 pub use lexer::Lexer;
 pub use parser::Parser;
@@ -61,6 +63,63 @@ fn sum_loop(n:i32)->i32
     }
 
     #[test]
+    fn test_binary_encode_decode_roundtrip() {
+        let code = r#"
+fn simd_scale(p:ptr, factor:f32, n:i64)
+  b0:
+    vfactor = splat factor
+    zero = cst 0:i64
+    jmp b1(zero)
+  b1(i:i64):
+    cond = lt i, n
+    br cond, b2, b3
+  b2:
+    sixteen = cst 16:i64
+    off = mul i, sixteen
+    elem_ptr = add p, off
+    v = ld elem_ptr:v128
+    vscaled = vfmul v, vfactor
+    st elem_ptr, vscaled
+    one = cst 1:i64
+    next_i = add i, one
+    jmp b1(next_i)
+  b3:
+    ret
+"#;
+        let original_module = parse_and_validate(code).expect("Valid AIR");
+        let bytes = encode_module(&original_module);
+
+        // Verify magic and minimum size
+        assert!(bytes.starts_with(b"\x00AIR"));
+        println!("bytes.len() = {}, text.len() = {}", bytes.len(), code.len());
+        assert!(bytes.len() < 500, "AIRB binary should be compact: {}", bytes.len());
+
+        // Decode back
+        let decoded_module = decode_module(&bytes).expect("Should decode AIRB cleanly");
+        assert_eq!(decoded_module.functions.len(), original_module.functions.len());
+        assert_eq!(decoded_module.functions[0].name, original_module.functions[0].name);
+        assert_eq!(decoded_module.functions[0].blocks.len(), original_module.functions[0].blocks.len());
+
+        // Validate decoded module
+        let mut validator = Validator::new();
+        validator.validate_module(&decoded_module).expect("Decoded module should be valid SSA");
+
+        // Disassemble back to text and re-validate
+        let disassembled_text = to_air_text(&decoded_module);
+        let roundtrip_module = parse_and_validate(&disassembled_text).expect("Disassembled text must validate");
+        assert_eq!(roundtrip_module.functions[0].name, "simd_scale");
+    }
+
+    #[test]
+    fn test_invalid_binary_magic() {
+        let bad_bytes = b"BADMAGICDATA";
+        let res = decode_module(bad_bytes);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.error_code, "ERR_INVALID_AIRB");
+    }
+
+    #[test]
     fn test_diagnostic_undefined_reg() {
         let code = r#"
 fn fail(a:i32)->i32
@@ -100,4 +159,5 @@ fn fail(a:i32)->i32
         assert_eq!(err.error_code, "ERR_SSA_REDEFINITION");
     }
 }
+
 

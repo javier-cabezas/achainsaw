@@ -1,11 +1,13 @@
 use achainsaw_codegen::JitEngine;
 use achainsaw_ir::diag::Diagnostic;
-use achainsaw_ir::parse_and_validate;
+use achainsaw_ir::{
+    decode_module, encode_module, parse_and_validate, to_air_text, Module, Validator,
+};
 use anyhow::{anyhow, Result};
 use clap::{Parser as ClapParser, Subcommand};
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(ClapParser)]
@@ -18,18 +20,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Validate IR module syntax and SSA invariants
+    /// Validate IR module syntax and SSA invariants (.air or .airb)
     Check {
-        /// Path to .air file
+        /// Path to .air or .airb file
         path: PathBuf,
         /// Emit structured machine-readable JSON output
         #[arg(long, default_value_t = true)]
         json: bool,
     },
 
-    /// Compile and execute an IR function via Cranelift JIT
+    /// Compile and execute an IR function via Cranelift JIT (.air or .airb)
     Run {
-        /// Path to .air file
+        /// Path to .air or .airb file
         path: PathBuf,
         /// Name of the function to execute
         #[arg(long, default_value = "main")]
@@ -44,11 +46,32 @@ enum Commands {
 
     /// Benchmark compilation and execution latency
     Bench {
-        /// Path to .air file
+        /// Path to .air or .airb file
         path: PathBuf,
         /// Number of compilation iterations
         #[arg(short, long, default_value_t = 100)]
         iters: u32,
+    },
+
+    /// Assemble text AIR (.air) into compact binary bytecode (.airb)
+    Assemble {
+        /// Path to input .air file
+        input: PathBuf,
+        /// Path to output .airb file (defaults to replacing .air with .airb)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Emit structured JSON telemetry
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+
+    /// Disassemble binary bytecode (.airb) into text AIR format (.air)
+    Disassemble {
+        /// Path to input .airb file
+        input: PathBuf,
+        /// Path to output .air file (defaults to printing to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -100,15 +123,61 @@ fn main() {
             Ok(bench_res) => println!("{}", serde_json::to_string_pretty(&bench_res).unwrap()),
             Err(e) => eprintln!("Benchmark error: {e}"),
         },
+        Commands::Assemble {
+            input,
+            output,
+            json,
+        } => match run_assemble(&input, output) {
+            Ok(stats) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                } else {
+                    println!(
+                        "Assembled {} ({} bytes) -> {} ({} bytes)",
+                        stats["input"], stats["source_bytes"], stats["output"], stats["binary_bytes"]
+                    );
+                }
+            }
+            Err(e) => {
+                if json {
+                    let err_json = json!({
+                        "status": "error",
+                        "error_code": "ERR_ASSEMBLE",
+                        "message": e.to_string(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+                } else {
+                    eprintln!("Assembly error: {e}");
+                }
+            }
+        },
+        Commands::Disassemble { input, output } => match run_disassemble(&input, output) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Disassembly error: {e}"),
+        },
     }
 }
 
-fn run_check(path: &PathBuf) -> Result<serde_json::Value, Diagnostic> {
-    let source = fs::read_to_string(path).map_err(|e| {
+fn load_module(path: &Path) -> Result<Module, Diagnostic> {
+    let bytes = fs::read(path).map_err(|e| {
         Diagnostic::error("ERR_FILE_IO", format!("Could not read file: {e}"), Default::default())
     })?;
 
-    let module = parse_and_validate(&source)?;
+    if bytes.starts_with(b"\x00AIR") {
+        let module = decode_module(&bytes)?;
+        let mut validator = Validator::new();
+        validator.validate_module(&module)?;
+        Ok(module)
+    } else {
+        let source = std::str::from_utf8(&bytes).map_err(|e| {
+            Diagnostic::error("ERR_INVALID_UTF8", format!("Source not valid UTF-8: {e}"), Default::default())
+        })?;
+        parse_and_validate(source)
+    }
+}
+
+fn run_check(path: &Path) -> Result<serde_json::Value, Diagnostic> {
+    let module = load_module(path)?;
     let total_blocks: usize = module.functions.iter().map(|f| f.blocks.len()).sum();
     let total_instructions: usize = module
         .functions
@@ -126,11 +195,9 @@ fn run_check(path: &PathBuf) -> Result<serde_json::Value, Diagnostic> {
     }))
 }
 
-fn run_exec(path: &PathBuf, func_name: &str, args: &[i64]) -> Result<serde_json::Value> {
-    let source = fs::read_to_string(path)?;
-
+fn run_exec(path: &Path, func_name: &str, args: &[i64]) -> Result<serde_json::Value> {
     let t0 = Instant::now();
-    let module = parse_and_validate(&source)
+    let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
     let parse_time_us = t0.elapsed().as_micros();
 
@@ -167,9 +234,8 @@ fn run_exec(path: &PathBuf, func_name: &str, args: &[i64]) -> Result<serde_json:
     }))
 }
 
-fn run_bench(path: &PathBuf, iters: u32) -> Result<serde_json::Value> {
-    let source = fs::read_to_string(path)?;
-    let module = parse_and_validate(&source)
+fn run_bench(path: &Path, iters: u32) -> Result<serde_json::Value> {
+    let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
 
     let t0 = Instant::now();
@@ -188,4 +254,38 @@ fn run_bench(path: &PathBuf, iters: u32) -> Result<serde_json::Value> {
         "avg_compile_time_ms": avg_compile_time_ms,
         "throughput_compiles_per_sec": throughput_compiles_per_sec,
     }))
+}
+
+fn run_assemble(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Value> {
+    let source = fs::read_to_string(input)?;
+    let module = parse_and_validate(&source)
+        .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
+
+    let binary = encode_module(&module);
+
+    let out_path = output.unwrap_or_else(|| input.with_extension("airb"));
+    fs::write(&out_path, &binary)?;
+
+    Ok(json!({
+        "status": "ok",
+        "input": input.to_string_lossy(),
+        "output": out_path.to_string_lossy(),
+        "source_bytes": source.len(),
+        "binary_bytes": binary.len(),
+        "compression_ratio": (binary.len() as f64) / (source.len().max(1) as f64),
+    }))
+}
+
+fn run_disassemble(input: &Path, output: Option<PathBuf>) -> Result<()> {
+    let bytes = fs::read(input)?;
+    let module = decode_module(&bytes)
+        .map_err(|d| anyhow!("AIRB decode failed: [{}] {}", d.error_code, d.message))?;
+
+    let text = to_air_text(&module);
+    if let Some(out_path) = output {
+        fs::write(out_path, text)?;
+    } else {
+        print!("{text}");
+    }
+    Ok(())
 }

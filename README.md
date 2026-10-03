@@ -135,6 +135,19 @@ achainsaw run examples/sum_loop.air --func sum_to_n --args 100 --json
 achainsaw bench examples/fibonacci.air --iters 200
 ```
 
+### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
+AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading:
+```bash
+# Assemble text AIR to compact binary bytecode (.airb)
+achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
+
+# Direct execution of pre-parsed binary bytecode
+achainsaw run examples/simd_vector_dot.airb --func simd_dot --args 1 --json
+
+# Disassemble binary bytecode back into canonical text AIR
+achainsaw disassemble examples/simd_vector_dot.airb
+```
+
 ---
 
 ## 🐍 Python Host Integration (`achainsaw-py`)
@@ -204,6 +217,19 @@ except achainsaw.CompilationError as e:
     k = achainsaw.compile(repaired_code)
 ```
 
+### Binary Bytecode (AIRB) in Python
+```python
+# Assemble to compact binary payload (for caching or network transfer)
+binary_payload = achainsaw.assemble(air_kernel)
+
+# Directly compile pre-parsed binary bytecode (<0.05 ms)
+kernel = achainsaw.compile_binary(binary_payload)
+result = kernel.run("simd_scale", arr, 2.5, 2)
+
+# Disassemble binary payload back into canonical text AIR
+text_ir = achainsaw.disassemble(binary_payload)
+```
+
 ### ⚡ Performance Comparison
 
 | Metric | Subprocess CLI (`achainsaw.exe`) | In-Process Python (`achainsaw-py`) | Speedup |
@@ -222,7 +248,7 @@ except achainsaw.CompilationError as e:
 achainsaw/
 ├── Cargo.toml                  # Workspace manifest
 ├── crates/
-│   ├── achainsaw-ir/           # Lexer, Parser, AST, SSA Type-Checker, JSON Diagnostics
+│   ├── achainsaw-ir/           # Lexer, Parser, AST, SSA Type-Checker, AIRB Binary Codec
 │   ├── achainsaw-codegen/      # Cranelift IR translator & JIT execution engine
 │   ├── achainsaw-cli/          # Agent CLI driver with structured JSON telemetry
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
@@ -230,9 +256,10 @@ achainsaw/
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── fibonacci.air           # Branching Fibonacci kernel
 │   ├── simd_vector_dot.air     # 128-bit SIMD hardware dot product kernel
+│   ├── simd_vector_dot.airb    # Compact pre-assembled AIRB binary bytecode
 │   └── py_numpy_simd.py        # Python zero-copy SIMD & agent self-repair demo
 ├── tests/
-│   └── test_py_binding.py      # Comprehensive Python test suite (11/11 passing)
+│   └── test_py_binding.py      # Comprehensive Python test suite (14/14 passing)
 └── README.md
 ```
 

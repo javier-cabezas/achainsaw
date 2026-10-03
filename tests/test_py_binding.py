@@ -142,6 +142,32 @@ class TestChainsawPy(unittest.TestCase):
         self.assertIn("context", diag)
         self.assertEqual(diag["context"].get("target"), "bad_reg")
 
+    def test_assemble_disassemble_roundtrip(self):
+        source = """fn add(a:i32, b:i32)->i32
+  b0:
+    c = add a, b
+    ret c
+"""
+        binary = achainsaw.assemble(source)
+        self.assertIsInstance(binary, bytes)
+        self.assertTrue(binary.startswith(b"\x00AIR"))
+
+        disassembled = achainsaw.disassemble(binary)
+        self.assertIn("fn add(a:i32, b:i32)->i32", disassembled)
+        self.assertIn("ret c", disassembled)
+
+    def test_compile_binary(self):
+        with open("examples/fibonacci.air", "r", encoding="utf-8") as f:
+            code = f.read()
+        binary = achainsaw.assemble(code)
+        k = achainsaw.compile_binary(binary)
+        self.assertEqual(k.run("fib", 10), 55)
+
+    def test_compile_binary_invalid(self):
+        with self.assertRaises(achainsaw.CompilationError) as ctx:
+            achainsaw.compile_binary(b"INVALID_PAYLOAD")
+        self.assertIn("ERR_INVALID_AIRB", str(ctx.exception))
+
     def test_runtime_errors(self):
         code = """fn add(a:i32, b:i32)->i32
   b0:

@@ -1,7 +1,7 @@
 use achainsaw_codegen::JitEngine;
 use achainsaw_ir::diag::Diagnostic;
-use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
+use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -275,6 +275,43 @@ pub fn check(py: Python<'_>, source: &str) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
+pub fn assemble(py: Python<'_>, source: &str) -> PyResult<PyObject> {
+    let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
+    let bytes = encode_module(&module);
+    Ok(pyo3::types::PyBytes::new_bound(py, &bytes).into_py(py))
+}
+
+#[pyfunction]
+pub fn disassemble(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
+    let module = decode_module(bytes).map_err(|d| diagnostic_to_py_err(py, d))?;
+    Ok(to_air_text(&module))
+}
+
+#[pyfunction]
+pub fn compile_binary(py: Python<'_>, bytes: &[u8]) -> PyResult<PyKernel> {
+    let module = decode_module(bytes).map_err(|d| diagnostic_to_py_err(py, d))?;
+    let mut validator = achainsaw_ir::Validator::new();
+    validator
+        .validate_module(&module)
+        .map_err(|d| diagnostic_to_py_err(py, d))?;
+
+    let mut signatures = HashMap::new();
+    for func in &module.functions {
+        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
+        signatures.insert(func.name.clone(), (p_types, func.ret_type));
+    }
+
+    let mut engine = JitEngine::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    engine
+        .compile_module(&module)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(PyKernel { engine, signatures })
+}
+
+#[pyfunction]
 pub fn compile(py: Python<'_>, source: &str) -> PyResult<PyKernel> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
 
@@ -305,6 +342,9 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CompilationError", m.py().get_type_bound::<CompilationError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(assemble, m)?)?;
+    m.add_function(wrap_pyfunction!(disassemble, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_binary, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }
