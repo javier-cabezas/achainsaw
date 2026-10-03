@@ -334,15 +334,15 @@ pub fn handle_air_assemble(arguments: &Value) -> Value {
             let binary = match encode_module(&module) {
                 Ok(b) => b,
                 Err(diag) => {
-                    return json_tool_error(
-                        serde_json::from_str(&diag.to_json()).unwrap_or_else(|_| {
+                    return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(
+                        |_| {
                             json!({
                                 "status": "error",
                                 "error_code": diag.error_code,
                                 "message": diag.message
                             })
-                        }),
-                    );
+                        },
+                    ));
                 }
             };
             let b64 = b64_encode(&binary);

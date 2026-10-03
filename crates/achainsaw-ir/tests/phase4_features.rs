@@ -2,8 +2,7 @@ use achainsaw_ir::{
     ast::{Constant, Instruction},
     decode_module, encode_module,
     opt::optimize_module,
-    parse_and_validate,
-    to_air_text,
+    parse_and_validate, to_air_text,
     types::Type,
 };
 
@@ -61,7 +60,7 @@ fn test_type_conversions_and_intrinsics_parsing_and_binary() {
         ret i_val
     "#;
     let module = parse_and_validate(code).expect("should parse and validate phase 4 instructions");
-    
+
     // AIRB encode/decode round trip
     let bytes = encode_module(&module).expect("encode should succeed");
     let decoded = decode_module(&bytes).expect("decode should succeed");
@@ -70,7 +69,10 @@ fn test_type_conversions_and_intrinsics_parsing_and_binary() {
     let orig_fn = &module.functions[0];
     let dec_fn = &decoded.functions[0];
     assert_eq!(orig_fn.name, dec_fn.name);
-    assert_eq!(orig_fn.blocks[0].instructions.len(), dec_fn.blocks[0].instructions.len());
+    assert_eq!(
+        orig_fn.blocks[0].instructions.len(),
+        dec_fn.blocks[0].instructions.len()
+    );
 
     // Disassembly round trip
     let text = to_air_text(&decoded);
@@ -105,5 +107,9 @@ fn test_phase4_constant_folding() {
     let mut module = parse_and_validate(code).expect("valid code");
     let stats = optimize_module(&mut module);
 
-    assert!(stats.constants_folded >= 5, "Expected constant folding of min, max, select, etc., got {}", stats.constants_folded);
+    assert!(
+        stats.constants_folded >= 5,
+        "Expected constant folding of min, max, select, etc., got {}",
+        stats.constants_folded
+    );
 }

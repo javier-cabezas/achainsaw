@@ -127,25 +127,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Check { path, json } => {
-            match run_check(&path) {
-                Ok(stats) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&stats).unwrap());
-                    } else {
-                        println!("Validation OK: {}", stats["function_count"]);
-                    }
-                }
-                Err(diag) => {
-                    if json {
-                        println!("{}", diag.to_json());
-                    } else {
-                        eprintln!("Error [{}]: {}", diag.error_code, diag.message);
-                    }
-                    std::process::exit(1);
+        Commands::Check { path, json } => match run_check(&path) {
+            Ok(stats) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                } else {
+                    println!("Validation OK: {}", stats["function_count"]);
                 }
             }
-        }
+            Err(diag) => {
+                if json {
+                    println!("{}", diag.to_json());
+                } else {
+                    eprintln!("Error [{}]: {}", diag.error_code, diag.message);
+                }
+                std::process::exit(1);
+            }
+        },
         Commands::Run {
             path,
             func,
@@ -367,14 +365,46 @@ fn run_exec(
     for (arg_str, (_, param_ty)) in args.iter().zip(&func.params) {
         let trimmed = arg_str.trim();
         let val = match param_ty {
-            Type::I8 => RtValue::I8(trimmed.parse::<i8>().map_err(|e| anyhow!("Invalid i8 argument '{trimmed}': {e}"))?),
-            Type::I16 => RtValue::I16(trimmed.parse::<i16>().map_err(|e| anyhow!("Invalid i16 argument '{trimmed}': {e}"))?),
-            Type::I32 => RtValue::I32(trimmed.parse::<i32>().map_err(|e| anyhow!("Invalid i32 argument '{trimmed}': {e}"))?),
-            Type::I64 => RtValue::I64(trimmed.parse::<i64>().map_err(|e| anyhow!("Invalid i64 argument '{trimmed}': {e}"))?),
-            Type::Ptr => RtValue::Ptr(trimmed.parse::<usize>().map_err(|e| anyhow!("Invalid ptr argument '{trimmed}': {e}"))?),
-            Type::F32 => RtValue::F32(trimmed.parse::<f32>().map_err(|e| anyhow!("Invalid f32 argument '{trimmed}': {e}"))?),
-            Type::F64 => RtValue::F64(trimmed.parse::<f64>().map_err(|e| anyhow!("Invalid f64 argument '{trimmed}': {e}"))?),
-            Type::V128 => return Err(anyhow!("Direct passing of v128 register arguments not supported via CLI")),
+            Type::I8 => RtValue::I8(
+                trimmed
+                    .parse::<i8>()
+                    .map_err(|e| anyhow!("Invalid i8 argument '{trimmed}': {e}"))?,
+            ),
+            Type::I16 => RtValue::I16(
+                trimmed
+                    .parse::<i16>()
+                    .map_err(|e| anyhow!("Invalid i16 argument '{trimmed}': {e}"))?,
+            ),
+            Type::I32 => RtValue::I32(
+                trimmed
+                    .parse::<i32>()
+                    .map_err(|e| anyhow!("Invalid i32 argument '{trimmed}': {e}"))?,
+            ),
+            Type::I64 => RtValue::I64(
+                trimmed
+                    .parse::<i64>()
+                    .map_err(|e| anyhow!("Invalid i64 argument '{trimmed}': {e}"))?,
+            ),
+            Type::Ptr => RtValue::Ptr(
+                trimmed
+                    .parse::<usize>()
+                    .map_err(|e| anyhow!("Invalid ptr argument '{trimmed}': {e}"))?,
+            ),
+            Type::F32 => RtValue::F32(
+                trimmed
+                    .parse::<f32>()
+                    .map_err(|e| anyhow!("Invalid f32 argument '{trimmed}': {e}"))?,
+            ),
+            Type::F64 => RtValue::F64(
+                trimmed
+                    .parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid f64 argument '{trimmed}': {e}"))?,
+            ),
+            Type::V128 => {
+                return Err(anyhow!(
+                    "Direct passing of v128 register arguments not supported via CLI"
+                ))
+            }
         };
         parsed_args.push(val);
     }
