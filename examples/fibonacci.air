@@ -1,0 +1,22 @@
+# Compute nth Fibonacci number in achainsaw AIR
+fn fib(n:i32)->i32
+  b0:
+    zero = cst 0:i32
+    one = cst 1:i32
+    cond = le n, one
+    br cond, b_base, b_loop_init
+  b_base:
+    ret n
+  b_loop_init:
+    curr_i = cst 2:i32
+    jmp b_loop(curr_i, zero, one)
+  b_loop(i:i32, a:i32, b:i32):
+    cond_loop = le i, n
+    br cond_loop, b_step, b_done
+  b_step:
+    c = add a, b
+    one_step = cst 1:i32
+    next_i = add i, one_step
+    jmp b_loop(next_i, b, c)
+  b_done:
+    ret b

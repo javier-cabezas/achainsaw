@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/achainsaw-ir",
+    "crates/achainsaw-codegen",
+    "crates/achainsaw-cli",
+    "crates/achainsaw-py",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["achainsaw authors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+cranelift-codegen = "0.136.2"
+cranelift-frontend = "0.136.2"
+cranelift-module = "0.136.2"
+cranelift-jit = "0.136.2"
+cranelift-native = "0.136.2"
+target-lexicon = "0.13.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
+anyhow = "1.0"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }

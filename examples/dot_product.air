@@ -1,0 +1,23 @@
+# Compute dot product of two f32 vectors via linear pointer arithmetic
+fn dot(p0:ptr, p1:ptr, n:i64)->f32
+  b0:
+    zero_f = cst 0.0:f32
+    zero_i = cst 0:i64
+    jmp b1(zero_i, zero_f)
+  b1(i:i64, acc:f32):
+    cond = lt i, n
+    br cond, b2, b3
+  b2:
+    four = cst 4:i64
+    byte_off = mul i, four
+    p0_elem = add p0, byte_off
+    p1_elem = add p1, byte_off
+    v0 = ld p0_elem:f32
+    v1 = ld p1_elem:f32
+    prod = mul v0, v1
+    next_acc = add acc, prod
+    one = cst 1:i64
+    next_i = add i, one
+    jmp b1(next_i, next_acc)
+  b3:
+    ret acc

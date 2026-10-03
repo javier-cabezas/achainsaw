@@ -1,0 +1,15 @@
+# Sum numbers from 1 to n in achainsaw AIR
+fn sum_to_n(n:i32)->i32
+  b0:
+    zero = cst 0:i32
+    jmp b1(zero, zero)
+  b1(i:i32, acc:i32):
+    cond = lt i, n
+    br cond, b2, b3
+  b2:
+    one = cst 1:i32
+    next_i = add i, one
+    next_acc = add acc, next_i
+    jmp b1(next_i, next_acc)
+  b3:
+    ret acc

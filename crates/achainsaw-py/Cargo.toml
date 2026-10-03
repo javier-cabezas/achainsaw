@@ -1,0 +1,19 @@
+[package]
+name = "achainsaw-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "achainsaw"
+crate-type = ["cdylib", "rlib"]
+test = false
+
+[dependencies]
+achainsaw-ir = { path = "../achainsaw-ir" }
+achainsaw-codegen = { path = "../achainsaw-codegen" }
+pyo3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

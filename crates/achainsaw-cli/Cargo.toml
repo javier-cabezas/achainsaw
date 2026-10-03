@@ -1,0 +1,18 @@
+[package]
+name = "achainsaw"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "achainsaw"
+path = "src/main.rs"
+
+[dependencies]
+achainsaw-ir = { path = "../achainsaw-ir" }
+achainsaw-codegen = { path = "../achainsaw-codegen" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
