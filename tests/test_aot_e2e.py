@@ -78,7 +78,7 @@ class TestAotCompilation(unittest.TestCase):
             # Unload DLL before removal on Windows
             if hasattr(ctypes, "_FreeLibrary"):
                 ctypes._FreeLibrary(lib._handle)
-            elif hasattr(ctypes.windll.kernel32, "FreeLibrary"):
+            elif hasattr(ctypes, "windll") and hasattr(ctypes.windll, "kernel32"):
                 ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(lib._handle))
 
             if os.path.exists(target_shared):
