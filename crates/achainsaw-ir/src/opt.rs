@@ -137,12 +137,16 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                         op, dst, lhs, rhs, ..
                     } => {
                         let ty = match (types.get(lhs), types.get(rhs)) {
-                            (Some(l), Some(r)) => crate::validator::binary_result_type(*op, *l, *r).ok(),
+                            (Some(l), Some(r)) => {
+                                crate::validator::binary_result_type(*op, *l, *r).ok()
+                            }
                             _ => None,
                         };
                         (dst, ty)
                     }
-                    Instruction::Select { dst, then_val, .. } => (dst, types.get(then_val).copied()),
+                    Instruction::Select { dst, then_val, .. } => {
+                        (dst, types.get(then_val).copied())
+                    }
                     Instruction::Unary { dst, src, .. } => (dst, types.get(src).copied()),
                     Instruction::Cast { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::VectorReduce { dst, ty, .. } => (dst, Some(*ty)),
@@ -201,17 +205,25 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                         rhs,
                         span,
                     } => {
-                        let (op, dst, lhs, rhs, span) = (*op, dst.clone(), lhs.clone(), rhs.clone(), *span);
-                        let (Some(&lhs_ty), Some(&rhs_ty)) = (reg_types.get(&lhs), reg_types.get(&rhs)) else {
+                        let (op, dst, lhs, rhs, span) =
+                            (*op, dst.clone(), lhs.clone(), rhs.clone(), *span);
+                        let (Some(&lhs_ty), Some(&rhs_ty)) =
+                            (reg_types.get(&lhs), reg_types.get(&rhs))
+                        else {
                             continue;
                         };
-                        let Ok(res_ty) = crate::validator::binary_result_type(op, lhs_ty, rhs_ty) else {
+                        let Ok(res_ty) = crate::validator::binary_result_type(op, lhs_ty, rhs_ty)
+                        else {
                             continue;
                         };
 
                         // Full constant folding if both operands are constants
-                        if let (Some((c1, _)), Some((c2, _))) = (constants.get(&lhs), constants.get(&rhs)) {
-                            if let Some((folded_const, folded_ty)) = fold_binary_op(op, c1, lhs_ty, c2, rhs_ty) {
+                        if let (Some((c1, _)), Some((c2, _))) =
+                            (constants.get(&lhs), constants.get(&rhs))
+                        {
+                            if let Some((folded_const, folded_ty)) =
+                                fold_binary_op(op, c1, lhs_ty, c2, rhs_ty)
+                            {
                                 debug_assert_eq!(folded_ty, res_ty);
                                 *inst = Instruction::AssignConst {
                                     dst: dst.clone(),
@@ -226,7 +238,9 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                         }
 
                         // Algebraic simplification
-                        if let Some(res) = simplify_algebraic(op, &lhs, &rhs, &constants, &reg_types, res_ty) {
+                        if let Some(res) =
+                            simplify_algebraic(op, &lhs, &rhs, &constants, &reg_types, res_ty)
+                        {
                             match res {
                                 AlgebraicResult::Constant(c, ty) => {
                                     *inst = Instruction::AssignConst {
@@ -239,7 +253,8 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                                     simplified_count += 1;
                                 }
                                 AlgebraicResult::Identity(source) => {
-                                    let real_source = substitutions.get(&source).cloned().unwrap_or(source);
+                                    let real_source =
+                                        substitutions.get(&source).cloned().unwrap_or(source);
                                     if substitutions.insert(dst, real_source).is_none() {
                                         simplified_count += 1;
                                     }
@@ -273,12 +288,15 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                         ty,
                         span,
                     } => {
-                        let (op, dst, src, target_ty, span) = (*op, dst.clone(), src.clone(), *ty, *span);
+                        let (op, dst, src, target_ty, span) =
+                            (*op, dst.clone(), src.clone(), *ty, *span);
                         let Some(&src_ty) = reg_types.get(&src) else {
                             continue;
                         };
                         if let Some((c, _)) = constants.get(&src) {
-                            if let Some((folded_const, folded_ty)) = fold_cast_op(op, c, src_ty, target_ty) {
+                            if let Some((folded_const, folded_ty)) =
+                                fold_cast_op(op, c, src_ty, target_ty)
+                            {
                                 *inst = Instruction::AssignConst {
                                     dst: dst.clone(),
                                     val: folded_const.clone(),
@@ -298,10 +316,16 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                         else_val,
                         span,
                     } => {
-                        let (dst, cond, then_val, else_val, span) =
-                            (dst.clone(), cond.clone(), then_val.clone(), else_val.clone(), *span);
+                        let (dst, cond, then_val, else_val, span) = (
+                            dst.clone(),
+                            cond.clone(),
+                            then_val.clone(),
+                            else_val.clone(),
+                            *span,
+                        );
                         if then_val == else_val {
-                            let real_source = substitutions.get(&then_val).cloned().unwrap_or(then_val);
+                            let real_source =
+                                substitutions.get(&then_val).cloned().unwrap_or(then_val);
                             if substitutions.insert(dst, real_source).is_none() {
                                 simplified_count += 1;
                             }
@@ -319,7 +343,8 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                                 constants.insert(dst, (c_val.clone(), *c_ty));
                                 folded_count += 1;
                             } else {
-                                let real_source = substitutions.get(&chosen).cloned().unwrap_or(chosen);
+                                let real_source =
+                                    substitutions.get(&chosen).cloned().unwrap_or(chosen);
                                 if substitutions.insert(dst, real_source).is_none() {
                                     simplified_count += 1;
                                 }
@@ -696,7 +721,12 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
     }
 }
 
-fn fold_cast_op(op: CastOp, c: &Constant, src_ty: Type, target_ty: Type) -> Option<(Constant, Type)> {
+fn fold_cast_op(
+    op: CastOp,
+    c: &Constant,
+    src_ty: Type,
+    target_ty: Type,
+) -> Option<(Constant, Type)> {
     match (op, c) {
         (CastOp::Itof, Constant::Int(n)) => {
             let val = src_ty.wrap_int(*n);
@@ -712,7 +742,11 @@ fn fold_cast_op(op: CastOp, c: &Constant, src_ty: Type, target_ty: Type) -> Opti
             if !target_ty.is_int() {
                 return None;
             }
-            let f = if src_ty == Type::F32 { *f as f32 as f64 } else { *f };
+            let f = if src_ty == Type::F32 {
+                *f as f32 as f64
+            } else {
+                *f
+            };
             let bits = target_ty.int_bits()?;
             let (min, max) = if bits == 64 {
                 (i64::MIN, i64::MAX)
@@ -731,14 +765,20 @@ fn fold_cast_op(op: CastOp, c: &Constant, src_ty: Type, target_ty: Type) -> Opti
             Some((Constant::Int(target_ty.wrap_int(int_val)), target_ty))
         }
         (CastOp::Sext, Constant::Int(n)) => {
-            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? <= src_ty.int_bits()? {
+            if !src_ty.is_int()
+                || !target_ty.is_int()
+                || target_ty.int_bits()? <= src_ty.int_bits()?
+            {
                 return None;
             }
             let val = src_ty.wrap_int(*n);
             Some((Constant::Int(target_ty.wrap_int(val)), target_ty))
         }
         (CastOp::Zext, Constant::Int(n)) => {
-            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? <= src_ty.int_bits()? {
+            if !src_ty.is_int()
+                || !target_ty.is_int()
+                || target_ty.int_bits()? <= src_ty.int_bits()?
+            {
                 return None;
             }
             let bits = src_ty.int_bits()?;
@@ -746,7 +786,10 @@ fn fold_cast_op(op: CastOp, c: &Constant, src_ty: Type, target_ty: Type) -> Opti
             Some((Constant::Int(target_ty.wrap_int(uval)), target_ty))
         }
         (CastOp::Trunc, Constant::Int(n)) => {
-            if !src_ty.is_int() || !target_ty.is_int() || target_ty.int_bits()? >= src_ty.int_bits()? {
+            if !src_ty.is_int()
+                || !target_ty.is_int()
+                || target_ty.int_bits()? >= src_ty.int_bits()?
+            {
                 return None;
             }
             Some((Constant::Int(target_ty.wrap_int(*n)), target_ty))
