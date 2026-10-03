@@ -10,6 +10,58 @@ use std::time::Instant;
 
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// MCP protocol revisions this server speaks, newest first.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// AIR primer returned in the `initialize` result. MCP clients such as Claude Code and
+/// Claude Desktop inject it into the model context, so agents can write valid AIR
+/// without having seen the language before. Keep in sync with the parser and validator.
+pub const SERVER_INSTRUCTIONS: &str = "\
+achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode.
+
+AIR syntax:
+- Types: i8 i16 i32 i64 f32 f64 ptr v128 (4 x f32 or 4 x i32).
+- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`.
+- First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
+- One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
+- Each block ends with exactly one terminator: `jmp b(args)` | `br cond, b_then(args), b_else(args)` | `ret v` | `ret`.
+- Constants: `x = cst 5:i32`, `f = cst 1.5:f32`. Operands may be inline immediates: `y = add x, 1:i32`.
+- Binary (operands must share a type): add sub mul div rem and or xor shl shr min max udiv urem ushr umin umax.
+- Compare -> i32 0/1: eq ne lt gt le ge ult ugt ule uge.
+- Pointers: `p2 = add p, off` with off:i64; `v = ld p:f32`; `st p, v`; `p = alloc n` (n:i64 bytes); `free p`.
+- Other: `s = select c, a, b`; unary neg abs sqrt; casts `itof x:f32` ftoi sext zext trunc fext ftrunc bitcast (`dst = op src:ty`).
+- SIMD: `v = splat f`; vfadd vfsub vfmul vfdiv viadd visub vimul; `e = extlane v, 0:f32`; reductions `vfsum v:f32` vfmax visum.
+- Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
+- Comments: `#` or `//`. Names starting with `__` are reserved.
+
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (v128 params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop.
+
+Example:
+fn sum_to(n:i64)->i64
+  b0:
+    jmp b1(0:i64, 0:i64)
+  b1(i:i64, acc:i64):
+    c = lt i, n
+    br c, b2, b3
+  b2:
+    acc2 = add acc, i
+    i2 = add i, 1:i64
+    jmp b1(i2, acc2)
+  b3:
+    ret acc
+";
+
+/// Picks the protocol version for the `initialize` response: the client's requested
+/// version if we support it, otherwise our latest (the client then decides whether to proceed).
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|&&v| v == r))
+        .copied()
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
+
 pub fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -374,6 +426,21 @@ pub fn handle_air_optimize(arguments: &Value) -> Value {
     }))
 }
 
+pub fn handle_initialize(params: &Value) -> Value {
+    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+    json!({
+        "protocolVersion": negotiate_protocol_version(requested),
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "achainsaw-mcp",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "instructions": SERVER_INSTRUCTIONS
+    })
+}
+
 pub fn get_tools_list() -> Value {
     json!({
         "tools": [
@@ -513,19 +580,11 @@ pub fn run_mcp_server() -> Result<()> {
 
         let response = match method {
             "initialize" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "achainsaw-mcp",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }
+                    "result": handle_initialize(&params)
                 })
             }
             "ping" => {
@@ -608,6 +667,46 @@ mod tests {
             let decoded = b64_decode(&encoded).expect("decode failed");
             assert_eq!(*data, &decoded[..]);
         }
+    }
+
+    #[test]
+    fn test_protocol_version_negotiation() {
+        assert_eq!(negotiate_protocol_version(Some("2024-11-05")), "2024-11-05");
+        assert_eq!(negotiate_protocol_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(
+            negotiate_protocol_version(Some("1999-01-01")),
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+        assert_eq!(
+            negotiate_protocol_version(None),
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+    }
+
+    #[test]
+    fn test_mcp_initialize() {
+        let res = handle_initialize(&json!({ "protocolVersion": "2025-06-18" }));
+        assert_eq!(res["protocolVersion"], "2025-06-18");
+        assert_eq!(res["serverInfo"]["name"], "achainsaw-mcp");
+        assert!(res["capabilities"]["tools"].is_object());
+        assert_eq!(res["instructions"], SERVER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn test_server_instructions_example_is_valid_air() {
+        let example = SERVER_INSTRUCTIONS
+            .split_once("Example:\n")
+            .expect("instructions must contain an example")
+            .1;
+        let res = handle_air_run(&json!({
+            "code": example,
+            "func": "sum_to",
+            "args": [10]
+        }));
+        assert_eq!(res["isError"], false, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["result"], 45);
     }
 
     #[test]
