@@ -152,9 +152,7 @@ impl PyKernel {
             rt_args.push(rt_val);
         }
 
-        let res_rt = unsafe {
-            self.engine.call_typed(func_name, &rt_args)
-        }.map_err(|e| {
+        let res_rt = unsafe { self.engine.call_typed(func_name, &rt_args) }.map_err(|e| {
             check_execution_status_py(py).err().unwrap_or_else(|| {
                 let err_type = py.get_type_bound::<ExecutionError>();
                 PyErr::from_value_bound(err_type.call1((e.to_string(),)).unwrap())
@@ -412,10 +410,7 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "CompilationError",
         m.py().get_type_bound::<CompilationError>(),
     )?;
-    m.add(
-        "ExecutionError",
-        m.py().get_type_bound::<ExecutionError>(),
-    )?;
+    m.add("ExecutionError", m.py().get_type_bound::<ExecutionError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;

@@ -3,6 +3,9 @@ use crate::diag::{Diagnostic, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::types::Type;
 
+/// Function signature: name, typed params, optional return type.
+type Signature = (String, Vec<(String, Type)>, Option<Type>);
+
 pub struct Parser<'a> {
     _source: &'a str,
     tokens: Vec<Token>,
@@ -268,9 +271,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_signature(
-        &mut self,
-    ) -> Result<(String, Vec<(String, Type)>, Option<Type>), Diagnostic> {
+    fn parse_signature(&mut self) -> Result<Signature, Diagnostic> {
         let (name, _) = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
         let params = self.parse_typed_params()?;

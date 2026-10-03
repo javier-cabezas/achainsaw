@@ -528,7 +528,8 @@ impl JitEngine {
                 self.module.get_name(&tramp_name)
             {
                 let tptr = self.module.get_finalized_function(tid);
-                self.trampoline_ptrs.insert(func.name.clone(), tptr as usize);
+                self.trampoline_ptrs
+                    .insert(func.name.clone(), tptr as usize);
             }
         }
 
