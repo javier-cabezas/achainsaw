@@ -261,11 +261,7 @@ impl<'a> Lexer<'a> {
 
             return if is_float {
                 let val: f64 = num_str.parse().map_err(|e| {
-                    Diagnostic::error(
-                        "ERR_LEXICAL",
-                        format!("Invalid float {num_str}: {e}"),
-                        span,
-                    )
+                    Diagnostic::error("ERR_LEXICAL", format!("Invalid float {num_str}: {e}"), span)
                 })?;
                 Ok(Token {
                     kind: TokenKind::FloatLit(val),
@@ -328,9 +324,8 @@ impl<'a> Lexer<'a> {
                 "visum" => TokenKind::VectorReduce(crate::ast::VectorReduceOp::ViSum),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
                 | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "vfadd" | "vfsub" | "vfmul"
-                | "vfdiv" | "viadd" | "visub" | "vimul"
-                | "min" | "max" | "umin" | "umax" | "udiv" | "urem" | "ushr"
-                | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),
+                | "vfdiv" | "viadd" | "visub" | "vimul" | "min" | "max" | "umin" | "umax"
+                | "udiv" | "urem" | "ushr" | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),
                 _ => TokenKind::Ident(ident),
             };
 

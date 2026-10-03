@@ -21,7 +21,6 @@ pub fn encode_module(module: &Module) -> Result<Vec<u8>, Diagnostic> {
     Ok(encoder.finish())
 }
 
-
 /// Deserializes AIRB binary bytes into an in-memory `Module`.
 pub fn decode_module(bytes: &[u8]) -> Result<Module, Diagnostic> {
     let mut decoder = BinaryDecoder::new(bytes);

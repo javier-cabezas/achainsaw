@@ -170,7 +170,10 @@ impl Validator {
         if func.blocks.is_empty() {
             return Err(Diagnostic::error(
                 "ERR_EMPTY_FUNCTION",
-                format!("Function '{}' must have at least one basic block", func.name),
+                format!(
+                    "Function '{}' must have at least one basic block",
+                    func.name
+                ),
                 func.span,
             ));
         }
@@ -366,7 +369,10 @@ impl Validator {
         match inst {
             Instruction::AssignConst { dst, val, ty, span } => {
                 match (val, ty) {
-                    (Constant::Int(n), Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr) => {
+                    (
+                        Constant::Int(n),
+                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr,
+                    ) => {
                         if !ty.int_literal_fits(*n) {
                             return Err(Diagnostic::error(
                                 "ERR_CONSTANT_OUT_OF_RANGE",
@@ -570,19 +576,16 @@ impl Validator {
                 }
                 Self::define(scope, defs, dst, then_ty, *span)?;
             }
-            Instruction::Unary {
-                op,
-                dst,
-                src,
-                span,
-            } => {
+            Instruction::Unary { op, dst, src, span } => {
                 let src_ty = self.check_reg(ctx, src, scope, *span)?;
                 let out_ty = match op {
                     UnaryOp::Sqrt => {
                         if !matches!(src_ty, Type::F32 | Type::F64) {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
-                                format!("Sqrt operand must be float (f32 or f64), found '{src_ty}'"),
+                                format!(
+                                    "Sqrt operand must be float (f32 or f64), found '{src_ty}'"
+                                ),
                                 *span,
                             ));
                         }
@@ -816,7 +819,9 @@ impl Validator {
             if actual_ty != *expected_ty {
                 return Err(Diagnostic::error(
                     "ERR_TYPE_MISMATCH",
-                    format!("{what} argument '{arg}' has type '{actual_ty}', expected '{expected_ty}'"),
+                    format!(
+                        "{what} argument '{arg}' has type '{actual_ty}', expected '{expected_ty}'"
+                    ),
                     span,
                 ));
             }

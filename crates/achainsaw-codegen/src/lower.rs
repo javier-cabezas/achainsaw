@@ -45,12 +45,20 @@ pub fn lower_function<M: ClifModule>(
     func_returns: &HashMap<String, Option<Type>>,
     config: &LowerConfig,
 ) -> Result<()> {
-    ctx.func.signature.clear(module.target_config().default_call_conv);
+    ctx.func
+        .signature
+        .clear(module.target_config().default_call_conv);
     for (_, p_ty) in &func.params {
-        ctx.func.signature.params.push(AbiParam::new(to_clif_type(*p_ty)));
+        ctx.func
+            .signature
+            .params
+            .push(AbiParam::new(to_clif_type(*p_ty)));
     }
     if let Some(r_ty) = func.ret_type {
-        ctx.func.signature.returns.push(AbiParam::new(to_clif_type(r_ty)));
+        ctx.func
+            .signature
+            .returns
+            .push(AbiParam::new(to_clif_type(r_ty)));
     }
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
@@ -145,13 +153,16 @@ pub fn lower_function<M: ClifModule>(
                                 (ext, Type::I32)
                             }
                             BinaryOp::Gt => {
-                                let cmp = builder.ins().fcmp(FloatCC::GreaterThan, lhs_val, rhs_val);
+                                let cmp =
+                                    builder.ins().fcmp(FloatCC::GreaterThan, lhs_val, rhs_val);
                                 let ext = builder.ins().uextend(types::I32, cmp);
                                 (ext, Type::I32)
                             }
                             BinaryOp::Le => {
                                 let cmp =
-                                    builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs_val, rhs_val);
+                                    builder
+                                        .ins()
+                                        .fcmp(FloatCC::LessThanOrEqual, lhs_val, rhs_val);
                                 let ext = builder.ins().uextend(types::I32, cmp);
                                 (ext, Type::I32)
                             }
@@ -174,24 +185,45 @@ pub fn lower_function<M: ClifModule>(
                             BinaryOp::VfMul => (builder.ins().fmul(lhs_val, rhs_val), Type::V128),
                             BinaryOp::VfDiv => (builder.ins().fdiv(lhs_val, rhs_val), Type::V128),
                             BinaryOp::ViAdd => {
-                                let lhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), lhs_val);
-                                let rhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), rhs_val);
+                                let lhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), lhs_val);
+                                let rhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), rhs_val);
                                 let sum_i = builder.ins().iadd(lhs_i, rhs_i);
-                                let res = builder.ins().bitcast(types::F32X4, bitcast_flags(), sum_i);
+                                let res =
+                                    builder.ins().bitcast(types::F32X4, bitcast_flags(), sum_i);
                                 (res, Type::V128)
                             }
                             BinaryOp::ViSub => {
-                                let lhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), lhs_val);
-                                let rhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), rhs_val);
+                                let lhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), lhs_val);
+                                let rhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), rhs_val);
                                 let diff_i = builder.ins().isub(lhs_i, rhs_i);
-                                let res = builder.ins().bitcast(types::F32X4, bitcast_flags(), diff_i);
+                                let res =
+                                    builder.ins().bitcast(types::F32X4, bitcast_flags(), diff_i);
                                 (res, Type::V128)
                             }
                             BinaryOp::ViMul => {
-                                let lhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), lhs_val);
-                                let rhs_i = builder.ins().bitcast(types::I32X4, bitcast_flags(), rhs_val);
+                                let lhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), lhs_val);
+                                let rhs_i =
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I32X4, bitcast_flags(), rhs_val);
                                 let prod_i = builder.ins().imul(lhs_i, rhs_i);
-                                let res = builder.ins().bitcast(types::F32X4, bitcast_flags(), prod_i);
+                                let res =
+                                    builder.ins().bitcast(types::F32X4, bitcast_flags(), prod_i);
                                 (res, Type::V128)
                             }
                             _ => return Err(anyhow!("Unsupported vector op {:?}", op)),
@@ -214,8 +246,10 @@ pub fn lower_function<M: ClifModule>(
                                 BinaryOp::Mul => (builder.ins().imul(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Div | BinaryOp::Rem => {
                                     // Safe division and remainder: guard against division by zero and INT_MIN / -1
-                                    let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, 0);
-                                    let is_neg_one = builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, -1);
+                                    let is_zero =
+                                        builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, 0);
+                                    let is_neg_one =
+                                        builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, -1);
                                     let min_val = match lhs_ty {
                                         Type::I8 => -128i64,
                                         Type::I16 => -32768i64,
@@ -223,7 +257,8 @@ pub fn lower_function<M: ClifModule>(
                                         Type::I64 | Type::Ptr => i64::MIN,
                                         _ => 0i64,
                                     };
-                                    let is_min = builder.ins().icmp_imm_s(IntCC::Equal, lhs_val, min_val);
+                                    let is_min =
+                                        builder.ins().icmp_imm_s(IntCC::Equal, lhs_val, min_val);
                                     let is_ovf = builder.ins().band(is_neg_one, is_min);
                                     let is_bad = builder.ins().bor(is_zero, is_ovf);
 
@@ -244,7 +279,9 @@ pub fn lower_function<M: ClifModule>(
 
                                     builder.switch_to_block(bad_block);
                                     let zero_res = builder.ins().iconst(clif_ty, 0);
-                                    builder.ins().jump(merge_block, &[BlockArg::Value(zero_res)]);
+                                    builder
+                                        .ins()
+                                        .jump(merge_block, &[BlockArg::Value(zero_res)]);
 
                                     builder.switch_to_block(merge_block);
                                     let res = builder.block_params(merge_block)[0];
@@ -272,9 +309,11 @@ pub fn lower_function<M: ClifModule>(
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Gt => {
-                                    let cmp = builder
-                                        .ins()
-                                        .icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val);
+                                    let cmp = builder.ins().icmp(
+                                        IntCC::SignedGreaterThan,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
@@ -302,27 +341,44 @@ pub fn lower_function<M: ClifModule>(
                                 BinaryOp::Umax => (builder.ins().umax(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Ushr => (builder.ins().ushr(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Ult => {
-                                    let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, lhs_val, rhs_val);
+                                    let cmp = builder.ins().icmp(
+                                        IntCC::UnsignedLessThan,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Ugt => {
-                                    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThan, lhs_val, rhs_val);
+                                    let cmp = builder.ins().icmp(
+                                        IntCC::UnsignedGreaterThan,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Ule => {
-                                    let cmp = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, lhs_val, rhs_val);
+                                    let cmp = builder.ins().icmp(
+                                        IntCC::UnsignedLessThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Uge => {
-                                    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_val, rhs_val);
+                                    let cmp = builder.ins().icmp(
+                                        IntCC::UnsignedGreaterThanOrEqual,
+                                        lhs_val,
+                                        rhs_val,
+                                    );
                                     let ext = builder.ins().uextend(types::I32, cmp);
                                     (ext, Type::I32)
                                 }
                                 BinaryOp::Udiv | BinaryOp::Urem => {
-                                    let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, 0);
+                                    let is_zero =
+                                        builder.ins().icmp_imm_s(IntCC::Equal, rhs_val, 0);
                                     let safe_block = builder.create_block();
                                     let bad_block = builder.create_block();
                                     let merge_block = builder.create_block();
@@ -340,7 +396,9 @@ pub fn lower_function<M: ClifModule>(
 
                                     builder.switch_to_block(bad_block);
                                     let zero_res = builder.ins().iconst(clif_ty, 0);
-                                    builder.ins().jump(merge_block, &[BlockArg::Value(zero_res)]);
+                                    builder
+                                        .ins()
+                                        .jump(merge_block, &[BlockArg::Value(zero_res)]);
 
                                     builder.switch_to_block(merge_block);
                                     let res = builder.block_params(merge_block)[0];
@@ -368,11 +426,14 @@ pub fn lower_function<M: ClifModule>(
                         .store(MemFlagsData::trusted(), val_val, ptr_val, 0);
                 }
                 Instruction::Call {
-                    dst, func: callee_name, args, ..
+                    dst,
+                    func: callee_name,
+                    args,
+                    ..
                 } => {
-                    let target_func_id = *func_ids.get(callee_name).ok_or_else(|| {
-                        anyhow!("Unknown function '{callee_name}' in call")
-                    })?;
+                    let target_func_id = *func_ids
+                        .get(callee_name)
+                        .ok_or_else(|| anyhow!("Unknown function '{callee_name}' in call"))?;
                     let callee = module.declare_func_in_func(target_func_id, builder.func);
                     let arg_vals: Vec<ClifValue> =
                         args.iter().map(|a| values.get(a).unwrap().0).collect();
@@ -415,15 +476,21 @@ pub fn lower_function<M: ClifModule>(
                     let scalar_val = match ty {
                         Type::F32 => builder.ins().extractlane(vec_val, *lane as u8),
                         Type::I32 => {
-                            let vi = builder.ins().bitcast(types::I32X4, bitcast_flags(), vec_val);
+                            let vi = builder
+                                .ins()
+                                .bitcast(types::I32X4, bitcast_flags(), vec_val);
                             builder.ins().extractlane(vi, *lane as u8)
                         }
                         Type::F64 => {
-                            let vf = builder.ins().bitcast(types::F64X2, bitcast_flags(), vec_val);
+                            let vf = builder
+                                .ins()
+                                .bitcast(types::F64X2, bitcast_flags(), vec_val);
                             builder.ins().extractlane(vf, *lane as u8)
                         }
                         Type::I64 => {
-                            let vi = builder.ins().bitcast(types::I64X2, bitcast_flags(), vec_val);
+                            let vi = builder
+                                .ins()
+                                .bitcast(types::I64X2, bitcast_flags(), vec_val);
                             builder.ins().extractlane(vi, *lane as u8)
                         }
                         _ => builder.ins().extractlane(vec_val, *lane as u8),
@@ -484,11 +551,7 @@ pub fn lower_function<M: ClifModule>(
                     values.insert(dst.clone(), (res, src_ty));
                 }
                 Instruction::Cast {
-                    op,
-                    dst,
-                    src,
-                    ty,
-                    ..
+                    op, dst, src, ty, ..
                 } => {
                     let (src_val, _) = *values.get(src).unwrap();
                     let clif_target_ty = to_clif_type(*ty);
@@ -508,17 +571,15 @@ pub fn lower_function<M: ClifModule>(
                         CastOp::Fext => builder.ins().fpromote(types::F64, src_val),
                         CastOp::Ftrunc => builder.ins().fdemote(types::F32, src_val),
                         CastOp::Bitcast => {
-                            builder.ins().bitcast(clif_target_ty, bitcast_flags(), src_val)
+                            builder
+                                .ins()
+                                .bitcast(clif_target_ty, bitcast_flags(), src_val)
                         }
                     };
                     values.insert(dst.clone(), (res, *ty));
                 }
                 Instruction::VectorReduce {
-                    op,
-                    dst,
-                    src,
-                    ty,
-                    ..
+                    op, dst, src, ty, ..
                 } => {
                     let (src_val, _) = *values.get(src).unwrap();
                     let res = match op {
@@ -541,7 +602,9 @@ pub fn lower_function<M: ClifModule>(
                             builder.ins().fmax(m01, m23)
                         }
                         VectorReduceOp::ViSum => {
-                            let vi = builder.ins().bitcast(types::I32X4, bitcast_flags(), src_val);
+                            let vi = builder
+                                .ins()
+                                .bitcast(types::I32X4, bitcast_flags(), src_val);
                             let l0 = builder.ins().extractlane(vi, 0);
                             let l1 = builder.ins().extractlane(vi, 1);
                             let l2 = builder.ins().extractlane(vi, 2);
@@ -610,21 +673,13 @@ pub fn lower_function<M: ClifModule>(
                         .brif(is_exhausted, trap_block, &[], normal_br_block, &[]);
 
                     builder.switch_to_block(normal_br_block);
-                    builder.ins().brif(
-                        cond_val,
-                        then_target,
-                        &then_vals,
-                        else_target,
-                        &else_vals,
-                    );
+                    builder
+                        .ins()
+                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
                 } else {
-                    builder.ins().brif(
-                        cond_val,
-                        then_target,
-                        &then_vals,
-                        else_target,
-                        &else_vals,
-                    );
+                    builder
+                        .ins()
+                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
                 }
             }
             Terminator::Ret { val, .. } => {
@@ -683,7 +738,7 @@ impl RtValue {
             (RtValue::I32(n), Type::I32) => Ok((n as u32) as u64),
             (RtValue::I64(n), Type::I64) => Ok(n as u64),
             (RtValue::Ptr(p), Type::Ptr) => Ok(p as u64),
-            (RtValue::F32(f), Type::F32) => Ok((f.to_bits() as u32) as u64),
+            (RtValue::F32(f), Type::F32) => Ok(f.to_bits() as u64),
             (RtValue::F64(f), Type::F64) => Ok(f.to_bits()),
             // Allow loose integer conversions if within range
             (RtValue::I64(n), Type::I32) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
@@ -750,7 +805,9 @@ pub fn lower_trampoline<M: ClifModule>(
     let mut arg_vals = Vec::with_capacity(param_types.len());
     for (i, &ty) in param_types.iter().enumerate() {
         let offset = (i * 8) as i32;
-        let raw_val = builder.ins().load(types::I64, MemFlagsData::trusted(), args_ptr, offset);
+        let raw_val = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), args_ptr, offset);
         let arg_val = match ty {
             Type::I64 | Type::Ptr => raw_val,
             Type::I32 => builder.ins().ireduce(types::I32, raw_val),
@@ -781,7 +838,9 @@ pub fn lower_trampoline<M: ClifModule>(
             }
             Type::V128 => return Err(anyhow!("Cannot return v128 directly in scalar trampoline")),
         };
-        builder.ins().store(MemFlagsData::trusted(), res_i64, ret_ptr, 0);
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), res_i64, ret_ptr, 0);
     }
 
     builder.ins().return_(&[]);
