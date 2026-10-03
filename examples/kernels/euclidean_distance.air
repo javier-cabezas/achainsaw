@@ -1,0 +1,36 @@
+# Euclidean Distance (L2) Kernel (128-bit SIMD)
+# Computes: sqrt(sum((a_i - b_i)^2))
+extfn sqrtf(x:f32)->f32
+
+fn euclidean_distance(p0:ptr, p1:ptr, n:i64)->f32
+  b0:
+    zero_f = cst 0.0:f32
+    vacc = splat zero_f
+    zero_i = cst 0:i64
+    jmp b_loop(zero_i, vacc)
+  b_loop(i:i64, acc:v128):
+    cond = lt i, n
+    br cond, b_body, b_done
+  b_body:
+    sixteen = cst 16:i64
+    byte_off = mul i, sixteen
+    a_ptr = add p0, byte_off
+    b_ptr = add p1, byte_off
+    va = ld a_ptr:v128
+    vb = ld b_ptr:v128
+    vdiff = vfsub va, vb
+    vsq = vfmul vdiff, vdiff
+    next_acc = vfadd acc, vsq
+    one = cst 1:i64
+    next_i = add i, one
+    jmp b_loop(next_i, next_acc)
+  b_done:
+    l0 = extlane acc, 0:f32
+    l1 = extlane acc, 1:f32
+    l2 = extlane acc, 2:f32
+    l3 = extlane acc, 3:f32
+    s01 = add l0, l1
+    s23 = add l2, l3
+    sum_sq = add s01, s23
+    dist = call sqrtf(sum_sq)
+    ret dist

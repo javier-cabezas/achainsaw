@@ -81,6 +81,32 @@ impl PyKernel {
         // Floats are passed in XMM0-XMM3.
         dispatch_call(py, fn_ptr, param_types, ret_type, args)
     }
+
+    #[pyo3(signature = (*args))]
+    pub fn __call__(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<PyObject> {
+        if !args.is_empty() {
+            if let Ok(name) = args.get_item(0)?.extract::<String>() {
+                if self.signatures.contains_key(&name) {
+                    let sub_args = args.get_slice(1, args.len());
+                    return self.run(py, &name, &sub_args);
+                }
+            }
+        }
+        if self.signatures.len() == 1 {
+            let func_name = self.signatures.keys().next().unwrap().clone();
+            return self.run(py, &func_name, args);
+        }
+        if self.signatures.contains_key("main") {
+            return self.run(py, "main", args);
+        }
+        Err(pyo3::exceptions::PyValueError::new_err(
+            "Kernel has multiple functions. Specify function name as first argument or call kernel.run('func_name', ...)"
+        ))
+    }
 }
 
 fn dispatch_call(
@@ -203,6 +229,16 @@ fn dispatch_call(
                 f(i_vals[0], i_vals[1], i_vals[2]);
                 Ok(py.None())
             }
+            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32], None) => {
+                let f: extern "C" fn(i64, i64, i64, i64) = std::mem::transmute(fn_ptr);
+                f(i_vals[0], i_vals[1], i_vals[2], i_vals[3]);
+                Ok(py.None())
+            }
+            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32], None) => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64) = std::mem::transmute(fn_ptr);
+                f(i_vals[0], i_vals[1], i_vals[2], i_vals[3], i_vals[4]);
+                Ok(py.None())
+            }
 
             // Integer returns
             ([], Some(Type::I32)) => {
@@ -237,6 +273,11 @@ fn dispatch_call(
                 let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(fn_ptr);
                 Ok(f(i_vals[0], i_vals[1]).into_py(py))
             }
+            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32], Some(Type::I64)) => {
+                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, i64) -> i64 = std::mem::transmute(fn_ptr);
+                let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2] as *const u8, i_vals[3], i_vals[4]);
+                Ok(res.into_py(py))
+            }
 
             // Float returns
             ([Type::F32], Some(Type::F32)) => {
@@ -258,6 +299,11 @@ fn dispatch_call(
             ([Type::Ptr, Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
                 let f: extern "C" fn(*const u8, *const u8, i64) -> f32 = std::mem::transmute(fn_ptr);
                 let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2]);
+                Ok(res.into_py(py))
+            }
+            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::F32], Some(Type::F32)) => {
+                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, f32) -> f32 = std::mem::transmute(fn_ptr);
+                let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2] as *const u8, i_vals[3], f_vals[0] as f32);
                 Ok(res.into_py(py))
             }
             ([Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {

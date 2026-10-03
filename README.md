@@ -162,6 +162,25 @@ achainsaw mcp
 
 ---
 
+## ⚡ Chainsaw-BLAS: High-Performance Agent AI Kernel Library
+
+`achainsaw` ships with pre-compiled, mathematically verified AI kernels in `examples/kernels/` targeting LLM inference primitives, vector search, and token normalization:
+
+| Kernel | Source | Bytecode | Primary Use Case | Numerical Error |
+|---|---|---|---|---|
+| **Cosine Similarity** | `cosine_similarity.air` | `.airb` | High-throughput embedding search & RAG | `< 1e-7` |
+| **Euclidean Distance (L2)** | `euclidean_distance.air` | `.airb` | Vector quantization & nearest neighbors | `0.00e+00` |
+| **Numerically Stable Softmax** | `softmax.air` | `.airb` | Attention head weighting ($\exp(x_i - \max)/\sum \exp$) | `< 1e-8` |
+| **RMSNorm** | `rmsnorm.air` | `.airb` | Transformer token normalization (LLaMA, Mistral, Gemma) | `< 5e-7` |
+| **GEMV (f32)** | `gemv_f32.air` | `.airb` | Matrix-vector linear projection | `< 3e-5` |
+
+Run the kernel benchmarks and numerical accuracy verification suite:
+```bash
+python benchmarks/benchmark_kernels.py
+```
+
+---
+
 ## 🐍 Python Host Integration (`achainsaw-py`)
 
 For AI agent orchestrators (LangGraph, AutoGen, CrewAI, DSPy), `achainsaw` provides native in-process Python bindings via PyO3 with **zero-copy NumPy memory integration** and microsecond compilation throughput.

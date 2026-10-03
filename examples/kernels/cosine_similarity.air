@@ -1,0 +1,67 @@
+# Cosine Similarity Kernel (128-bit SIMD)
+# Computes: dot(a, b) / (sqrt(norm(a)) * sqrt(norm(b)) + 1e-12)
+extfn sqrtf(x:f32)->f32
+
+fn cosine_similarity(p0:ptr, p1:ptr, n:i64)->f32
+  b0:
+    zero_f = cst 0.0:f32
+    vdot = splat zero_f
+    vna = splat zero_f
+    vnb = splat zero_f
+    zero_i = cst 0:i64
+    jmp b_loop(zero_i, vdot, vna, vnb)
+  b_loop(i:i64, acc_dot:v128, acc_na:v128, acc_nb:v128):
+    cond = lt i, n
+    br cond, b_body, b_done
+  b_body:
+    sixteen = cst 16:i64
+    byte_off = mul i, sixteen
+    a_ptr = add p0, byte_off
+    b_ptr = add p1, byte_off
+    va = ld a_ptr:v128
+    vb = ld b_ptr:v128
+    prod_dot = vfmul va, vb
+    next_dot = vfadd acc_dot, prod_dot
+    prod_na = vfmul va, va
+    next_na = vfadd acc_na, prod_na
+    prod_nb = vfmul vb, vb
+    next_nb = vfadd acc_nb, prod_nb
+    one = cst 1:i64
+    next_i = add i, one
+    jmp b_loop(next_i, next_dot, next_na, next_nb)
+  b_done:
+    # Reduce dot product
+    d0 = extlane acc_dot, 0:f32
+    d1 = extlane acc_dot, 1:f32
+    d2 = extlane acc_dot, 2:f32
+    d3 = extlane acc_dot, 3:f32
+    d01 = add d0, d1
+    d23 = add d2, d3
+    sum_dot = add d01, d23
+
+    # Reduce norm A
+    a0 = extlane acc_na, 0:f32
+    a1 = extlane acc_na, 1:f32
+    a2 = extlane acc_na, 2:f32
+    a3 = extlane acc_na, 3:f32
+    a01 = add a0, a1
+    a23 = add a2, a3
+    sum_na = add a01, a23
+
+    # Reduce norm B
+    b0_val = extlane acc_nb, 0:f32
+    b1_val = extlane acc_nb, 1:f32
+    b2_val = extlane acc_nb, 2:f32
+    b3_val = extlane acc_nb, 3:f32
+    b01 = add b0_val, b1_val
+    b23 = add b2_val, b3_val
+    sum_nb = add b01, b23
+
+    # Compute cosine similarity
+    norm_a = call sqrtf(sum_na)
+    norm_b = call sqrtf(sum_nb)
+    denom = mul norm_a, norm_b
+    eps = cst 0.000000000001:f32
+    safe_denom = add denom, eps
+    sim = div sum_dot, safe_denom
+    ret sim
