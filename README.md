@@ -164,6 +164,7 @@ achainsaw mcp
 - **`air_assemble`**: Assembles textual AIR into compact base64-encoded AIRB bytecode with compression metrics.
 - **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
 - **`air_optimize`**: Optimizes IR using constant folding, algebraic simplification, branch folding, and DCE to a fixpoint.
+- **`air_target`**: Reports the host's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and each backend's vector width (see [CPU Features & ISA Targeting](#9-cpu-features--isa-targeting-achainsaw-cpu)).
 
 The `initialize` response includes server `instructions`, a compact AIR syntax primer that MCP clients inject into the model's context. That lets an agent write valid AIR on the first attempt without this README.
 
@@ -237,6 +238,46 @@ achainsaw build examples/fibonacci.air --shared --json
   "link_time_us": 112751,
   "total_time_ms": 116.0
 }
+```
+
+### 9. CPU Features & ISA Targeting (`achainsaw cpu`)
+Report the host's vector ISA features (feature names use LLVM spelling), the active ISA cap, and the vector width each code generation backend uses:
+```bash
+achainsaw cpu
+```
+
+```json
+{
+  "status": "ok",
+  "host": {
+    "arch": "x86_64",
+    "features": ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16", "avx", "f16c", "avx2", "fma", "...", "avx512f", "avx512vl", "avx512bw", "avx512bf16"],
+    "max_isa": "avx512",
+    "native_vector_bits": 512,
+    "sve_vector_bits": null,
+    "sme_vector_bits": null
+  },
+  "isa_cap": null,
+  "effective": { "...": "host features after the ISA cap" },
+  "backends": {
+    "cranelift": { "available": true, "vector_bits": 128, "unused_features": ["f16c", "avx512bw", "avx512cd", "avx512bf16"] },
+    "llvm": { "available": false }
+  }
+}
+```
+
+Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift currently emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available); 256/512-bit, scalable, and matrix code generation is planned for an opt-in LLVM backend.
+
+**Cap the ISA level** to exercise lower tiers on a more capable machine (for example, AVX2 code on an AVX-512 host). Levels: `sse`, `avx`, `avx2`, `avx512`, `amx` (x86_64) and `neon`, `sve`, `sve2`, `sme` (AArch64):
+```bash
+achainsaw run examples/sum_loop.air --func sum_to_n --args 100 --isa avx2
+ACHAINSAW_MAX_ISA=sse achainsaw mcp      # every JIT compilation in the server is capped
+```
+
+**Target a specific CPU in AOT builds** with LLVM CPU names and feature strings. `+feature` also enables its prerequisites and `-feature` disables everything that depends on it, as in LLVM. Features the backend cannot use are listed in `ignored_features`:
+```bash
+achainsaw build examples/kernels/gemv_f32.air --target-cpu x86-64-v3
+achainsaw build examples/kernels/gemv_f32.air --target-cpu znver4 --target-features -avx512f
 ```
 
 ---
@@ -325,6 +366,16 @@ except achainsaw.CompilationError as e:
         diag["context"]["available_registers"][0]
     )
     k = achainsaw.compile(repaired_code)
+```
+
+### CPU Features & ISA Cap in Python
+```python
+report = achainsaw.cpu_features()       # same report as `achainsaw cpu`
+print(report["host"]["max_isa"])        # e.g. "avx512"
+
+achainsaw.set_isa_cap("avx2")           # kernels compiled from now on use at most AVX2
+kernel = achainsaw.compile(air_kernel)
+achainsaw.set_isa_cap(None)             # remove the cap
 ```
 
 ### Binary Bytecode (AIRB) in Python

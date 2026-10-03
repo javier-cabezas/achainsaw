@@ -4,7 +4,7 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 
 ## Layout
 - `crates/achainsaw-ir`: lexer, parser, AST, validator (SSA/type checks), optimizer (`opt.rs`), AIRB codec (`binary.rs`), JSON diagnostics (`diag.rs`).
-- `crates/achainsaw-codegen`: Cranelift lowering (`lower.rs`), JIT (`jit.rs`), AOT objects/shared libs (`aot.rs`).
+- `crates/achainsaw-codegen`: Cranelift lowering (`lower.rs`), JIT (`jit.rs`), AOT objects/shared libs (`aot.rs`), CPU feature detection, ISA cap, and Cranelift ISA flags (`cpu.rs`).
 - `crates/achainsaw-cli`: `achainsaw` binary (`main.rs`) and the MCP stdio server (`mcp.rs`).
 - `crates/achainsaw-py`: PyO3 bindings; type stubs in `achainsaw.pyi`.
 - `examples/`: `.air` sources with matching `.airb` bytecode; `tests/`: Python e2e tests.
@@ -26,3 +26,4 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 - `SERVER_INSTRUCTIONS` in `crates/achainsaw-cli/src/mcp.rs` is the AIR primer shown to MCP clients (Claude Code, Claude Desktop). Update it when syntax changes; `test_server_instructions_example_is_valid_air` JIT-runs its example.
 - New MCP tools: add a `handle_*` function, a `get_tools_list` entry, a `tools/call` match arm, and a unit test.
 - `.mcp.json` registers the local MCP server for Claude Code in this repo.
+- Vector ISA work: test lower tiers on one machine with `--isa <level>` or `ACHAINSAW_MAX_ISA` (`sse`, `avx`, `avx2`, `avx512`, `amx`, `neon`, `sve`, `sve2`, `sme`); in tests use `JitEngine::with_features(&CpuFeatures::host().capped(level)?)` since the cap is process-global. Cranelift's generic `x86-64-v3`/`v4` presets omit `has_avx`, so always configure ISAs through `cpu.rs` (it completes feature prerequisites).

@@ -67,6 +67,7 @@ def test_mcp_server():
     assert "air_run" in tool_names
     assert "air_assemble" in tool_names
     assert "air_disassemble" in tool_names
+    assert "air_target" in tool_names
     print(f"[PASS] MCP tools/list ({len(tools)} tools: {', '.join(tool_names)})")
 
     # 4. Tool Call: air_check
@@ -197,6 +198,20 @@ def test_mcp_server():
     assert opt_payload["total_optimizations"] >= 2
     assert "ret x" in opt_payload["code"]
     print("[PASS] MCP tools/call air_optimize")
+
+    # 10. Tool Call: air_target
+    target_res = send_req({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "air_target", "arguments": {}}
+    })
+    assert target_res["result"]["isError"] is False
+    target_payload = json.loads(target_res["result"]["content"][0]["text"])
+    assert target_payload["status"] == "ok"
+    assert isinstance(target_payload["host"]["features"], list)
+    assert target_payload["backends"]["cranelift"]["vector_bits"] == 128
+    print(f"[PASS] MCP tools/call air_target (max_isa={target_payload['host']['max_isa']})")
     proc.terminate()
     try:
         proc.wait(timeout=2)

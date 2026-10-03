@@ -19,7 +19,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 /// without having seen the language before. Keep in sync with the parser and validator.
 pub const SERVER_INSTRUCTIONS: &str = "\
 achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
-Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode.
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features (backends currently generate 128-bit vector code).
 
 AIR syntax:
 - Types: i8 i16 i32 i64 f32 f64 ptr v128 (4 x f32 or 4 x i32).
@@ -426,6 +426,17 @@ pub fn handle_air_optimize(arguments: &Value) -> Value {
     }))
 }
 
+pub fn handle_air_target(_arguments: &Value) -> Value {
+    match achainsaw_codegen::cpu::target_report() {
+        Ok(report) => json_tool_result(report),
+        Err(e) => json_tool_error(json!({
+            "status": "error",
+            "error_code": "ERR_CPU_DETECTION",
+            "message": e.to_string(),
+        })),
+    }
+}
+
 pub fn handle_initialize(params: &Value) -> Value {
     let requested = params.get("protocolVersion").and_then(|v| v.as_str());
     json!({
@@ -515,6 +526,14 @@ pub fn get_tools_list() -> Value {
                         }
                     },
                     "required": ["binary_base64"]
+                }
+            },
+            {
+                "name": "air_target",
+                "description": "Report the host CPU's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and the vector width each code generation backend uses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             },
             {
@@ -615,6 +634,7 @@ pub fn run_mcp_server() -> Result<()> {
                     "air_assemble" => handle_air_assemble(&arguments),
                     "air_disassemble" => handle_air_disassemble(&arguments),
                     "air_optimize" => handle_air_optimize(&arguments),
+                    "air_target" => handle_air_target(&arguments),
                     unknown => error_response(&format!("Unknown tool: '{unknown}'")),
                 };
 
@@ -707,6 +727,23 @@ mod tests {
         let text = res["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["result"], 45);
+    }
+
+    #[test]
+    fn test_mcp_air_target() {
+        let res = handle_air_target(&json!({}));
+        assert_eq!(res["isError"], false);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["status"], "ok");
+        assert!(report["host"]["features"].is_array());
+        assert_eq!(report["backends"]["cranelift"]["vector_bits"], 128);
+        let tools = get_tools_list();
+        assert!(tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "air_target"));
     }
 
     #[test]
