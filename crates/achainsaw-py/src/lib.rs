@@ -403,6 +403,36 @@ pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
     Ok(dict.into_py(py))
 }
 
+/// Host CPU vector features, active ISA cap, and backend vector widths.
+#[pyfunction]
+pub fn cpu_features(py: Python<'_>) -> PyResult<PyObject> {
+    let report = achainsaw_codegen::cpu::target_report()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let parsed = py
+        .import_bound("json")?
+        .call_method1("loads", (report.to_string(),))?;
+    Ok(parsed.into_py(py))
+}
+
+/// Caps the vector ISA for kernels compiled afterwards (`None` removes the cap).
+#[pyfunction]
+#[pyo3(signature = (level))]
+pub fn set_isa_cap(level: Option<&str>) -> PyResult<()> {
+    let cap = level
+        .map(|l| l.parse::<achainsaw_codegen::cpu::IsaLevel>())
+        .transpose()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    achainsaw_codegen::cpu::set_isa_cap(cap)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction]
+pub fn get_isa_cap() -> PyResult<Option<String>> {
+    achainsaw_codegen::cpu::isa_cap()
+        .map(|c| c.map(|l| l.as_str().to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
@@ -425,5 +455,8 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_memory_quota, m)?)?;
     m.add_function(wrap_pyfunction!(get_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_features, m)?)?;
+    m.add_function(wrap_pyfunction!(set_isa_cap, m)?)?;
+    m.add_function(wrap_pyfunction!(get_isa_cap, m)?)?;
     Ok(())
 }

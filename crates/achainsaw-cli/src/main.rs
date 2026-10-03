@@ -1,4 +1,5 @@
-use achainsaw_codegen::{link_shared_library, AotCompiler, JitEngine, RtValue};
+use achainsaw_codegen::cpu::{self, IsaLevel};
+use achainsaw_codegen::{link_shared_library, AotCompiler, AotTarget, JitEngine, RtValue};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::{
@@ -17,6 +18,10 @@ mod mcp;
 #[command(name = "achainsaw")]
 #[command(about = "High-performance agent-native toolchain & JIT compiler", long_about = None)]
 struct Cli {
+    /// Cap the vector ISA used for code generation (sse, avx, avx2, avx512, amx, neon, sve,
+    /// sve2, sme). Overrides ACHAINSAW_MAX_ISA.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = clap::value_parser!(IsaLevel))]
+    isa: Option<IsaLevel>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -105,6 +110,12 @@ enum Commands {
         /// Target triple (defaults to host architecture)
         #[arg(long)]
         target: Option<String>,
+        /// Target CPU using LLVM names, e.g. x86-64-v3, znver4, sapphirerapids (defaults to host)
+        #[arg(long)]
+        target_cpu: Option<String>,
+        /// LLVM-style target feature overrides, e.g. +avx2,-avx512f
+        #[arg(long, allow_hyphen_values = true)]
+        target_features: Option<String>,
         /// Link into shared library (.so / .dll) using host C compiler
         #[arg(long, default_value_t = false)]
         shared: bool,
@@ -113,14 +124,79 @@ enum Commands {
         json: bool,
     },
 
+    /// Report host CPU vector features, the active ISA cap, and backend vector widths
+    Cpu {
+        /// Emit structured machine-readable JSON output
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+
     /// Run Model Context Protocol (MCP) server over standard I/O (stdio)
     Mcp,
+}
+
+/// Splits an `[ERR_CODE] message` error into its code and message.
+fn split_error_code(e: &anyhow::Error, default_code: &'static str) -> (String, String) {
+    let text = e.to_string();
+    if let Some(rest) = text.strip_prefix('[') {
+        if let Some((code, msg)) = rest.split_once("] ") {
+            if code.starts_with("ERR_") {
+                return (code.to_string(), msg.to_string());
+            }
+        }
+    }
+    (default_code.to_string(), text)
+}
+
+fn print_error_json(e: &anyhow::Error, default_code: &'static str) {
+    let (code, message) = split_error_code(e, default_code);
+    let err_json = json!({
+        "status": "error",
+        "error_code": code,
+        "message": message,
+    });
+    println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
 }
 
 fn main() {
     let cli = Cli::parse();
 
+    if let Some(level) = cli.isa {
+        if let Err(e) = cpu::set_isa_cap(Some(level)) {
+            print_error_json(&e, "ERR_INVALID_ISA_LEVEL");
+            std::process::exit(1);
+        }
+    }
+
     match cli.command {
+        Commands::Cpu { json } => match cpu::target_report() {
+            Ok(report) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else {
+                    let eff = &report["effective"];
+                    println!("arch: {}", eff["arch"].as_str().unwrap_or("?"));
+                    println!("max ISA: {}", eff["max_isa"].as_str().unwrap_or("none"));
+                    println!("ISA cap: {}", report["isa_cap"].as_str().unwrap_or("none"));
+                    println!("native vector bits: {}", eff["native_vector_bits"]);
+                    println!(
+                        "features: {}",
+                        eff["features"]
+                            .as_array()
+                            .map(|a| a
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" "))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => {
+                print_error_json(&e, "ERR_CPU_DETECTION");
+                std::process::exit(1);
+            }
+        },
         Commands::Mcp => {
             if let Err(e) = mcp::run_mcp_server() {
                 eprintln!("MCP server error: {e}");
@@ -258,9 +334,20 @@ fn main() {
             input,
             output,
             target,
+            target_cpu,
+            target_features,
             shared,
             json,
-        } => match run_build(&input, output, target.as_deref(), shared) {
+        } => match run_build(
+            &input,
+            output,
+            &AotTarget {
+                triple: target,
+                cpu: target_cpu,
+                features: target_features,
+            },
+            shared,
+        ) {
             Ok(stats) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
@@ -273,12 +360,7 @@ fn main() {
             }
             Err(e) => {
                 if json {
-                    let err_json = json!({
-                        "status": "error",
-                        "error_code": "ERR_BUILD",
-                        "message": e.to_string(),
-                    });
-                    println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+                    print_error_json(&e, "ERR_BUILD");
                 } else {
                     eprintln!("Build error: {e}");
                 }
@@ -541,7 +623,7 @@ fn run_optimize(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Val
 fn run_build(
     input: &Path,
     output: Option<PathBuf>,
-    target: Option<&str>,
+    target: &AotTarget,
     shared: bool,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
@@ -550,7 +632,9 @@ fn run_build(
     let parse_time_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
-    let mut compiler = AotCompiler::new(target)?;
+    let mut compiler = AotCompiler::with_target(target)?;
+    let triple = compiler.triple();
+    let ignored_features = compiler.ignored_features().to_vec();
     compiler.compile_module(&module)?;
     let bytes = compiler.finish()?;
     let compile_time_us = t1.elapsed().as_micros();
@@ -604,6 +688,10 @@ fn run_build(
         "output": target_shared.to_string_lossy(),
         "object_bytes": bytes.len(),
         "shared": shared,
+        "target": triple,
+        "target_cpu": target.cpu,
+        "target_features": target.features,
+        "ignored_features": ignored_features,
         "parse_time_us": parse_time_us,
         "compile_time_us": compile_time_us,
         "link_time_us": link_time_us,
