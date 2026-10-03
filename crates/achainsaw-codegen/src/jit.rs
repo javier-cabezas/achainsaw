@@ -349,15 +349,20 @@ pub struct JitEngine {
 unsafe impl Send for JitEngine {}
 
 impl JitEngine {
+    /// JIT engine for the host CPU, honoring the ISA cap (`ACHAINSAW_MAX_ISA`).
     pub fn new() -> Result<Self> {
+        Self::with_features(&crate::cpu::CpuFeatures::effective()?)
+    }
+
+    /// JIT engine restricted to `features`, which must be a subset of the host's.
+    pub fn with_features(features: &crate::cpu::CpuFeatures) -> Result<Self> {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false")?;
         flag_builder.set("is_pic", "false")?;
         flag_builder.set("opt_level", "speed")?;
 
-        let isa_builder = cranelift_native::builder()
-            .map_err(|msg| anyhow!("Host machine not supported by Cranelift: {msg}"))?;
-        let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
+        let isa =
+            crate::cpu::native_isa_builder(features)?.finish(settings::Flags::new(flag_builder))?;
 
         let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
         let reg_lookup = Arc::clone(&registry);

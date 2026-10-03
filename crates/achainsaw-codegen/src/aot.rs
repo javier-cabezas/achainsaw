@@ -1,3 +1,5 @@
+use crate::cpu;
+use crate::lower::{lower_function, to_clif_type, LowerConfig};
 use achainsaw_ir::ast::Module;
 use anyhow::{anyhow, Result};
 use cranelift_codegen::ir::types;
@@ -9,10 +11,6 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::str::FromStr;
-use target_lexicon::Triple;
-
-use crate::lower::{lower_function, to_clif_type, LowerConfig};
 
 pub struct AotCompiler {
     builder_context: FunctionBuilderContext,
@@ -20,23 +18,39 @@ pub struct AotCompiler {
     module: ObjectModule,
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
+    ignored_features: Vec<&'static str>,
+}
+
+/// Code generation target for AOT builds. All fields default to the (capped) host.
+#[derive(Debug, Clone, Default)]
+pub struct AotTarget {
+    /// Target triple, e.g. `aarch64-unknown-linux-gnu`.
+    pub triple: Option<String>,
+    /// CPU preset using LLVM names, e.g. `znver4` or `x86-64-v3`.
+    pub cpu: Option<String>,
+    /// LLVM-style feature overrides, e.g. `+avx2,-avx512f`.
+    pub features: Option<String>,
 }
 
 impl AotCompiler {
     pub fn new(target_triple: Option<&str>) -> Result<Self> {
+        Self::with_target(&AotTarget {
+            triple: target_triple.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    pub fn with_target(target: &AotTarget) -> Result<Self> {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "true")?;
         flag_builder.set("opt_level", "speed")?;
 
-        let isa = if let Some(triple_str) = target_triple {
-            let triple =
-                Triple::from_str(triple_str).map_err(|e| anyhow!("Invalid target triple: {e}"))?;
-            cranelift_codegen::isa::lookup(triple)?.finish(settings::Flags::new(flag_builder))?
-        } else {
-            let isa_builder = cranelift_native::builder()
-                .map_err(|msg| anyhow!("Host machine not supported by Cranelift: {msg}"))?;
-            isa_builder.finish(settings::Flags::new(flag_builder))?
-        };
+        let (isa_builder, ignored_features) = cpu::target_isa_builder(
+            target.triple.as_deref(),
+            target.cpu.as_deref(),
+            target.features.as_deref(),
+        )?;
+        let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
 
         let builder = ObjectBuilder::new(isa, "achainsaw_aot", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
@@ -58,7 +72,18 @@ impl AotCompiler {
             module,
             rt_malloc_id,
             rt_free_id,
+            ignored_features,
         })
+    }
+
+    /// Requested target features that Cranelift cannot use (e.g. `avx512bw`, `sve`).
+    pub fn ignored_features(&self) -> &[&'static str] {
+        &self.ignored_features
+    }
+
+    /// Triple of the ISA being compiled for.
+    pub fn triple(&self) -> String {
+        self.module.isa().triple().to_string()
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
@@ -238,5 +263,87 @@ mod tests {
             "Expected 'add' symbol in object file, found: {:?}",
             symbols
         );
+    }
+
+    const SIMD_CODE: &str = r#"
+    fn scale(x:f32, y:f32)->f32
+      b0:
+        vx = splat x
+        vy = splat y
+        vp = vfmul vx, vy
+        vs = vfadd vp, vx
+        s = vfsum vs:f32
+        ret s
+    "#;
+
+    fn text_section(target: &AotTarget) -> (Vec<u8>, Vec<&'static str>) {
+        use object::ObjectSection;
+        let module = parse_and_validate(SIMD_CODE).unwrap();
+        let mut compiler = AotCompiler::with_target(target).unwrap();
+        let ignored = compiler.ignored_features().to_vec();
+        compiler.compile_module(&module).unwrap();
+        let bytes = compiler.finish().unwrap();
+        let obj = object::File::parse(&*bytes).unwrap();
+        let text = obj
+            .section_by_name(".text")
+            .unwrap()
+            .data()
+            .unwrap()
+            .to_vec();
+        (text, ignored)
+    }
+
+    fn x86_target(cpu: &str, features: Option<&str>) -> AotTarget {
+        AotTarget {
+            triple: Some("x86_64-unknown-linux-gnu".into()),
+            cpu: Some(cpu.into()),
+            features: features.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_aot_target_cpu_changes_codegen() {
+        let (v2, _) = text_section(&x86_target("x86-64-v2", None));
+        let (v3, _) = text_section(&x86_target("x86-64-v3", None));
+        assert_ne!(v2, v3, "AVX2 target should emit VEX-encoded vector code");
+        // `-avx` also drops AVX2/FMA (they require it), leaving the same SSE code as v2.
+        let (v3_no_avx, _) = text_section(&x86_target("x86-64-v3", Some("-avx")));
+        assert_eq!(v2, v3_no_avx);
+        // Named presets and generic levels agree once prerequisites are completed.
+        let (haswell, _) = text_section(&x86_target("haswell", None));
+        assert_eq!(v3, haswell);
+    }
+
+    #[test]
+    fn test_aot_reports_features_cranelift_cannot_use() {
+        let (_, ignored) = text_section(&x86_target(
+            "x86-64-v4",
+            Some("+avx512bw,+amx-tile,-avx512f"),
+        ));
+        assert_eq!(ignored, vec!["avx512bw", "amx-tile"]);
+
+        let arm = AotTarget {
+            triple: Some("aarch64-unknown-linux-gnu".into()),
+            cpu: Some("generic".into()),
+            features: Some("+sve2,+dotprod".into()),
+        };
+        let (text, ignored) = text_section(&arm);
+        assert!(!text.is_empty());
+        assert_eq!(ignored, vec!["sve2"]);
+    }
+
+    #[test]
+    fn test_aot_target_errors() {
+        let err = |t: AotTarget| AotCompiler::with_target(&t).err().unwrap().to_string();
+        assert!(err(x86_target("pentium9", None)).contains("ERR_UNKNOWN_TARGET_CPU"));
+        assert!(err(x86_target("x86-64-v3", Some("+sve"))).contains("ERR_ISA_ARCH_MISMATCH"));
+        assert!(
+            err(x86_target("x86-64-v3", Some("+avx1024"))).contains("ERR_UNKNOWN_TARGET_FEATURE")
+        );
+        let bad_triple = AotTarget {
+            triple: Some("not-a-triple-at-all".into()),
+            ..Default::default()
+        };
+        assert!(err(bad_triple).contains("ERR_INVALID_TARGET"));
     }
 }

@@ -20,6 +20,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 libloading = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# Both backends so tests can validate ISA settings for x86_64 and aarch64 on any host.
+cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
 
 [lints]
 workspace = true

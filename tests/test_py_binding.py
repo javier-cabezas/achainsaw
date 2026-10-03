@@ -67,6 +67,41 @@ class TestChainsawPy(unittest.TestCase):
         self.assertEqual(k.run("fib", 10), 55)
         self.assertEqual(k.run("fib", 20), 6765)
 
+    def test_cpu_features(self):
+        report = achainsaw.cpu_features()
+        self.assertEqual(report["status"], "ok")
+        self.assertIn(report["host"]["arch"], ("x86_64", "aarch64", "other"))
+        self.assertIsInstance(report["host"]["features"], list)
+        self.assertEqual(report["backends"]["cranelift"]["vector_bits"], 128)
+
+    def test_isa_cap(self):
+        host = achainsaw.cpu_features()["host"]
+        lowest = {"x86_64": "sse", "aarch64": "neon"}.get(host["arch"])
+        if lowest is None:
+            self.skipTest("no ISA levels for this architecture")
+        try:
+            achainsaw.set_isa_cap(lowest)
+            self.assertEqual(achainsaw.get_isa_cap(), lowest)
+            capped = achainsaw.cpu_features()["effective"]
+            self.assertEqual(capped["max_isa"], lowest)
+            self.assertTrue(set(capped["features"]) <= set(host["features"]))
+
+            # Kernels compiled under the cap still produce correct results.
+            with open("examples/simd_vector_dot.air", "r", encoding="utf-8") as f:
+                k = achainsaw.compile(f.read())
+            a = np.arange(8, dtype=np.float32)
+            b = np.ones(8, dtype=np.float32)
+            self.assertAlmostEqual(k.run("simd_dot", a, b, 2), 28.0, places=5)
+        finally:
+            achainsaw.set_isa_cap(None)
+        self.assertIsNone(achainsaw.get_isa_cap())
+
+        with self.assertRaises(ValueError):
+            achainsaw.set_isa_cap("avx9000")
+        foreign = "sve" if host["arch"] == "x86_64" else "avx2"
+        with self.assertRaises(ValueError):
+            achainsaw.set_isa_cap(foreign)
+
     def test_simd_dot_numpy(self):
         with open("examples/simd_vector_dot.air", "r", encoding="utf-8") as f:
             code = f.read()
