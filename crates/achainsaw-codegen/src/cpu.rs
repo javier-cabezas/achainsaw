@@ -1207,11 +1207,25 @@ mod tests {
     fn host_detection_is_consistent() {
         let host = CpuFeatures::host();
         assert_eq!(host.arch, Arch::host());
-        if host.arch == Arch::X86_64 {
+        // Feature-detection macros only exist on their own architecture.
+        #[cfg(target_arch = "x86_64")]
+        {
             assert_eq!(host.has(F::Avx2), std::is_x86_feature_detected!("avx2"));
             assert_eq!(
                 host.has(F::Avx512f),
                 std::is_x86_feature_detected!("avx512f")
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(host.has(F::Neon));
+            assert_eq!(
+                host.has(F::Sve),
+                std::arch::is_aarch64_feature_detected!("sve")
+            );
+            assert_eq!(
+                host.sve_vector_bits.is_some(),
+                cfg!(target_os = "linux") && host.has(F::Sve)
             );
         }
         let report = target_report().unwrap();
