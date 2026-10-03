@@ -9,6 +9,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -68,12 +69,126 @@ extern "C" {
     fn free(ptr: *mut u8);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStatus {
+    Ok,
+    OutOfFuel,
+    OutOfMemory { requested: usize, limit: usize },
+}
+
+thread_local! {
+    static CURRENT_STATUS: Cell<ExecutionStatus> = const { Cell::new(ExecutionStatus::Ok) };
+    static FUEL_REMAINING: Cell<i64> = const { Cell::new(-1) };
+    static MEMORY_ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    static MEMORY_QUOTA: Cell<usize> = const { Cell::new(0) };
+}
+
+pub fn set_execution_fuel(fuel: Option<u64>) {
+    FUEL_REMAINING.with(|f| match fuel {
+        Some(val) => f.set(val as i64),
+        None => f.set(-1),
+    });
+}
+
+pub fn get_remaining_fuel() -> Option<u64> {
+    FUEL_REMAINING.with(|f| {
+        let val = f.get();
+        if val < 0 {
+            None
+        } else {
+            Some(val as u64)
+        }
+    })
+}
+
+pub fn set_memory_quota(quota_bytes: usize) {
+    MEMORY_QUOTA.with(|q| q.set(quota_bytes));
+}
+
+pub fn get_allocated_memory() -> usize {
+    MEMORY_ALLOCATED.with(|m| m.get())
+}
+
+pub fn get_execution_status() -> ExecutionStatus {
+    CURRENT_STATUS.with(|s| s.get())
+}
+
+pub fn reset_execution_status() {
+    CURRENT_STATUS.with(|s| s.set(ExecutionStatus::Ok));
+}
+
+pub fn check_execution_status() -> Result<()> {
+    match get_execution_status() {
+        ExecutionStatus::Ok => Ok(()),
+        ExecutionStatus::OutOfFuel => Err(anyhow!(
+            "[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted"
+        )),
+        ExecutionStatus::OutOfMemory { requested, limit } => Err(anyhow!(
+            "[ERR_OUT_OF_MEMORY] Allocation of {requested} bytes exceeded memory quota of {limit} bytes"
+        )),
+    }
+}
+
+pub extern "C" fn rt_check_fuel() -> i32 {
+    FUEL_REMAINING.with(|f| {
+        let fuel = f.get();
+        if fuel < 0 {
+            return 0;
+        }
+        if fuel <= 0 {
+            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            return 1;
+        }
+        f.set(fuel - 1);
+        if fuel - 1 <= 0 {
+            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            return 1;
+        }
+        0
+    })
+}
+
 unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
-    malloc(size)
+    let quota = MEMORY_QUOTA.with(|q| q.get());
+    let current = MEMORY_ALLOCATED.with(|m| m.get());
+    if quota > 0 && current.saturating_add(size) > quota {
+        CURRENT_STATUS.with(|s| {
+            s.set(ExecutionStatus::OutOfMemory {
+                requested: size,
+                limit: quota,
+            })
+        });
+        return std::ptr::null_mut();
+    }
+
+    let total = size + 16;
+    let raw = malloc(total);
+    if raw.is_null() {
+        CURRENT_STATUS.with(|s| {
+            s.set(ExecutionStatus::OutOfMemory {
+                requested: size,
+                limit: quota,
+            })
+        });
+        return std::ptr::null_mut();
+    }
+
+    *(raw as *mut usize) = size;
+    MEMORY_ALLOCATED.with(|m| m.set(current + size));
+    raw.add(16)
 }
 
 unsafe extern "C" fn rt_free(ptr: *mut u8) {
-    free(ptr)
+    if ptr.is_null() {
+        return;
+    }
+    let raw = ptr.sub(16);
+    let size = *(raw as *const usize);
+    MEMORY_ALLOCATED.with(|m| {
+        let cur = m.get();
+        m.set(cur.saturating_sub(size));
+    });
+    free(raw);
 }
 
 pub struct SymbolRegistry {
@@ -185,7 +300,9 @@ pub struct JitEngine {
     module: JITModule,
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
+    rt_check_fuel_id: FuncId,
     pub registry: Arc<RwLock<SymbolRegistry>>,
+    pub fuel_enabled: bool,
 }
 
 impl JitEngine {
@@ -205,6 +322,7 @@ impl JitEngine {
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
         jit_builder.symbol("rt_free", rt_free as *const u8);
+        jit_builder.symbol("rt_check_fuel", rt_check_fuel as *const u8);
         jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
             reg_lookup.read().unwrap().lookup(name)
         }));
@@ -220,6 +338,10 @@ impl JitEngine {
         free_sig.params.push(AbiParam::new(types::I64));
         let rt_free_id = module.declare_function("rt_free", Linkage::Import, &free_sig)?;
 
+        let mut fuel_sig = module.make_signature();
+        fuel_sig.returns.push(AbiParam::new(types::I32));
+        let rt_check_fuel_id = module.declare_function("rt_check_fuel", Linkage::Import, &fuel_sig)?;
+
         let ctx = module.make_context();
 
         Ok(Self {
@@ -228,8 +350,30 @@ impl JitEngine {
             module,
             rt_malloc_id,
             rt_free_id,
+            rt_check_fuel_id,
             registry,
+            fuel_enabled: true,
         })
+    }
+
+    pub fn set_fuel(&mut self, fuel: Option<u64>) {
+        set_execution_fuel(fuel);
+    }
+
+    pub fn set_fuel_enabled(&mut self, enabled: bool) {
+        self.fuel_enabled = enabled;
+    }
+
+    pub fn is_fuel_enabled(&self) -> bool {
+        self.fuel_enabled
+    }
+
+    pub fn set_memory_quota(&self, bytes: usize) {
+        set_memory_quota(bytes);
+    }
+
+    pub fn get_allocated_memory(&self) -> usize {
+        get_allocated_memory()
     }
 
     pub fn register_symbol(&self, name: impl Into<String>, ptr: *const u8) {
@@ -333,6 +477,12 @@ impl JitEngine {
                 builder.append_block_param(clif_block, to_clif_type(*p_ty));
             }
         }
+
+        let fuel_trap_block = if self.fuel_enabled {
+            Some(builder.create_block())
+        } else {
+            None
+        };
 
         // Entry block parameters are the function parameters
         let entry_block = *clif_blocks.get(&func.blocks[0].label).unwrap();
@@ -546,7 +696,15 @@ impl JitEngine {
                         .iter()
                         .map(|a| BlockArg::Value(values.get(a).unwrap().0))
                         .collect();
-                    builder.ins().jump(target_block, &arg_vals);
+
+                    if let Some(trap_block) = fuel_trap_block {
+                        let callee = self.module.declare_func_in_func(self.rt_check_fuel_id, &mut builder.func);
+                        let call_inst = builder.ins().call(callee, &[]);
+                        let is_exhausted = builder.inst_results(call_inst)[0];
+                        builder.ins().brif(is_exhausted, trap_block, &[], target_block, &arg_vals);
+                    } else {
+                        builder.ins().jump(target_block, &arg_vals);
+                    }
                 }
                 Terminator::Br {
                     cond,
@@ -568,9 +726,18 @@ impl JitEngine {
                         .map(|a| BlockArg::Value(values.get(a).unwrap().0))
                         .collect();
 
-                    builder
-                        .ins()
-                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                    if let Some(trap_block) = fuel_trap_block {
+                        let callee = self.module.declare_func_in_func(self.rt_check_fuel_id, &mut builder.func);
+                        let call_inst = builder.ins().call(callee, &[]);
+                        let is_exhausted = builder.inst_results(call_inst)[0];
+                        let normal_br_block = builder.create_block();
+                        builder.ins().brif(is_exhausted, trap_block, &[], normal_br_block, &[]);
+
+                        builder.switch_to_block(normal_br_block);
+                        builder.ins().brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                    } else {
+                        builder.ins().brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                    }
                 }
                 Terminator::Ret { val, .. } => {
                     if let Some(v) = val {
@@ -580,6 +747,27 @@ impl JitEngine {
                         builder.ins().return_(&[]);
                     }
                 }
+            }
+        }
+
+        if let Some(trap_block) = fuel_trap_block {
+            builder.switch_to_block(trap_block);
+            if let Some(r_ty) = func.ret_type {
+                let zero_val = match r_ty {
+                    Type::F32 => builder.ins().f32const(0.0),
+                    Type::F64 => builder.ins().f64const(0.0),
+                    Type::I64 | Type::Ptr => builder.ins().iconst(types::I64, 0),
+                    Type::I32 => builder.ins().iconst(types::I32, 0),
+                    Type::I16 => builder.ins().iconst(types::I16, 0),
+                    Type::I8 => builder.ins().iconst(types::I8, 0),
+                    Type::V128 => {
+                        let zero_f = builder.ins().f32const(0.0);
+                        builder.ins().splat(types::F32X4, zero_f)
+                    }
+                };
+                builder.ins().return_(&[zero_val]);
+            } else {
+                builder.ins().return_(&[]);
             }
         }
 
@@ -604,16 +792,22 @@ impl JitEngine {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(i32) -> i32 = std::mem::transmute(ptr);
-        Ok(func(arg))
+        let res = func(arg);
+        check_execution_status()?;
+        Ok(res)
     }
 
     pub unsafe fn run_i32_2_to_i32(&self, name: &str, a: i32, b: i32) -> Result<i32> {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(ptr);
-        Ok(func(a, b))
+        let res = func(a, b);
+        check_execution_status()?;
+        Ok(res)
     }
 
     pub unsafe fn run_ptr_ptr_i32_to_f32(
@@ -626,24 +820,33 @@ impl JitEngine {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(*const f32, *const f32, i32) -> f32 = std::mem::transmute(ptr);
-        Ok(func(p0, p1, n))
+        let res = func(p0, p1, n);
+        check_execution_status()?;
+        Ok(res)
     }
 
     pub unsafe fn run_f32_to_f32(&self, name: &str, arg: f32) -> Result<f32> {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(f32) -> f32 = std::mem::transmute(ptr);
-        Ok(func(arg))
+        let res = func(arg);
+        check_execution_status()?;
+        Ok(res)
     }
 
     pub unsafe fn run_f64_to_f64(&self, name: &str, arg: f64) -> Result<f64> {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(f64) -> f64 = std::mem::transmute(ptr);
-        Ok(func(arg))
+        let res = func(arg);
+        check_execution_status()?;
+        Ok(res)
     }
 
     pub unsafe fn run_ptr_ptr_i64_to_f32(
@@ -656,7 +859,10 @@ impl JitEngine {
         let ptr = self
             .get_fn_ptr(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
+        reset_execution_status();
         let func: extern "C" fn(*const f32, *const f32, i64) -> f32 = std::mem::transmute(ptr);
-        Ok(func(p0, p1, n))
+        let res = func(p0, p1, n);
+        check_execution_status()?;
+        Ok(res)
     }
 }

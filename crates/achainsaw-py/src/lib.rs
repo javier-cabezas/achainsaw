@@ -40,6 +40,15 @@ impl PyKernel {
         self.engine.lookup_symbol(name).map(|ptr| ptr as usize)
     }
 
+    #[pyo3(signature = (fuel=None))]
+    pub fn set_fuel(&mut self, fuel: Option<u64>) {
+        self.engine.set_fuel(fuel);
+    }
+
+    pub fn set_memory_quota(&self, quota_bytes: usize) {
+        self.engine.set_memory_quota(quota_bytes);
+    }
+
     #[pyo3(signature = (func_name, *args))]
     pub fn run(
         &self,
@@ -161,7 +170,8 @@ fn dispatch_call(
 
     // Dynamic execution dispatch based on parameter pattern
     unsafe {
-        match (param_types, ret_type) {
+        achainsaw_codegen::reset_execution_status();
+        let res = match (param_types, ret_type) {
             // Void returns
             ([], None) => {
                 let f: extern "C" fn() = std::mem::transmute(fn_ptr);
@@ -275,8 +285,60 @@ fn dispatch_call(
                 "Signature with params {:?} and return {:?} not yet mapped in dispatcher",
                 param_types, ret_type
             ))),
-        }
+        };
+        check_execution_status_py(py)?;
+        res
     }
+}
+
+fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
+    achainsaw_codegen::check_execution_status().map_err(|e| {
+        let status = achainsaw_codegen::get_execution_status();
+        match status {
+            achainsaw_codegen::ExecutionStatus::OutOfFuel => {
+                let err_type = py.get_type_bound::<CompilationError>();
+                let err_instance = err_type
+                    .call1(("[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted",))
+                    .unwrap();
+                let diag = serde_json::json!({
+                    "status": "error",
+                    "error_code": "ERR_OUT_OF_FUEL",
+                    "message": "Execution halted: loop fuel budget exhausted",
+                });
+                if let Ok(py_dict) = py
+                    .import_bound("json")
+                    .and_then(|m| m.call_method1("loads", (diag.to_string(),)))
+                {
+                    let _ = err_instance.setattr("diagnostic", py_dict);
+                }
+                PyErr::from_value_bound(err_instance)
+            }
+            achainsaw_codegen::ExecutionStatus::OutOfMemory { requested, limit } => {
+                let err_type = py.get_type_bound::<CompilationError>();
+                let msg = format!(
+                    "[ERR_OUT_OF_MEMORY] Allocation of {requested} bytes exceeded memory quota of {limit} bytes"
+                );
+                let err_instance = err_type.call1((msg.clone(),)).unwrap();
+                let diag = serde_json::json!({
+                    "status": "error",
+                    "error_code": "ERR_OUT_OF_MEMORY",
+                    "message": msg,
+                    "context": {
+                        "requested_bytes": requested,
+                        "quota_bytes": limit,
+                    }
+                });
+                if let Ok(py_dict) = py
+                    .import_bound("json")
+                    .and_then(|m| m.call_method1("loads", (diag.to_string(),)))
+                {
+                    let _ = err_instance.setattr("diagnostic", py_dict);
+                }
+                PyErr::from_value_bound(err_instance)
+            }
+            _ => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+        }
+    })
 }
 
 fn diagnostic_to_py_err(py: Python<'_>, diag: Diagnostic) -> PyErr {
@@ -391,6 +453,27 @@ pub fn get_symbol_address(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (fuel=None))]
+pub fn set_fuel(fuel: Option<u64>) {
+    achainsaw_codegen::set_execution_fuel(fuel);
+}
+
+#[pyfunction]
+pub fn get_remaining_fuel() -> Option<u64> {
+    achainsaw_codegen::get_remaining_fuel()
+}
+
+#[pyfunction]
+pub fn set_memory_quota(quota_bytes: usize) {
+    achainsaw_codegen::set_memory_quota(quota_bytes);
+}
+
+#[pyfunction]
+pub fn get_allocated_memory() -> usize {
+    achainsaw_codegen::get_allocated_memory()
+}
+
+#[pyfunction]
 pub fn version() -> &'static str {
     "0.1.0"
 }
@@ -407,6 +490,10 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_symbol, m)?)?;
     m.add_function(wrap_pyfunction!(load_library, m)?)?;
     m.add_function(wrap_pyfunction!(get_symbol_address, m)?)?;
+    m.add_function(wrap_pyfunction!(set_fuel, m)?)?;
+    m.add_function(wrap_pyfunction!(get_remaining_fuel, m)?)?;
+    m.add_function(wrap_pyfunction!(set_memory_quota, m)?)?;
+    m.add_function(wrap_pyfunction!(get_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

@@ -39,6 +39,12 @@ enum Commands {
         /// Integer arguments passed to the function
         #[arg(short, long, value_delimiter = ' ')]
         args: Vec<i64>,
+        /// Loop fuel instruction budget (prevents infinite loops)
+        #[arg(long)]
+        fuel: Option<u64>,
+        /// Maximum heap allocation quota in megabytes
+        #[arg(long)]
+        max_memory_mb: Option<usize>,
         /// Emit structured machine-readable JSON output
         #[arg(long, default_value_t = true)]
         json: bool,
@@ -98,7 +104,9 @@ fn main() {
             func,
             args,
             json,
-        } => match run_exec(&path, &func, &args) {
+            fuel,
+            max_memory_mb,
+        } => match run_exec(&path, &func, &args, fuel, max_memory_mb) {
             Ok(output) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -197,7 +205,13 @@ fn run_check(path: &Path) -> Result<serde_json::Value, Diagnostic> {
     }))
 }
 
-fn run_exec(path: &Path, func_name: &str, args: &[i64]) -> Result<serde_json::Value> {
+fn run_exec(
+    path: &Path,
+    func_name: &str,
+    args: &[i64],
+    fuel: Option<u64>,
+    max_memory_mb: Option<usize>,
+) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
@@ -205,6 +219,12 @@ fn run_exec(path: &Path, func_name: &str, args: &[i64]) -> Result<serde_json::Va
 
     let t1 = Instant::now();
     let mut engine = JitEngine::new()?;
+    if let Some(f) = fuel {
+        engine.set_fuel(Some(f));
+    }
+    if let Some(mb) = max_memory_mb {
+        engine.set_memory_quota(mb * 1024 * 1024);
+    }
     engine.compile_module(&module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -215,8 +235,11 @@ fn run_exec(path: &Path, func_name: &str, args: &[i64]) -> Result<serde_json::Va
                 let func_ptr = engine
                     .get_fn_ptr(func_name)
                     .ok_or_else(|| anyhow!("Function '{func_name}' not found"))?;
+                achainsaw_codegen::reset_execution_status();
                 let f: extern "C" fn() -> i32 = std::mem::transmute(func_ptr);
-                f() as i64
+                let val = f() as i64;
+                achainsaw_codegen::check_execution_status()?;
+                val
             }
             1 => engine.run_i32_to_i32(func_name, args[0] as i32)? as i64,
             2 => engine.run_i32_2_to_i32(func_name, args[0] as i32, args[1] as i32)? as i64,

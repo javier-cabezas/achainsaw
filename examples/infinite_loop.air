@@ -1,0 +1,8 @@
+fn main()->i32
+  b0:
+    zero = cst 0:i32
+    jmp b1(zero)
+  b1(x:i32):
+    one = cst 1:i32
+    next_x = add x, one
+    jmp b1(next_x)

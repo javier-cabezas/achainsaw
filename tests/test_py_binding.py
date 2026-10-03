@@ -273,6 +273,59 @@ fn test_fma(x:i32, y:i32, z:i32)->i32
         with self.assertRaises(RuntimeError):
             achainsaw.load_library("non_existent_library_12345.dll")
 
+    def test_fuel_exhaustion_in_python(self):
+        """Test that infinite loops are safely caught and terminated by loop fuel budget."""
+        code = """fn infinite_loop(n:i32)->i32
+  b0:
+    jmp b1(n)
+  b1(x:i32):
+    one = cst 1:i32
+    next_x = add x, one
+    jmp b1(next_x)
+"""
+        k = achainsaw.compile(code)
+
+        # Set fuel to 500 loop iterations
+        achainsaw.set_fuel(500)
+        try:
+            with self.assertRaises(achainsaw.CompilationError) as ctx:
+                k.run("infinite_loop", 0)
+
+            err = ctx.exception
+            self.assertIn("ERR_OUT_OF_FUEL", str(err))
+            self.assertTrue(hasattr(err, "diagnostic"))
+            diag = err.diagnostic
+            self.assertEqual(diag.get("error_code"), "ERR_OUT_OF_FUEL")
+        finally:
+            # Reset fuel to unlimited
+            achainsaw.set_fuel(None)
+
+    def test_memory_quota_in_python(self):
+        """Test that heap allocation limits protect the host process from memory exhaustion."""
+        code = """fn request_giant_heap(n:i32)->ptr
+  b0:
+    bytes = cst 104857600:i64
+    buf = alloc bytes
+    ret buf
+"""
+        k = achainsaw.compile(code)
+
+        # Limit memory quota to 10 MB (allocation asks for 100 MB)
+        achainsaw.set_memory_quota(10 * 1024 * 1024)
+        try:
+            with self.assertRaises(achainsaw.CompilationError) as ctx:
+                k.run("request_giant_heap", 1)
+
+            err = ctx.exception
+            self.assertIn("ERR_OUT_OF_MEMORY", str(err))
+            self.assertTrue(hasattr(err, "diagnostic"))
+            diag = err.diagnostic
+            self.assertEqual(diag.get("error_code"), "ERR_OUT_OF_MEMORY")
+            self.assertEqual(diag.get("context", {}).get("quota_bytes"), 10 * 1024 * 1024)
+        finally:
+            # Reset memory quota to unlimited
+            achainsaw.set_memory_quota(0)
+
 
 if __name__ == "__main__":
     unittest.main()

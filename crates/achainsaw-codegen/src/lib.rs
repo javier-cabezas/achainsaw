@@ -1,8 +1,9 @@
 pub mod jit;
 
 pub use jit::{
-    get_global_symbol_address, load_global_library, register_global_symbol, to_clif_type,
-    JitEngine, SymbolRegistry,
+    check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
+    get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,
+    set_execution_fuel, set_memory_quota, to_clif_type, ExecutionStatus, JitEngine, SymbolRegistry,
 };
 
 #[cfg(test)]
@@ -229,5 +230,71 @@ fn inc_global(p:ptr)->i32
             assert_eq!(res, 1000);
             assert_eq!(global_counter, 1000);
         }
+    }
+
+    #[test]
+    fn test_jit_fuel_exhaustion_infinite_loop() {
+        let code = r#"
+fn loop_forever(n:i32)->i32
+  b0:
+    jmp b1(n)
+  b1(x:i32):
+    one = cst 1:i32
+    next_x = add x, one
+    jmp b1(next_x)
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let mut engine = JitEngine::new().expect("JIT init");
+        engine.compile_module(&module).expect("Compile module");
+
+        // Set fuel budget to 500 steps
+        engine.set_fuel(Some(500));
+
+        unsafe {
+            let res = engine.run_i32_to_i32("loop_forever", 0);
+            assert!(res.is_err(), "Expected fuel exhaustion error, got: {:?}", res);
+            let err_msg = res.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("[ERR_OUT_OF_FUEL]"),
+                "Expected [ERR_OUT_OF_FUEL] in: {err_msg}"
+            );
+        }
+
+        // Reset fuel to unlimited
+        engine.set_fuel(None);
+    }
+
+    #[test]
+    fn test_jit_memory_quota_limit() {
+        let code = r#"
+fn allocate_huge(n:i32)->ptr
+  b0:
+    bytes = cst 104857600:i64
+    buf = alloc bytes
+    ret buf
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let mut engine = JitEngine::new().expect("JIT init");
+        engine.compile_module(&module).expect("Compile module");
+
+        // Set memory quota to 10 MB (10485760 bytes), while request is 100 MB
+        engine.set_memory_quota(10 * 1024 * 1024);
+
+        unsafe {
+            let ptr = engine.get_fn_ptr("allocate_huge").expect("Found allocate_huge");
+            reset_execution_status();
+            let f: extern "C" fn(i32) -> *mut u8 = std::mem::transmute(ptr);
+            let _ = f(1);
+            let status_res = check_execution_status();
+            assert!(status_res.is_err(), "Expected memory quota error");
+            let err_msg = status_res.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("[ERR_OUT_OF_MEMORY]"),
+                "Expected [ERR_OUT_OF_MEMORY] in: {err_msg}"
+            );
+        }
+
+        // Reset memory quota to unlimited
+        engine.set_memory_quota(0);
     }
 }
