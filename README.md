@@ -165,6 +165,34 @@ achainsaw mcp
 - **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
 - **`air_optimize`**: Optimizes IR using constant folding, algebraic simplification, branch folding, and DCE to a fixpoint.
 
+The `initialize` response includes server `instructions`, a compact AIR syntax primer that MCP clients inject into the model's context. That lets an agent write valid AIR on the first attempt without this README.
+
+#### Using with Claude Code
+The repository ships a project-scoped [`.mcp.json`](.mcp.json) that runs the server via `cargo run --release`. Build once so the first startup does not exceed the MCP connection timeout, then start Claude Code in the repo and approve the `achainsaw` server when prompted:
+```bash
+cargo build --release -p achainsaw
+claude
+```
+
+To make the tools available in every project, register an installed binary at user scope instead:
+```bash
+cargo install --path crates/achainsaw-cli
+claude mcp add --scope user achainsaw -- achainsaw mcp
+```
+
+#### Using with Claude Desktop
+Add the server to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`), using the absolute path to the binary, then restart Claude Desktop:
+```json
+{
+  "mcpServers": {
+    "achainsaw": {
+      "command": "/absolute/path/to/achainsaw",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
 ### 7. IR Optimization Engine (`achainsaw opt`)
 Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks:
 ```bash

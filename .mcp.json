@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "achainsaw": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "--release", "--package", "achainsaw", "--", "mcp"]
+    }
+  }
+}

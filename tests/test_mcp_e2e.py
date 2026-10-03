@@ -46,7 +46,13 @@ def test_mcp_server():
     init_res = send_req(init_req)
     assert init_res["id"] == 1, f"Init failed: {init_res}"
     assert init_res["result"]["serverInfo"]["name"] == "achainsaw-mcp"
+    assert init_res["result"]["protocolVersion"] == "2024-11-05"
+    assert "air_check" in init_res["result"]["instructions"]
     print("[PASS] MCP initialize")
+
+    # 1b. Initialized notification (no response expected)
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    proc.stdin.flush()
 
     # 2. Ping
     ping_res = send_req({"jsonrpc": "2.0", "id": 2, "method": "ping"})
