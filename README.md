@@ -182,6 +182,31 @@ achainsaw opt examples/opt_demo.air --json
 }
 ```
 
+### 8. Ahead-Of-Time (AOT) Compilation (`achainsaw build`)
+Compile AIR modules into native object files (`.o`) or linked shared libraries (`.so` / `.dll`) for direct embedding into C, C++, Rust, or Python programs via standard C ABI:
+```bash
+# Compile to native object file (.o)
+achainsaw build examples/fibonacci.air -o examples/fibonacci.o --json
+
+# Compile and link directly into shared library (.dll / .so)
+achainsaw build examples/fibonacci.air --shared --json
+```
+
+**Build Telemetry:**
+```json
+{
+  "status": "ok",
+  "input": "examples/fibonacci.air",
+  "output": "examples/fibonacci.dll",
+  "object_bytes": 265,
+  "shared": true,
+  "parse_time_us": 304,
+  "compile_time_us": 2563,
+  "link_time_us": 112751,
+  "total_time_ms": 116.0
+}
+```
+
 ---
 
 ## ⚡ Chainsaw-BLAS: High-Performance Agent AI Kernel Library

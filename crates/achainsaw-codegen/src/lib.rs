@@ -1,5 +1,7 @@
+pub mod aot;
 pub mod jit;
 
+pub use aot::{link_shared_library, AotCompiler};
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
     get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,

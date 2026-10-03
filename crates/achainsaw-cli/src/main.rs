@@ -1,4 +1,4 @@
-use achainsaw_codegen::JitEngine;
+use achainsaw_codegen::{link_shared_library, AotCompiler, JitEngine};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::{
     decode_module, encode_module, parse_and_validate, to_air_text, Module, Validator,
@@ -91,6 +91,24 @@ enum Commands {
         output: Option<PathBuf>,
         /// Emit structured machine-readable JSON telemetry
         #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Ahead-Of-Time (AOT) compile AIR module into native object (.o) or shared library (.so / .dll)
+    Build {
+        /// Path to input .air or .airb file
+        input: PathBuf,
+        /// Path to output object file (.o) or shared library
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Target triple (defaults to host architecture)
+        #[arg(long)]
+        target: Option<String>,
+        /// Link into shared library (.so / .dll) using host C compiler
+        #[arg(long, default_value_t = false)]
+        shared: bool,
+        /// Emit structured machine-readable JSON telemetry
+        #[arg(long, default_value_t = true)]
         json: bool,
     },
 
@@ -209,6 +227,36 @@ fn main() {
                     println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
                 } else {
                     eprintln!("Optimization error: {e}");
+                }
+            }
+        },
+        Commands::Build {
+            input,
+            output,
+            target,
+            shared,
+            json,
+        } => match run_build(&input, output, target.as_deref(), shared) {
+            Ok(stats) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                } else {
+                    println!(
+                        "Built {} -> {} ({} bytes, shared: {})",
+                        stats["input"], stats["output"], stats["object_bytes"], stats["shared"]
+                    );
+                }
+            }
+            Err(e) => {
+                if json {
+                    let err_json = json!({
+                        "status": "error",
+                        "error_code": "ERR_BUILD",
+                        "message": e.to_string(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+                } else {
+                    eprintln!("Build error: {e}");
                 }
             }
         },
@@ -391,5 +439,57 @@ fn run_optimize(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Val
         "total_optimizations": stats.total_optimizations(),
         "iterations": stats.iterations,
         "code": optimized_code,
+    }))
+}
+
+fn run_build(
+    input: &Path,
+    output: Option<PathBuf>,
+    target: Option<&str>,
+    shared: bool,
+) -> Result<serde_json::Value> {
+    let t0 = Instant::now();
+    let module = load_module(input)
+        .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
+    let parse_time_us = t0.elapsed().as_micros();
+
+    let t1 = Instant::now();
+    let mut compiler = AotCompiler::new(target)?;
+    compiler.compile_module(&module)?;
+    let bytes = compiler.finish()?;
+    let compile_time_us = t1.elapsed().as_micros();
+
+    let obj_path = output.clone().unwrap_or_else(|| input.with_extension("o"));
+    fs::write(&obj_path, &bytes)?;
+
+    let mut final_path = obj_path.clone();
+    let mut shared_linked = false;
+    let mut link_time_us = 0;
+
+    if shared {
+        let t2 = Instant::now();
+        let target_shared = if cfg!(target_os = "windows") {
+            input.with_extension("dll")
+        } else if cfg!(target_os = "macos") {
+            input.with_extension("dylib")
+        } else {
+            input.with_extension("so")
+        };
+        link_shared_library(&obj_path, &target_shared)?;
+        link_time_us = t2.elapsed().as_micros();
+        final_path = target_shared;
+        shared_linked = true;
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "input": input.to_string_lossy(),
+        "output": final_path.to_string_lossy(),
+        "object_bytes": bytes.len(),
+        "shared": shared_linked,
+        "parse_time_us": parse_time_us,
+        "compile_time_us": compile_time_us,
+        "link_time_us": link_time_us,
+        "total_time_ms": (t0.elapsed().as_micros() as f64) / 1000.0,
     }))
 }
