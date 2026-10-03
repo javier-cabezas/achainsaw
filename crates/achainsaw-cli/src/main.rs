@@ -566,10 +566,10 @@ fn run_build(
     let (obj_path, target_shared) = if shared {
         match output {
             Some(ref out) => {
-                if out.extension().map_or(false, |e| e == "o" || e == "obj") {
+                if out.extension().is_some_and(|e| e == "o" || e == "obj") {
                     let sh = input.with_extension(sh_ext);
                     (out.clone(), sh)
-                } else if out.extension().map_or(false, |e| e == sh_ext) {
+                } else if out.extension().is_some_and(|e| e == sh_ext) {
                     let obj = out.with_extension("o");
                     (obj, out.clone())
                 } else {

@@ -738,7 +738,7 @@ impl RtValue {
             (RtValue::I32(n), Type::I32) => Ok((n as u32) as u64),
             (RtValue::I64(n), Type::I64) => Ok(n as u64),
             (RtValue::Ptr(p), Type::Ptr) => Ok(p as u64),
-            (RtValue::F32(f), Type::F32) => Ok((f.to_bits() as u32) as u64),
+            (RtValue::F32(f), Type::F32) => Ok(f.to_bits() as u64),
             (RtValue::F64(f), Type::F64) => Ok(f.to_bits()),
             // Allow loose integer conversions if within range
             (RtValue::I64(n), Type::I32) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
