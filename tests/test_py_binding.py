@@ -279,6 +279,44 @@ fn test_fma(x:i32, y:i32, z:i32)->i32
         res = k.run("test_fma", 7, 8, 9)
         self.assertEqual(res, 65)  # 7 * 8 + 9 = 65
 
+    def test_kernel_usable_from_other_threads(self):
+        """A kernel compiled on one thread can be called from others."""
+        import threading
+        k = achainsaw.compile("fn sq(x:i64)->i64\n  b0:\n    y = mul x, x\n    ret y\n")
+        results = {}
+
+        def worker(i):
+            results[i] = k.run("sq", i)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, {i: i * i for i in range(8)})
+
+    def test_reentrant_kernel_call_raises(self):
+        """A host callback calling back into the kernel that is running gets a clear error."""
+        import ctypes
+        cb_ty = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32)
+        seen = {}
+
+        def reenter(x):
+            try:
+                kernel.run("outer", x)
+            except RuntimeError as e:
+                seen["error"] = str(e)
+            return x + 1
+
+        cb = cb_ty(reenter)
+        achainsaw.register_symbol("py_reenter", ctypes.cast(cb, ctypes.c_void_p).value)
+        kernel = achainsaw.compile(
+            "extfn py_reenter(x:i32)->i32\n"
+            "fn outer(x:i32)->i32\n  b0:\n    r = call py_reenter(x)\n    ret r\n"
+        )
+        self.assertEqual(kernel.run("outer", 41), 42)
+        self.assertIn("re-entrant", seen.get("error", ""))
+
     def test_external_variable_access(self):
         """Test accessing and modifying external variables via pointers in IR."""
         import ctypes
