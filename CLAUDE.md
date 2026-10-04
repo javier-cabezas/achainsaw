@@ -21,6 +21,7 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 ## Git workflow
 - Never commit or push directly to `main`. Do work on a feature branch, push it, and open a pull request against `main` (`gh pr create --base main`).
 - Make sure `cargo test --workspace` passes before opening the PR.
+- Commits are attributed solely to the maintainer, `Javier Cabezas <javier-cabezas@users.noreply.github.com>`. Do not add `Co-Authored-By` trailers for Claude or any other AI assistant, in commits or in squash/merge messages.
 
 ## Conventions
 - Errors are machine-readable `Diagnostic`s with an `ERR_*` code, span, and `context` for agent self-repair; never plain prose.
