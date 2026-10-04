@@ -338,6 +338,14 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 self.ctx.create_string_attribute(attr, ""),
             );
         }
+        // vscale in streaming mode follows the streaming vector length, which need not equal
+        // the SVE length the module's `vscale_range` describes.
+        let vscale_range = Attribute::get_named_enum_kind_id("vscale_range");
+        f.remove_enum_attribute(AttributeLoc::Function, vscale_range);
+        f.add_attribute(
+            AttributeLoc::Function,
+            self.ctx.create_enum_attribute(vscale_range, (1 << 32) | 16),
+        );
         let [pc, pa, pb, m, n, k] = regs;
         let g = Self::sme_group(dtype);
         let esize = dtype.byte_size() as i64;
@@ -378,8 +386,23 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             )
         };
         let tile = |t: u64| self.i32().const_int(t, false).into();
+        // ZA slice indices go through an empty inline-asm copy so they always reach the
+        // instruction in a register: LLVM 22 miscompiles constant slice indices (e.g. after
+        // fully unrolling a row loop), addressing the slice from an uninitialized w12.
+        let opaque_ty = self.i32().fn_type(&[self.i32().into()], false);
+        let opaque = self.ctx.create_inline_asm(
+            opaque_ty,
+            String::new(),
+            "=r,0".to_string(),
+            false,
+            false,
+            None,
+            false,
+        );
         let as_i32 = |v: IntValue<'ctx>| -> Result<BasicValueEnum<'ctx>> {
-            Ok(b.build_int_truncate(v, self.i32(), "")?.into())
+            let v = b.build_int_truncate(v, self.i32(), "")?;
+            let cs = b.build_indirect_call(opaque_ty, opaque, &[v.into()], "slice")?;
+            Ok(cs.try_as_basic_value().basic().expect("i32 result"))
         };
         let ptrue32 = mask(p32, s)?;
 
