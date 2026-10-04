@@ -1,25 +1,26 @@
-# Euclidean Distance (L2) Kernel (128-bit SIMD, Modernized Phase 4)
-# Computes: sqrt(sum((a_i - b_i)^2))
-fn euclidean_distance(p0:ptr, p1:ptr, n:i64)->f32
+# Euclidean (L2) distance between two f32 vectors of n elements: sqrt(sum((a_i - b_i)^2)).
+# Vector-length agnostic, with a masked load for the final partial vector.
+fn euclidean_distance(a:ptr, b:ptr, n:i64)->f32
   b0:
-    zero_f = cst 0.0:f32
-    vacc = splat zero_f
-    jmp b_loop(0:i64, vacc)
-  b_loop(i:i64, acc:v128):
-    cond = lt i, n
-    br cond, b_body, b_done
-  b_body:
-    byte_off = mul i, 16:i64
-    a_ptr = add p0, byte_off
-    b_ptr = add p1, byte_off
-    va = ld a_ptr:v128
-    vb = ld b_ptr:v128
-    vdiff = vfsub va, vb
-    vsq = vfmul vdiff, vdiff
-    next_acc = vfadd acc, vsq
-    next_i = add i, 1:i64
-    jmp b_loop(next_i, next_acc)
-  b_done:
-    sum_sq = vfsum acc:f32
-    dist = sqrt sum_sq
+    z = cst 0.0:f32
+    zero = splat z:vx
+    w = vl f32
+    jmp loop(0:i64, zero)
+  loop(i:i64, acc:vx):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    off = mul i, 4:i64
+    pa = add a, off
+    pb = add b, off
+    va = ldm pa:vx, rest:f32
+    vb = ldm pb:vx, rest:f32
+    d = vsub va, vb:f32
+    acc2 = vfma d, d, acc:f32
+    i2 = add i, w
+    jmp loop(i2, acc2)
+  done:
+    s = vsum acc:f32
+    dist = sqrt s
     ret dist

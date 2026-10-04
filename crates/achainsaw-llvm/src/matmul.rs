@@ -216,8 +216,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     /// remainder); for each `vx`-wide strip of columns, the block's accumulators start as C
     /// and add `broadcast(A[r][kk]) * B[kk][strip]` for every `kk`, so each B strip is loaded
     /// and widened once per row block. Per element the sum runs over `kk` in order, like the
-    /// scalar reference, but with fused multiply-adds. Masked loads/stores cover the last
-    /// strip.
+    /// scalar reference, but fused where the target has FMA. Masked loads/stores cover the
+    /// last strip.
     fn mm_fma(&self, f: FunctionValue<'ctx>, dtype: Type, regs: [IntValue<'ctx>; 6]) -> Result<()> {
         const ROWS: i64 = 4;
         let b = &self.builder;
@@ -293,7 +293,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                         let prod = vec2!(a, bv, |x, y| b.build_int_mul(x, y, "")?);
                         vec2!(*acc, prod, |x, y| b.build_int_add(x, y, "")?)
                     } else {
-                        self.intr("llvm.fma", &[acc_ty], &[a, bv, *acc])?
+                        // Fused where the target has FMA, multiply + add elsewhere (a libcall
+                        // per element otherwise); `mm` only promises rounding-level agreement.
+                        self.intr("llvm.fmuladd", &[acc_ty], &[a, bv, *acc])?
                     });
                 }
                 Ok(next)

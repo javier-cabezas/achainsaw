@@ -47,9 +47,11 @@ fn k(pa:ptr, po:ptr)->f64
 #[test]
 fn every_example_airb_decodes_including_v1() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    // Kernels assembled before AIRB v2, kept unchanged as decoder compatibility fixtures.
+    let v1 = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1");
     let mut checked = 0;
     let mut v1_files = 0;
-    for dir in [examples.clone(), examples.join("kernels")] {
+    for dir in [examples.clone(), examples.join("kernels"), v1] {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let airb = entry.unwrap().path();
             if airb.extension().is_none_or(|e| e != "airb") {
@@ -67,7 +69,6 @@ fn every_example_airb_decodes_including_v1() {
         }
     }
     assert!(checked >= 7, "only {checked} .airb files found");
-    // The kernels were assembled before v2; keep them as v1 compatibility fixtures.
     assert!(v1_files >= 5, "only {v1_files} v1 .airb fixtures left");
 }
 

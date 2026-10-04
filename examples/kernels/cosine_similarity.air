@@ -1,37 +1,35 @@
-# Cosine Similarity Kernel (128-bit SIMD, Modernized Phase 4)
-# Computes: dot(a, b) / (sqrt(norm(a)) * sqrt(norm(b)) + 1e-12)
-fn cosine_similarity(p0:ptr, p1:ptr, n:i64)->f32
+# Cosine similarity of two f32 vectors of n elements:
+#   dot(a, b) / (sqrt(dot(a, a)) * sqrt(dot(b, b)) + 1e-12)
+# Vector-length agnostic: `vl` lanes per step at the backend's full width (`vx`), with a
+# masked load for the final partial vector.
+fn cosine_similarity(a:ptr, b:ptr, n:i64)->f32
   b0:
-    zero_f = cst 0.0:f32
-    vdot = splat zero_f
-    vna = splat zero_f
-    vnb = splat zero_f
-    jmp b_loop(0:i64, vdot, vna, vnb)
-  b_loop(i:i64, acc_dot:v128, acc_na:v128, acc_nb:v128):
-    cond = lt i, n
-    br cond, b_body, b_done
-  b_body:
-    byte_off = mul i, 16:i64
-    a_ptr = add p0, byte_off
-    b_ptr = add p1, byte_off
-    va = ld a_ptr:v128
-    vb = ld b_ptr:v128
-    prod_dot = vfmul va, vb
-    next_dot = vfadd acc_dot, prod_dot
-    prod_na = vfmul va, va
-    next_na = vfadd acc_na, prod_na
-    prod_nb = vfmul vb, vb
-    next_nb = vfadd acc_nb, prod_nb
-    next_i = add i, 1:i64
-    jmp b_loop(next_i, next_dot, next_na, next_nb)
-  b_done:
-    sum_dot = vfsum acc_dot:f32
-    sum_na = vfsum acc_na:f32
-    sum_nb = vfsum acc_nb:f32
-
-    norm_a = sqrt sum_na
-    norm_b = sqrt sum_nb
-    denom = mul norm_a, norm_b
-    safe_denom = add denom, 0.000000000001:f32
-    sim = div sum_dot, safe_denom
+    z = cst 0.0:f32
+    zero = splat z:vx
+    w = vl f32
+    jmp loop(0:i64, zero, zero, zero)
+  loop(i:i64, dot:vx, na:vx, nb:vx):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    off = mul i, 4:i64
+    pa = add a, off
+    pb = add b, off
+    va = ldm pa:vx, rest:f32
+    vb = ldm pb:vx, rest:f32
+    dot2 = vfma va, vb, dot:f32
+    na2 = vfma va, va, na:f32
+    nb2 = vfma vb, vb, nb:f32
+    i2 = add i, w
+    jmp loop(i2, dot2, na2, nb2)
+  done:
+    sd = vsum dot:f32
+    sa = vsum na:f32
+    sb = vsum nb:f32
+    ra = sqrt sa
+    rb = sqrt sb
+    denom = mul ra, rb
+    safe = add denom, 0.000000000001:f32
+    sim = div sd, safe
     ret sim

@@ -1,49 +1,68 @@
-# Numerically Stable Softmax Kernel (Modernized Phase 4)
-# Computes: y_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+# Numerically stable softmax over n f32 values:
+#   out_i = exp(x_i - max(x)) / sum_j exp(x_j - max(x))
+# Returns the sum of exponentials. The max and the normalization run at full vector width;
+# exp is a scalar libm call per element. A masked load would pad the max with zeros, so
+# the max uses full vectors plus a scalar tail instead.
 extfn expf(x:f32)->f32
 
-fn softmax(p_in:ptr, p_out:ptr, n:i64)->f32
+fn softmax(x:ptr, out:ptr, n:i64)->f32
   b0:
-    init_max = ld p_in:f32
-    jmp b_max_loop(1:i64, init_max)
-  b_max_loop(i:i64, cur_max:f32):
-    cond_max = lt i, n
-    br cond_max, b_max_body, b_max_done(cur_max)
-  b_max_body:
-    byte_off = mul i, 4:i64
-    curr_ptr = add p_in, byte_off
-    val = ld curr_ptr:f32
-    next_max = max val, cur_max
-    next_i = add i, 1:i64
-    jmp b_max_loop(next_i, next_max)
-  b_max_done(max_val:f32):
-    jmp b_exp_loop(0:i64, 0.0:f32, max_val)
-  b_exp_loop(j:i64, cur_sum:f32, m_val:f32):
-    cond_exp = lt j, n
-    br cond_exp, b_exp_body, b_exp_done(cur_sum)
-  b_exp_body:
-    in_off = mul j, 4:i64
-    in_p = add p_in, in_off
-    x_val = ld in_p:f32
-    shifted = sub x_val, m_val
-    e_val = call expf(shifted)
-    out_p = add p_out, in_off
-    st out_p, e_val
-    next_sum = add cur_sum, e_val
-    next_j = add j, 1:i64
-    jmp b_exp_loop(next_j, next_sum, m_val)
-  b_exp_done(total_sum:f32):
-    jmp b_norm_loop(0:i64, total_sum)
-  b_norm_loop(k:i64, t_sum:f32):
-    cond_norm = lt k, n
-    br cond_norm, b_norm_body, b_norm_done(t_sum)
-  b_norm_body:
-    norm_off = mul k, 4:i64
-    out_pk = add p_out, norm_off
-    raw_e = ld out_pk:f32
-    prob = div raw_e, t_sum
-    st out_pk, prob
-    next_k = add k, 1:i64
-    jmp b_norm_loop(next_k, t_sum)
-  b_norm_done(res_sum:f32):
-    ret res_sum
+    first = ld x:f32
+    w = vl f32
+    vmax0 = splat first:vx
+    jmp max_vec(0:i64, vmax0)
+  max_vec(i:i64, vm:vx):
+    end = add i, w
+    full = le end, n
+    br full, max_vec_body, max_reduce(i, vm)
+  max_vec_body:
+    off = mul i, 4:i64
+    px = add x, off
+    v = ld px:vx
+    vm2 = vmax vm, v:f32
+    jmp max_vec(end, vm2)
+  max_reduce(t:i64, vfinal:vx):
+    m0 = vmaxr vfinal:f32
+    jmp max_tail(t, m0)
+  max_tail(k:i64, m:f32):
+    more_k = lt k, n
+    br more_k, max_tail_body, exps(0:i64, 0.0:f32, m)
+  max_tail_body:
+    off_k = mul k, 4:i64
+    pk = add x, off_k
+    xk = ld pk:f32
+    m2 = max m, xk
+    k2 = add k, 1:i64
+    jmp max_tail(k2, m2)
+  exps(e:i64, total:f32, mx:f32):
+    more_e = lt e, n
+    br more_e, exps_body, norm_init(total)
+  exps_body:
+    off_e = mul e, 4:i64
+    pe = add x, off_e
+    xe = ld pe:f32
+    shifted = sub xe, mx
+    ev = call expf(shifted)
+    po = add out, off_e
+    st po, ev
+    total2 = add total, ev
+    e2 = add e, 1:i64
+    jmp exps(e2, total2, mx)
+  norm_init(s:f32):
+    inv = div 1.0:f32, s
+    vinv = splat inv:vx
+    jmp norm(0:i64)
+  norm(j:i64):
+    more_j = lt j, n
+    br more_j, norm_body, done
+  norm_body:
+    rest = sub n, j
+    off_j = mul j, 4:i64
+    pj = add out, off_j
+    ej = ldm pj:vx, rest:f32
+    pj2 = vmul ej, vinv:f32
+    stm pj, pj2, rest:f32
+    j2 = add j, w
+    jmp norm(j2)
+  done:
+    ret s

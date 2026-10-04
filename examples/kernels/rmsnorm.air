@@ -1,47 +1,48 @@
-# Root-Mean-Square Normalization (RMSNorm) Kernel (128-bit SIMD, Modernized Phase 4)
-# Computes: y_i = (x_i / sqrt(mean(x^2) + eps)) * w_i
-# Used in modern LLM architectures (LLaMA, Mistral, Gemma)
-fn rmsnorm(p_x:ptr, p_w:ptr, p_out:ptr, n_vecs:i64, inv_n:f32)->f32
+# RMSNorm over n f32 values, as in LLaMA, Mistral and Gemma:
+#   out_i = x_i / sqrt(mean(x^2) + 1e-6) * w_i
+# Returns the scale 1 / sqrt(mean(x^2) + 1e-6). Vector-length agnostic, with masked
+# loads/stores for the final partial vector.
+fn rmsnorm(x:ptr, w:ptr, out:ptr, n:i64)->f32
   b0:
-    zero_f = cst 0.0:f32
-    vacc_sq = splat zero_f
-    jmp b_sum_loop(0:i64, vacc_sq)
-  b_sum_loop(i:i64, acc_sq:v128):
-    cond_sum = lt i, n_vecs
-    br cond_sum, b_sum_body, b_sum_done
-  b_sum_body:
-    off_i = mul i, 16:i64
-    px_i = add p_x, off_i
-    vx_i = ld px_i:v128
-    vsq_i = vfmul vx_i, vx_i
-    next_acc = vfadd acc_sq, vsq_i
-    next_i = add i, 1:i64
-    jmp b_sum_loop(next_i, next_acc)
-  b_sum_done:
-    sum_sq = vfsum acc_sq:f32
-
-    # Calculate RMS scale
-    mean_sq = mul sum_sq, inv_n
-    mean_eps = add mean_sq, 0.000001:f32
+    z = cst 0.0:f32
+    zero = splat z:vx
+    lanes = vl f32
+    jmp sum(0:i64, zero)
+  sum(i:i64, acc:vx):
+    more = lt i, n
+    br more, sum_body, scale
+  sum_body:
+    rest = sub n, i
+    off = mul i, 4:i64
+    px = add x, off
+    vx0 = ldm px:vx, rest:f32
+    acc2 = vfma vx0, vx0, acc:f32
+    i2 = add i, lanes
+    jmp sum(i2, acc2)
+  scale:
+    ss = vsum acc:f32
+    nf = itof n:f32
+    mean = div ss, nf
+    mean_eps = add mean, 0.000001:f32
     rms = sqrt mean_eps
-    inv_rms = div 1.0:f32, rms
-    vinv_rms = splat inv_rms
-
-    jmp b_norm_loop(0:i64, vinv_rms, inv_rms)
-  b_norm_loop(j:i64, v_scale:v128, final_inv_rms:f32):
-    cond_norm = lt j, n_vecs
-    br cond_norm, b_norm_body, b_norm_done(final_inv_rms)
-  b_norm_body:
-    off_j = mul j, 16:i64
-    px_j = add p_x, off_j
-    pw_j = add p_w, off_j
-    pout_j = add p_out, off_j
-    vx_j = ld px_j:v128
-    vw_j = ld pw_j:v128
-    vnorm = vfmul vx_j, v_scale
-    vy = vfmul vnorm, vw_j
-    st pout_j, vy
-    next_j = add j, 1:i64
-    jmp b_norm_loop(next_j, v_scale, final_inv_rms)
-  b_norm_done(res_inv_rms:f32):
-    ret res_inv_rms
+    inv = div 1.0:f32, rms
+    vinv = splat inv:vx
+    jmp norm(0:i64)
+  norm(j:i64):
+    more_j = lt j, n
+    br more_j, norm_body, done
+  norm_body:
+    rest_j = sub n, j
+    off_j = mul j, 4:i64
+    px_j = add x, off_j
+    pw_j = add w, off_j
+    po_j = add out, off_j
+    xv = ldm px_j:vx, rest_j:f32
+    wv = ldm pw_j:vx, rest_j:f32
+    xs = vmul xv, vinv:f32
+    y = vmul xs, wv:f32
+    stm po_j, y, rest_j:f32
+    j2 = add j, lanes
+    jmp norm(j2)
+  done:
+    ret inv
