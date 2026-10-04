@@ -236,8 +236,9 @@ fn masked_module() -> String {
 
 type Masked = extern "C" fn(*const u8, i64, *mut u8);
 
-fn bytes_of(w: Type) -> usize {
-    w.bit_width().unwrap_or(128) as usize / 8
+/// Bytes in a vector of type `w` on `engine` (`vx` depends on the backend and ISA).
+fn bytes_of(w: Type, engine: &JitEngine) -> usize {
+    w.bit_width().unwrap_or(engine.vx_bits()) as usize / 8
 }
 
 #[test]
@@ -247,11 +248,11 @@ fn masked_load_store_semantics() {
         let engine = jit(&src, &features);
         for w in WIDTHS {
             for l in LANES {
-                let width = bytes_of(w);
+                let width = bytes_of(w, &engine);
                 let s = l.byte_size();
                 let lanes = (width / s) as i64;
-                let input: Vec<u8> = (0..width as u8)
-                    .map(|i| i.wrapping_mul(29).wrapping_add(7))
+                let input: Vec<u8> = (0..width)
+                    .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
                     .collect();
                 let ldm: Masked = unsafe {
                     std::mem::transmute(engine.get_fn_ptr(&format!("ldm_{l}_{w}")).unwrap())
@@ -320,7 +321,8 @@ fn masked_ops_never_touch_memory_past_the_tail() {
     for w in WIDTHS {
         for l in LANES {
             let s = l.byte_size();
-            let lanes = bytes_of(w) / s;
+            let width = bytes_of(w, &engine);
+            let lanes = width / s;
             let ldm: Masked =
                 unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("ldm_{l}_{w}")).unwrap()) };
             let stm: Masked =
@@ -328,9 +330,9 @@ fn masked_ops_never_touch_memory_past_the_tail() {
             for n in 0..lanes {
                 // The first n lanes end exactly at the guard page.
                 let tail = unsafe { guard.sub(n * s) };
-                let mut out = vec![0u8; 64];
+                let mut out = vec![0u8; width];
                 ldm(tail, n as i64, out.as_mut_ptr());
-                let src = [0x5Au8; 64];
+                let src = vec![0x5Au8; width];
                 stm(src.as_ptr(), n as i64, tail);
                 let written = unsafe { std::slice::from_raw_parts(tail, n * s) };
                 assert!(written.iter().all(|&b| b == 0x5A), "stm {l} {w} n={n}");
@@ -558,5 +560,30 @@ fn new_ops_compile_for_every_target() {
             .compile_module(&module)
             .unwrap_or_else(|e| panic!("{triple} {cpu}: {e}"));
         assert!(!compiler.finish().unwrap().is_empty());
+    }
+}
+
+#[cfg(feature = "llvm")]
+#[test]
+fn new_ops_compile_for_every_llvm_target() {
+    use achainsaw_codegen::{compile_object, Backend};
+    let src = format!("{MM}\n{}\n{CONVERSIONS}", masked_module());
+    let module = parse_and_validate(&src).unwrap();
+    for (triple, cpu, features) in [
+        ("x86_64-unknown-linux-gnu", "x86-64", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v3", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v4", ""),
+        ("aarch64-unknown-linux-gnu", "generic", ""),
+        ("aarch64-unknown-linux-gnu", "generic", "+sve"),
+        ("aarch64-unknown-linux-gnu", "generic", "+sve2"),
+    ] {
+        let target = AotTarget {
+            triple: Some(triple.into()),
+            cpu: Some(cpu.into()),
+            features: (!features.is_empty()).then(|| features.into()),
+        };
+        let obj = compile_object(&module, &target, Backend::Llvm)
+            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
+        assert!(!obj.bytes.is_empty());
     }
 }

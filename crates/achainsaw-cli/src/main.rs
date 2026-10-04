@@ -25,7 +25,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = clap::value_parser!(IsaLevel))]
     isa: Option<IsaLevel>,
     /// Code generator for run, bench and build: cranelift, llvm (needs an LLVM-enabled
-    /// build), or auto. Overrides ACHAINSAW_BACKEND; auto currently means cranelift.
+    /// build), or auto (default: ACHAINSAW_BACKEND if set, else llvm for modules using
+    /// v256/v512/vx/mm when built in, else cranelift).
     #[arg(long, global = true, value_name = "BACKEND")]
     backend: Option<String>,
     #[command(subcommand)]
@@ -174,21 +175,7 @@ fn main() {
         }
     }
 
-    let generates_code = matches!(
-        cli.command,
-        Commands::Run { .. } | Commands::Bench { .. } | Commands::Build { .. }
-    );
-    let backend = if generates_code {
-        match Backend::resolve(cli.backend.as_deref()) {
-            Ok(b) => b,
-            Err(e) => {
-                print_error_json(&e, "ERR_UNKNOWN_BACKEND");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        Backend::Cranelift
-    };
+    let backend = cli.backend.as_deref();
 
     match cli.command {
         Commands::Cpu { json } => match cpu::target_report() {
@@ -446,7 +433,7 @@ fn run_exec(
     args: &[String],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
-    backend: Backend,
+    backend: Option<&str>,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(path)
@@ -516,6 +503,7 @@ fn run_exec(
     }
 
     let t1 = Instant::now();
+    let backend = Backend::resolve_for(backend, &module)?;
     let mut engine = JitEngine::with_backend(backend, &cpu::CpuFeatures::effective()?)?;
     if let Some(f) = fuel {
         engine.set_fuel(Some(f));
@@ -553,9 +541,10 @@ fn run_exec(
     }))
 }
 
-fn run_bench(path: &Path, iters: u32, backend: Backend) -> Result<serde_json::Value> {
+fn run_bench(path: &Path, iters: u32, backend: Option<&str>) -> Result<serde_json::Value> {
     let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
+    let backend = Backend::resolve_for(backend, &module)?;
 
     let features = cpu::CpuFeatures::effective()?;
     let t0 = Instant::now();
@@ -652,7 +641,7 @@ fn run_build(
     output: Option<PathBuf>,
     target: &AotTarget,
     shared: bool,
-    backend: Backend,
+    backend: Option<&str>,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(input)
@@ -660,6 +649,7 @@ fn run_build(
     let parse_time_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
+    let backend = Backend::resolve_for(backend, &module)?;
     let AotObject {
         bytes,
         triple,

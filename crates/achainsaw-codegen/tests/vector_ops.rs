@@ -1,9 +1,13 @@
-//! AIR v2 vector ops on the Cranelift backend.
+//! AIR v2 vector ops on the backend selected by `ACHAINSAW_BACKEND` (Cranelift by default).
 //!
 //! Every op x lane type x width combination the validator accepts must:
 //! - compile for x86_64 (each ISA level this host reaches via the JIT, and every x86-64
-//!   micro-architecture level via AOT) and for aarch64, and
-//! - produce exactly the results of a scalar reference model, lane by lane.
+//!   micro-architecture level via AOT) and for aarch64 (NEON, and SVE on LLVM), and
+//! - produce exactly the results of a scalar reference model, lane by lane, at the
+//!   engine's `vx` width.
+//!
+//! With the `llvm` feature, fixed-width results must also match bit for bit between the
+//! two backends.
 
 use achainsaw_codegen::cpu::{CpuFeatures, IsaLevel};
 use achainsaw_codegen::{AotCompiler, AotTarget, JitEngine};
@@ -26,13 +30,13 @@ const REDUCE_OPS: [VectorReduceOp; 3] = [
     VectorReduceOp::Max,
     VectorReduceOp::Min,
 ];
-/// Input/output buffers are sized for the widest vector.
-const BUF: usize = 64;
+/// Input/output buffers are sized for the widest vector: a 2048-bit SVE `vx`.
+const BUF: usize = 256;
 const TRIALS: u64 = 12;
 
-/// Bytes a vector occupies on the Cranelift backend, where `vx` is 128 bits.
-fn width_bytes(w: Type) -> usize {
-    w.bit_width().unwrap_or(128) as usize / 8
+/// Bytes a vector occupies; `vx` is `vx_bytes` wide on the engine under test.
+fn width_bytes(w: Type, vx_bytes: usize) -> usize {
+    w.bit_width().map_or(vx_bytes, |b| b as usize / 8)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,10 +101,10 @@ impl Kernel {
     }
 
     /// Bytes of output to compare.
-    fn out_bytes(&self) -> usize {
+    fn out_bytes(&self, vx_bytes: usize) -> usize {
         match self {
             Kernel::Reduce(_, l, _) => l.byte_size(),
-            _ => width_bytes(self.width()),
+            _ => width_bytes(self.width(), vx_bytes),
         }
     }
 
@@ -257,9 +261,9 @@ fn tree<T: Copy>(vals: &[T], f: &impl Fn(T, T) -> T) -> T {
     f(tree(lo, f), tree(hi, f))
 }
 
-fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
+fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8> {
     let mut out = vec![0u8; BUF];
-    let w = width_bytes(k.width());
+    let w = width_bytes(k.width(), vx_bytes);
     let lane = k.lane();
     let n = w / lane.byte_size();
     match k {
@@ -488,8 +492,8 @@ fn fill(buf: &mut [u8], lane: Type, rng: &mut Rng, trial: u64) {
     }
 }
 
-fn check_output(k: Kernel, expected: &[u8], actual: &[u8], ctx: &str) {
-    let n = k.out_bytes();
+fn check_output(k: Kernel, expected: &[u8], actual: &[u8], vx_bytes: usize, ctx: &str) {
+    let n = k.out_bytes(vx_bytes);
     if k.float_output() {
         let s = k.lane().byte_size();
         for i in 0..n / s {
@@ -543,6 +547,13 @@ fn vector_ops_match_reference_at_every_isa_level() {
         engine
             .compile_module(&module)
             .unwrap_or_else(|e| panic!("compile at {level}: {e}"));
+        let vx_bytes = engine.vx_bits() as usize / 8;
+        let ctx = |trial| {
+            format!(
+                "ISA {level}, {} vx={vx_bytes}B, trial {trial}",
+                engine.backend()
+            )
+        };
 
         for k in &kernels {
             let f: KernelFn = unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
@@ -557,8 +568,8 @@ fn vector_ops_match_reference_at_every_isa_level() {
                 }
                 let mut out = [0u8; BUF];
                 f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
-                let expected = reference(*k, &a, &b, &c);
-                check_output(*k, &expected, &out, &format!("ISA {level}, trial {trial}"));
+                let expected = reference(*k, &a, &b, &c, vx_bytes);
+                check_output(*k, &expected, &out, vx_bytes, &ctx(trial));
             }
         }
     }
@@ -619,7 +630,7 @@ fn extract_lane_reads_every_lane_of_wide_vectors() {
 #[test]
 fn vl_and_wide_values_across_blocks_and_calls() {
     // v256 values flow through block parameters, a loop, and an internal call that takes
-    // and returns a v512; vl reports the Cranelift vx lane count.
+    // and returns a v512; vl reports the engine's vx lane count.
     let src = r#"
 fn twice(v:v512)->v512
   b0:
@@ -666,7 +677,8 @@ fn lanes()->i64
         // 4 rows of 8: sum(0..32) = 496; twice(first 16) = 2 * sum(0..16) = 240
         assert_eq!(f(data.as_ptr(), 4), 496.0 + 240.0);
         let g: extern "C" fn() -> i64 = std::mem::transmute(engine.get_fn_ptr("lanes").unwrap());
-        assert_eq!(g(), 4 + 16);
+        let vx_bytes = engine.vx_bits() as i64 / 8;
+        assert_eq!(g(), vx_bytes / 4 + vx_bytes);
     }
     // Functions with vector signatures have no host trampoline, with a clear error.
     let err = unsafe { engine.call_typed("twice", &[]) }
@@ -699,6 +711,84 @@ fn shift(pa:ptr, po:ptr)
             let x = i32::from_le_bytes(input[o..o + 4].try_into().unwrap());
             let y = i32::from_le_bytes(out[o..o + 4].try_into().unwrap());
             assert_eq!(y, x.wrapping_add(x), "misalign {misalign}, lane {i}");
+        }
+    }
+}
+
+/// Targets every LLVM build must handle, including scalable `vx` (SVE).
+#[cfg(feature = "llvm")]
+pub const LLVM_TARGETS: &[(&str, &str, &str)] = &[
+    ("x86_64-unknown-linux-gnu", "x86-64", ""),
+    ("x86_64-unknown-linux-gnu", "x86-64-v3", ""),
+    ("x86_64-unknown-linux-gnu", "x86-64-v4", ""),
+    ("aarch64-unknown-linux-gnu", "generic", ""),
+    ("aarch64-unknown-linux-gnu", "generic", "+sve"),
+    ("aarch64-unknown-linux-gnu", "generic", "+sve2"),
+];
+
+#[cfg(feature = "llvm")]
+#[test]
+fn vector_ops_compile_for_every_llvm_target() {
+    use achainsaw_codegen::{compile_object, Backend};
+    let kernels = all_kernels();
+    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    for (triple, cpu, features) in LLVM_TARGETS {
+        let target = AotTarget {
+            triple: Some((*triple).into()),
+            cpu: Some((*cpu).into()),
+            features: (!features.is_empty()).then(|| (*features).into()),
+        };
+        let obj = compile_object(&module, &target, Backend::Llvm)
+            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
+        assert!(!obj.bytes.is_empty());
+    }
+}
+
+/// Fixed-width vectors must give bit-identical results on both backends (NaN payloads
+/// aside), at every ISA level.
+#[cfg(feature = "llvm")]
+#[test]
+fn fixed_width_vector_ops_agree_across_backends() {
+    use achainsaw_codegen::Backend;
+    let kernels: Vec<Kernel> = all_kernels()
+        .into_iter()
+        .filter(|k| k.width() != Type::Vx)
+        .collect();
+    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    for (level, features) in host_levels() {
+        let engines: Vec<JitEngine> = [Backend::Cranelift, Backend::Llvm]
+            .into_iter()
+            .map(|b| {
+                let mut e = JitEngine::with_backend(b, &features).unwrap();
+                e.compile_module(&module).unwrap();
+                e
+            })
+            .collect();
+        for k in &kernels {
+            let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
+            for trial in 0..TRIALS {
+                let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                fill(&mut a, k.lane(), &mut rng, trial);
+                fill(&mut b, k.lane(), &mut rng, trial + 1);
+                fill(&mut c, k.lane(), &mut rng, trial + 2);
+                let outs: Vec<[u8; BUF]> = engines
+                    .iter()
+                    .map(|e| {
+                        let f: KernelFn =
+                            unsafe { std::mem::transmute(e.get_fn_ptr(&k.name()).unwrap()) };
+                        let mut out = [0u8; BUF];
+                        f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                        out
+                    })
+                    .collect();
+                check_output(
+                    *k,
+                    &outs[0],
+                    &outs[1],
+                    16,
+                    &format!("cranelift vs llvm, ISA {level}, trial {trial}"),
+                );
+            }
         }
     }
 }

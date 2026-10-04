@@ -315,14 +315,14 @@ fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResul
         signatures.insert(func.name.clone(), (p_types, func.ret_type));
     }
 
-    let mut engine = JitEngine::for_backend(backend).map_err(runtime_err)?;
+    let mut engine = JitEngine::for_module(backend, module).map_err(runtime_err)?;
     engine.compile_module(module).map_err(runtime_err)?;
 
     Ok(PyKernel { engine, signatures })
 }
 
-/// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default, which
-/// follows ACHAINSAW_BACKEND and otherwise uses Cranelift).
+/// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default: follows
+/// ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else Cranelift).
 #[pyfunction]
 #[pyo3(signature = (bytes, backend=None))]
 pub fn compile_binary(py: Python<'_>, bytes: &[u8], backend: Option<&str>) -> PyResult<PyKernel> {
@@ -334,8 +334,9 @@ pub fn compile_binary(py: Python<'_>, bytes: &[u8], backend: Option<&str>) -> Py
     build_kernel(&module, backend)
 }
 
-/// Compiles AIR source text. `backend` is "cranelift", "llvm" or "auto" (the default,
-/// which follows ACHAINSAW_BACKEND and otherwise uses Cranelift).
+/// Compiles AIR source text. `backend` is "cranelift", "llvm" or "auto" (the default:
+/// follows ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else
+/// Cranelift).
 #[pyfunction]
 #[pyo3(signature = (source, backend=None))]
 pub fn compile(py: Python<'_>, source: &str, backend: Option<&str>) -> PyResult<PyKernel> {

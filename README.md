@@ -131,7 +131,16 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
 
 **Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
 
-**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. The opt-in [LLVM backend](#10-choosing-a-backend---backend) compiles `v256`/`v512` to native AVX2/AVX-512 registers when the host has them; `vx` is still 128 bits there. Wider `vx`, scalable (SVE), and matrix-engine (AMX, SME) code generation are planned for the LLVM backend; programs written against `vl` and `mm` will speed up without changes.
+**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
+
+| Target (LLVM backend) | `vx` | Masked `ldm`/`stm` |
+|---|---|---|
+| x86_64 with AVX-512F | 512 bits (zmm) | AVX-512 k-masks |
+| x86_64 with AVX2 | 256 bits (ymm) | `vmaskmov` |
+| x86_64 SSE/AVX only, AArch64 NEON (including Apple M4) | 128 bits | per-lane |
+| AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
+
+`v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Matrix-engine (AMX, SME) code for `mm` is planned; programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
 
 ---
 
@@ -324,7 +333,7 @@ achainsaw cpu
 }
 ```
 
-Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available) and runs `v256`/`v512`/`vx` programs as 128-bit operations. The LLVM backend, when built in, uses every enabled feature for `v256`/`v512`, and `backends.llvm` reports `"available": true`.
+Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available) and runs `v256`/`v512`/`vx` programs as 128-bit operations. The LLVM backend, when built in, uses every enabled feature, and `backends.llvm` reports `"available": true` with its `vx` width (`vector_bits`) and whether `vx` is scalable (`vx_scalable`, on SVE).
 
 **Cap the ISA level** to exercise lower tiers on a more capable machine (for example, AVX2 code on an AVX-512 host). Levels: `sse`, `avx`, `avx2`, `avx512`, `amx` (x86_64) and `neon`, `sve`, `sve2`, `sme` (AArch64):
 ```bash
@@ -358,14 +367,14 @@ python benchmarks/benchmark_kernels.py
 ```
 
 ### 10. Choosing a Backend (`--backend`)
-Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and results are the same on both:
+Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
 
 | Backend | Compile latency (release, simple kernel) | Code | Availability |
 |---|---|---|---|
-| `cranelift` (default) | ~0.2–0.3 ms | 128-bit vectors | always |
-| `llvm` | ~5–7 ms | fully optimized; native 256/512-bit for `v256`/`v512` | builds with the `llvm` feature |
+| `cranelift` | ~0.2–0.3 ms | 128-bit vectors | always |
+| `llvm` | ~5–7 ms | fully optimized; full-width AVX2/AVX-512/SVE vectors (`vx` up to 512 bits or scalable) | builds with the `llvm` feature |
 
-Pick one with `--backend` on `run`, `bench` and `build`, the `ACHAINSAW_BACKEND` environment variable, `backend=` in Python, or the `backend` argument of MCP `air_run`. `auto` (the default) currently means Cranelift.
+Pick one with `--backend` on `run`, `bench` and `build`, the `ACHAINSAW_BACKEND` environment variable, `backend=` in Python, or the `backend` argument of MCP `air_run`. `auto` (the default) uses LLVM, when it is built in, for modules that use `v256`, `v512`, `vx`/`vl` or `mm`, and Cranelift otherwise, so scalar code keeps sub-millisecond compiles. For example, [`examples/saxpy_vx.air`](examples/saxpy_vx.air) on an AVX-512 machine runs 3–4x faster on LLVM.
 
 ```bash
 # Build with the LLVM backend (needs LLVM 22, e.g. apt install llvm-22-dev)

@@ -23,7 +23,7 @@ use inkwell::module::{Linkage, Module as LModule};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, VectorType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PhiValue,
-    PointerValue, VectorValue,
+    PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
@@ -48,6 +48,22 @@ pub struct SandboxBounds {
     pub len: u64,
 }
 
+/// Shape of `vx` for one compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VxShape {
+    /// A fixed width in bits: 128, 256 (AVX2) or 512 (AVX-512).
+    Fixed(u32),
+    /// SVE `<vscale x 128 bits>`. `vscale_range` bounds vscale: exact for the JIT, which
+    /// knows the host's vector length, and `(1, 16)` for AOT code.
+    Scalable { vscale_range: (u32, u32) },
+}
+
+impl Default for VxShape {
+    fn default() -> Self {
+        VxShape::Fixed(128)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LowerOptions {
     /// Call the fuel hooks at every branch and before `mm`.
@@ -60,24 +76,41 @@ pub struct LowerOptions {
     /// Value of the `target-cpu` / `target-features` function attributes.
     pub target_cpu: String,
     pub target_features: String,
-}
-
-/// Width in bits of a vector type on this backend. `vx` is 128 bits until the LLVM tier
-/// targets wider vectors natively.
-fn vec_bits(ty: Type) -> u32 {
-    match ty {
-        Type::V256 => 256,
-        Type::V512 => 512,
-        _ => 128,
-    }
+    /// Width and kind of `vx`.
+    pub vx: VxShape,
+    /// Widest vector register to use (`prefer-vector-width` / `min-legal-vector-width`), so
+    /// x86 code uses zmm/ymm registers instead of splitting wide vectors.
+    pub vector_width: Option<u32>,
 }
 
 fn lane_bits(lane: Type) -> u32 {
     lane.bit_width().expect("lane type has a width")
 }
 
-fn lane_count(ty: Type, lane: Type) -> u32 {
-    vec_bits(ty) / lane_bits(lane)
+/// Applies an expression to a fixed or scalable vector operand.
+macro_rules! vec1 {
+    ($a:expr, |$x:ident| $e:expr) => {
+        match $a {
+            BasicValueEnum::VectorValue($x) => BasicValueEnum::from($e),
+            BasicValueEnum::ScalableVectorValue($x) => BasicValueEnum::from($e),
+            other => unreachable!("vector operand expected, found {other:?}"),
+        }
+    };
+}
+
+/// Applies an expression to two vector operands of the same kind.
+macro_rules! vec2 {
+    ($a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {
+        match ($a, $b) {
+            (BasicValueEnum::VectorValue($x), BasicValueEnum::VectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (BasicValueEnum::ScalableVectorValue($x), BasicValueEnum::ScalableVectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (a, b) => unreachable!("vector operands expected, found {a:?} and {b:?}"),
+        }
+    };
 }
 
 pub fn lower_module<'ctx>(
@@ -137,6 +170,7 @@ type Values<'ctx> = HashMap<String, (BasicValueEnum<'ctx>, Type)>;
 /// Per-function lowering state.
 struct FnState<'ctx> {
     func: FunctionValue<'ctx>,
+    entry: BasicBlock<'ctx>,
     values: Values<'ctx>,
     blocks: HashMap<String, (BasicBlock<'ctx>, Vec<PhiValue<'ctx>>)>,
     /// Returns zeroes once a runtime check fails; the host then reports the status.
@@ -185,18 +219,76 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
     }
 
-    /// Canonical representation of an (untyped) AIR vector: i32 lanes.
-    fn canon_vec(&self, ty: Type) -> VectorType<'ctx> {
-        self.i32().vec_type(vec_bits(ty) / 32)
+    /// Whether `ty` is a scalable (SVE) vector in this compilation.
+    fn scalable(&self, ty: Type) -> bool {
+        ty == Type::Vx && matches!(self.opts.vx, VxShape::Scalable { .. })
     }
 
-    fn lane_vec(&self, ty: Type, lane: Type) -> VectorType<'ctx> {
-        let n = lane_count(ty, lane);
-        match self.scalar_type(lane) {
-            BasicTypeEnum::IntType(t) => t.vec_type(n),
-            BasicTypeEnum::FloatType(t) => t.vec_type(n),
-            _ => unreachable!(),
+    /// Width of a vector type in bits; for a scalable `vx`, the width per vscale unit.
+    fn vec_bits(&self, ty: Type) -> u32 {
+        match ty {
+            Type::V256 => 256,
+            Type::V512 => 512,
+            Type::Vx => match self.opts.vx {
+                VxShape::Fixed(bits) => bits,
+                VxShape::Scalable { .. } => 128,
+            },
+            _ => 128,
         }
+    }
+
+    /// Lane count, or lanes per vscale unit for a scalable `vx`.
+    fn lanes_min(&self, ty: Type, lane: Type) -> u32 {
+        self.vec_bits(ty) / lane_bits(lane)
+    }
+
+    fn vec_of(&self, elem: BasicTypeEnum<'ctx>, n: u32, scalable: bool) -> BasicTypeEnum<'ctx> {
+        match (elem, scalable) {
+            (BasicTypeEnum::IntType(t), false) => t.vec_type(n).into(),
+            (BasicTypeEnum::IntType(t), true) => t.scalable_vec_type(n).into(),
+            (BasicTypeEnum::FloatType(t), false) => t.vec_type(n).into(),
+            (BasicTypeEnum::FloatType(t), true) => t.scalable_vec_type(n).into(),
+            (other, _) => unreachable!("no vectors of {other:?}"),
+        }
+    }
+
+    /// Canonical representation of an (untyped) AIR vector: i32 lanes.
+    fn canon_vec(&self, ty: Type) -> BasicTypeEnum<'ctx> {
+        self.vec_of(self.i32().into(), self.vec_bits(ty) / 32, self.scalable(ty))
+    }
+
+    fn lane_vec(&self, ty: Type, lane: Type) -> BasicTypeEnum<'ctx> {
+        self.vec_of(
+            self.scalar_type(lane),
+            self.lanes_min(ty, lane),
+            self.scalable(ty),
+        )
+    }
+
+    /// `i1` mask with one bit per `lane` of `ty`.
+    fn mask_vec(&self, ty: Type, lane: Type) -> BasicTypeEnum<'ctx> {
+        self.vec_of(
+            self.i1().into(),
+            self.lanes_min(ty, lane),
+            self.scalable(ty),
+        )
+    }
+
+    /// Number of `lane` lanes in `ty` as an i64, computed from vscale when scalable.
+    fn lanes_value(&self, ty: Type, lane: Type) -> Result<IntValue<'ctx>> {
+        let n = self.c64(self.lanes_min(ty, lane) as i64);
+        if !self.scalable(ty) {
+            return Ok(n);
+        }
+        let vscale = self
+            .intr("llvm.vscale", &[self.i64().into()], &[])?
+            .into_int_value();
+        Ok(self.builder.build_int_mul(vscale, n, "")?)
+    }
+
+    /// Size of a vector of type `ty` in bytes, as an i64.
+    fn vec_bytes(&self, ty: Type) -> Result<IntValue<'ctx>> {
+        self.lanes_value(ty, Type::I8)
     }
 
     fn air_type(&self, ty: Type) -> BasicTypeEnum<'ctx> {
@@ -236,6 +328,26 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                     self.ctx.create_string_attribute(k, v),
                 );
             }
+        }
+        if let Some(width) = self.opts.vector_width {
+            for k in ["prefer-vector-width", "min-legal-vector-width"] {
+                f.add_attribute(
+                    AttributeLoc::Function,
+                    self.ctx.create_string_attribute(k, &width.to_string()),
+                );
+            }
+        }
+        if let VxShape::Scalable {
+            vscale_range: (min, max),
+        } = self.opts.vx
+        {
+            f.add_attribute(
+                AttributeLoc::Function,
+                self.ctx.create_enum_attribute(
+                    Attribute::get_named_enum_kind_id("vscale_range"),
+                    ((min as u64) << 32) | max as u64,
+                ),
+            );
         }
         f.add_attribute(AttributeLoc::Function, self.enum_attr("nounwind"));
     }
@@ -340,10 +452,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(self.builder.build_bit_cast(v, ty, "")?)
     }
 
-    fn as_lanes(&self, v: BasicValueEnum<'ctx>, ty: Type, lane: Type) -> Result<VectorValue<'ctx>> {
-        Ok(self
-            .bitcast(v, self.lane_vec(ty, lane))?
-            .into_vector_value())
+    fn as_lanes(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        ty: Type,
+        lane: Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        self.bitcast(v, self.lane_vec(ty, lane))
     }
 
     fn to_canon(&self, v: impl BasicValue<'ctx>, ty: Type) -> Result<BasicValueEnum<'ctx>> {
@@ -380,20 +495,26 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(self.builder.build_int_z_extend(b, self.i32(), "")?.into())
     }
 
-    /// Splats `x` into every lane of a `ty`-wide vector whose lanes have `x`'s type.
-    fn splat(&self, x: BasicValueEnum<'ctx>, n: u32) -> Result<VectorValue<'ctx>> {
-        let vt = match x.get_type() {
-            BasicTypeEnum::IntType(t) => t.vec_type(n),
-            BasicTypeEnum::FloatType(t) => t.vec_type(n),
-            _ => unreachable!(),
-        };
-        let one = self
-            .builder
-            .build_insert_element(vt.get_poison(), x, self.c32(0), "")?;
-        let zeros = self.i32().vec_type(n).const_zero();
-        Ok(self
-            .builder
-            .build_shuffle_vector(one, vt.get_poison(), zeros, "")?)
+    /// Splats `x` (of AIR type `lane`) into every lane of a vector of type `ty`.
+    fn splat(&self, x: BasicValueEnum<'ctx>, lane: Type, ty: Type) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let n = self.lanes_min(ty, lane);
+        let mask = self.vec_of(self.i32().into(), n, self.scalable(ty));
+        Ok(match self.lane_vec(ty, lane) {
+            BasicTypeEnum::VectorType(vt) => {
+                let one = b.build_insert_element(vt.get_poison(), x, self.c32(0), "")?;
+                let zeros = mask.into_vector_type().const_zero();
+                b.build_shuffle_vector(one, vt.get_poison(), zeros, "")?
+                    .into()
+            }
+            BasicTypeEnum::ScalableVectorType(vt) => {
+                let one = b.build_insert_element(vt.get_poison(), x, self.c32(0), "")?;
+                let zeros = mask.into_scalable_vector_type().const_zero();
+                b.build_shuffle_vector(one, vt.get_poison(), zeros, "")?
+                    .into()
+            }
+            other => unreachable!("{other:?}"),
+        })
     }
 
     // ---------------------------------------------------------------------------------
@@ -571,6 +692,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
 
         let mut st = FnState {
             func: f,
+            entry,
             values: HashMap::new(),
             blocks,
             trap,
@@ -735,24 +857,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
             Instruction::Load { dst, ptr, ty, .. } => {
                 let addr = self.int(st, ptr);
-                let bytes = if ty.is_vector() {
-                    vec_bits(*ty) / 8
-                } else {
-                    ty.byte_size() as u32
-                };
-                self.bounds_check(st, addr, self.c64(bytes as i64))?;
+                let bytes = self.access_bytes(*ty)?;
+                self.bounds_check(st, addr, bytes)?;
                 let v = self.load(self.air_type(*ty), addr)?;
                 st.values.insert(dst.clone(), (v, *ty));
             }
             Instruction::Store { ptr, val, .. } => {
                 let addr = self.int(st, ptr);
                 let (v, vty) = self.val(st, val);
-                let bytes = if vty.is_vector() {
-                    vec_bits(vty) / 8
-                } else {
-                    vty.byte_size() as u32
-                };
-                self.bounds_check(st, addr, self.c64(bytes as i64))?;
+                let bytes = self.access_bytes(vty)?;
+                self.bounds_check(st, addr, bytes)?;
                 self.store(v, addr)?;
             }
             Instruction::Call {
@@ -796,7 +910,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
             Instruction::Splat { dst, src, ty, .. } => {
                 let (s, sty) = self.val(st, src);
-                let v = self.splat(s, lane_count(*ty, sty))?;
+                let v = self.splat(s, sty, *ty)?;
                 st.values.insert(dst.clone(), (self.to_canon(v, *ty)?, *ty));
             }
             Instruction::ExtractLane {
@@ -804,7 +918,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (v, vty) = self.val(st, vec);
                 let lanes = self.as_lanes(v, vty, *ty)?;
-                let x = b.build_extract_element(lanes, self.c32(*lane), "")?;
+                let x = vec1!(lanes, |l| b.build_extract_element(
+                    l,
+                    self.c32(*lane),
+                    ""
+                )?);
                 st.values.insert(dst.clone(), (x, *ty));
             }
             Instruction::Alloc { dst, size, .. } => {
@@ -860,7 +978,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 op, dst, src, ty, ..
             } => {
                 let (v, vty) = self.val(st, src);
-                let r = self.reduce(*op, *ty, self.as_lanes(v, vty, *ty)?)?;
+                let r = self.reduce(st, *op, *ty, vty, self.as_lanes(v, vty, *ty)?)?;
                 st.values.insert(dst.clone(), (r, *ty));
             }
             Instruction::VBinary {
@@ -888,11 +1006,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let x = self.as_lanes(av, vty, *lane)?;
                 let y = self.as_lanes(self.val(st, bb).0, vty, *lane)?;
                 let z = self.as_lanes(self.val(st, c).0, vty, *lane)?;
-                let r = self.intr(
-                    "llvm.fma",
-                    &[x.get_type().into()],
-                    &[x.into(), y.into(), z.into()],
-                )?;
+                let r = self.intr("llvm.fma", &[x.get_type()], &[x, y, z])?;
                 st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
             }
             Instruction::VCmp {
@@ -916,21 +1030,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 ..
             } => {
                 let (m, vty) = self.val(st, mask);
-                let (m, t, e) = (
-                    m.into_vector_value(),
-                    self.val(st, then_val).0.into_vector_value(),
-                    self.val(st, else_val).0.into_vector_value(),
-                );
-                let mt = b.build_and(m, t, "")?;
-                let nm = b.build_not(m, "")?;
-                let me = b.build_and(nm, e, "")?;
-                let r = b.build_or(mt, me, "")?;
-                st.values.insert(dst.clone(), (r.into(), vty));
+                let (t, e) = (self.val(st, then_val).0, self.val(st, else_val).0);
+                let mt = vec2!(m, t, |x, y| b.build_and(x, y, "")?);
+                let nm = vec1!(m, |x| b.build_not(x, "")?);
+                let me = vec2!(nm, e, |x, y| b.build_and(x, y, "")?);
+                let r = vec2!(mt, me, |x, y| b.build_or(x, y, "")?);
+                st.values.insert(dst.clone(), (r, vty));
             }
             Instruction::VLen { dst, lane, .. } => {
-                let n = lane_count(Type::Vx, *lane);
-                st.values
-                    .insert(dst.clone(), (self.c64(n as i64).into(), Type::I64));
+                let n = self.lanes_value(Type::Vx, *lane)?;
+                st.values.insert(dst.clone(), (n.into(), Type::I64));
             }
             Instruction::MaskedLoad {
                 dst,
@@ -941,19 +1050,19 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 ..
             } => {
                 let addr = self.int(st, ptr);
-                let n = self.clamp_count(self.int(st, count), lane_count(*ty, *lane))?;
+                let n = self.clamp_count(self.int(st, count), self.lanes_value(*ty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
                 self.bounds_check(st, addr, bytes)?;
                 let vt = self.lane_vec(*ty, *lane);
-                let mask = self.lane_mask(n, lane_count(*ty, *lane))?;
+                let mask = self.lane_mask(n, *ty, *lane)?;
                 let p = self.int_ptr(addr)?;
-                let f = self.intrinsic("llvm.masked.load", &[vt.into(), p.get_type().into()]);
+                let f = self.intrinsic("llvm.masked.load", &[vt, p.get_type().into()]);
                 let mut args: Vec<BasicValueEnum> = vec![p.into()];
                 if f.count_params() == 4 {
                     args.push(self.c32(1).into());
                 }
-                args.push(mask.into());
-                args.push(vt.const_zero().into());
+                args.push(mask);
+                args.push(vt.const_zero());
                 let v = self.call1(f, &args)?;
                 st.values.insert(dst.clone(), (self.to_canon(v, *ty)?, *ty));
             }
@@ -966,21 +1075,21 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let addr = self.int(st, ptr);
                 let (v, vty) = self.val(st, val);
-                let n = self.clamp_count(self.int(st, count), lane_count(vty, *lane))?;
+                let n = self.clamp_count(self.int(st, count), self.lanes_value(vty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
                 self.bounds_check(st, addr, bytes)?;
                 let lanes = self.as_lanes(v, vty, *lane)?;
-                let mask = self.lane_mask(n, lane_count(vty, *lane))?;
+                let mask = self.lane_mask(n, vty, *lane)?;
                 let p = self.int_ptr(addr)?;
                 let f = self.intrinsic(
                     "llvm.masked.store",
-                    &[lanes.get_type().into(), p.get_type().into()],
+                    &[lanes.get_type(), p.get_type().into()],
                 );
-                let mut args: Vec<BasicValueEnum> = vec![lanes.into(), p.into()];
+                let mut args: Vec<BasicValueEnum> = vec![lanes, p.into()];
                 if f.count_params() == 4 {
                     args.push(self.c32(1).into());
                 }
-                args.push(mask.into());
+                args.push(mask);
                 self.call(f, &args)?;
             }
             Instruction::MatMul {
@@ -1171,15 +1280,31 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         })
     }
 
+    /// Bytes a plain `ld`/`st` of `ty` touches.
+    fn access_bytes(&self, ty: Type) -> Result<IntValue<'ctx>> {
+        if ty.is_vector() {
+            self.vec_bytes(ty)
+        } else {
+            Ok(self.c64(ty.byte_size() as i64))
+        }
+    }
+
     /// Canonical recursive-halves reduction: `reduce(v) = op(reduce(lo), reduce(hi))`,
-    /// built level by level by combining even and odd lanes.
+    /// which combines adjacent lanes first. Fixed vectors combine even and odd lanes level
+    /// by level with shuffles; scalable vectors run the same tree through memory.
     fn reduce(
         &self,
+        st: &FnState<'ctx>,
         op: VectorReduceOp,
         lane: Type,
-        mut v: VectorValue<'ctx>,
+        vty: Type,
+        v: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
+        let mut v = match v {
+            BasicValueEnum::VectorValue(v) => v,
+            _ => return self.reduce_in_memory(st, op, lane, vty, v),
+        };
         let mut n = v.get_type().get_size();
         while n > 1 {
             let half = n / 2;
@@ -1192,37 +1317,122 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             };
             let even = b.build_shuffle_vector(v, v, pick(0), "")?;
             let odd = b.build_shuffle_vector(v, v, pick(1), "")?;
-            v = self.combine(op, lane, even, odd)?;
+            v = self
+                .combine(op, lane, even.into(), odd.into())?
+                .into_vector_value();
             n = half;
         }
         Ok(b.build_extract_element(v, self.c32(0), "")?)
     }
 
+    /// Reduction of a scalable vector: spills it to a stack slot and repeatedly combines
+    /// adjacent pairs in place (`buf[i] = op(buf[2i], buf[2i+1])`) until one lane is left.
+    /// For power-of-two lane counts (every SVE vector length in use) this is exactly the
+    /// recursive-halves tree; an odd lane out is carried to the next level unchanged.
+    fn reduce_in_memory(
+        &self,
+        st: &FnState<'ctx>,
+        op: VectorReduceOp,
+        lane: Type,
+        vty: Type,
+        v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let elem = self.scalar_type(lane);
+        let i64t = self.i64();
+        // The slot lives in the entry block so reductions inside loops reuse it.
+        let entry_b = self.ctx.create_builder();
+        match st.entry.get_terminator() {
+            Some(t) => entry_b.position_before(&t),
+            None => entry_b.position_at_end(st.entry),
+        }
+        let buf = entry_b.build_alloca(v.get_type(), "reduce.buf")?;
+        b.build_store(buf, v)?;
+        let n0 = self.lanes_value(vty, lane)?;
+        let at = |i: IntValue<'ctx>| unsafe { b.build_gep(elem, buf, &[i], "") };
+
+        let f = st.func;
+        let (lvl, pairs, body, next_lvl, done) = (
+            self.ctx.append_basic_block(f, "reduce.level"),
+            self.ctx.append_basic_block(f, "reduce.pairs"),
+            self.ctx.append_basic_block(f, "reduce.body"),
+            self.ctx.append_basic_block(f, "reduce.next"),
+            self.ctx.append_basic_block(f, "reduce.done"),
+        );
+        let pre = b.get_insert_block().unwrap();
+        b.build_unconditional_branch(lvl)?;
+
+        // while n > 1
+        b.position_at_end(lvl);
+        let n = b.build_phi(i64t, "n")?;
+        n.add_incoming(&[(&n0, pre)]);
+        let nv = n.as_basic_value().into_int_value();
+        let more = b.build_int_compare(IntPredicate::UGT, nv, self.c64(1), "")?;
+        let half = b.build_int_add(nv, self.c64(1), "")?;
+        let half = b.build_right_shift(half, self.c64(1), false, "")?;
+        b.build_conditional_branch(more, pairs, done)?;
+
+        // for i in 0..ceil(n/2)
+        b.position_at_end(pairs);
+        let i = b.build_phi(i64t, "i")?;
+        i.add_incoming(&[(&self.c64(0), lvl)]);
+        let iv = i.as_basic_value().into_int_value();
+        let more_i = b.build_int_compare(IntPredicate::ULT, iv, half, "")?;
+        b.build_conditional_branch(more_i, body, next_lvl)?;
+
+        b.position_at_end(body);
+        let j = b.build_int_add(iv, iv, "")?;
+        let j1 = b.build_int_add(j, self.c64(1), "")?;
+        let x = b.build_load(elem, at(j)?, "")?;
+        // With an odd lane count the last lane has no partner and is carried over as-is;
+        // reload buf[j] instead of reading past the vector, then keep x.
+        let y_idx_ok = b.build_int_compare(IntPredicate::ULT, j1, nv, "")?;
+        let safe_j1 = b.build_select(y_idx_ok, j1, j, "")?.into_int_value();
+        let y = b.build_load(elem, at(safe_j1)?, "")?;
+        let r = self.combine(op, lane, x, y)?;
+        let r = b.build_select(y_idx_ok, r, x, "")?;
+        b.build_store(at(iv)?, r)?;
+        let i2 = b.build_int_add(iv, self.c64(1), "")?;
+        i.add_incoming(&[(&i2, body)]);
+        b.build_unconditional_branch(pairs)?;
+
+        b.position_at_end(next_lvl);
+        n.add_incoming(&[(&half, next_lvl)]);
+        b.build_unconditional_branch(lvl)?;
+
+        b.position_at_end(done);
+        Ok(b.build_load(elem, buf, "")?)
+    }
+
+    /// One reduction step on scalars or vectors of `lane` values.
     fn combine(
         &self,
         op: VectorReduceOp,
         lane: Type,
-        a: VectorValue<'ctx>,
-        c: VectorValue<'ctx>,
-    ) -> Result<VectorValue<'ctx>> {
+        a: BasicValueEnum<'ctx>,
+        c: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let t: BasicTypeEnum = a.get_type().into();
-        let (x, y) = (a.into(), c.into());
-        Ok(match (op, lane.is_float()) {
-            (VectorReduceOp::Sum, true) => b.build_float_add(a, c, "")?,
-            (VectorReduceOp::Sum, false) => b.build_int_add(a, c, "")?,
-            (VectorReduceOp::Max, true) => self
-                .intr("llvm.maximum", &[t], &[x, y])?
-                .into_vector_value(),
-            (VectorReduceOp::Max, false) => {
-                self.intr("llvm.smax", &[t], &[x, y])?.into_vector_value()
-            }
-            (VectorReduceOp::Min, true) => self
-                .intr("llvm.minimum", &[t], &[x, y])?
-                .into_vector_value(),
-            (VectorReduceOp::Min, false) => {
-                self.intr("llvm.smin", &[t], &[x, y])?.into_vector_value()
-            }
+        let t = a.get_type();
+        Ok(match (op, lane.is_float(), a, c) {
+            (
+                VectorReduceOp::Sum,
+                true,
+                BasicValueEnum::FloatValue(x),
+                BasicValueEnum::FloatValue(y),
+            ) => b.build_float_add(x, y, "")?.into(),
+            (
+                VectorReduceOp::Sum,
+                false,
+                BasicValueEnum::IntValue(x),
+                BasicValueEnum::IntValue(y),
+            ) => b.build_int_add(x, y, "")?.into(),
+            (VectorReduceOp::Sum, true, _, _) => vec2!(a, c, |x, y| b.build_float_add(x, y, "")?),
+            (VectorReduceOp::Sum, false, _, _) => vec2!(a, c, |x, y| b.build_int_add(x, y, "")?),
+            (VectorReduceOp::Max, true, _, _) => self.intr("llvm.maximum", &[t], &[a, c])?,
+            (VectorReduceOp::Max, false, _, _) => self.intr("llvm.smax", &[t], &[a, c])?,
+            (VectorReduceOp::Min, true, _, _) => self.intr("llvm.minimum", &[t], &[a, c])?,
+            (VectorReduceOp::Min, false, _, _) => self.intr("llvm.smin", &[t], &[a, c])?,
         })
     }
 
@@ -1236,31 +1446,28 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     ) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
         if op.is_bitwise() {
-            let (x, y) = (l.into_vector_value(), r.into_vector_value());
-            let res = match op {
-                VBinOp::And => b.build_and(x, y, "")?,
-                VBinOp::Or => b.build_or(x, y, "")?,
-                _ => b.build_xor(x, y, "")?,
-            };
-            return Ok(res.into());
+            return Ok(match op {
+                VBinOp::And => vec2!(l, r, |x, y| b.build_and(x, y, "")?),
+                VBinOp::Or => vec2!(l, r, |x, y| b.build_or(x, y, "")?),
+                _ => vec2!(l, r, |x, y| b.build_xor(x, y, "")?),
+            });
         }
         let x = self.as_lanes(l, vty, lane)?;
         let y = self.as_lanes(r, vty, lane)?;
-        let t: BasicTypeEnum = x.get_type().into();
-        let (xv, yv) = (x.into(), y.into());
-        let res: BasicValueEnum = match (op, lane.is_float()) {
-            (VBinOp::Add, true) => b.build_float_add(x, y, "")?.into(),
-            (VBinOp::Add, false) => b.build_int_add(x, y, "")?.into(),
-            (VBinOp::Sub, true) => b.build_float_sub(x, y, "")?.into(),
-            (VBinOp::Sub, false) => b.build_int_sub(x, y, "")?.into(),
-            (VBinOp::Mul, true) => b.build_float_mul(x, y, "")?.into(),
-            (VBinOp::Mul, false) => b.build_int_mul(x, y, "")?.into(),
-            (VBinOp::Min, true) => self.intr("llvm.minimum", &[t], &[xv, yv])?,
-            (VBinOp::Min, false) => self.intr("llvm.smin", &[t], &[xv, yv])?,
-            (VBinOp::Max, true) => self.intr("llvm.maximum", &[t], &[xv, yv])?,
-            (VBinOp::Max, false) => self.intr("llvm.smax", &[t], &[xv, yv])?,
+        let t = x.get_type();
+        let res = match (op, lane.is_float()) {
+            (VBinOp::Add, true) => vec2!(x, y, |a, c| b.build_float_add(a, c, "")?),
+            (VBinOp::Add, false) => vec2!(x, y, |a, c| b.build_int_add(a, c, "")?),
+            (VBinOp::Sub, true) => vec2!(x, y, |a, c| b.build_float_sub(a, c, "")?),
+            (VBinOp::Sub, false) => vec2!(x, y, |a, c| b.build_int_sub(a, c, "")?),
+            (VBinOp::Mul, true) => vec2!(x, y, |a, c| b.build_float_mul(a, c, "")?),
+            (VBinOp::Mul, false) => vec2!(x, y, |a, c| b.build_int_mul(a, c, "")?),
+            (VBinOp::Min, true) => self.intr("llvm.minimum", &[t], &[x, y])?,
+            (VBinOp::Min, false) => self.intr("llvm.smin", &[t], &[x, y])?,
+            (VBinOp::Max, true) => self.intr("llvm.maximum", &[t], &[x, y])?,
+            (VBinOp::Max, false) => self.intr("llvm.smax", &[t], &[x, y])?,
             // The validator only allows float lanes for vdiv.
-            (VBinOp::Div, _) => b.build_float_div(x, y, "")?.into(),
+            (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
             (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
         };
         self.to_canon(res, vty)
@@ -1286,7 +1493,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 VCmpOp::Le => FloatPredicate::OLE,
                 VCmpOp::Ge => FloatPredicate::OGE,
             };
-            b.build_float_compare(p, x, y, "")?
+            vec2!(x, y, |a, c| b.build_float_compare(p, a, c, "")?)
         } else {
             let p = match op {
                 VCmpOp::Eq => IntPredicate::EQ,
@@ -1296,33 +1503,43 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 VCmpOp::Le => IntPredicate::SLE,
                 VCmpOp::Ge => IntPredicate::SGE,
             };
-            b.build_int_compare(p, x, y, "")?
+            vec2!(x, y, |a, c| b.build_int_compare(p, a, c, "")?)
         };
         // All-ones lanes where true.
-        let mask_ty = self
-            .int_of_bits(lane_bits(lane))
-            .vec_type(lane_count(vty, lane));
-        let m = b.build_int_s_extend(bits, mask_ty, "")?;
+        let mask_ty = self.vec_of(
+            self.int_of_bits(lane_bits(lane)).into(),
+            self.lanes_min(vty, lane),
+            self.scalable(vty),
+        );
+        let m: BasicValueEnum = match bits {
+            BasicValueEnum::VectorValue(m) => b
+                .build_int_s_extend(m, mask_ty.into_vector_type(), "")?
+                .into(),
+            BasicValueEnum::ScalableVectorValue(m) => b
+                .build_int_s_extend(m, mask_ty.into_scalable_vector_type(), "")?
+                .into(),
+            other => unreachable!("{other:?}"),
+        };
         self.to_canon(m, vty)
     }
 
     /// `min(max(count, 0), lanes)`.
-    fn clamp_count(&self, count: IntValue<'ctx>, lanes: u32) -> Result<IntValue<'ctx>> {
+    fn clamp_count(&self, count: IntValue<'ctx>, lanes: IntValue<'ctx>) -> Result<IntValue<'ctx>> {
         let t: BasicTypeEnum = self.i64().into();
         let n = self.intr("llvm.smax", &[t], &[count.into(), self.c64(0).into()])?;
         Ok(self
-            .intr("llvm.smin", &[t], &[n, self.c64(lanes as i64).into()])?
+            .intr("llvm.smin", &[t], &[n, lanes.into()])?
             .into_int_value())
     }
 
-    /// `<lanes x i1>` mask with the first `n` lanes set.
-    fn lane_mask(&self, n: IntValue<'ctx>, lanes: u32) -> Result<VectorValue<'ctx>> {
-        let iota =
-            VectorType::const_vector(&(0..lanes).map(|i| self.c64(i as i64)).collect::<Vec<_>>());
-        let ns = self.splat(n.into(), lanes)?;
-        Ok(self
-            .builder
-            .build_int_compare(IntPredicate::ULT, iota, ns, "")?)
+    /// Mask with the first `n` lanes of `ty` set (`llvm.get.active.lane.mask`, which
+    /// becomes `whilelo` on SVE and a k-mask on AVX-512).
+    fn lane_mask(&self, n: IntValue<'ctx>, ty: Type, lane: Type) -> Result<BasicValueEnum<'ctx>> {
+        self.intr(
+            "llvm.get.active.lane.mask",
+            &[self.mask_vec(ty, lane), self.i64().into()],
+            &[self.c64(0).into(), n.into()],
+        )
     }
 
     /// `mm`: same loop nest, accumulation order and fuel charge as the Cranelift backend.

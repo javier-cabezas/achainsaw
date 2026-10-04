@@ -56,8 +56,13 @@ jobs:
         run: cargo test --workspace --verbose
 
   test-llvm:
-    name: LLVM Backend (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: LLVM Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The arm64 runners (Neoverse N2) have SVE2, so the scalable `vx` path runs natively.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     env:
       LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       LLVM_FEATURES: achainsaw/llvm,achainsaw-codegen/llvm,achainsaw-llvm/llvm,achainsaw-py/llvm
@@ -83,6 +88,9 @@ jobs:
 
       - name: Run Clippy lints with LLVM
         run: cargo clippy --workspace --all-targets --features "$LLVM_FEATURES" -- -D warnings
+
+      - name: Report target features
+        run: cargo run -q --bin achainsaw --features achainsaw/llvm -- cpu
 
       # The whole suite runs twice: Cranelift (default) and LLVM (ACHAINSAW_BACKEND), so both
       # backends are held to the same tests. backend_parity.rs compares them directly.
@@ -113,6 +121,24 @@ jobs:
           python tests/test_mcp_e2e.py
           python tests/test_aot_e2e.py
           python benchmarks/benchmark_kernels.py
+        env:
+          ACHAINSAW_BACKEND: llvm
+
+      # Scalable vectors must work at every SVE vector length, not just the runner's
+      # 128 bits: rerun the vector tests under QEMU at 256, 512 and 2048 bits (also exercising
+      # SME detection, which `-cpu max` provides).
+      - name: SVE vector-length sweep under QEMU
+        if: runner.arch == 'ARM64'
+        run: |
+          sudo apt-get install -y qemu-user
+          cargo test -p achainsaw-codegen --features llvm --no-run
+          for vl_bytes in 32 64 256; do
+            echo "::group::SVE vector length $((vl_bytes * 8)) bits"
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -cpu max,sve-default-vector-length=$vl_bytes" \
+              cargo test -p achainsaw-codegen --features llvm \
+                --test vector_ops --test half_masked_mm --test sandbox --test backend_parity
+            echo "::endgroup::"
+          done
         env:
           ACHAINSAW_BACKEND: llvm
 

@@ -8,14 +8,20 @@ use inkwell::targets::FileType;
 /// Compiles `air` to a relocatable object file for `spec`, returning the object and its
 /// target triple. Like the Cranelift AOT backend, `alloc`/`free` call libc `malloc`/`free`
 /// and there is no fuel or sandboxing.
-pub fn compile_object(air: &Module, spec: &TargetSpec) -> Result<(Vec<u8>, String)> {
+pub fn compile_object(
+    air: &Module,
+    spec: &TargetSpec,
+    opts: &LowerOptions,
+) -> Result<(Vec<u8>, String)> {
     let tm = target_machine(spec, false)?;
     let ctx = Context::create();
     let opts = LowerOptions {
         aot: true,
+        fuel: false,
+        sandbox: None,
         target_cpu: spec.cpu.clone(),
         target_features: spec.features.clone(),
-        ..Default::default()
+        ..opts.clone()
     };
     let module = lower_module(&ctx, air, &opts)?;
     optimize(&module, &tm)?;

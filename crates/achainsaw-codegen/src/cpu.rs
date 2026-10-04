@@ -19,8 +19,6 @@ pub const ISA_CAP_ENV: &str = "ACHAINSAW_MAX_ISA";
 
 /// Vector register width Cranelift generates code for, regardless of host features.
 pub const CRANELIFT_VECTOR_BITS: u32 = 128;
-/// Width of `vx` on the LLVM backend (native wider vectors arrive in a later phase).
-pub const LLVM_VECTOR_BITS: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -542,6 +540,32 @@ impl CpuFeatures {
             .join(",")
     }
 
+    /// Shape of `vx` and the preferred vector register width for LLVM code using these
+    /// features: 512/256/128-bit fixed vectors on x86 by AVX-512F/AVX2, scalable vectors on
+    /// SVE (with the exact vscale for JIT code, which runs on this host), else 128 bits.
+    #[cfg(feature = "llvm")]
+    pub fn llvm_vector_shape(&self, jit: bool) -> (achainsaw_llvm::VxShape, Option<u32>) {
+        use achainsaw_llvm::VxShape;
+        match self.arch {
+            Arch::Aarch64 if self.has(F::Sve) => {
+                let vscale_range = match (jit, self.sve_vector_bits) {
+                    (true, Some(bits)) if bits >= 128 => (bits / 128, bits / 128),
+                    _ => (1, 16),
+                };
+                (VxShape::Scalable { vscale_range }, None)
+            }
+            _ => {
+                let bits = self.native_vector_bits();
+                (VxShape::Fixed(bits), (bits > 128).then_some(bits))
+            }
+        }
+    }
+
+    /// Whether LLVM code for these features uses scalable (SVE) `vx` vectors.
+    pub fn llvm_vx_scalable(&self) -> bool {
+        self.arch == Arch::Aarch64 && self.has(F::Sve)
+    }
+
     /// LLVM CPU name and feature string for JIT code using exactly these features. The
     /// host's CPU model (for scheduling) is used only when nothing is capped, so a capped
     /// tier cannot pick up model-implied features outside the feature table.
@@ -615,7 +639,11 @@ pub fn target_report() -> Result<Value> {
                 "unused_features": effective.cranelift_unused(),
             },
             "llvm": if cfg!(feature = "llvm") {
-                json!({ "available": true, "vector_bits": LLVM_VECTOR_BITS })
+                json!({
+                    "available": true,
+                    "vector_bits": effective.native_vector_bits(),
+                    "vx_scalable": effective.llvm_vx_scalable(),
+                })
             } else {
                 json!({ "available": false })
             },
@@ -801,7 +829,9 @@ pub fn target_isa_builder(
 /// capped host when neither a triple nor a CPU is given, otherwise the named CPU (or the
 /// architecture's generic model) plus `features` overrides, validated against the table.
 #[cfg(feature = "llvm")]
-pub fn llvm_aot_target(target: &crate::aot::AotTarget) -> Result<achainsaw_llvm::TargetSpec> {
+pub fn llvm_aot_target(
+    target: &crate::aot::AotTarget,
+) -> Result<(achainsaw_llvm::TargetSpec, CpuFeatures)> {
     let arch = match target.triple.as_deref() {
         None => Arch::host(),
         Some(t) => {
@@ -850,16 +880,39 @@ pub fn llvm_aot_target(target: &crate::aot::AotTarget) -> Result<achainsaw_llvm:
             String::new(),
         ),
     };
+    // Our view of the target's features, used to shape `vx`: the capped host, or the CPU
+    // preset (x86 only; other named CPUs contribute nothing), plus the overrides.
+    let mut set = match (&target.triple, &target.cpu, arch) {
+        (None, None, _) => CpuFeatures::effective()?,
+        (_, Some(cpu), Arch::X86_64) => {
+            let x86 = target_lexicon::Triple::from_str("x86_64-unknown-linux-gnu").unwrap();
+            match isa::lookup(x86) {
+                Ok(mut builder) => {
+                    let _ = builder.enable(cpu);
+                    enabled_cranelift_features(&builder, arch)?.with_prerequisites()
+                }
+                Err(_) => CpuFeatures::empty(arch),
+            }
+        }
+        (_, _, Arch::Aarch64) => CpuFeatures::from_features(arch, &[F::Neon]),
+        _ => CpuFeatures::empty(arch),
+    };
+    if !overrides.is_empty() {
+        set.apply_feature_string(&overrides)?;
+    }
     let features = [base, overrides]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(",");
-    Ok(achainsaw_llvm::TargetSpec {
-        triple: target.triple.clone(),
-        cpu,
-        features,
-    })
+    Ok((
+        achainsaw_llvm::TargetSpec {
+            triple: target.triple.clone(),
+            cpu,
+            features,
+        },
+        set,
+    ))
 }
 
 /// Features whose Cranelift settings are currently enabled on `builder`.

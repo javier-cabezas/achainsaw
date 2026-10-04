@@ -14,5 +14,5 @@ mod target;
 
 pub use aot::compile_object;
 pub use jit::{LlvmJit, RuntimeHooks};
-pub use lower::{trampoline_name, LowerOptions, SandboxBounds};
+pub use lower::{trampoline_name, LowerOptions, SandboxBounds, VxShape};
 pub use target::{host_cpu_name, TargetSpec};
