@@ -19,6 +19,8 @@ pub const ISA_CAP_ENV: &str = "ACHAINSAW_MAX_ISA";
 
 /// Vector register width Cranelift generates code for, regardless of host features.
 pub const CRANELIFT_VECTOR_BITS: u32 = 128;
+/// Width of `vx` on the LLVM backend (native wider vectors arrive in a later phase).
+pub const LLVM_VECTOR_BITS: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -526,6 +528,34 @@ impl CpuFeatures {
             .collect()
     }
 
+    /// LLVM `+`/`-` feature string naming every table feature of this architecture, so
+    /// LLVM enables exactly these features whatever its CPU model implies.
+    pub fn llvm_feature_string(&self) -> String {
+        FEATURE_TABLE
+            .iter()
+            .filter(|i| i.level.arch() == self.arch)
+            .map(|i| {
+                let sign = if self.has(i.feature) { '+' } else { '-' };
+                format!("{sign}{}", i.name)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// LLVM CPU name and feature string for JIT code using exactly these features. The
+    /// host's CPU model (for scheduling) is used only when nothing is capped, so a capped
+    /// tier cannot pick up model-implied features outside the feature table.
+    #[cfg(feature = "llvm")]
+    pub fn llvm_target(&self) -> (String, String) {
+        let cpu = match self.arch {
+            _ if *self == Self::host() => achainsaw_llvm::host_cpu_name(),
+            Arch::X86_64 => "x86-64".to_string(),
+            Arch::Aarch64 => "generic".to_string(),
+            Arch::Other => achainsaw_llvm::host_cpu_name(),
+        };
+        (cpu, self.llvm_feature_string())
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "arch": self.arch.as_str(),
@@ -584,7 +614,11 @@ pub fn target_report() -> Result<Value> {
                 "vector_bits": CRANELIFT_VECTOR_BITS,
                 "unused_features": effective.cranelift_unused(),
             },
-            "llvm": { "available": false },
+            "llvm": if cfg!(feature = "llvm") {
+                json!({ "available": true, "vector_bits": LLVM_VECTOR_BITS })
+            } else {
+                json!({ "available": false })
+            },
         },
     }))
 }
@@ -761,6 +795,71 @@ pub fn target_isa_builder(
     }
     apply_cranelift_flags(&mut builder, &set)?;
     Ok((builder, ignored))
+}
+
+/// LLVM target for an AOT build, with the same defaults as [`target_isa_builder`]: the
+/// capped host when neither a triple nor a CPU is given, otherwise the named CPU (or the
+/// architecture's generic model) plus `features` overrides, validated against the table.
+#[cfg(feature = "llvm")]
+pub fn llvm_aot_target(target: &crate::aot::AotTarget) -> Result<achainsaw_llvm::TargetSpec> {
+    let arch = match target.triple.as_deref() {
+        None => Arch::host(),
+        Some(t) => {
+            let triple = target_lexicon::Triple::from_str(t)
+                .map_err(|e| anyhow!("[ERR_INVALID_TARGET] Invalid target triple '{t}': {e}"))?;
+            match triple.architecture {
+                target_lexicon::Architecture::X86_64 => Arch::X86_64,
+                target_lexicon::Architecture::Aarch64(_) => Arch::Aarch64,
+                _ => Arch::Other,
+            }
+        }
+    };
+    let overrides = match target.features.as_deref() {
+        Some(spec) if arch == Arch::Other => {
+            return Err(anyhow!(
+                "[ERR_UNKNOWN_TARGET_FEATURE] Target features are only supported for x86_64 and aarch64 (got '{spec}')"
+            ))
+        }
+        Some(spec) => {
+            parse_feature_string(spec, arch)?;
+            spec.to_string()
+        }
+        None => String::new(),
+    };
+    if let (Arch::X86_64, Some(cpu)) = (arch, &target.cpu) {
+        // LLVM only warns about unknown CPUs and falls back to a generic model. x86 CPU
+        // presets use LLVM names, so reject unknown ones with the Cranelift error instead.
+        let x86 = target_lexicon::Triple::from_str("x86_64-unknown-linux-gnu").unwrap();
+        if let Ok(mut builder) = isa::lookup(x86) {
+            if builder.enable(cpu).is_err() {
+                return Err(anyhow!(
+                    "[ERR_UNKNOWN_TARGET_CPU] Unknown target CPU '{cpu}' for x86_64; use LLVM CPU names such as x86-64-v3, znver4, sapphirerapids"
+                ));
+            }
+        }
+    }
+    let (cpu, base) = match (&target.triple, &target.cpu) {
+        (None, None) => CpuFeatures::effective()?.llvm_target(),
+        (_, Some(cpu)) => (cpu.clone(), String::new()),
+        (Some(_), None) => (
+            match arch {
+                Arch::X86_64 => "x86-64",
+                _ => "generic",
+            }
+            .to_string(),
+            String::new(),
+        ),
+    };
+    let features = [base, overrides]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(achainsaw_llvm::TargetSpec {
+        triple: target.triple.clone(),
+        cpu,
+        features,
+    })
 }
 
 /// Features whose Cranelift settings are currently enabled on `builder`.

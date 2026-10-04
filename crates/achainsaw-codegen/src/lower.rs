@@ -226,7 +226,6 @@ fn mm_widen(builder: &mut FunctionBuilder, dtype: Type, v: ClifValue) -> ClifVal
     }
 }
 
-/// Number of `lane` lanes in a vector of type `ty` on this backend.
 /// Bytes a plain `ld`/`st` of `ty` touches.
 fn access_bytes(ty: Type) -> usize {
     if ty.is_vector() {
@@ -236,6 +235,7 @@ fn access_bytes(ty: Type) -> usize {
     }
 }
 
+/// Number of `lane` lanes in a vector of type `ty` on this backend.
 fn lanes_of(ty: Type, lane: Type) -> i64 {
     (part_count(ty) * 16 / lane.byte_size()) as i64
 }

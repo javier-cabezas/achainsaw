@@ -19,7 +19,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 /// without having seen the language before. Keep in sync with the parser and validator.
 pub const SERVER_INSTRUCTIONS: &str = "\
 achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
-Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features (backends currently generate 128-bit vector code).
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features and which backends are available (Cranelift generates 128-bit vector code; LLVM, when built in, uses native widths for v256/v512).
 
 AIR syntax:
 - Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits, lane count via `vl`). Vectors are untyped bits; each vector op names its lane type.
@@ -37,7 +37,7 @@ AIR syntax:
 - Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
 - Comments: `#` or `//`. Names starting with `__` are reserved.
 
-air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion.
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); results are identical on both.
 
 Example:
 fn sum_to(n:i64)->i64
@@ -144,13 +144,14 @@ pub fn execute_ir(
     args: &[f64],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    backend: Option<&str>,
 ) -> Result<Value> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("air_run".into())
             .stack_size(EXECUTION_STACK_BYTES)
             .spawn_scoped(scope, || {
-                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb)
+                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb, backend)
             })?
             .join()
             .map_err(|_| anyhow!("air_run execution thread panicked"))?
@@ -163,6 +164,7 @@ fn execute_ir_on_this_thread(
     args: &[f64],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    backend: Option<&str>,
 ) -> Result<Value> {
     const ALLOWED_EXTERNALS: &[&str] = &[
         "sinf", "cosf", "tanf", "sqrtf", "expf", "logf", "powf", "fabsf", "floorf", "ceilf",
@@ -202,7 +204,7 @@ fn execute_ir_on_this_thread(
     let arena_bytes = memory_mb * 1024 * 1024;
 
     let t1 = Instant::now();
-    let mut engine = JitEngine::new()?;
+    let mut engine = JitEngine::for_backend(backend)?;
     // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
     let effective_fuel = fuel.or(Some(1_000_000));
     engine.set_fuel(effective_fuel);
@@ -249,6 +251,7 @@ fn execute_ir_on_this_thread(
         "status": "ok",
         "function": func_name,
         "result": res_val,
+        "backend": engine.backend().as_str(),
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,
     }))
@@ -360,7 +363,8 @@ pub fn handle_air_run(arguments: &Value) -> Value {
         }
     };
 
-    match execute_ir(&module, func, &args, fuel, max_memory_mb) {
+    let backend = arguments.get("backend").and_then(|v| v.as_str());
+    match execute_ir(&module, func, &args, fuel, max_memory_mb, backend) {
         Ok(val) => json_tool_result(val),
         Err(e) => json_tool_error(json!({
             "status": "error",
@@ -537,6 +541,11 @@ pub fn get_tools_list() -> Value {
                         "fuel": {
                             "type": "integer",
                             "description": "Loop fuel instruction budget (prevents infinite loops)"
+                        },
+                        "backend": {
+                            "type": "string",
+                            "enum": ["auto", "cranelift", "llvm"],
+                            "description": "Code generator (default auto = cranelift; llvm compiles slower but optimizes fully, if this build has it)"
                         },
                         "max_memory_mb": {
                             "type": "integer",
@@ -849,6 +858,27 @@ mod tests {
         assert_eq!(res["isError"], true);
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ERR_OUT_OF_FUEL"));
+    }
+
+    #[test]
+    fn test_mcp_air_run_backend_choice() {
+        let code = "fn main(x:i32)->i32\n  b0:\n    y = add x, 1:i32\n    ret y\n";
+        for backend in achainsaw_codegen::Backend::available() {
+            let res = handle_air_run(&json!({
+                "code": code, "args": [41], "backend": backend.as_str()
+            }));
+            assert_eq!(res["isError"], false, "{res}");
+            let text = res["content"][0]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(payload["result"], 42);
+            assert_eq!(payload["backend"], backend.as_str());
+        }
+        let text = run_error_text(json!({ "code": code, "backend": "gcc" }));
+        assert!(text.contains("ERR_UNKNOWN_BACKEND"), "{text}");
+        if !achainsaw_codegen::Backend::Llvm.is_available() {
+            let text = run_error_text(json!({ "code": code, "backend": "llvm" }));
+            assert!(text.contains("ERR_BACKEND_UNAVAILABLE"), "{text}");
+        }
     }
 
     fn run_error_text(arguments: Value) -> String {

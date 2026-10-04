@@ -4,6 +4,7 @@ members = [
     "crates/achainsaw-codegen",
     "crates/achainsaw-cli",
     "crates/achainsaw-py",
+    "crates/achainsaw-llvm",
 ]
 resolver = "2"
 

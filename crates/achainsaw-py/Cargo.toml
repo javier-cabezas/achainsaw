@@ -10,6 +10,10 @@ name = "achainsaw"
 crate-type = ["cdylib", "rlib"]
 test = false
 
+[features]
+# Optional LLVM backend (`--backend llvm`); needs LLVM 22 (set LLVM_SYS_221_PREFIX).
+llvm = ["achainsaw-codegen/llvm"]
+
 [dependencies]
 achainsaw-ir = { path = "../achainsaw-ir" }
 achainsaw-codegen = { path = "../achainsaw-codegen" }
