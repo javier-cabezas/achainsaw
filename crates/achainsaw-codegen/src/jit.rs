@@ -819,6 +819,9 @@ enum Codegen {
     #[cfg(feature = "llvm")]
     Llvm {
         target: achainsaw_llvm::TargetSpec,
+        vx: achainsaw_llvm::VxShape,
+        vector_width: Option<u32>,
+        vx_bits: u32,
         /// One LLJIT per `compile_module` call; kept alive so earlier code stays valid.
         modules: Vec<achainsaw_llvm::LlvmJit>,
     },
@@ -860,6 +863,15 @@ impl JitEngine {
         )
     }
 
+    /// JIT engine for the (capped) host to compile `module`, choosing the backend with
+    /// [`Backend::resolve_for`] (so `auto` uses LLVM for wide-vector modules when built in).
+    pub fn for_module(choice: Option<&str>, module: &Module) -> Result<Self> {
+        Self::with_backend(
+            Backend::resolve_for(choice, module)?,
+            &crate::cpu::CpuFeatures::effective()?,
+        )
+    }
+
     /// JIT engine using `backend` for the host CPU restricted to `features`.
     pub fn with_backend(backend: Backend, features: &crate::cpu::CpuFeatures) -> Result<Self> {
         let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
@@ -871,6 +883,8 @@ impl JitEngine {
             Backend::Llvm => {
                 // Same host-subset rule as Cranelift: JIT code must run on this CPU.
                 crate::cpu::native_isa_builder(features)?;
+                let (vx, vector_width) = features.llvm_vector_shape(true);
+                let vx_bits = features.native_vector_bits();
                 let (cpu, features) = features.llvm_target();
                 Codegen::Llvm {
                     target: achainsaw_llvm::TargetSpec {
@@ -878,6 +892,9 @@ impl JitEngine {
                         cpu,
                         features,
                     },
+                    vx,
+                    vector_width,
+                    vx_bits,
                     modules: Vec::new(),
                 }
             }
@@ -904,6 +921,17 @@ impl JitEngine {
     /// Backend generating this engine's code.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// Width of `vx` in bits for this engine's code (what `vl` reports times the lane
+    /// width): 128 on Cranelift; on LLVM 512/256/128 by AVX-512F/AVX2, or the host's SVE
+    /// vector length.
+    pub fn vx_bits(&self) -> u32 {
+        match &self.codegen {
+            Codegen::Cranelift(_) => crate::cpu::CRANELIFT_VECTOR_BITS,
+            #[cfg(feature = "llvm")]
+            Codegen::Llvm { vx_bits, .. } => *vx_bits,
+        }
     }
 
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
@@ -966,7 +994,13 @@ impl JitEngine {
         let compiled = match &mut self.codegen {
             Codegen::Cranelift(clif) => clif.compile(ir_mod, self.fuel_enabled, sandbox)?,
             #[cfg(feature = "llvm")]
-            Codegen::Llvm { target, modules } => {
+            Codegen::Llvm {
+                target,
+                vx,
+                vector_width,
+                modules,
+                ..
+            } => {
                 let hooks = achainsaw_llvm::RuntimeHooks {
                     malloc: rt_malloc as *const () as usize,
                     free: rt_free as *const () as usize,
@@ -982,6 +1016,8 @@ impl JitEngine {
                         base: base as u64,
                         len: len as u64,
                     }),
+                    vx: *vx,
+                    vector_width: *vector_width,
                     ..Default::default()
                 };
                 // Functions from earlier modules first, then registered symbols.
