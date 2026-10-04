@@ -30,7 +30,7 @@ use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 /// Runtime hook symbols referenced by JIT code (see `achainsaw-codegen/src/jit.rs`).
 pub const RT_MALLOC: &str = "__achainsaw_rt_malloc";
 pub const RT_FREE: &str = "__achainsaw_rt_free";
-pub const RT_CHECK_FUEL: &str = "__achainsaw_rt_check_fuel";
+pub const RT_FUEL_EXHAUSTED: &str = "__achainsaw_rt_fuel_exhausted";
 pub const RT_CONSUME_FUEL: &str = "__achainsaw_rt_consume_fuel";
 pub const RT_SANDBOX_FAULT: &str = "__achainsaw_rt_sandbox_fault";
 pub const RT_STACK_CHECK: &str = "__achainsaw_rt_stack_check";
@@ -77,8 +77,11 @@ impl Default for VxShape {
 
 #[derive(Debug, Clone, Default)]
 pub struct LowerOptions {
-    /// Call the fuel hooks at every branch and before `mm`.
+    /// Charge fuel at every branch and before `mm`.
     pub fuel: bool,
+    /// Address of the engine's i64 fuel counter, decremented inline at every branch (also
+    /// used for the halt checks of sandboxed code).
+    pub fuel_counter: u64,
     /// Bounds-check memory accesses and stack depth (implies the halt checks at branches).
     pub sandbox: Option<SandboxBounds>,
     /// AOT objects: `alloc`/`free` call libc `malloc`/`free`, no runtime hooks, and no
@@ -451,7 +454,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
         decl(RT_MALLOC, i64t.fn_type(&[i64t.into()], false));
         decl(RT_FREE, void.fn_type(&[i64t.into()], false));
-        decl(RT_CHECK_FUEL, i32t.fn_type(&[], false));
+        decl(RT_FUEL_EXHAUSTED, i32t.fn_type(&[], false));
         decl(RT_CONSUME_FUEL, i32t.fn_type(&[i64t.into()], false));
         decl(
             RT_SANDBOX_FAULT,
@@ -821,9 +824,27 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         if !(self.opts.fuel || self.opts.sandbox.is_some()) || self.opts.aot {
             return Ok(());
         }
+        // Decrement the engine's counter in place; only when it reaches zero ask the runtime
+        // whether to unwind (budget spent, or a failure was recorded).
+        let b = &self.builder;
+        let addr = self.c64(self.opts.fuel_counter as i64);
+        let fuel = self.load(self.i64().into(), addr)?.into_int_value();
+        let left = b.build_int_sub(fuel, self.c64(1), "fuel")?;
+        self.store(left.into(), addr)?;
+        let out = b.build_int_compare(IntPredicate::SLE, left, self.c64(0), "")?;
+        let out = self
+            .intr(
+                "llvm.expect",
+                &[self.i1().into()],
+                &[out.into(), self.i1().const_zero().into()],
+            )?
+            .into_int_value();
+        let slow = self.ctx.append_basic_block(st.func, "fuel.out");
         let cont = self.ctx.append_basic_block(st.func, "fueled");
-        self.check_hook(st, RT_CHECK_FUEL, &[], cont)?;
-        self.builder.position_at_end(cont);
+        b.build_conditional_branch(out, slow, cont)?;
+        b.position_at_end(slow);
+        self.check_hook(st, RT_FUEL_EXHAUSTED, &[], cont)?;
+        b.position_at_end(cont);
         Ok(())
     }
 

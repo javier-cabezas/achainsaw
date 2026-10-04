@@ -14,7 +14,7 @@ use std::ffi::{CStr, CString};
 pub struct RuntimeHooks {
     pub malloc: usize,
     pub free: usize,
-    pub check_fuel: usize,
+    pub fuel_exhausted: usize,
     pub consume_fuel: usize,
     pub sandbox_fault: usize,
     pub stack_check: usize,
@@ -96,7 +96,7 @@ impl LlvmJit {
             let mut symbols: Vec<(String, usize)> = vec![
                 (lower::RT_MALLOC.into(), hooks.malloc),
                 (lower::RT_FREE.into(), hooks.free),
-                (lower::RT_CHECK_FUEL.into(), hooks.check_fuel),
+                (lower::RT_FUEL_EXHAUSTED.into(), hooks.fuel_exhausted),
                 (lower::RT_CONSUME_FUEL.into(), hooks.consume_fuel),
                 (lower::RT_SANDBOX_FAULT.into(), hooks.sandbox_fault),
                 (lower::RT_STACK_CHECK.into(), hooks.stack_check),
