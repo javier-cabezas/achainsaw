@@ -3,7 +3,7 @@
 //! tails. Runs on the backend selected by `ACHAINSAW_BACKEND`.
 
 use achainsaw_codegen::cpu::{CpuFeatures, IsaLevel};
-use achainsaw_codegen::JitEngine;
+use achainsaw_codegen::{JitEngine, RtValue};
 use achainsaw_ir::parse_and_validate;
 
 const LENGTHS: [usize; 8] = [1, 2, 3, 7, 16, 17, 100, 1031];
@@ -180,6 +180,39 @@ fn gemv_matches_reference() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn gemv_par_matches_reference() {
+    type Gemv = extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
+    for (level, engine) in engines("gemv_par") {
+        let k: Gemv = unsafe { std::mem::transmute(engine.get_fn_ptr("gemv_par").unwrap()) };
+        let mut rng = Rng(21);
+        for (m, kk) in [(1, 1), (15, 17), (16, 64), (17, 100), (333, 1031)] {
+            let a = rng.vec(m * kk);
+            let x = rng.vec(kk);
+            let mut y = vec![f32::NAN; m];
+            k(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), m as i64, kk as i64);
+            for i in 0..m {
+                let terms = (0..kk).map(|j| a[i * kk + j] as f64 * x[j] as f64);
+                let scale: f64 = terms.clone().map(f64::abs).sum();
+                let want: f64 = terms.sum();
+                let ctx = format!("gemv_par {m}x{kk} row {i} at {level}");
+                close(y[i] as f64, want, scale, &ctx);
+            }
+        }
+        // The driver: rows of A sum to ((i + j) mod 7 - 3) / 4 terms, so sum(y) is exact.
+        let bench = unsafe { engine.call_typed("bench", &[200i64, 70, 2].map(RtValue::I64)) };
+        let fill = |i: i64, j: i64| ((i + j) % 7 - 3) as f64 / 4.0;
+        let want: f64 = (0..200)
+            .map(|i| (0..70).map(|j| fill(i, j) * fill(0, j)).sum::<f64>())
+            .sum();
+        assert_eq!(
+            bench.unwrap(),
+            Some(RtValue::F32(want as f32)),
+            "bench at {level}"
+        );
     }
 }
 

@@ -10,7 +10,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use pyo3::IntoPyObjectExt;
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::thread::ThreadId;
 
 create_exception!(achainsaw, CompilationError, PyException);
 create_exception!(achainsaw, ExecutionError, CompilationError);
@@ -30,26 +31,69 @@ impl Drop for BufferGuard {
 #[pyclass(name = "Kernel")]
 pub struct PyKernel {
     /// pyo3 requires `#[pyclass]` types to be `Sync`; the engine (JIT state, fuel counter)
-    /// is not, so calls go through a mutex. Calls already hold the GIL, so the lock is never
-    /// contended; `try_lock` turns re-entry (a host callback calling the same kernel while it
-    /// runs) into a Python error instead of a deadlock.
+    /// is not, so calls go through a mutex. Calls release the GIL, so other Python threads
+    /// (and host callbacks on `par` workers) keep running; a second thread calling the same
+    /// kernel waits for it.
     engine: Mutex<JitEngine>,
+    /// Thread currently running AIR code of this kernel, to turn re-entry (a host callback
+    /// calling the same kernel while it runs) into a Python error instead of a deadlock.
+    running: Mutex<Option<ThreadId>>,
     signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
 }
 
+/// Lets a `!Sync` value cross into `Python::detach`; the caller keeps it alive and
+/// unaliased for the duration.
+struct Unshared<T>(*const T);
+unsafe impl<T> Send for Unshared<T> {}
+impl<T> Unshared<T> {
+    unsafe fn get(&self) -> &T {
+        &*self.0
+    }
+}
+
 impl PyKernel {
-    fn engine(&self) -> PyResult<MutexGuard<'_, JitEngine>> {
-        match self.engine.try_lock() {
-            Ok(guard) => Ok(guard),
-            // A panic during an earlier call (raised in Python as PanicException) poisons the
-            // lock but leaves the engine intact.
-            Err(std::sync::TryLockError::Poisoned(p)) => Ok(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "kernel is already running on this thread (re-entrant call from a host callback)",
-                ))
+    fn engine(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, JitEngine>> {
+        let reentrant = || {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "kernel is already running (re-entrant call from a host callback)",
+            )
+        };
+        let me = std::thread::current().id();
+        loop {
+            match self.engine.try_lock() {
+                Ok(guard) => return Ok(guard),
+                // A panic during an earlier call (raised in Python as PanicException) poisons
+                // the lock but leaves the engine intact.
+                Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    let running = *self.running.lock().unwrap_or_else(|e| e.into_inner());
+                    // Waiting on the running thread, or on a `par` worker, would deadlock.
+                    if running == Some(me) || achainsaw_codegen::in_par_worker() {
+                        return Err(reentrant());
+                    }
+                    // Another Python thread is running it: wait without holding the GIL.
+                    py.detach(|| drop(self.engine.lock()));
+                }
             }
         }
+    }
+
+    /// Runs `func_name` with the GIL released, so host callbacks from `par` workers can
+    /// take it.
+    fn call(
+        &self,
+        py: Python<'_>,
+        func_name: &str,
+        args: &[RtValue],
+    ) -> PyResult<anyhow::Result<Option<RtValue>>> {
+        let engine = self.engine(py)?;
+        let set_running = |t| *self.running.lock().unwrap_or_else(|e| e.into_inner()) = t;
+        set_running(Some(std::thread::current().id()));
+        let shared = Unshared(&*engine as *const JitEngine);
+        // SAFETY: `engine` holds the lock until the call returns.
+        let res = py.detach(move || unsafe { shared.get().call_typed(func_name, args) });
+        set_running(None);
+        Ok(res)
     }
 }
 
@@ -59,24 +103,42 @@ impl PyKernel {
         self.signatures.keys().cloned().collect()
     }
 
-    pub fn lookup_symbol(&self, name: &str) -> PyResult<Option<usize>> {
-        Ok(self.engine()?.lookup_symbol(name).map(|ptr| ptr as usize))
+    pub fn lookup_symbol(&self, py: Python<'_>, name: &str) -> PyResult<Option<usize>> {
+        Ok(self.engine(py)?.lookup_symbol(name).map(|ptr| ptr as usize))
     }
 
     /// Code generator that compiled this kernel ("cranelift" or "llvm").
     #[getter]
-    pub fn backend(&self) -> PyResult<&'static str> {
-        Ok(self.engine()?.backend().as_str())
+    pub fn backend(&self, py: Python<'_>) -> PyResult<&'static str> {
+        Ok(self.engine(py)?.backend().as_str())
     }
 
-    #[pyo3(signature = (fuel=None))]
-    pub fn set_fuel(&self, fuel: Option<u64>) -> PyResult<()> {
-        self.engine()?.set_fuel(fuel);
+    /// Most threads `par` loops may use (`None`: all cores; 1 runs them serially).
+    #[pyo3(signature = (threads=None))]
+    pub fn set_threads(&self, py: Python<'_>, threads: Option<usize>) -> PyResult<()> {
+        if threads == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "threads must be at least 1",
+            ));
+        }
+        self.engine(py)?.set_threads(threads);
         Ok(())
     }
 
-    pub fn set_memory_quota(&self, quota_bytes: usize) -> PyResult<()> {
-        self.engine()?.set_memory_quota(quota_bytes);
+    /// Threads `par` loops run on.
+    #[getter]
+    pub fn threads(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.engine(py)?.threads())
+    }
+
+    #[pyo3(signature = (fuel=None))]
+    pub fn set_fuel(&self, py: Python<'_>, fuel: Option<u64>) -> PyResult<()> {
+        self.engine(py)?.set_fuel(fuel);
+        Ok(())
+    }
+
+    pub fn set_memory_quota(&self, py: Python<'_>, quota_bytes: usize) -> PyResult<()> {
+        self.engine(py)?.set_memory_quota(quota_bytes);
         Ok(())
     }
 
@@ -182,7 +244,7 @@ impl PyKernel {
             rt_args.push(rt_val);
         }
 
-        let res_rt = unsafe { self.engine()?.call_typed(func_name, &rt_args) }.map_err(|e| {
+        let res_rt = self.call(py, func_name, &rt_args)?.map_err(|e| {
             check_execution_status_py(py).err().unwrap_or_else(|| {
                 let err_type = py.get_type::<ExecutionError>();
                 PyErr::from_value(err_type.call1((e.to_string(),)).unwrap())
@@ -344,6 +406,7 @@ fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResul
 
     Ok(PyKernel {
         engine: Mutex::new(engine),
+        running: Mutex::new(None),
         signatures,
     })
 }

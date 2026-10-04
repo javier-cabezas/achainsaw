@@ -204,6 +204,65 @@ def test_mcp_server():
         assert code in res["result"]["content"][0]["text"]
         print(f"[PASS] MCP tools/call air_run sandbox {code}")
 
+    # 8c. par: a fork-join loop gives the same result on all cores and on one thread, and
+    # a fault in one worker is reported like any other sandbox violation.
+    par_air = """fn square(i:i64, p:ptr)
+  b0:
+    off = mul i, 8:i64
+    q = add p, off
+    v = mul i, i
+    st q, v
+    ret
+
+fn main(n:i64)->i64
+  b0:
+    bytes = mul n, 8:i64
+    p = alloc bytes
+    par n, square(p)
+    jmp b1(0:i64, 0:i64)
+  b1(i:i64, acc:i64):
+    more = lt i, n
+    br more, b2, b3
+  b2:
+    off = mul i, 8:i64
+    q = add p, off
+    v = ld q:i64
+    acc2 = add acc, v
+    i2 = add i, 1:i64
+    jmp b1(i2, acc2)
+  b3:
+    ret acc
+"""
+    for i, threads in enumerate([None, 1]):
+        arguments = {"code": par_air, "args": [1000]}
+        if threads is not None:
+            arguments["threads"] = threads
+        res = send_req({
+            "jsonrpc": "2.0",
+            "id": 85 + i,
+            "method": "tools/call",
+            "params": {"name": "air_run", "arguments": arguments}
+        })
+        assert res["result"]["isError"] is False, res
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert payload["result"] == sum(k * k for k in range(1000))
+        assert threads is None or payload["threads"] == threads
+        print(f"[PASS] MCP tools/call air_run par (threads={payload['threads']})")
+    res = send_req({
+        "jsonrpc": "2.0",
+        "id": 87,
+        "method": "tools/call",
+        "params": {
+            "name": "air_run",
+            "arguments": {"code": par_air.replace("off = mul i, 8:i64\n    q = add p, off\n    v = mul i, i",
+                                                  "off = mul i, 1048576:i64\n    q = add p, off\n    v = mul i, i", 1),
+                          "args": [64], "max_memory_mb": 1}
+        }
+    })
+    assert res["result"]["isError"] is True
+    assert "ERR_MEMORY_VIOLATION" in res["result"]["content"][0]["text"]
+    print("[PASS] MCP tools/call air_run par worker violation")
+
     # 9. Tool Call: air_optimize
     unopt_air = """fn opt_me(x:i32)->i32
   b0:
@@ -241,6 +300,7 @@ def test_mcp_server():
     assert target_payload["status"] == "ok"
     assert isinstance(target_payload["host"]["features"], list)
     assert target_payload["backends"]["cranelift"]["vector_bits"] == 128
+    assert target_payload["par_threads"] >= 1
     print(f"[PASS] MCP tools/call air_target (max_isa={target_payload['host']['max_isa']})")
     proc.terminate()
     try:

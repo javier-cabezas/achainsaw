@@ -294,6 +294,11 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("mm {pc}, {pa}, {pb}, {m}, {n}, {k}:{dtype}"));
                     }
+                    Instruction::Par {
+                        count, func, args, ..
+                    } => {
+                        out.push_str(&format!("par {count}, {func}({})", args.join(", ")));
+                    }
                 }
                 out.push('\n');
             }
@@ -433,7 +438,7 @@ impl BinaryEncoder {
                     if let Some(dst) = inst.dst() {
                         self.intern(dst);
                     }
-                    if let Instruction::Call { func, .. } = inst {
+                    if let Instruction::Call { func, .. } | Instruction::Par { func, .. } = inst {
                         self.intern(func);
                     }
                     for reg in inst.operands() {
@@ -802,6 +807,17 @@ impl BinaryEncoder {
                 self.buf.push(0x27);
                 self.buf.push(encode_type(*dtype));
                 self.push_regs(&[pc, pa, pb, m, n, k]);
+            }
+            Instruction::Par {
+                count, func, args, ..
+            } => {
+                self.buf.push(0x28);
+                self.push_regs(&[count, func]);
+                self.buf
+                    .extend_from_slice(&(args.len() as u32).to_le_bytes());
+                for a in args {
+                    self.push_regs(&[a]);
+                }
             }
         }
     }
@@ -1320,6 +1336,21 @@ impl<'a> BinaryDecoder<'a> {
                     n: self.read_string()?,
                     k: self.read_string()?,
                     dtype,
+                    span,
+                })
+            }
+            0x28 => {
+                let count = self.read_string()?;
+                let func = self.read_string()?;
+                let arg_count = self.read_u32()?;
+                let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
+                for _ in 0..arg_count {
+                    args.push(self.read_string()?);
+                }
+                Ok(Instruction::Par {
+                    count,
+                    func,
+                    args,
                     span,
                 })
             }

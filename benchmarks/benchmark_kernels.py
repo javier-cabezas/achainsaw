@@ -146,6 +146,17 @@ def make_cases():
         verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
     ))
 
+    def verify_gemv_par(k):
+        yg[:] = np.nan
+        k.run("gemv_par", A, xg, yg, gm, gk)
+        return float(np.max(np.abs(yg - gemv_ref)) / np.max(np.abs(gemv_ref)))
+
+    cases.append(dict(
+        name="gemv_par", label=f"GEMV f32, all cores via par ({gm}x{gk})",
+        run=lambda k: k.run("gemv_par", A, xg, yg, gm, gk),
+        verify=verify_gemv_par, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
+    ))
+
     n = 256
     Ab = bf16_bits(rng.standard_normal((n, n)))
     Bb = bf16_bits(rng.standard_normal((n, n)))

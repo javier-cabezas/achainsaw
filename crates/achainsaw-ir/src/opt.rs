@@ -1067,7 +1067,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::Free { .. }
                 | Instruction::MaskedLoad { .. }
                 | Instruction::MaskedStore { .. }
-                | Instruction::MatMul { .. } => true,
+                | Instruction::MatMul { .. }
+                | Instruction::Par { .. } => true,
             });
             pass_removed += before_len - block.instructions.len();
         }

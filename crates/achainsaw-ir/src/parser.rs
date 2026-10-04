@@ -641,6 +641,24 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // `par n, f(args...)`; followed by `=` it is an ordinary register name.
+        if matches!(&first_tok.kind, TokenKind::Ident(name) if name == "par")
+            && self.peek_at(1) != Some(&TokenKind::Equal)
+        {
+            let span = self.advance().span;
+            let count = self.parse_operand(instructions, Some(Type::I64))?;
+            self.expect(TokenKind::Comma)?;
+            let (func, _) = self.expect_ident()?;
+            let args = self.parse_paren_operands(instructions)?;
+            self.expect_eol()?;
+            return Ok(Instruction::Par {
+                count,
+                func,
+                args,
+                span,
+            });
+        }
+
         // Check if store: st ptr, val
         if first_tok.kind == TokenKind::St {
             let span = self.advance().span;

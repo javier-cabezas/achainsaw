@@ -331,6 +331,14 @@ pub enum Instruction {
         args: Vec<String>,
         span: Span,
     },
+    /// Fork-join parallel loop `par n, f(a, b)`: calls `f(i, a, b)` for every `i` in
+    /// `[0, n)`, possibly concurrently and in any order, and returns when all calls finish.
+    Par {
+        count: String,
+        func: String,
+        args: Vec<String>,
+        span: Span,
+    },
     // SIMD Intrinsics
     /// Broadcast a scalar to every lane of a vector of type `ty` (default `v128`).
     Splat {
@@ -481,7 +489,8 @@ impl Instruction {
             Instruction::Store { .. }
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
-            | Instruction::MatMul { .. } => None,
+            | Instruction::MatMul { .. }
+            | Instruction::Par { .. } => None,
         }
     }
 
@@ -495,6 +504,7 @@ impl Instruction {
             Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
             Instruction::Store { ptr, val, .. } => vec![ptr, val],
             Instruction::Call { args, .. } => args.iter().collect(),
+            Instruction::Par { count, args, .. } => std::iter::once(count).chain(args).collect(),
             Instruction::Splat { src, .. }
             | Instruction::Unary { src, .. }
             | Instruction::Cast { src, .. }
@@ -540,6 +550,9 @@ impl Instruction {
             Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
             Instruction::Store { ptr, val, .. } => vec![ptr, val],
             Instruction::Call { args, .. } => args.iter_mut().collect(),
+            Instruction::Par { count, args, .. } => {
+                std::iter::once(count).chain(args.iter_mut()).collect()
+            }
             Instruction::Splat { src, .. }
             | Instruction::Unary { src, .. }
             | Instruction::Cast { src, .. }
@@ -627,4 +640,15 @@ pub struct ExternFunction {
 pub struct Module {
     pub extern_functions: Vec<ExternFunction>,
     pub functions: Vec<Function>,
+}
+
+impl Module {
+    /// True when some function runs a `par` loop.
+    pub fn uses_par(&self) -> bool {
+        self.functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i, Instruction::Par { .. }))
+    }
 }

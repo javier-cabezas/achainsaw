@@ -61,6 +61,9 @@ enum Commands {
         /// Maximum heap allocation quota in megabytes
         #[arg(long)]
         max_memory_mb: Option<usize>,
+        /// Most threads `par` loops may use (default: all cores; 1 runs them serially)
+        #[arg(long)]
+        threads: Option<usize>,
         /// Emit structured machine-readable JSON output
         #[arg(long, default_value_t = true)]
         json: bool,
@@ -241,7 +244,8 @@ fn main() {
             json,
             fuel,
             max_memory_mb,
-        } => match run_exec(&path, &func, &args, fuel, max_memory_mb, backend) {
+            threads,
+        } => match run_exec(&path, &func, &args, fuel, max_memory_mb, threads, backend) {
             Ok(output) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -453,6 +457,7 @@ fn run_exec(
     args: &[String],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    threads: Option<usize>,
     backend: Option<&str>,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
@@ -531,6 +536,7 @@ fn run_exec(
     if let Some(mb) = max_memory_mb {
         engine.set_memory_quota(mb * 1024 * 1024);
     }
+    engine.set_threads(threads);
     engine.compile_module(&module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -554,6 +560,7 @@ fn run_exec(
         "function": func_name,
         "result": res_json,
         "backend": backend.as_str(),
+        "threads": engine.threads(),
         "parse_time_us": parse_time_us,
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,

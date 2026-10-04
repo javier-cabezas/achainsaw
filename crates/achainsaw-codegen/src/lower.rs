@@ -8,7 +8,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    AbiParam, Block as ClifBlock, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
+    AbiParam, Block as ClifBlock, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
     Value as ClifValue,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -731,21 +731,23 @@ fn emit_matmul(
     builder.switch_to_block(done);
 }
 
-/// Inline fuel check before a branch: decrements the engine's counter in place and, only
-/// when it reaches zero, asks `rt_fuel_exhausted` whether to unwind (budget spent, or a
-/// failure was recorded). Leaves the builder in the block where execution continues.
+/// Inline fuel check before a branch: decrements the fuel counter at `counter` in place
+/// and, only when it reaches zero, asks `rt_fuel_exhausted` whether to unwind (budget spent,
+/// or a failure was recorded). Leaves the builder in the block where execution continues.
 fn emit_fuel_check<M: ClifModule>(
     builder: &mut FunctionBuilder,
     module: &mut M,
-    (counter, exhausted): (i64, FuncId),
+    counter: ClifValue,
+    exhausted: FuncId,
     trap_block: ClifBlock,
 ) {
-    let addr = c64(builder, counter);
     let fuel = builder
         .ins()
-        .load(types::I64, MemFlagsData::trusted(), addr, 0);
+        .load(types::I64, MemFlagsData::trusted(), counter, 0);
     let left = builder.ins().iadd_imm_s(fuel, -1);
-    builder.ins().store(MemFlagsData::trusted(), left, addr, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), left, counter, 0);
     let out = builder
         .ins()
         .icmp_imm_s(IntCC::SignedLessThanOrEqual, left, 0);
@@ -763,6 +765,49 @@ fn emit_fuel_check<M: ClifModule>(
     builder.switch_to_block(cont);
 }
 
+/// Packs a scalar into the u64 slot layout of scalar trampolines (`lower_trampoline`).
+fn pack_u64(builder: &mut FunctionBuilder, v: ClifValue, ty: Type) -> ClifValue {
+    match ty {
+        Type::I32 | Type::I16 | Type::I8 => builder.ins().uextend(types::I64, v),
+        Type::F64 => builder.ins().bitcast(types::I64, bitcast_flags(), v),
+        Type::F32 => {
+            let bits = builder.ins().bitcast(types::I32, bitcast_flags(), v);
+            builder.ins().uextend(types::I64, bits)
+        }
+        _ => v,
+    }
+}
+
+/// `par n, f(args)` as a counted loop calling `f(i, args)` in order (AOT code, which has
+/// no runtime to run it in parallel; any order is a valid execution of `par`).
+fn emit_serial_par(
+    builder: &mut FunctionBuilder,
+    callee: FuncRef,
+    n: ClifValue,
+    args: &[ClifValue],
+) {
+    let header = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let body = builder.create_block();
+    let done = builder.create_block();
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(header, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(header);
+    let i = builder.block_params(header)[0];
+    let more = builder.ins().icmp(IntCC::SignedLessThan, i, n);
+    builder.ins().brif(more, body, &[], done, &[]);
+
+    builder.switch_to_block(body);
+    let mut call_args = vec![i];
+    call_args.extend_from_slice(args);
+    builder.ins().call(callee, &call_args);
+    let next = builder.ins().iadd_imm_s(i, 1);
+    builder.ins().jump(header, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(done);
+}
+
 pub struct LowerConfig {
     /// Inline fuel check at every branch: the address of the engine's i64 fuel counter
     /// (decremented in place) and `rt_fuel_exhausted() -> i32`, called when it reaches zero.
@@ -773,6 +818,19 @@ pub struct LowerConfig {
     pub rt_free_id: FuncId,
     /// Bounds-check memory accesses and cap stack depth (JIT only; see `JitEngine::enable_sandbox`).
     pub sandbox: Option<SandboxConfig>,
+    /// Runtime support for `par` (JIT only); without it, `par` runs serially.
+    pub par: Option<ParConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParConfig {
+    /// `rt_par_for(tramp, args, slots, n) -> i32`.
+    pub par_for_id: FuncId,
+    /// Scalar trampoline of each function `par` can run (see `declare_trampoline`).
+    pub trampolines: HashMap<String, FuncId>,
+    /// `rt_fuel_counter() -> ptr`, called on entry to find this thread's fuel counter (null:
+    /// use the engine's). Set for modules that use `par`, whose workers count fuel apart.
+    pub fuel_counter_id: Option<FuncId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -855,6 +913,30 @@ pub fn lower_function<M: ClifModule>(
         );
         next_param += n;
     }
+
+    // Fuel counter decremented at branches: this thread's (`par` workers count their own)
+    // or the engine's.
+    let has_branches = func
+        .blocks
+        .iter()
+        .any(|b| !matches!(b.terminator, Terminator::Ret { .. }));
+    let fuel_counter = match (config.fuel_check, &config.par) {
+        (
+            Some((counter, _)),
+            Some(ParConfig {
+                fuel_counter_id: Some(id),
+                ..
+            }),
+        ) if has_branches => {
+            let callee = module.declare_func_in_func(*id, builder.func);
+            let call_inst = builder.ins().call(callee, &[]);
+            let active = builder.inst_results(call_inst)[0];
+            let engine = c64(&mut builder, counter);
+            let none = builder.ins().icmp_imm_u(IntCC::Equal, active, 0);
+            Some(builder.ins().select(none, engine, active))
+        }
+        _ => None,
+    };
 
     // Jump from synthetic entry to function's first block
     let first_block_label = &func.blocks[0].label;
@@ -1460,6 +1542,50 @@ pub fn lower_function<M: ClifModule>(
                     };
                     emit_matmul(&mut builder, &regs, *dtype, bounds, fuel);
                 }
+                Instruction::Par {
+                    count, func, args, ..
+                } => {
+                    let (n, _) = scalar(&values, count);
+                    let Some(par) = &config.par else {
+                        let target = *func_ids
+                            .get(func)
+                            .ok_or_else(|| anyhow!("Unknown function '{func}' in par"))?;
+                        let callee = module.declare_func_in_func(target, builder.func);
+                        let arg_vals = flat_args(&values, args);
+                        emit_serial_par(&mut builder, callee, n, &arg_vals);
+                        continue;
+                    };
+                    // Arguments in trampoline layout; slot 0 is the index, set by the runtime.
+                    let slots = 1 + args.len();
+                    let buf = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        (slots * 8) as u32,
+                        3,
+                    ));
+                    for (j, arg) in args.iter().enumerate() {
+                        let (v, ty) = scalar(&values, arg);
+                        let raw = pack_u64(&mut builder, v, ty);
+                        builder
+                            .ins()
+                            .stack_store(types::I64, raw, buf, ((j + 1) * 8) as i32);
+                    }
+                    let buf_addr = builder.ins().stack_addr(types::I64, buf, 0);
+                    let tramp_id = *par
+                        .trampolines
+                        .get(func)
+                        .ok_or_else(|| anyhow!("par body '{func}' has no scalar trampoline"))?;
+                    let tramp_ref = module.declare_func_in_func(tramp_id, builder.func);
+                    let tramp = builder.ins().func_addr(types::I64, tramp_ref);
+                    let slots = builder.ins().iconst(types::I64, slots as i64);
+                    let callee = module.declare_func_in_func(par.par_for_id, builder.func);
+                    let call_inst = builder.ins().call(callee, &[tramp, buf_addr, slots, n]);
+                    if let Some(trap) = fuel_trap_block {
+                        let failed = builder.inst_results(call_inst)[0];
+                        let cont = builder.create_block();
+                        builder.ins().brif(failed, trap, &[], cont, &[]);
+                        builder.switch_to_block(cont);
+                    }
+                }
                 Instruction::VLen { dst, lane, .. } => {
                     let lanes = VECTOR_PART_BITS / lane.bit_width().unwrap_or(32);
                     let v = builder.ins().iconst(types::I64, lanes as i64);
@@ -1477,8 +1603,11 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some(check), Some(trap_block)) = (config.fuel_check, fuel_trap_block) {
-                    emit_fuel_check(&mut builder, module, check, trap_block);
+                if let (Some((counter, exhausted)), Some(trap_block)) =
+                    (config.fuel_check, fuel_trap_block)
+                {
+                    let addr = fuel_counter.unwrap_or_else(|| c64(&mut builder, counter));
+                    emit_fuel_check(&mut builder, module, addr, exhausted, trap_block);
                 }
                 builder.ins().jump(target_block, &arg_vals);
             }
@@ -1502,8 +1631,11 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some(check), Some(trap_block)) = (config.fuel_check, fuel_trap_block) {
-                    emit_fuel_check(&mut builder, module, check, trap_block);
+                if let (Some((counter, exhausted)), Some(trap_block)) =
+                    (config.fuel_check, fuel_trap_block)
+                {
+                    let addr = fuel_counter.unwrap_or_else(|| c64(&mut builder, counter));
+                    emit_fuel_check(&mut builder, module, addr, exhausted, trap_block);
                 }
                 builder
                     .ins()
@@ -1614,6 +1746,24 @@ impl RtValue {
     }
 }
 
+/// `void tramp(u64 *args, u64 *ret)`.
+fn trampoline_signature<M: ClifModule>(module: &M) -> cranelift_codegen::ir::Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64)); // args_ptr
+    sig.params.push(AbiParam::new(types::I64)); // ret_ptr
+    sig
+}
+
+/// Declares the scalar host-call trampoline of `func_name` (defined by `lower_trampoline`).
+pub fn declare_trampoline<M: ClifModule>(module: &mut M, func_name: &str) -> Result<FuncId> {
+    let sig = trampoline_signature(module);
+    Ok(module.declare_function(
+        &format!("__achainsaw_trampoline_{func_name}"),
+        cranelift_module::Linkage::Export,
+        &sig,
+    )?)
+}
+
 pub fn lower_trampoline<M: ClifModule>(
     module: &mut M,
     ctx: &mut cranelift_codegen::Context,
@@ -1623,15 +1773,8 @@ pub fn lower_trampoline<M: ClifModule>(
     param_types: &[Type],
     ret_type: Option<Type>,
 ) -> Result<FuncId> {
-    let trampoline_name = format!("__achainsaw_trampoline_{func_name}");
-    let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(types::I64)); // args_ptr
-    sig.params.push(AbiParam::new(types::I64)); // ret_ptr
-
-    let tramp_id =
-        module.declare_function(&trampoline_name, cranelift_module::Linkage::Export, &sig)?;
-
-    ctx.func.signature = sig;
+    let tramp_id = declare_trampoline(module, func_name)?;
+    ctx.func.signature = trampoline_signature(module);
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);

@@ -10,8 +10,9 @@ pub use aot::{
 pub use backend::{uses_wide_vectors, Backend};
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
-    get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,
-    set_execution_fuel, set_memory_quota, ExecutionStatus, JitEngine, SymbolRegistry,
+    get_remaining_fuel, in_par_worker, load_global_library, par_pool_threads,
+    register_global_symbol, reset_execution_status, set_execution_fuel, set_memory_quota,
+    ExecutionStatus, JitEngine, SymbolRegistry, EXECUTION_STACK_BYTES,
 };
 pub use lower::{lower_function, to_clif_type, RtValue};
 

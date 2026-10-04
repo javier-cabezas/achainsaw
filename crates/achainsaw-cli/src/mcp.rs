@@ -1,4 +1,4 @@
-use achainsaw_codegen::{JitEngine, RtValue};
+use achainsaw_codegen::{JitEngine, RtValue, EXECUTION_STACK_BYTES};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::{
     decode_module, encode_module, parse_and_validate, to_air_text, Module, Type, Validator,
@@ -35,9 +35,10 @@ AIR syntax:
 - Vectors: `v = ld p:v256`, `st p, v` (any alignment); `v = splat x:v256` (the vector type is required); `r = vadd a, b:f32` (vsub vmul vdiv vmin vmax vand vor vxor; lane types i8 i16 i32 i64 f32 f64, but vmul has no i8, vdiv is float-only, vmin/vmax have no i64); `r = vfma a, b, c:f32` (a*b+c, f32/f64); `m = vlt a, b:f32` (veq vne vgt vle vge, all-ones lanes when true); `r = vsel m, a, b`; `s = vsum v:f32` (vmaxr vminr); `e = extlane v, 7:f32`; `n = vl f32` (i64 lanes in vx); tail-masked `v = ldm p:vx, n:f32` / `stm p, v, n:f32` touch only the first n lanes (rest of a load is zero).
 - Matmul: `mm pc, pa, pb, m, n, k:bf16` does C[m x n] += A[m x k] * B[k x n], row-major contiguous; dtype bf16/f16/f32 with f32 C, or i8 with i32 C; m n k are i64; costs 1 fuel per 1024 multiply-adds; on llvm it uses AMX/SME/full-width FMA kernels. vx cannot appear in function signatures; extfn takes no v256/v512.
 - Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
+- Parallel: `par n, f(a, b)` calls `f(i, a, b)` for every i in 0..n-1 across all cores and returns when all calls finish (n:i64). f is an AIR function `fn f(i:i64, a:.., b:..)` with scalar or ptr params and no return value. Calls run concurrently in any order, so each i must write only its own memory: for a reduction, store per-i partials in an alloc'd array and sum them after the par. Give each i real work (a row, a block of thousands of elements), not one element. A par inside a par body runs serially. All calls share the fuel budget (1 unit per i plus every branch).
 - Comments: `#` or `//`. Names starting with `__` are reserved.
 
-air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); auto uses llvm for wide-vector or mm code when available. vx width (and so `vl`) depends on the backend and CPU; fixed-width results are identical on both.
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); auto uses llvm for wide-vector or mm code when available. `threads` caps the threads par may use (default all, air_target's par_threads; 1 is serial), and the result reports it with exec_time_us, so compare both to measure a speedup. vx width (and so `vl`) depends on the backend and CPU; fixed-width results are identical on both.
 
 Example:
 fn sum_to(n:i64)->i64
@@ -134,24 +135,31 @@ pub const DEFAULT_SANDBOX_MEMORY_MB: usize = 64;
 /// Largest `max_memory_mb` that `air_run` accepts.
 pub const MAX_SANDBOX_MEMORY_MB: usize = 4096;
 
-/// Stack for the thread that runs `air_run` code: the sandbox's recursion budget plus
-/// headroom, independent of the host thread (Windows main threads only get 1 MiB).
-const EXECUTION_STACK_BYTES: usize = 8 << 20;
-
 pub fn execute_ir(
     module: &Module,
     func_name: &str,
     args: &[f64],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    threads: Option<usize>,
     backend: Option<&str>,
 ) -> Result<Value> {
+    // Runs on its own thread so the sandbox's recursion budget fits whatever the host
+    // thread's stack is (Windows main threads only get 1 MiB); `par` workers get the same.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("air_run".into())
             .stack_size(EXECUTION_STACK_BYTES)
             .spawn_scoped(scope, || {
-                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb, backend)
+                execute_ir_on_this_thread(
+                    module,
+                    func_name,
+                    args,
+                    fuel,
+                    max_memory_mb,
+                    threads,
+                    backend,
+                )
             })?
             .join()
             .map_err(|_| anyhow!("air_run execution thread panicked"))?
@@ -164,6 +172,7 @@ fn execute_ir_on_this_thread(
     args: &[f64],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    threads: Option<usize>,
     backend: Option<&str>,
 ) -> Result<Value> {
     const ALLOWED_EXTERNALS: &[&str] = &[
@@ -211,6 +220,7 @@ fn execute_ir_on_this_thread(
     // Bounds-check all memory accesses and cap recursion so untrusted code cannot
     // touch or crash the server process.
     engine.enable_sandbox(arena_bytes)?;
+    engine.set_threads(threads);
     engine.compile_module(module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -252,6 +262,7 @@ fn execute_ir_on_this_thread(
         "function": func_name,
         "result": res_val,
         "backend": engine.backend().as_str(),
+        "threads": engine.threads(),
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,
     }))
@@ -363,8 +374,15 @@ pub fn handle_air_run(arguments: &Value) -> Value {
         }
     };
 
+    let threads = match arguments.get("threads") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64().filter(|&n| n >= 1) {
+            Some(n) => Some(n as usize),
+            None => return error_response("'threads' must be a positive integer"),
+        },
+    };
     let backend = arguments.get("backend").and_then(|v| v.as_str());
-    match execute_ir(&module, func, &args, fuel, max_memory_mb, backend) {
+    match execute_ir(&module, func, &args, fuel, max_memory_mb, threads, backend) {
         Ok(val) => json_tool_result(val),
         Err(e) => json_tool_error(json!({
             "status": "error",
@@ -478,7 +496,10 @@ pub fn handle_air_optimize(arguments: &Value) -> Value {
 
 pub fn handle_air_target(_arguments: &Value) -> Value {
     match achainsaw_codegen::cpu::target_report() {
-        Ok(report) => json_tool_result(report),
+        Ok(mut report) => {
+            report["par_threads"] = json!(achainsaw_codegen::par_pool_threads());
+            json_tool_result(report)
+        }
         Err(e) => json_tool_error(json!({
             "status": "error",
             "error_code": "ERR_CPU_DETECTION",
@@ -550,6 +571,11 @@ pub fn get_tools_list() -> Value {
                         "max_memory_mb": {
                             "type": "integer",
                             "description": "Sandbox memory available to alloc, in megabytes (default 64)"
+                        },
+                        "threads": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Most threads `par` loops may use (default: all cores, see air_target's par_threads); 1 runs them serially, to measure the speedup"
                         }
                     },
                     "required": ["code"]
@@ -952,6 +978,55 @@ mod tests {
         assert!(text.contains("ERR_OUT_OF_MEMORY"), "{text}");
         let text = run_error_text(json!({ "code": code, "max_memory_mb": 1u64 << 40 }));
         assert!(text.contains("max_memory_mb"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_par_threads() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/kernels/gemv_par.air"
+        );
+        let code = std::fs::read_to_string(path).unwrap();
+        let mut results = Vec::new();
+        for threads in [json!(null), json!(1), json!(2)] {
+            let res = handle_air_run(&json!({
+                "code": code, "func": "bench", "args": [300, 64, 2], "threads": threads,
+            }));
+            assert_eq!(res["isError"], false, "{res}");
+            let text = res["content"][0]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text).unwrap();
+            let used = payload["threads"].as_u64().unwrap();
+            match threads.as_u64() {
+                Some(cap) => {
+                    assert_eq!(used, cap.min(achainsaw_codegen::par_pool_threads() as u64))
+                }
+                None => assert_eq!(used, achainsaw_codegen::par_pool_threads() as u64),
+            }
+            results.push(payload["result"].clone());
+        }
+        assert!(results.iter().all(|r| *r == results[0]), "{results:?}");
+
+        let bad = handle_air_run(&json!({ "code": code, "func": "bench", "threads": 0 }));
+        assert_eq!(bad["isError"], true);
+        assert!(bad["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("threads"));
+    }
+
+    #[test]
+    fn test_mcp_air_run_par_violation() {
+        let code = "fn poke(i:i64, p:ptr)\n  b0:\n    off = mul i, 1048576:i64\n    q = add p, off\n    st q, i\n    ret\n\nfn main()->i32\n  b0:\n    p = alloc 64:i64\n    par 8:i64, poke(p)\n    ret 1:i32\n";
+        let text = run_error_text(json!({ "code": code, "max_memory_mb": 1 }));
+        assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_target_reports_par_threads() {
+        let res = handle_air_target(&json!({}));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert!(report["par_threads"].as_u64().unwrap() >= 1);
     }
 
     #[test]
