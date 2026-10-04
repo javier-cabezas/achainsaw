@@ -41,6 +41,12 @@ impl PyKernel {
         self.engine.lookup_symbol(name).map(|ptr| ptr as usize)
     }
 
+    /// Code generator that compiled this kernel ("cranelift" or "llvm").
+    #[getter]
+    pub fn backend(&self) -> &'static str {
+        self.engine.backend().as_str()
+    }
+
     #[pyo3(signature = (fuel=None))]
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
         self.engine.set_fuel(fuel);
@@ -300,48 +306,50 @@ pub fn disassemble(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
     Ok(to_air_text(&module))
 }
 
+fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResult<PyKernel> {
+    let runtime_err = |e: anyhow::Error| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
+
+    let mut signatures = HashMap::new();
+    for func in &module.functions {
+        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
+        signatures.insert(func.name.clone(), (p_types, func.ret_type));
+    }
+
+    let mut engine = JitEngine::for_backend(backend).map_err(runtime_err)?;
+    engine.compile_module(module).map_err(runtime_err)?;
+
+    Ok(PyKernel { engine, signatures })
+}
+
+/// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default, which
+/// follows ACHAINSAW_BACKEND and otherwise uses Cranelift).
 #[pyfunction]
-pub fn compile_binary(py: Python<'_>, bytes: &[u8]) -> PyResult<PyKernel> {
+#[pyo3(signature = (bytes, backend=None))]
+pub fn compile_binary(py: Python<'_>, bytes: &[u8], backend: Option<&str>) -> PyResult<PyKernel> {
     let module = decode_module(bytes).map_err(|d| diagnostic_to_py_err(py, d))?;
     let mut validator = achainsaw_ir::Validator::new();
     validator
         .validate_module(&module)
         .map_err(|d| diagnostic_to_py_err(py, d))?;
-
-    let mut signatures = HashMap::new();
-    for func in &module.functions {
-        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-        signatures.insert(func.name.clone(), (p_types, func.ret_type));
-    }
-
-    let mut engine =
-        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    engine
-        .compile_module(&module)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    Ok(PyKernel { engine, signatures })
+    build_kernel(&module, backend)
 }
 
+/// Compiles AIR source text. `backend` is "cranelift", "llvm" or "auto" (the default,
+/// which follows ACHAINSAW_BACKEND and otherwise uses Cranelift).
 #[pyfunction]
-pub fn compile(py: Python<'_>, source: &str) -> PyResult<PyKernel> {
+#[pyo3(signature = (source, backend=None))]
+pub fn compile(py: Python<'_>, source: &str, backend: Option<&str>) -> PyResult<PyKernel> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
+    build_kernel(&module, backend)
+}
 
-    let mut signatures = HashMap::new();
-    for func in &module.functions {
-        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-        signatures.insert(func.name.clone(), (p_types, func.ret_type));
-    }
-
-    let mut engine =
-        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    engine
-        .compile_module(&module)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    Ok(PyKernel { engine, signatures })
+/// Backends compiled into this build, e.g. ["cranelift", "llvm"].
+#[pyfunction]
+pub fn available_backends() -> Vec<&'static str> {
+    achainsaw_codegen::Backend::available()
+        .iter()
+        .map(|b| b.as_str())
+        .collect()
 }
 
 #[pyfunction]
@@ -443,6 +451,7 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ExecutionError", m.py().get_type_bound::<ExecutionError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(available_backends, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;
     m.add_function(wrap_pyfunction!(assemble, m)?)?;
     m.add_function(wrap_pyfunction!(disassemble, m)?)?;

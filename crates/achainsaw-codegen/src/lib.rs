@@ -1,9 +1,11 @@
 pub mod aot;
+pub mod backend;
 pub mod cpu;
 pub mod jit;
 pub mod lower;
 
-pub use aot::{link_shared_library, AotCompiler, AotTarget};
+pub use aot::{compile_object, link_shared_library, AotCompiler, AotObject, AotTarget};
+pub use backend::Backend;
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
     get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,

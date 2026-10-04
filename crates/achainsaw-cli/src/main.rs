@@ -1,5 +1,7 @@
 use achainsaw_codegen::cpu::{self, IsaLevel};
-use achainsaw_codegen::{link_shared_library, AotCompiler, AotTarget, JitEngine, RtValue};
+use achainsaw_codegen::{
+    compile_object, link_shared_library, AotObject, AotTarget, Backend, JitEngine, RtValue,
+};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::{
@@ -22,6 +24,10 @@ struct Cli {
     /// sve2, sme). Overrides ACHAINSAW_MAX_ISA.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = clap::value_parser!(IsaLevel))]
     isa: Option<IsaLevel>,
+    /// Code generator for run, bench and build: cranelift, llvm (needs an LLVM-enabled
+    /// build), or auto. Overrides ACHAINSAW_BACKEND; auto currently means cranelift.
+    #[arg(long, global = true, value_name = "BACKEND")]
+    backend: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -37,7 +43,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Compile and execute an IR function via Cranelift JIT (.air or .airb)
+    /// Compile and execute an IR function via the JIT (.air or .airb)
     Run {
         /// Path to .air or .airb file
         path: PathBuf,
@@ -168,6 +174,22 @@ fn main() {
         }
     }
 
+    let generates_code = matches!(
+        cli.command,
+        Commands::Run { .. } | Commands::Bench { .. } | Commands::Build { .. }
+    );
+    let backend = if generates_code {
+        match Backend::resolve(cli.backend.as_deref()) {
+            Ok(b) => b,
+            Err(e) => {
+                print_error_json(&e, "ERR_UNKNOWN_BACKEND");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Backend::Cranelift
+    };
+
     match cli.command {
         Commands::Cpu { json } => match cpu::target_report() {
             Ok(report) => {
@@ -227,7 +249,7 @@ fn main() {
             json,
             fuel,
             max_memory_mb,
-        } => match run_exec(&path, &func, &args, fuel, max_memory_mb) {
+        } => match run_exec(&path, &func, &args, fuel, max_memory_mb, backend) {
             Ok(output) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -249,7 +271,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Commands::Bench { path, iters } => match run_bench(&path, iters) {
+        Commands::Bench { path, iters } => match run_bench(&path, iters, backend) {
             Ok(bench_res) => println!("{}", serde_json::to_string_pretty(&bench_res).unwrap()),
             Err(e) => {
                 eprintln!("Benchmark error: {e}");
@@ -347,6 +369,7 @@ fn main() {
                 features: target_features,
             },
             shared,
+            backend,
         ) {
             Ok(stats) => {
                 if json {
@@ -423,6 +446,7 @@ fn run_exec(
     args: &[String],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    backend: Backend,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(path)
@@ -492,7 +516,7 @@ fn run_exec(
     }
 
     let t1 = Instant::now();
-    let mut engine = JitEngine::new()?;
+    let mut engine = JitEngine::with_backend(backend, &cpu::CpuFeatures::effective()?)?;
     if let Some(f) = fuel {
         engine.set_fuel(Some(f));
     }
@@ -521,6 +545,7 @@ fn run_exec(
         "status": "ok",
         "function": func_name,
         "result": res_json,
+        "backend": backend.as_str(),
         "parse_time_us": parse_time_us,
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,
@@ -528,13 +553,14 @@ fn run_exec(
     }))
 }
 
-fn run_bench(path: &Path, iters: u32) -> Result<serde_json::Value> {
+fn run_bench(path: &Path, iters: u32, backend: Backend) -> Result<serde_json::Value> {
     let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
 
+    let features = cpu::CpuFeatures::effective()?;
     let t0 = Instant::now();
     for _ in 0..iters {
-        let mut engine = JitEngine::new()?;
+        let mut engine = JitEngine::with_backend(backend, &features)?;
         engine.compile_module(&module)?;
     }
     let total_duration = t0.elapsed();
@@ -543,6 +569,7 @@ fn run_bench(path: &Path, iters: u32) -> Result<serde_json::Value> {
 
     Ok(json!({
         "status": "ok",
+        "backend": backend.as_str(),
         "iterations": iters,
         "total_duration_sec": total_duration.as_secs_f64(),
         "avg_compile_time_ms": avg_compile_time_ms,
@@ -625,6 +652,7 @@ fn run_build(
     output: Option<PathBuf>,
     target: &AotTarget,
     shared: bool,
+    backend: Backend,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(input)
@@ -632,11 +660,11 @@ fn run_build(
     let parse_time_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
-    let mut compiler = AotCompiler::with_target(target)?;
-    let triple = compiler.triple();
-    let ignored_features = compiler.ignored_features().to_vec();
-    compiler.compile_module(&module)?;
-    let bytes = compiler.finish()?;
+    let AotObject {
+        bytes,
+        triple,
+        ignored_features,
+    } = compile_object(&module, target, backend)?;
     let compile_time_us = t1.elapsed().as_micros();
 
     let sh_ext = if cfg!(target_os = "windows") {
@@ -688,6 +716,7 @@ fn run_build(
         "output": target_shared.to_string_lossy(),
         "object_bytes": bytes.len(),
         "shared": shared,
+        "backend": backend.as_str(),
         "target": triple,
         "target_cpu": target.cpu,
         "target_features": target.features,
