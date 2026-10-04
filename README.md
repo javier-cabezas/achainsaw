@@ -131,6 +131,16 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
 
 **Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
 
+On the LLVM backend, `mm` uses the best kernel the target has:
+
+| Target | `mm` kernel |
+|---|---|
+| x86 with AMX (Sapphire/Emerald Rapids: bf16, i8; Granite Rapids: also f16) | 16x16 AMX tiles (`tdpbf16ps`, `tdpbssd`, `tdpfp16ps`) |
+| AArch64 with SME (e.g. Apple M4) | ZA-tile outer products (`fmopa`, `bfmopa`, `smopa`) in streaming mode |
+| Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), 4 rows of C per B strip |
+
+On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32 (about 50x Cranelift's scalar loop), 90 for bf16, 70 GOP/s for i8, and 29 for f16. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
+
 **Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
 
 | Target (LLVM backend) | `vx` | Masked `ldm`/`stm` |
@@ -140,7 +150,7 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
 | x86_64 SSE/AVX only, AArch64 NEON (including Apple M4) | 128 bits | per-lane |
 | AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
 
-`v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Matrix-engine (AMX, SME) code for `mm` is planned; programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
+`v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
 
 ---
 
@@ -345,6 +355,7 @@ ACHAINSAW_MAX_ISA=sse achainsaw mcp      # every JIT compilation in the server i
 ```bash
 achainsaw build examples/kernels/gemv_f32.air --target-cpu x86-64-v3
 achainsaw build examples/kernels/gemv_f32.air --target-cpu znver4 --target-features -avx512f
+achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphirerapids --emit asm   # writes gemv_f32.s
 ```
 
 ---

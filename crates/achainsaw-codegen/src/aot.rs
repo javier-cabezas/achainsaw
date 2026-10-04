@@ -178,6 +178,42 @@ pub struct AotObject {
     pub ignored_features: Vec<&'static str>,
 }
 
+/// Target assembly for `ir_mod` (LLVM backend only), and its triple.
+pub fn compile_assembly(
+    ir_mod: &Module,
+    target: &AotTarget,
+    backend: Backend,
+) -> Result<(String, String)> {
+    match backend {
+        #[cfg(feature = "llvm")]
+        Backend::Llvm => {
+            let (spec, opts) = llvm_aot_options(target)?;
+            achainsaw_llvm::compile_assembly(ir_mod, &spec, &opts)
+        }
+        _ => {
+            let _ = (ir_mod, target);
+            Err(anyhow!(
+                "[ERR_UNSUPPORTED_EMIT] Assembly output needs the llvm backend (--backend llvm)"
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "llvm")]
+fn llvm_aot_options(
+    target: &AotTarget,
+) -> Result<(achainsaw_llvm::TargetSpec, achainsaw_llvm::LowerOptions)> {
+    let (spec, features) = cpu::llvm_aot_target(target)?;
+    let (vx, vector_width) = features.llvm_vector_shape(false);
+    let opts = achainsaw_llvm::LowerOptions {
+        vx,
+        vector_width,
+        matrix: features.llvm_matrix_units(),
+        ..Default::default()
+    };
+    Ok((spec, opts))
+}
+
 /// Compiles `ir_mod` to a native object for `target` with `backend`.
 pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> Result<AotObject> {
     match backend {
@@ -194,13 +230,7 @@ pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> 
         }
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
-            let (spec, features) = cpu::llvm_aot_target(target)?;
-            let (vx, vector_width) = features.llvm_vector_shape(false);
-            let opts = achainsaw_llvm::LowerOptions {
-                vx,
-                vector_width,
-                ..Default::default()
-            };
+            let (spec, opts) = llvm_aot_options(target)?;
             let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec, &opts)?;
             Ok(AotObject {
                 bytes,

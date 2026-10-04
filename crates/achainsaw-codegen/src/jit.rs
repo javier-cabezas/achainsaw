@@ -821,6 +821,7 @@ enum Codegen {
         target: achainsaw_llvm::TargetSpec,
         vx: achainsaw_llvm::VxShape,
         vector_width: Option<u32>,
+        matrix: achainsaw_llvm::MatrixUnits,
         vx_bits: u32,
         /// One LLJIT per `compile_module` call; kept alive so earlier code stays valid.
         modules: Vec<achainsaw_llvm::LlvmJit>,
@@ -885,6 +886,7 @@ impl JitEngine {
                 crate::cpu::native_isa_builder(features)?;
                 let (vx, vector_width) = features.llvm_vector_shape(true);
                 let vx_bits = features.native_vector_bits();
+                let matrix = features.llvm_matrix_units();
                 let (cpu, features) = features.llvm_target();
                 Codegen::Llvm {
                     target: achainsaw_llvm::TargetSpec {
@@ -894,6 +896,7 @@ impl JitEngine {
                     },
                     vx,
                     vector_width,
+                    matrix,
                     vx_bits,
                     modules: Vec::new(),
                 }
@@ -998,6 +1001,7 @@ impl JitEngine {
                 target,
                 vx,
                 vector_width,
+                matrix,
                 modules,
                 ..
             } => {
@@ -1018,6 +1022,7 @@ impl JitEngine {
                     }),
                     vx: *vx,
                     vector_width: *vector_width,
+                    matrix: *matrix,
                     ..Default::default()
                 };
                 // Functions from earlier modules first, then registered symbols.

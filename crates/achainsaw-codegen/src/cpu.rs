@@ -561,6 +561,18 @@ impl CpuFeatures {
         }
     }
 
+    /// Matrix engines LLVM `mm` kernels may use with these features.
+    #[cfg(feature = "llvm")]
+    pub fn llvm_matrix_units(&self) -> achainsaw_llvm::MatrixUnits {
+        let amx = self.arch == Arch::X86_64 && self.has(F::AmxTile);
+        achainsaw_llvm::MatrixUnits {
+            amx_bf16: amx && self.has(F::AmxBf16),
+            amx_int8: amx && self.has(F::AmxInt8),
+            amx_fp16: amx && self.has(F::AmxFp16),
+            sme: self.arch == Arch::Aarch64 && self.has(F::Sme),
+        }
+    }
+
     /// Whether LLVM code for these features uses scalable (SVE) `vx` vectors.
     pub fn llvm_vx_scalable(&self) -> bool {
         self.arch == Arch::Aarch64 && self.has(F::Sve)
@@ -897,6 +909,11 @@ pub fn llvm_aot_target(
         (_, _, Arch::Aarch64) => CpuFeatures::from_features(arch, &[F::Neon]),
         _ => CpuFeatures::empty(arch),
     };
+    if let Some(cpu) = &target.cpu {
+        for &f in llvm_cpu_extra_features(arch, cpu) {
+            set.enable(f);
+        }
+    }
     if !overrides.is_empty() {
         set.apply_feature_string(&overrides)?;
     }
@@ -913,6 +930,25 @@ pub fn llvm_aot_target(
         },
         set,
     ))
+}
+
+/// Features of named CPUs that Cranelift's presets do not model but LLVM lowering depends
+/// on: AMX (which `mm` kernel to use) and SVE/SME (`vx` shape and `mm` kernel).
+#[cfg(feature = "llvm")]
+fn llvm_cpu_extra_features(arch: Arch, cpu: &str) -> &'static [Feature] {
+    match (arch, cpu.to_ascii_lowercase().as_str()) {
+        (Arch::X86_64, "sapphirerapids" | "emeraldrapids") => &[F::AmxTile, F::AmxBf16, F::AmxInt8],
+        (Arch::X86_64, "graniterapids" | "graniterapids-d" | "diamondrapids") => {
+            &[F::AmxTile, F::AmxBf16, F::AmxInt8, F::AmxFp16]
+        }
+        (Arch::Aarch64, "a64fx" | "neoverse-v1") => &[F::Sve],
+        (Arch::Aarch64, "neoverse-n2" | "neoverse-n3" | "neoverse-v2" | "neoverse-v3") => {
+            &[F::Sve, F::Sve2]
+        }
+        // Apple M4 has SME (streaming mode only) but no non-streaming SVE.
+        (Arch::Aarch64, "apple-m4") => &[F::Sme],
+        _ => &[],
+    }
 }
 
 /// Features whose Cranelift settings are currently enabled on `builder`.

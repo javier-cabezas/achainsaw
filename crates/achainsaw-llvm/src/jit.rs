@@ -107,6 +107,7 @@ impl LlvmJit {
                     symbols.push((ext.name.clone(), addr));
                 }
             }
+            symbols.extend(sme_abi_fallbacks());
             let names: Vec<CString> = symbols
                 .iter()
                 .map(|(n, _)| CString::new(n.as_str()).unwrap())
@@ -184,6 +185,36 @@ impl LlvmJit {
     pub fn function_names(&self) -> impl Iterator<Item = &str> {
         self.functions.keys().map(String::as_str)
     }
+}
+
+/// SME support routines that ZA-using code (the SME `mm` kernel) calls, for processes whose
+/// C runtime lacks them (libgcc gained them in GCC 14). Only routines missing from the
+/// process are returned; ORC resolves the others from it.
+fn sme_abi_fallbacks() -> Vec<(String, usize)> {
+    #[cfg(all(target_arch = "aarch64", unix))]
+    {
+        /// Called on entry to a function with new ZA state only when a caller left a lazy
+        /// ZA save pending (TPIDR2_EL0 != 0). Nothing that calls into JIT code here sets one
+        /// up, so reaching this means unsupported ZA use by the host: stop rather than
+        /// corrupt the caller's ZA state.
+        extern "C" fn tpidr2_save_unsupported() {
+            eprintln!(
+                "achainsaw: __arm_tpidr2_save called with a pending ZA lazy save; \
+                 link a C runtime with SME support (GCC 14+ libgcc or compiler-rt)"
+            );
+            std::process::abort();
+        }
+        let name = c"__arm_tpidr2_save";
+        // SAFETY: dlsym with a valid NUL-terminated name only performs a lookup.
+        let found = unsafe { !libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()).is_null() };
+        if !found {
+            return vec![(
+                "__arm_tpidr2_save".to_string(),
+                tpidr2_save_unsupported as *const () as usize,
+            )];
+        }
+    }
+    Vec::new()
 }
 
 impl Drop for LlvmJit {

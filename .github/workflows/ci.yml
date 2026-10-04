@@ -124,9 +124,22 @@ jobs:
         env:
           ACHAINSAW_BACKEND: llvm
 
+      # AOT-compiled AArch64 mm kernels (SVE vector FMAs, SME outer products, NEON) run in a
+      # freestanding harness under QEMU, on x86 too: see tools/qemu-aarch64/run.sh.
+      - name: AArch64 mm kernels under QEMU (AOT harness)
+        if: runner.arch == 'X64'
+        run: |
+          sudo apt-get install -y qemu-user
+          rustup target add aarch64-unknown-linux-gnu
+          cargo build --bin achainsaw --features achainsaw/llvm
+          tools/qemu-aarch64/run.sh +neon 16
+          tools/qemu-aarch64/run.sh +sve 16 32 256
+          tools/qemu-aarch64/run.sh +sve,+sme 16 32 256
+
       # Scalable vectors must work at every SVE vector length, not just the runner's
-      # 128 bits: rerun the vx tests (the code that depends on the length) under QEMU at 256,
-      # 512 and 2048 bits. Everything else already ran natively above; QEMU also emulates
+      # 128 bits: rerun the vx and mm tests (the code that depends on the length) under QEMU
+      # at 256, 512 and 2048 bits. `-cpu max` also has SME, so `mm` uses the SME kernel
+      # there, at the same streaming vector length. Everything else already ran natively above; QEMU also emulates
       # LLVM itself, so the full suites would take hours.
       - name: SVE vector-length sweep under QEMU
         if: runner.arch == 'ARM64'
@@ -136,7 +149,7 @@ jobs:
           cargo test -p achainsaw-codegen --features llvm --no-run
           for vl_bytes in 32 64 256; do
             echo "::group::SVE vector length $((vl_bytes * 8)) bits"
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -cpu max,sve-default-vector-length=$vl_bytes" \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -cpu max,sve-default-vector-length=$vl_bytes,sme-default-vector-length=$vl_bytes" \
               cargo test -p achainsaw-codegen --features llvm \
                 --test vector_ops --test half_masked_mm -- at_host_vector_length
             echo "::endgroup::"
