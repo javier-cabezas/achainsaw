@@ -7,7 +7,10 @@ use anyhow::{anyhow, Result};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value as ClifValue};
+use cranelift_codegen::ir::{
+    AbiParam, Block as ClifBlock, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
+    Value as ClifValue,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Module as ClifModule};
 use std::collections::HashMap;
@@ -42,6 +45,8 @@ pub fn to_clif_type(ty: Type) -> types::Type {
         Type::I64 => types::I64,
         Type::F32 => types::F32,
         Type::F64 => types::F64,
+        // Storage-only half types are carried as their raw bits.
+        Type::F16 | Type::BF16 => types::I16,
         Type::Ptr => types::I64,
         Type::V128 | Type::V256 | Type::V512 | Type::Vx => VEC_PART,
     }
@@ -83,11 +88,318 @@ fn to_part(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
     }
 }
 
-/// Memory flags for vector loads and stores. Unlike `trusted()`, these do not claim
-/// alignment: AIR pointers into user buffers can be arbitrarily aligned, and an aligned
-/// load may be folded into an SSE instruction that faults on unaligned addresses.
-fn vector_mem_flags() -> MemFlagsData {
+/// Memory flags for vector and bulk (`ldm`/`stm`/`mm`) accesses. Unlike `trusted()`, these
+/// do not claim alignment: AIR pointers into user buffers can be arbitrarily aligned, and
+/// an aligned load may be folded into an SSE instruction that faults on unaligned addresses.
+fn user_mem_flags() -> MemFlagsData {
     MemFlagsData::new().with_notrap()
+}
+
+fn c32(builder: &mut FunctionBuilder, v: u32) -> ClifValue {
+    builder.ins().iconst(types::I32, v as i64)
+}
+
+fn c64(builder: &mut FunctionBuilder, v: i64) -> ClifValue {
+    builder.ins().iconst(types::I64, v)
+}
+
+/// Integer type with the same width as `lane` (for copying lanes as raw bits).
+fn lane_int_type(lane: Type) -> types::Type {
+    match lane.byte_size() {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => types::I64,
+    }
+}
+
+/// binary16 bits (I16) -> f32. Exact; NaN payloads are preserved.
+fn f16_to_f32(builder: &mut FunctionBuilder, h: ClifValue) -> ClifValue {
+    let x = builder.ins().uextend(types::I32, h);
+    let k8000 = c32(builder, 0x8000);
+    let sign = builder.ins().band(x, k8000);
+    let sign = builder.ins().ishl_imm_u(sign, 16);
+    let exp = builder.ins().ushr_imm_u(x, 10);
+    let k1f = c32(builder, 0x1f);
+    let exp = builder.ins().band(exp, k1f);
+    let k3ff = c32(builder, 0x3ff);
+    let mant = builder.ins().band(x, k3ff);
+    let mant13 = builder.ins().ishl_imm_u(mant, 13);
+    // Normal: rebias the exponent from 15 to 127.
+    let k112 = c32(builder, 112);
+    let exp32 = builder.ins().iadd(exp, k112);
+    let exp32 = builder.ins().ishl_imm_u(exp32, 23);
+    let normal = builder.ins().bor(exp32, mant13);
+    // Inf/NaN.
+    let kinf = c32(builder, 0x7f80_0000);
+    let infnan = builder.ins().bor(mant13, kinf);
+    // Zero/subnormal: mant * 2^-24, exact in f32.
+    let mant_f = builder.ins().fcvt_from_uint(types::F32, mant);
+    let scale = builder.ins().f32const(f32::from_bits(0x3380_0000)); // 2^-24
+    let sub_f = builder.ins().fmul(mant_f, scale);
+    let sub = builder.ins().bitcast(types::I32, bitcast_flags(), sub_f);
+    let is_sub = builder.ins().icmp_imm_u(IntCC::Equal, exp, 0);
+    let is_max = builder.ins().icmp_imm_u(IntCC::Equal, exp, 31);
+    let mag = builder.ins().select(is_max, infnan, normal);
+    let mag = builder.ins().select(is_sub, sub, mag);
+    let bits = builder.ins().bor(mag, sign);
+    builder.ins().bitcast(types::F32, bitcast_flags(), bits)
+}
+
+/// f32 -> binary16 bits (I16), rounding to nearest-even (F. Giesen's
+/// `float_to_half_fast3_rtne`). NaNs become the canonical quiet NaN 0x7e00.
+fn f32_to_f16(builder: &mut FunctionBuilder, f: ClifValue) -> ClifValue {
+    let x = builder.ins().bitcast(types::I32, bitcast_flags(), f);
+    let ksign = c32(builder, 0x8000_0000);
+    let sign = builder.ins().band(x, ksign);
+    let a = builder.ins().bxor(x, sign);
+    // |f| >= 65536.0 (2^16): Inf, or NaN when above the f32 Inf pattern.
+    let is_big = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, a, 0x4780_0000);
+    let is_nan = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedGreaterThan, a, 0x7f80_0000);
+    let qnan = c32(builder, 0x7e00);
+    let inf = c32(builder, 0x7c00);
+    let big = builder.ins().select(is_nan, qnan, inf);
+    // Result is subnormal or zero: let the FPU round by adding 0.5 (denorm magic).
+    let is_sub = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThan, a, 0x3880_0000);
+    let af = builder.ins().bitcast(types::F32, bitcast_flags(), a);
+    let magic = builder.ins().f32const(f32::from_bits(0x3f00_0000));
+    let sum = builder.ins().fadd(af, magic);
+    let sum_bits = builder.ins().bitcast(types::I32, bitcast_flags(), sum);
+    let kmagic = c32(builder, 0x3f00_0000);
+    let sub = builder.ins().isub(sum_bits, kmagic);
+    // Normal: rebias and round to nearest-even on the 13 dropped mantissa bits.
+    let odd = builder.ins().ushr_imm_u(a, 13);
+    let k1 = c32(builder, 1);
+    let odd = builder.ins().band(odd, k1);
+    let bias = c32(builder, (((15i32 - 127) << 23) + 0xfff) as u32);
+    let t = builder.ins().iadd(a, bias);
+    let t = builder.ins().iadd(t, odd);
+    let normal = builder.ins().ushr_imm_u(t, 13);
+    let mag = builder.ins().select(is_sub, sub, normal);
+    let mag = builder.ins().select(is_big, big, mag);
+    let sign16 = builder.ins().ushr_imm_u(sign, 16);
+    let bits = builder.ins().bor(mag, sign16);
+    builder.ins().ireduce(types::I16, bits)
+}
+
+/// bfloat16 bits (I16) -> f32. Exact.
+fn bf16_to_f32(builder: &mut FunctionBuilder, h: ClifValue) -> ClifValue {
+    let x = builder.ins().uextend(types::I32, h);
+    let x = builder.ins().ishl_imm_u(x, 16);
+    builder.ins().bitcast(types::F32, bitcast_flags(), x)
+}
+
+/// f32 -> bfloat16 bits (I16), rounding to nearest-even; NaNs are quieted.
+fn f32_to_bf16(builder: &mut FunctionBuilder, f: ClifValue) -> ClifValue {
+    let x = builder.ins().bitcast(types::I32, bitcast_flags(), f);
+    let hi = builder.ins().ushr_imm_u(x, 16);
+    let k1 = c32(builder, 1);
+    let lsb = builder.ins().band(hi, k1);
+    let k7fff = c32(builder, 0x7fff);
+    let r = builder.ins().iadd(x, k7fff);
+    let r = builder.ins().iadd(r, lsb);
+    let rounded = builder.ins().ushr_imm_u(r, 16);
+    let k40 = c32(builder, 0x40);
+    let quiet = builder.ins().bor(hi, k40);
+    let kabs = c32(builder, 0x7fff_ffff);
+    let abs = builder.ins().band(x, kabs);
+    let is_nan = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedGreaterThan, abs, 0x7f80_0000);
+    let bits = builder.ins().select(is_nan, quiet, rounded);
+    builder.ins().ireduce(types::I16, bits)
+}
+
+/// Converts a loaded `mm` element (`dtype`) to the accumulator type (f32, or i32 for i8).
+fn mm_widen(builder: &mut FunctionBuilder, dtype: Type, v: ClifValue) -> ClifValue {
+    match dtype {
+        Type::BF16 => bf16_to_f32(builder, v),
+        Type::F16 => f16_to_f32(builder, v),
+        Type::I8 => builder.ins().sextend(types::I32, v),
+        _ => v,
+    }
+}
+
+/// Number of `lane` lanes in a vector of type `ty` on this backend.
+fn lanes_of(ty: Type, lane: Type) -> i64 {
+    (part_count(ty) * 16 / lane.byte_size()) as i64
+}
+
+/// `min(max(count, 0), lanes)`.
+fn clamp_count(builder: &mut FunctionBuilder, count: ClifValue, lanes: i64) -> ClifValue {
+    let zero = c64(builder, 0);
+    let lanes_v = c64(builder, lanes);
+    let n = builder.ins().smax(count, zero);
+    builder.ins().smin(n, lanes_v)
+}
+
+/// Emits `for i in 0..n { *(dst + i*size) = *(src + i*size) }` with `size`-byte lanes,
+/// leaving the builder in the block after the loop.
+fn emit_lane_copy(
+    builder: &mut FunctionBuilder,
+    src: ClifValue,
+    dst: ClifValue,
+    n: ClifValue,
+    lane: Type,
+) {
+    let header = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    let zero = c64(builder, 0);
+    builder.ins().jump(header, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(header);
+    let i = builder.block_params(header)[0];
+    let more = builder.ins().icmp(IntCC::SignedLessThan, i, n);
+    builder.ins().brif(more, body, &[], exit, &[]);
+
+    builder.switch_to_block(body);
+    let size = c64(builder, lane.byte_size() as i64);
+    let off = builder.ins().imul(i, size);
+    let from = builder.ins().iadd(src, off);
+    let to = builder.ins().iadd(dst, off);
+    let v = builder
+        .ins()
+        .load(lane_int_type(lane), user_mem_flags(), from, 0);
+    builder.ins().store(user_mem_flags(), v, to, 0);
+    let one = c64(builder, 1);
+    let next = builder.ins().iadd(i, one);
+    builder.ins().jump(header, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(exit);
+}
+
+/// Stack slot big enough for a vector of type `ty`, and its address.
+fn vector_scratch(builder: &mut FunctionBuilder, ty: Type) -> ClifValue {
+    let bytes = (part_count(ty) * 16) as u32;
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        bytes,
+        4, // 16-byte alignment
+    ));
+    builder.ins().stack_addr(types::I64, slot, 0)
+}
+
+fn load_parts(builder: &mut FunctionBuilder, ptr: ClifValue, ty: Type) -> Parts {
+    (0..part_count(ty))
+        .map(|k| {
+            builder
+                .ins()
+                .load(VEC_PART, user_mem_flags(), ptr, (k * 16) as i32)
+        })
+        .collect()
+}
+
+fn store_parts(builder: &mut FunctionBuilder, ptr: ClifValue, parts: &[ClifValue]) {
+    for (k, part) in parts.iter().enumerate() {
+        builder
+            .ins()
+            .store(user_mem_flags(), *part, ptr, (k * 16) as i32);
+    }
+}
+
+/// `v = ldm p:ty, n:lane`. Full vectors use a plain load; partial ones copy the first
+/// `n` lanes into a zeroed stack slot, so memory past them is never touched.
+fn emit_masked_load(
+    builder: &mut FunctionBuilder,
+    ptr: ClifValue,
+    count: ClifValue,
+    ty: Type,
+    lane: Type,
+) -> Parts {
+    let lanes = lanes_of(ty, lane);
+    let n = clamp_count(builder, count, lanes);
+    let full_blk = builder.create_block();
+    let part_blk = builder.create_block();
+    let merge = builder.create_block();
+    for _ in 0..part_count(ty) {
+        builder.append_block_param(merge, VEC_PART);
+    }
+    let is_full = builder.ins().icmp_imm_u(IntCC::Equal, n, lanes);
+    builder.ins().brif(is_full, full_blk, &[], part_blk, &[]);
+
+    builder.switch_to_block(full_blk);
+    let parts = load_parts(builder, ptr, ty);
+    jump_with(builder, merge, &parts);
+
+    builder.switch_to_block(part_blk);
+    let scratch = vector_scratch(builder, ty);
+    let zero_f = builder.ins().f32const(0.0);
+    let zero = builder.ins().splat(VEC_PART, zero_f);
+    store_parts(builder, scratch, &vec![zero; part_count(ty)]);
+    emit_lane_copy(builder, ptr, scratch, n, lane);
+    let parts = load_parts(builder, scratch, ty);
+    jump_with(builder, merge, &parts);
+
+    builder.switch_to_block(merge);
+    builder.block_params(merge).to_vec()
+}
+
+/// `stm p, v, n:lane`: writes only the first `n` lanes.
+fn emit_masked_store(
+    builder: &mut FunctionBuilder,
+    ptr: ClifValue,
+    parts: &[ClifValue],
+    count: ClifValue,
+    ty: Type,
+    lane: Type,
+) {
+    let lanes = lanes_of(ty, lane);
+    let n = clamp_count(builder, count, lanes);
+    let full_blk = builder.create_block();
+    let part_blk = builder.create_block();
+    let done = builder.create_block();
+    let is_full = builder.ins().icmp_imm_u(IntCC::Equal, n, lanes);
+    builder.ins().brif(is_full, full_blk, &[], part_blk, &[]);
+
+    builder.switch_to_block(full_blk);
+    store_parts(builder, ptr, parts);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(part_blk);
+    let scratch = vector_scratch(builder, ty);
+    store_parts(builder, scratch, parts);
+    emit_lane_copy(builder, scratch, ptr, n, lane);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(done);
+}
+
+fn jump_with(builder: &mut FunctionBuilder, target: ClifBlock, vals: &[ClifValue]) {
+    let args: Vec<BlockArg> = vals.iter().copied().map(BlockArg::Value).collect();
+    builder.ins().jump(target, &args);
+}
+
+/// Pointer to element `row * cols + col` of a row-major matrix with `esize`-byte elements.
+fn elem_ptr(
+    builder: &mut FunctionBuilder,
+    base: ClifValue,
+    row: ClifValue,
+    cols: ClifValue,
+    col: ClifValue,
+    esize: i64,
+) -> ClifValue {
+    let idx = builder.ins().imul(row, cols);
+    let idx = builder.ins().iadd(idx, col);
+    let size = c64(builder, esize);
+    let off = builder.ins().imul(idx, size);
+    builder.ins().iadd(base, off)
+}
+
+/// Element type loaded for an `mm` operand.
+fn mm_elem_type(dtype: Type) -> types::Type {
+    match dtype {
+        Type::BF16 | Type::F16 => types::I16,
+        Type::I8 => types::I8,
+        _ => types::F32,
+    }
 }
 
 fn scalar(values: &Values, name: &str) -> (ClifValue, Type) {
@@ -218,8 +530,131 @@ fn bitcast_flags() -> MemFlagsData {
     flags
 }
 
+/// `mm pc, pa, pb, m, n, k:dtype`: `C[m x n] += A[m x k] * B[k x n]` as an inline loop
+/// nest accumulating in f32 (i32 for i8) over `k` in order. Non-positive dimensions are a
+/// no-op. With `fuel`, charges one unit per 1024 multiply-adds before starting.
+fn emit_matmul(
+    builder: &mut FunctionBuilder,
+    regs: &[ClifValue],
+    dtype: Type,
+    fuel: Option<(cranelift_codegen::ir::FuncRef, ClifBlock)>,
+) {
+    let (pc, pa, pb, m, n, k) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    let is_int = dtype == Type::I8;
+    let acc_ty = if is_int { types::I32 } else { types::F32 };
+    let esize = dtype.byte_size() as i64;
+    let elem_ty = mm_elem_type(dtype);
+
+    let start = builder.create_block();
+    let i_hdr = builder.create_block();
+    let j_hdr = builder.create_block();
+    let k_init = builder.create_block();
+    let k_hdr = builder.create_block();
+    let k_body = builder.create_block();
+    let k_done = builder.create_block();
+    let i_next = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(i_hdr, types::I64); // i
+    builder.append_block_param(j_hdr, types::I64); // i
+    builder.append_block_param(j_hdr, types::I64); // j
+    for _ in 0..3 {
+        builder.append_block_param(k_hdr, types::I64); // i, j, kk
+    }
+    builder.append_block_param(k_hdr, acc_ty); // acc
+
+    let m_pos = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, m, 0);
+    let n_pos = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, n, 0);
+    let k_pos = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, k, 0);
+    let mn = builder.ins().band(m_pos, n_pos);
+    let any = builder.ins().band(mn, k_pos);
+    builder.ins().brif(any, start, &[], done, &[]);
+
+    builder.switch_to_block(start);
+    let zero = c64(builder, 0);
+    if let Some((consume, trap)) = fuel {
+        // units = m*n*k / 1024 + 1, computed in f64 and saturated so huge shapes cannot wrap.
+        let mf = builder.ins().fcvt_from_sint(types::F64, m);
+        let nf = builder.ins().fcvt_from_sint(types::F64, n);
+        let kf = builder.ins().fcvt_from_sint(types::F64, k);
+        let work = builder.ins().fmul(mf, nf);
+        let work = builder.ins().fmul(work, kf);
+        let per_unit = builder.ins().f64const(1024.0);
+        let units_f = builder.ins().fdiv(work, per_unit);
+        let units = builder.ins().fcvt_to_sint_sat(types::I64, units_f);
+        let units = builder.ins().iadd_imm_s(units, 1);
+        let call = builder.ins().call(consume, &[units]);
+        let exhausted = builder.inst_results(call)[0];
+        builder
+            .ins()
+            .brif(exhausted, trap, &[], i_hdr, &[BlockArg::Value(zero)]);
+    } else {
+        builder.ins().jump(i_hdr, &[BlockArg::Value(zero)]);
+    }
+
+    builder.switch_to_block(i_hdr);
+    let i = builder.block_params(i_hdr)[0];
+    let more_i = builder.ins().icmp(IntCC::SignedLessThan, i, m);
+    builder.ins().brif(
+        more_i,
+        j_hdr,
+        &[BlockArg::Value(i), BlockArg::Value(zero)],
+        done,
+        &[],
+    );
+
+    builder.switch_to_block(j_hdr);
+    let (ji, j) = (
+        builder.block_params(j_hdr)[0],
+        builder.block_params(j_hdr)[1],
+    );
+    let more_j = builder.ins().icmp(IntCC::SignedLessThan, j, n);
+    builder.ins().brif(more_j, k_init, &[], i_next, &[]);
+
+    builder.switch_to_block(i_next);
+    let i2 = builder.ins().iadd_imm_s(ji, 1);
+    builder.ins().jump(i_hdr, &[BlockArg::Value(i2)]);
+
+    builder.switch_to_block(k_init);
+    let c_ptr = elem_ptr(builder, pc, ji, n, j, 4);
+    let acc0 = builder.ins().load(acc_ty, user_mem_flags(), c_ptr, 0);
+    jump_with(builder, k_hdr, &[ji, j, zero, acc0]);
+
+    builder.switch_to_block(k_hdr);
+    let p = builder.block_params(k_hdr).to_vec();
+    let (ki, kj, kk, acc) = (p[0], p[1], p[2], p[3]);
+    let more_k = builder.ins().icmp(IntCC::SignedLessThan, kk, k);
+    builder.ins().brif(more_k, k_body, &[], k_done, &[]);
+
+    builder.switch_to_block(k_body);
+    let a_ptr = elem_ptr(builder, pa, ki, k, kk, esize);
+    let b_ptr = elem_ptr(builder, pb, kk, n, kj, esize);
+    let a_raw = builder.ins().load(elem_ty, user_mem_flags(), a_ptr, 0);
+    let b_raw = builder.ins().load(elem_ty, user_mem_flags(), b_ptr, 0);
+    let a = mm_widen(builder, dtype, a_raw);
+    let b = mm_widen(builder, dtype, b_raw);
+    let acc2 = if is_int {
+        let prod = builder.ins().imul(a, b);
+        builder.ins().iadd(acc, prod)
+    } else {
+        let prod = builder.ins().fmul(a, b);
+        builder.ins().fadd(acc, prod)
+    };
+    let kk2 = builder.ins().iadd_imm_s(kk, 1);
+    jump_with(builder, k_hdr, &[ki, kj, kk2, acc2]);
+
+    builder.switch_to_block(k_done);
+    let c_out = elem_ptr(builder, pc, ki, n, kj, 4);
+    builder.ins().store(user_mem_flags(), acc, c_out, 0);
+    let j2 = builder.ins().iadd_imm_s(kj, 1);
+    jump_with(builder, j_hdr, &[ki, j2]);
+
+    builder.switch_to_block(done);
+}
+
 pub struct LowerConfig {
     pub fuel_check_func_id: Option<FuncId>,
+    /// `rt_consume_fuel(units: i64) -> i32`, charged up front by bulk ops (`mm`).
+    pub fuel_consume_func_id: Option<FuncId>,
     pub rt_malloc_id: FuncId,
     pub rt_free_id: FuncId,
 }
@@ -564,7 +999,7 @@ pub fn lower_function<M: ClifModule>(
                             let offset = (k * 16) as i32;
                             loaded.push(builder.ins().load(
                                 VEC_PART,
-                                vector_mem_flags(),
+                                user_mem_flags(),
                                 ptr_val,
                                 offset,
                             ));
@@ -583,7 +1018,7 @@ pub fn lower_function<M: ClifModule>(
                     let (ptr_val, _) = scalar(&values, ptr);
                     let (val_parts, val_ty) = parts(&values, val);
                     let flags = if val_ty.is_vector() {
-                        vector_mem_flags()
+                        user_mem_flags()
                     } else {
                         MemFlagsData::trusted()
                     };
@@ -699,9 +1134,15 @@ pub fn lower_function<M: ClifModule>(
                 Instruction::Cast {
                     op, dst, src, ty, ..
                 } => {
-                    let (src_val, _) = scalar(&values, src);
+                    let (src_val, src_ty) = scalar(&values, src);
                     let clif_target_ty = to_clif_type(*ty);
                     let res = match op {
+                        CastOp::Fext if src_ty == Type::F16 => f16_to_f32(&mut builder, src_val),
+                        CastOp::Fext if src_ty == Type::BF16 => bf16_to_f32(&mut builder, src_val),
+                        CastOp::Ftrunc if *ty == Type::F16 => f32_to_f16(&mut builder, src_val),
+                        CastOp::Ftrunc if *ty == Type::BF16 => f32_to_bf16(&mut builder, src_val),
+                        // f16/bf16 <-> i16 bitcasts: both are carried as I16 already.
+                        CastOp::Bitcast if to_clif_type(src_ty) == clif_target_ty => src_val,
                         CastOp::Itof => builder.ins().fcvt_from_sint(clif_target_ty, src_val),
                         CastOp::Ftoi => {
                             if *ty == Type::I8 || *ty == Type::I16 {
@@ -808,6 +1249,53 @@ pub fn lower_function<M: ClifModule>(
                     }
                     values.insert(dst.clone(), (out, vec_ty));
                 }
+                Instruction::MaskedLoad {
+                    dst,
+                    ptr,
+                    count,
+                    ty,
+                    lane,
+                    ..
+                } => {
+                    let (ptr_val, _) = scalar(&values, ptr);
+                    let (count_val, _) = scalar(&values, count);
+                    let parts = emit_masked_load(&mut builder, ptr_val, count_val, *ty, *lane);
+                    values.insert(dst.clone(), (parts, *ty));
+                }
+                Instruction::MaskedStore {
+                    ptr,
+                    val,
+                    count,
+                    lane,
+                    ..
+                } => {
+                    let (ptr_val, _) = scalar(&values, ptr);
+                    let (count_val, _) = scalar(&values, count);
+                    let (val_parts, val_ty) = parts(&values, val);
+                    emit_masked_store(&mut builder, ptr_val, &val_parts, count_val, val_ty, *lane);
+                }
+                Instruction::MatMul {
+                    pc,
+                    pa,
+                    pb,
+                    m,
+                    n,
+                    k,
+                    dtype,
+                    ..
+                } => {
+                    let regs: Vec<ClifValue> = [pc, pa, pb, m, n, k]
+                        .iter()
+                        .map(|r| scalar(&values, r).0)
+                        .collect();
+                    let fuel = match (config.fuel_consume_func_id, fuel_trap_block) {
+                        (Some(id), Some(trap)) => {
+                            Some((module.declare_func_in_func(id, builder.func), trap))
+                        }
+                        _ => None,
+                    };
+                    emit_matmul(&mut builder, &regs, *dtype, fuel);
+                }
                 Instruction::VLen { dst, lane, .. } => {
                     let lanes = VECTOR_PART_BITS / lane.bit_width().unwrap_or(32);
                     let v = builder.ins().iconst(types::I64, lanes as i64);
@@ -900,6 +1388,7 @@ pub fn lower_function<M: ClifModule>(
                 Type::I32 => builder.ins().iconst(types::I32, 0),
                 Type::I16 => builder.ins().iconst(types::I16, 0),
                 Type::I8 => builder.ins().iconst(types::I8, 0),
+                Type::F16 | Type::BF16 => builder.ins().iconst(types::I16, 0),
                 Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
                     let zero_f = builder.ins().f32const(0.0);
                     builder.ins().splat(VEC_PART, zero_f)
@@ -968,7 +1457,7 @@ impl RtValue {
             Type::Ptr => RtValue::Ptr(raw as usize),
             Type::F32 => RtValue::F32(f32::from_bits(raw as u32)),
             Type::F64 => RtValue::F64(f64::from_bits(raw)),
-            Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
                 panic!("{ty} cannot be decoded from scalar u64")
             }
         }
@@ -1017,7 +1506,7 @@ pub fn lower_trampoline<M: ClifModule>(
                 let r32 = builder.ins().ireduce(types::I32, raw_val);
                 builder.ins().bitcast(types::F32, bitcast_flags(), r32)
             }
-            Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
                 return Err(anyhow!("Cannot pass {ty} directly in scalar trampoline"))
             }
         };
@@ -1037,7 +1526,7 @@ pub fn lower_trampoline<M: ClifModule>(
                 let b = builder.ins().bitcast(types::I32, bitcast_flags(), res);
                 builder.ins().uextend(types::I64, b)
             }
-            Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
                 return Err(anyhow!(
                     "Cannot return {r_ty} directly in scalar trampoline"
                 ))

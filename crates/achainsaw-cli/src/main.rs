@@ -482,9 +482,9 @@ fn run_exec(
                     .parse::<f64>()
                     .map_err(|e| anyhow!("Invalid f64 argument '{trimmed}': {e}"))?,
             ),
-            Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
                 return Err(anyhow!(
-                    "Direct passing of {param_ty} vector arguments not supported via CLI; pass a pointer instead"
+                    "Direct passing of {param_ty} arguments not supported via CLI; pass a pointer instead"
                 ))
             }
         };

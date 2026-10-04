@@ -1,38 +1,24 @@
 # Vector-length-agnostic SAXPY: y[i] = a * x[i] + y[i] for i in 0..n (f32)
-# Uses the widest vectors the backend supports (`vx`) with `vl` lanes per step,
-# then finishes the remaining elements with a scalar loop.
+# Processes `vl` lanes per step with the widest vectors the backend supports (`vx`);
+# masked loads/stores (`ldm`/`stm`) handle the final partial vector without a scalar loop.
 fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
   b0:
     va = splat a:vx
     w = vl f32
     jmp vloop(0:i64)
   vloop(i:i64):
-    rest = sub n, i
-    full = ge rest, w
-    br full, vbody, tail(i)
+    more = lt i, n
+    br more, vbody, done
   vbody:
+    rest = sub n, i
     off = mul i, 4:i64
     px = add x, off
     py = add y, off
-    xv = ld px:vx
-    yv = ld py:vx
+    xv = ldm px:vx, rest:f32
+    yv = ldm py:vx, rest:f32
     r = vfma va, xv, yv:f32
-    st py, r
+    stm py, r, rest:f32
     i2 = add i, w
     jmp vloop(i2)
-  tail(j:i64):
-    more = lt j, n
-    br more, tbody, done
-  tbody:
-    toff = mul j, 4:i64
-    tx = add x, toff
-    ty = add y, toff
-    xs = ld tx:f32
-    ys = ld ty:f32
-    prod = mul a, xs
-    sum = add prod, ys
-    st ty, sum
-    j2 = add j, 1:i64
-    jmp tail(j2)
   done:
     ret

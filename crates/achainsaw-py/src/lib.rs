@@ -143,9 +143,9 @@ impl PyKernel {
                 Type::I64 => RtValue::I64(arg.extract()?),
                 Type::F32 => RtValue::F32(arg.extract()?),
                 Type::F64 => RtValue::F64(arg.extract()?),
-                Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+                Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "Direct passing of {ty} vector arguments across Python boundary not supported; pass by pointer (ptr)",
+                        "Direct passing of {ty} arguments across Python boundary not supported; pass by pointer (ptr)",
                     )));
                 }
             };

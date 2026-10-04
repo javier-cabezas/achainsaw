@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"\x00AIR";
 /// Current AIRB version. Version 2 added v256/v512/vx and lane-typed vector ops;
-/// version 1 files still decode.
-pub const VERSION: u16 = 2;
+/// version 3 added f16/bf16, masked loads/stores, and `mm`. Older files still decode.
+pub const VERSION: u16 = 3;
 const MIN_VERSION: u16 = 1;
 
 /// Serializes an in-memory AIR `Module` into compact AIRB binary bytes.
@@ -266,6 +266,37 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(dst);
                         out.push_str(" = vl ");
                         out.push_str(lane.as_str());
+                    }
+                    Instruction::MaskedLoad {
+                        dst,
+                        ptr,
+                        count,
+                        ty,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = ldm {ptr}:{ty}, {count}:{lane}"));
+                    }
+                    Instruction::MaskedStore {
+                        ptr,
+                        val,
+                        count,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("stm {ptr}, {val}, {count}:{lane}"));
+                    }
+                    Instruction::MatMul {
+                        pc,
+                        pa,
+                        pb,
+                        m,
+                        n,
+                        k,
+                        dtype,
+                        ..
+                    } => {
+                        out.push_str(&format!("mm {pc}, {pa}, {pb}, {m}, {n}, {k}:{dtype}"));
                     }
                 }
                 out.push('\n');
@@ -737,6 +768,44 @@ impl BinaryEncoder {
                 self.buf.push(0x24);
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst]);
+            }
+            Instruction::MaskedLoad {
+                dst,
+                ptr,
+                count,
+                ty,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x25);
+                self.buf.push(encode_type(*ty));
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, ptr, count]);
+            }
+            Instruction::MaskedStore {
+                ptr,
+                val,
+                count,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x26);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[ptr, val, count]);
+            }
+            Instruction::MatMul {
+                pc,
+                pa,
+                pb,
+                m,
+                n,
+                k,
+                dtype,
+                ..
+            } => {
+                self.buf.push(0x27);
+                self.buf.push(encode_type(*dtype));
+                self.push_regs(&[pc, pa, pb, m, n, k]);
             }
         }
     }
@@ -1240,6 +1309,42 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x25 => {
+                let ty = self.read_vector_type()?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::MaskedLoad {
+                    dst: self.read_string()?,
+                    ptr: self.read_string()?,
+                    count: self.read_string()?,
+                    ty,
+                    lane,
+                    span,
+                })
+            }
+            0x26 => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::MaskedStore {
+                    ptr: self.read_string()?,
+                    val: self.read_string()?,
+                    count: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x27 => {
+                let dtype = decode_type(self.read_u8()?)
+                    .ok_or_else(|| self.err("Invalid mm element type in AIRB"))?;
+                Ok(Instruction::MatMul {
+                    pc: self.read_string()?,
+                    pa: self.read_string()?,
+                    pb: self.read_string()?,
+                    m: self.read_string()?,
+                    n: self.read_string()?,
+                    k: self.read_string()?,
+                    dtype,
+                    span,
+                })
+            }
             _ => Err(self.err(format!(
                 "Unknown instruction opcode tag 0x{tag:02X} in AIRB"
             ))),
@@ -1325,6 +1430,8 @@ fn encode_type(ty: Type) -> u8 {
         Type::V256 => 9,
         Type::V512 => 10,
         Type::Vx => 11,
+        Type::F16 => 12,
+        Type::BF16 => 13,
     }
 }
 
@@ -1341,6 +1448,8 @@ fn decode_type(code: u8) -> Option<Type> {
         9 => Some(Type::V256),
         10 => Some(Type::V512),
         11 => Some(Type::Vx),
+        12 => Some(Type::F16),
+        13 => Some(Type::BF16),
         _ => None,
     }
 }

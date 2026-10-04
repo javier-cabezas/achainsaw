@@ -134,6 +134,7 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                         dst, then_val: lhs, ..
                     } => (dst, types.get(lhs).copied()),
                     Instruction::VLen { dst, .. } => (dst, Some(Type::I64)),
+                    Instruction::MaskedLoad { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
                     Instruction::Call {
                         dst: Some(dst),
@@ -1063,7 +1064,10 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::Store { .. }
                 | Instruction::Call { .. }
                 | Instruction::Alloc { .. }
-                | Instruction::Free { .. } => true,
+                | Instruction::Free { .. }
+                | Instruction::MaskedLoad { .. }
+                | Instruction::MaskedStore { .. }
+                | Instruction::MatMul { .. } => true,
             });
             pass_removed += before_len - block.instructions.len();
         }
