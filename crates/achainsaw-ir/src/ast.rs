@@ -26,14 +26,6 @@ pub enum BinaryOp {
     Gt,
     Le,
     Ge,
-    // Universal 128-bit SIMD Vector Ops
-    VfAdd,
-    VfSub,
-    VfMul,
-    VfDiv,
-    ViAdd,
-    ViSub,
-    ViMul,
     // Phase 4 Math & Unsigned Ops
     Min,
     Max,
@@ -75,13 +67,6 @@ impl BinaryOp {
             "gt" => Some(BinaryOp::Gt),
             "le" => Some(BinaryOp::Le),
             "ge" => Some(BinaryOp::Ge),
-            "vfadd" => Some(BinaryOp::VfAdd),
-            "vfsub" => Some(BinaryOp::VfSub),
-            "vfmul" => Some(BinaryOp::VfMul),
-            "vfdiv" => Some(BinaryOp::VfDiv),
-            "viadd" => Some(BinaryOp::ViAdd),
-            "visub" => Some(BinaryOp::ViSub),
-            "vimul" => Some(BinaryOp::ViMul),
             "min" => Some(BinaryOp::Min),
             "max" => Some(BinaryOp::Max),
             "umin" => Some(BinaryOp::Umin),
@@ -127,18 +112,106 @@ impl BinaryOp {
                 | BinaryOp::Uge
         )
     }
+}
 
-    pub fn is_vector(&self) -> bool {
-        matches!(
-            self,
-            BinaryOp::VfAdd
-                | BinaryOp::VfSub
-                | BinaryOp::VfMul
-                | BinaryOp::VfDiv
-                | BinaryOp::ViAdd
-                | BinaryOp::ViSub
-                | BinaryOp::ViMul
-        )
+/// Lane-wise vector binary op: `r = vadd a, b:f32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    And,
+    Or,
+    Xor,
+}
+
+impl VBinOp {
+    pub const ALL: [VBinOp; 9] = [
+        VBinOp::Add,
+        VBinOp::Sub,
+        VBinOp::Mul,
+        VBinOp::Div,
+        VBinOp::Min,
+        VBinOp::Max,
+        VBinOp::And,
+        VBinOp::Or,
+        VBinOp::Xor,
+    ];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    /// Pre-v2 spellings (`vfadd`, `viadd`, ...) with their implied lane type.
+    pub fn from_legacy(s: &str) -> Option<(Self, Type)> {
+        match s {
+            "vfadd" => Some((VBinOp::Add, Type::F32)),
+            "vfsub" => Some((VBinOp::Sub, Type::F32)),
+            "vfmul" => Some((VBinOp::Mul, Type::F32)),
+            "vfdiv" => Some((VBinOp::Div, Type::F32)),
+            "viadd" => Some((VBinOp::Add, Type::I32)),
+            "visub" => Some((VBinOp::Sub, Type::I32)),
+            "vimul" => Some((VBinOp::Mul, Type::I32)),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VBinOp::Add => "vadd",
+            VBinOp::Sub => "vsub",
+            VBinOp::Mul => "vmul",
+            VBinOp::Div => "vdiv",
+            VBinOp::Min => "vmin",
+            VBinOp::Max => "vmax",
+            VBinOp::And => "vand",
+            VBinOp::Or => "vor",
+            VBinOp::Xor => "vxor",
+        }
+    }
+
+    pub fn is_bitwise(&self) -> bool {
+        matches!(self, VBinOp::And | VBinOp::Or | VBinOp::Xor)
+    }
+}
+
+/// Lane-wise vector comparison producing all-ones (true) or all-zeros (false) lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl VCmpOp {
+    pub const ALL: [VCmpOp; 6] = [
+        VCmpOp::Eq,
+        VCmpOp::Ne,
+        VCmpOp::Lt,
+        VCmpOp::Gt,
+        VCmpOp::Le,
+        VCmpOp::Ge,
+    ];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VCmpOp::Eq => "veq",
+            VCmpOp::Ne => "vne",
+            VCmpOp::Lt => "vlt",
+            VCmpOp::Gt => "vgt",
+            VCmpOp::Le => "vle",
+            VCmpOp::Ge => "vge",
+        }
     }
 }
 
@@ -209,28 +282,34 @@ impl CastOp {
     }
 }
 
+/// Horizontal reduction of all lanes to a scalar of the lane type: `s = vsum v:f32`.
+///
+/// Lanes are combined as a recursive-halves tree: `reduce(v) = op(reduce(lo), reduce(hi))`,
+/// which pairs adjacent lanes first. Every backend uses this order, so float results are
+/// bit-identical for fixed-width vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VectorReduceOp {
-    VfSum,
-    VfMax,
-    ViSum,
+    Sum,
+    Max,
+    Min,
 }
 
 impl VectorReduceOp {
+    /// Accepts the canonical names and the pre-v2 aliases `vfsum`, `visum`, `vfmax`.
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
-            "vfsum" => Some(VectorReduceOp::VfSum),
-            "vfmax" => Some(VectorReduceOp::VfMax),
-            "visum" => Some(VectorReduceOp::ViSum),
+            "vsum" | "vfsum" | "visum" => Some(VectorReduceOp::Sum),
+            "vmaxr" | "vfmax" => Some(VectorReduceOp::Max),
+            "vminr" => Some(VectorReduceOp::Min),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            VectorReduceOp::VfSum => "vfsum",
-            VectorReduceOp::VfMax => "vfmax",
-            VectorReduceOp::ViSum => "visum",
+            VectorReduceOp::Sum => "vsum",
+            VectorReduceOp::Max => "vmaxr",
+            VectorReduceOp::Min => "vminr",
         }
     }
 }
@@ -268,9 +347,11 @@ pub enum Instruction {
         span: Span,
     },
     // SIMD Intrinsics
+    /// Broadcast a scalar to every lane of a vector of type `ty` (default `v128`).
     Splat {
         dst: String,
         src: String,
+        ty: Type,
         span: Span,
     },
     ExtractLane {
@@ -318,6 +399,135 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
+    // AIR v2 lane-typed vector ops. `lane` is the scalar lane type.
+    VBinary {
+        op: VBinOp,
+        dst: String,
+        lhs: String,
+        rhs: String,
+        lane: Type,
+        span: Span,
+    },
+    /// Fused multiply-add `a * b + c` with a single rounding.
+    VFma {
+        dst: String,
+        a: String,
+        b: String,
+        c: String,
+        lane: Type,
+        span: Span,
+    },
+    VCmp {
+        op: VCmpOp,
+        dst: String,
+        lhs: String,
+        rhs: String,
+        lane: Type,
+        span: Span,
+    },
+    /// Bitwise select: bits of `then_val` where `mask` is 1, else bits of `else_val`.
+    VSelect {
+        dst: String,
+        mask: String,
+        then_val: String,
+        else_val: String,
+        span: Span,
+    },
+    /// Lane count of `vx` for `lane` (`n = vl f32`), as an i64.
+    VLen {
+        dst: String,
+        lane: Type,
+        span: Span,
+    },
+}
+
+impl Instruction {
+    /// Register defined by this instruction, if any.
+    pub fn dst(&self) -> Option<&str> {
+        match self {
+            Instruction::AssignConst { dst, .. }
+            | Instruction::Binary { dst, .. }
+            | Instruction::Load { dst, .. }
+            | Instruction::Splat { dst, .. }
+            | Instruction::ExtractLane { dst, .. }
+            | Instruction::Alloc { dst, .. }
+            | Instruction::Select { dst, .. }
+            | Instruction::Unary { dst, .. }
+            | Instruction::Cast { dst, .. }
+            | Instruction::VectorReduce { dst, .. }
+            | Instruction::VBinary { dst, .. }
+            | Instruction::VFma { dst, .. }
+            | Instruction::VCmp { dst, .. }
+            | Instruction::VSelect { dst, .. }
+            | Instruction::VLen { dst, .. } => Some(dst),
+            Instruction::Call { dst, .. } => dst.as_deref(),
+            Instruction::Store { .. } | Instruction::Free { .. } => None,
+        }
+    }
+
+    /// Registers read by this instruction, in operand order.
+    pub fn operands(&self) -> Vec<&String> {
+        match self {
+            Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
+            Instruction::Binary { lhs, rhs, .. }
+            | Instruction::VBinary { lhs, rhs, .. }
+            | Instruction::VCmp { lhs, rhs, .. } => vec![lhs, rhs],
+            Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
+            Instruction::Store { ptr, val, .. } => vec![ptr, val],
+            Instruction::Call { args, .. } => args.iter().collect(),
+            Instruction::Splat { src, .. }
+            | Instruction::Unary { src, .. }
+            | Instruction::Cast { src, .. }
+            | Instruction::VectorReduce { src, .. } => vec![src],
+            Instruction::ExtractLane { vec, .. } => vec![vec],
+            Instruction::Alloc { size, .. } => vec![size],
+            Instruction::Select {
+                cond: a,
+                then_val: b,
+                else_val: c,
+                ..
+            }
+            | Instruction::VSelect {
+                mask: a,
+                then_val: b,
+                else_val: c,
+                ..
+            }
+            | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+        }
+    }
+
+    /// Mutable access to the registers read by this instruction.
+    pub fn operands_mut(&mut self) -> Vec<&mut String> {
+        match self {
+            Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
+            Instruction::Binary { lhs, rhs, .. }
+            | Instruction::VBinary { lhs, rhs, .. }
+            | Instruction::VCmp { lhs, rhs, .. } => vec![lhs, rhs],
+            Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
+            Instruction::Store { ptr, val, .. } => vec![ptr, val],
+            Instruction::Call { args, .. } => args.iter_mut().collect(),
+            Instruction::Splat { src, .. }
+            | Instruction::Unary { src, .. }
+            | Instruction::Cast { src, .. }
+            | Instruction::VectorReduce { src, .. } => vec![src],
+            Instruction::ExtractLane { vec, .. } => vec![vec],
+            Instruction::Alloc { size, .. } => vec![size],
+            Instruction::Select {
+                cond: a,
+                then_val: b,
+                else_val: c,
+                ..
+            }
+            | Instruction::VSelect {
+                mask: a,
+                then_val: b,
+                else_val: c,
+                ..
+            }
+            | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

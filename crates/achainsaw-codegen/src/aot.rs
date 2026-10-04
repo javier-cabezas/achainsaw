@@ -1,5 +1,5 @@
 use crate::cpu;
-use crate::lower::{lower_function, to_clif_type, LowerConfig};
+use crate::lower::{lower_function, push_abi_params, LowerConfig};
 use achainsaw_ir::ast::Module;
 use anyhow::{anyhow, Result};
 use cranelift_codegen::ir::types;
@@ -44,6 +44,9 @@ impl AotCompiler {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "true")?;
         flag_builder.set("opt_level", "speed")?;
+        // v256/v512 values span 2/4 vector registers, more than ABIs return in registers;
+        // spill extra return values through an implicit struct-return pointer.
+        flag_builder.set("enable_multi_ret_implicit_sret", "true")?;
 
         let (isa_builder, ignored_features) = cpu::target_isa_builder(
             target.triple.as_deref(),
@@ -94,10 +97,10 @@ impl AotCompiler {
         for ext_fn in &ir_mod.extern_functions {
             let mut sig = self.module.make_signature();
             for (_, p_ty) in &ext_fn.params {
-                sig.params.push(AbiParam::new(to_clif_type(*p_ty)));
+                push_abi_params(&mut sig.params, *p_ty);
             }
             if let Some(r_ty) = ext_fn.ret_type {
-                sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
+                push_abi_params(&mut sig.returns, r_ty);
             }
             func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
 
@@ -111,10 +114,10 @@ impl AotCompiler {
         for func in &ir_mod.functions {
             let mut sig = self.module.make_signature();
             for (_, p_ty) in &func.params {
-                sig.params.push(AbiParam::new(to_clif_type(*p_ty)));
+                push_abi_params(&mut sig.params, *p_ty);
             }
             if let Some(r_ty) = func.ret_type {
-                sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
+                push_abi_params(&mut sig.returns, r_ty);
             }
             func_returns.insert(func.name.clone(), func.ret_type);
 
