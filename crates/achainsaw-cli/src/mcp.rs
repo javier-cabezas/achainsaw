@@ -37,7 +37,7 @@ AIR syntax:
 - Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
 - Comments: `#` or `//`. Names starting with `__` are reserved.
 
-air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (v128 params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop.
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion.
 
 Example:
 fn sum_to(n:i64)->i64
@@ -129,7 +129,35 @@ pub fn load_module_from_code(code: &str) -> Result<Module, Diagnostic> {
     parse_and_validate(trimmed)
 }
 
+/// Sandbox arena size for `air_run` when `max_memory_mb` is not given.
+pub const DEFAULT_SANDBOX_MEMORY_MB: usize = 64;
+/// Largest `max_memory_mb` that `air_run` accepts.
+pub const MAX_SANDBOX_MEMORY_MB: usize = 4096;
+
+/// Stack for the thread that runs `air_run` code: the sandbox's recursion budget plus
+/// headroom, independent of the host thread (Windows main threads only get 1 MiB).
+const EXECUTION_STACK_BYTES: usize = 8 << 20;
+
 pub fn execute_ir(
+    module: &Module,
+    func_name: &str,
+    args: &[f64],
+    fuel: Option<u64>,
+    max_memory_mb: Option<usize>,
+) -> Result<Value> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("air_run".into())
+            .stack_size(EXECUTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb)
+            })?
+            .join()
+            .map_err(|_| anyhow!("air_run execution thread panicked"))?
+    })
+}
+
+fn execute_ir_on_this_thread(
     module: &Module,
     func_name: &str,
     args: &[f64],
@@ -157,15 +185,30 @@ pub fn execute_ir(
         .find(|f| f.name == func_name)
         .ok_or_else(|| anyhow!("Function '{func_name}' not defined in module"))?;
 
+    // Sandboxed code can only reach its own arena, so a pointer from the caller is
+    // never valid; reject it up front with a clear message.
+    if let Some((name, _)) = func.params.iter().find(|(_, ty)| *ty == Type::Ptr) {
+        return Err(anyhow!(
+            "[ERR_PTR_ARGUMENT] air_run cannot pass pointer parameter '{name}'; allocate buffers inside the function with alloc"
+        ));
+    }
+
+    let memory_mb = max_memory_mb.unwrap_or(DEFAULT_SANDBOX_MEMORY_MB);
+    if memory_mb > MAX_SANDBOX_MEMORY_MB {
+        return Err(anyhow!(
+            "max_memory_mb must be at most {MAX_SANDBOX_MEMORY_MB}, got {memory_mb}"
+        ));
+    }
+    let arena_bytes = memory_mb * 1024 * 1024;
+
     let t1 = Instant::now();
     let mut engine = JitEngine::new()?;
     // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
     let effective_fuel = fuel.or(Some(1_000_000));
     engine.set_fuel(effective_fuel);
-
-    if let Some(mb) = max_memory_mb {
-        engine.set_memory_quota(mb * 1024 * 1024);
-    }
+    // Bounds-check all memory accesses and cap recursion so untrusted code cannot
+    // touch or crash the server process.
+    engine.enable_sandbox(arena_bytes)?;
     engine.compile_module(module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -177,7 +220,7 @@ pub fn execute_ir(
             Type::I16 => RtValue::I16(val_num as i16),
             Type::I32 => RtValue::I32(val_num as i32),
             Type::I64 => RtValue::I64(val_num as i64),
-            Type::Ptr => RtValue::Ptr(val_num as usize),
+            Type::Ptr => unreachable!("rejected above"),
             Type::F32 => RtValue::F32(val_num as f32),
             Type::F64 => RtValue::F64(val_num),
             Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
@@ -497,7 +540,7 @@ pub fn get_tools_list() -> Value {
                         },
                         "max_memory_mb": {
                             "type": "integer",
-                            "description": "Maximum heap memory quota in megabytes"
+                            "description": "Sandbox memory available to alloc, in megabytes (default 64)"
                         }
                     },
                     "required": ["code"]
@@ -806,6 +849,79 @@ mod tests {
         assert_eq!(res["isError"], true);
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ERR_OUT_OF_FUEL"));
+    }
+
+    fn run_error_text(arguments: Value) -> String {
+        let res = handle_air_run(&arguments);
+        assert_eq!(res["isError"], true, "{res}");
+        res["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_mcp_air_run_uses_alloc_memory() {
+        let code = r#"
+        fn main(n:i64)->i64
+          b0:
+            bytes = mul n, 8:i64
+            p = alloc bytes
+            jmp b1(0:i64)
+          b1(i:i64):
+            c = lt i, n
+            br c, b2, b3
+          b2:
+            off = mul i, 8:i64
+            q = add p, off
+            st q, i
+            i2 = add i, 1:i64
+            jmp b1(i2)
+          b3:
+            last = sub bytes, 8:i64
+            q2 = add p, last
+            v = ld q2:i64
+            free p
+            ret v
+        "#;
+        let res = handle_air_run(&json!({ "code": code, "args": [1000] }));
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"result\": 999"));
+    }
+
+    #[test]
+    fn test_mcp_air_run_rejects_pointer_arguments() {
+        let code = "fn main(p:ptr)->i32\n  b0:\n    v = ld p:i32\n    ret v\n";
+        let text = run_error_text(json!({ "code": code, "args": [4096] }));
+        assert!(text.contains("ERR_PTR_ARGUMENT"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_memory_violation() {
+        // A pointer made from a constant, and one walked past the end of an allocation.
+        let forged = "fn main()->i32\n  b0:\n    p = cst 4096:ptr\n    x = cst 1:i32\n    st p, x\n    ret x\n";
+        let text = run_error_text(json!({ "code": forged }));
+        assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+
+        let overrun = "fn main()->i32\n  b0:\n    p = alloc 16:i64\n    q = add p, 1048576:i64\n    v = ld q:i32\n    ret v\n";
+        let text = run_error_text(json!({ "code": overrun, "max_memory_mb": 1 }));
+        assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_stack_overflow() {
+        let code = "fn main()->i32\n  b0:\n    r = call main()\n    ret r\n";
+        let text = run_error_text(json!({ "code": code }));
+        assert!(text.contains("ERR_STACK_OVERFLOW"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_memory_limit() {
+        let code = "fn main()->i32\n  b0:\n    p = alloc 2097152:i64\n    ret 0:i32\n";
+        let text = run_error_text(json!({ "code": code, "max_memory_mb": 1 }));
+        assert!(text.contains("ERR_OUT_OF_MEMORY"), "{text}");
+        let text = run_error_text(json!({ "code": code, "max_memory_mb": 1u64 << 40 }));
+        assert!(text.contains("max_memory_mb"), "{text}");
     }
 
     #[test]

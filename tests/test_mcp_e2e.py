@@ -174,6 +174,36 @@ def test_mcp_server():
     assert "ERR_OUT_OF_FUEL" in err_text
     print("[PASS] MCP tools/call air_run fuel trap enforcement")
 
+    # 8b. Sandbox: out-of-bounds access and unbounded recursion are errors, and the
+    # server keeps running afterwards (later requests below still succeed).
+    sandbox_cases = [
+        ("ERR_MEMORY_VIOLATION", """fn main()->i32
+  b0:
+    p = alloc 16:i64
+    q = add p, 1048576:i64
+    v = ld q:i32
+    ret v
+"""),
+        ("ERR_STACK_OVERFLOW", """fn main()->i32
+  b0:
+    r = call main()
+    ret r
+"""),
+    ]
+    for i, (code, air) in enumerate(sandbox_cases):
+        res = send_req({
+            "jsonrpc": "2.0",
+            "id": 80 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "air_run",
+                "arguments": {"code": air, "max_memory_mb": 1}
+            }
+        })
+        assert res["result"]["isError"] is True
+        assert code in res["result"]["content"][0]["text"]
+        print(f"[PASS] MCP tools/call air_run sandbox {code}")
+
     # 9. Tool Call: air_optimize
     unopt_air = """fn opt_me(x:i32)->i32
   b0:

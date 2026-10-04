@@ -133,6 +133,7 @@ impl AotCompiler {
             fuel_consume_func_id: None,
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
+            sandbox: None,
         };
 
         for func in &ir_mod.functions {
