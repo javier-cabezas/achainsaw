@@ -48,6 +48,17 @@ pub struct SandboxBounds {
     pub len: u64,
 }
 
+/// Matrix engines `mm` may use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatrixUnits {
+    /// Intel AMX with BF16 (`tdpbf16ps`), INT8 (`tdpbssd`) and FP16 (`tdpfp16ps`) support.
+    pub amx_bf16: bool,
+    pub amx_int8: bool,
+    pub amx_fp16: bool,
+    /// Arm SME outer products into ZA (streaming mode).
+    pub sme: bool,
+}
+
 /// Shape of `vx` for one compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VxShape {
@@ -81,6 +92,8 @@ pub struct LowerOptions {
     /// Widest vector register to use (`prefer-vector-width` / `min-legal-vector-width`), so
     /// x86 code uses zmm/ymm registers instead of splitting wide vectors.
     pub vector_width: Option<u32>,
+    /// Matrix engines for `mm`; without one, `mm` uses vector FMAs at `vx` width.
+    pub matrix: MatrixUnits,
 }
 
 fn lane_bits(lane: Type) -> u32 {
@@ -94,6 +107,54 @@ macro_rules! vec1 {
             BasicValueEnum::VectorValue($x) => BasicValueEnum::from($e),
             BasicValueEnum::ScalableVectorValue($x) => BasicValueEnum::from($e),
             other => unreachable!("vector operand expected, found {other:?}"),
+        }
+    };
+}
+
+/// Applies an integer expression to a scalar or (fixed/scalable) vector operand.
+macro_rules! anyi1 {
+    ($a:expr, |$x:ident| $e:expr) => {
+        match $a {
+            BasicValueEnum::IntValue($x) => BasicValueEnum::from($e),
+            BasicValueEnum::VectorValue($x) => BasicValueEnum::from($e),
+            BasicValueEnum::ScalableVectorValue($x) => BasicValueEnum::from($e),
+            other => unreachable!("integer operand expected, found {other:?}"),
+        }
+    };
+}
+
+/// Applies an integer expression to two scalar or vector operands of the same kind.
+macro_rules! anyi2 {
+    ($a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {
+        match ($a, $b) {
+            (BasicValueEnum::IntValue($x), BasicValueEnum::IntValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (BasicValueEnum::VectorValue($x), BasicValueEnum::VectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (BasicValueEnum::ScalableVectorValue($x), BasicValueEnum::ScalableVectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (a, b) => unreachable!("integer operands expected, found {a:?} and {b:?}"),
+        }
+    };
+}
+
+/// Applies a float expression to two scalar or vector operands of the same kind.
+macro_rules! anyf2 {
+    ($a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {
+        match ($a, $b) {
+            (BasicValueEnum::FloatValue($x), BasicValueEnum::FloatValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (BasicValueEnum::VectorValue($x), BasicValueEnum::VectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (BasicValueEnum::ScalableVectorValue($x), BasicValueEnum::ScalableVectorValue($y)) => {
+                BasicValueEnum::from($e)
+            }
+            (a, b) => unreachable!("float operands expected, found {a:?} and {b:?}"),
         }
     };
 }
@@ -112,6 +173,9 @@ macro_rules! vec2 {
         }
     };
 }
+
+#[path = "matmul.rs"]
+mod matmul;
 
 pub fn lower_module<'ctx>(
     ctx: &'ctx Context,
@@ -134,6 +198,22 @@ pub fn lower_module<'ctx>(
         let fn_ty = lw.fn_type(&func.params, func.ret_type);
         let f = module.add_function(&func.name, fn_ty, Some(Linkage::External));
         lw.add_target_attributes(f);
+    }
+    let mut mm_dtypes = Vec::new();
+    for inst in air
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.instructions)
+    {
+        if let Instruction::MatMul { dtype, .. } = inst {
+            if !mm_dtypes.contains(dtype) {
+                mm_dtypes.push(*dtype);
+            }
+        }
+    }
+    for dtype in mm_dtypes {
+        lw.build_mm_helper(dtype)?;
     }
     for func in &air.functions {
         lw.lower_function(func, air)?;
@@ -521,30 +601,117 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     // f16 / bf16 (bit-exact ports of the Cranelift sequences)
     // ---------------------------------------------------------------------------------
 
-    fn f16_to_f32(&self, h: IntValue<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+    /// Lane count and scalability of a vector value; `None` for scalars.
+    fn shape_of(v: BasicValueEnum<'ctx>) -> Option<(u32, bool)> {
+        match v {
+            BasicValueEnum::VectorValue(x) => Some((x.get_type().get_size(), false)),
+            BasicValueEnum::ScalableVectorValue(x) => Some((x.get_type().get_size(), true)),
+            _ => None,
+        }
+    }
+
+    /// `elem`, or a vector of `elem` with the given shape.
+    fn shaped(&self, elem: BasicTypeEnum<'ctx>, shape: Option<(u32, bool)>) -> BasicTypeEnum<'ctx> {
+        match shape {
+            None => elem,
+            Some((n, scalable)) => self.vec_of(elem, n, scalable),
+        }
+    }
+
+    /// Constant `c` (a scalar constant), splatted to `shape`.
+    fn splat_const(
+        &self,
+        c: BasicValueEnum<'ctx>,
+        shape: Option<(u32, bool)>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        Ok(match shape {
+            None => c,
+            Some((n, false)) => VectorType::const_vector(&vec![c; n as usize]).into(),
+            Some((n, true)) => {
+                let b = &self.builder;
+                let vt = self
+                    .vec_of(c.get_type(), n, true)
+                    .into_scalable_vector_type();
+                let one = b.build_insert_element(vt.get_poison(), c, self.c32(0), "")?;
+                let zeros = self.i32().scalable_vec_type(n).const_zero();
+                b.build_shuffle_vector(one, vt.get_poison(), zeros, "")?
+                    .into()
+            }
+        })
+    }
+
+    /// Zero-extends integer lanes (or a scalar) to i32.
+    fn zext_to_i32(&self, v: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let x = b.build_int_z_extend(h, self.i32(), "")?;
-        let sign = b.build_and(x, self.c32(0x8000), "")?;
-        let sign = b.build_left_shift(sign, self.c32(16), "")?;
-        let exp = b.build_right_shift(x, self.c32(10), false, "")?;
-        let exp = b.build_and(exp, self.c32(0x1f), "")?;
-        let mant = b.build_and(x, self.c32(0x3ff), "")?;
-        let mant13 = b.build_left_shift(mant, self.c32(13), "")?;
-        let exp32 = b.build_int_add(exp, self.c32(112), "")?;
-        let exp32 = b.build_left_shift(exp32, self.c32(23), "")?;
-        let normal = b.build_or(exp32, mant13, "")?;
-        let infnan = b.build_or(mant13, self.c32(0x7f80_0000), "")?;
-        let f32t = self.ctx.f32_type();
-        let mant_f = b.build_unsigned_int_to_float(mant, f32t, "")?;
-        let scale = f32t.const_float(f32::from_bits(0x3380_0000) as f64);
-        let sub_f = b.build_float_mul(mant_f, scale, "")?;
-        let sub = b.build_bit_cast(sub_f, self.i32(), "")?.into_int_value();
-        let is_sub = b.build_int_compare(IntPredicate::EQ, exp, self.c32(0), "")?;
-        let is_max = b.build_int_compare(IntPredicate::EQ, exp, self.c32(31), "")?;
-        let mag = b.build_select(is_max, infnan, normal, "")?.into_int_value();
-        let mag = b.build_select(is_sub, sub, mag, "")?.into_int_value();
-        let bits = b.build_or(mag, sign, "")?;
-        Ok(b.build_bit_cast(bits, f32t, "")?)
+        let t = self.shaped(self.i32().into(), Self::shape_of(v));
+        Ok(match v {
+            BasicValueEnum::IntValue(x) => b.build_int_z_extend(x, t.into_int_type(), "")?.into(),
+            BasicValueEnum::VectorValue(x) => {
+                b.build_int_z_extend(x, t.into_vector_type(), "")?.into()
+            }
+            BasicValueEnum::ScalableVectorValue(x) => b
+                .build_int_z_extend(x, t.into_scalable_vector_type(), "")?
+                .into(),
+            other => unreachable!("{other:?}"),
+        })
+    }
+
+    /// binary16 bits (i16, or i16 lanes) -> f32. Exact; NaN payloads are preserved. The same
+    /// integer sequence as Cranelift's `f16_to_f32`, so both backends agree bit for bit.
+    fn f16_to_f32(&self, h: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let shape = Self::shape_of(h);
+        let k = |v: u32| self.splat_const(self.c32(v).into(), shape);
+        let x = self.zext_to_i32(h)?;
+        let sign = anyi2!(x, k(0x8000)?, |p, q| b.build_and(p, q, "")?);
+        let sign = anyi2!(sign, k(16)?, |p, q| b.build_left_shift(p, q, "")?);
+        let exp = anyi2!(x, k(10)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let exp = anyi2!(exp, k(0x1f)?, |p, q| b.build_and(p, q, "")?);
+        let mant = anyi2!(x, k(0x3ff)?, |p, q| b.build_and(p, q, "")?);
+        let mant13 = anyi2!(mant, k(13)?, |p, q| b.build_left_shift(p, q, "")?);
+        let exp32 = anyi2!(exp, k(112)?, |p, q| b.build_int_add(p, q, "")?);
+        let exp32 = anyi2!(exp32, k(23)?, |p, q| b.build_left_shift(p, q, "")?);
+        let normal = anyi2!(exp32, mant13, |p, q| b.build_or(p, q, "")?);
+        let infnan = anyi2!(mant13, k(0x7f80_0000)?, |p, q| b.build_or(p, q, "")?);
+        // Zero/subnormal: mant * 2^-24, exact in f32.
+        let f32t = self.shaped(self.ctx.f32_type().into(), shape);
+        let mant_f: BasicValueEnum = match mant {
+            BasicValueEnum::IntValue(m) => b
+                .build_unsigned_int_to_float(m, f32t.into_float_type(), "")?
+                .into(),
+            BasicValueEnum::VectorValue(m) => b
+                .build_unsigned_int_to_float(m, f32t.into_vector_type(), "")?
+                .into(),
+            BasicValueEnum::ScalableVectorValue(m) => b
+                .build_unsigned_int_to_float(m, f32t.into_scalable_vector_type(), "")?
+                .into(),
+            other => unreachable!("{other:?}"),
+        };
+        let scale = self.splat_const(
+            self.ctx
+                .f32_type()
+                .const_float(f32::from_bits(0x3380_0000) as f64)
+                .into(),
+            shape,
+        )?;
+        let sub_f = anyf2!(mant_f, scale, |p, q| b.build_float_mul(p, q, "")?);
+        let sub = self.bitcast(sub_f, x.get_type())?;
+        let is_sub = anyi2!(exp, k(0)?, |p, q| b.build_int_compare(
+            IntPredicate::EQ,
+            p,
+            q,
+            ""
+        )?);
+        let is_max = anyi2!(exp, k(31)?, |p, q| b.build_int_compare(
+            IntPredicate::EQ,
+            p,
+            q,
+            ""
+        )?);
+        let mag = anyi1!(is_max, |c| b.build_select(c, infnan, normal, "")?);
+        let mag = anyi1!(is_sub, |c| b.build_select(c, sub, mag, "")?);
+        let bits = anyi2!(mag, sign, |p, q| b.build_or(p, q, "")?);
+        self.bitcast(bits, f32t)
     }
 
     fn f32_to_f16(&self, f: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
@@ -577,11 +744,14 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(b.build_int_truncate(bits, self.i16(), "")?.into())
     }
 
-    fn bf16_to_f32(&self, h: IntValue<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+    /// bfloat16 bits (i16, or i16 lanes) -> f32. Exact.
+    fn bf16_to_f32(&self, h: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let x = b.build_int_z_extend(h, self.i32(), "")?;
-        let x = b.build_left_shift(x, self.c32(16), "")?;
-        Ok(b.build_bit_cast(x, self.ctx.f32_type(), "")?)
+        let shape = Self::shape_of(h);
+        let x = self.zext_to_i32(h)?;
+        let sixteen = self.splat_const(self.c32(16).into(), shape)?;
+        let x = anyi2!(x, sixteen, |p, q| b.build_left_shift(p, q, "")?);
+        self.bitcast(x, self.shaped(self.ctx.f32_type().into(), shape))
     }
 
     fn f32_to_bf16(&self, f: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
@@ -1239,8 +1409,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
         let target = self.scalar_type(ty);
         Ok(match op {
-            CastOp::Fext if sty == Type::F16 => self.f16_to_f32(s.into_int_value())?,
-            CastOp::Fext if sty == Type::BF16 => self.bf16_to_f32(s.into_int_value())?,
+            CastOp::Fext if sty == Type::F16 => self.f16_to_f32(s)?,
+            CastOp::Fext if sty == Type::BF16 => self.bf16_to_f32(s)?,
             CastOp::Ftrunc if ty == Type::F16 => self.f32_to_f16(s)?,
             CastOp::Ftrunc if ty == Type::BF16 => self.f32_to_bf16(s)?,
             CastOp::Bitcast => self.bitcast(s, target)?,
@@ -1542,35 +1712,15 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         )
     }
 
-    /// `mm`: same loop nest, accumulation order and fuel charge as the Cranelift backend.
+    /// `mm`: the same checks and fuel charge as the Cranelift backend, then a call to the
+    /// dtype's kernel (see `matmul.rs`). Non-positive dimensions are a no-op.
     fn matmul(&self, st: &FnState<'ctx>, regs: [IntValue<'ctx>; 6], dtype: Type) -> Result<()> {
         let b = &self.builder;
         let [pc, pa, pb, m, n, k] = regs;
-        let is_int = dtype == Type::I8;
-        let acc_ty: BasicTypeEnum = if is_int {
-            self.i32().into()
-        } else {
-            self.ctx.f32_type().into()
-        };
         let esize = dtype.byte_size() as i64;
-        let elem_ty: BasicTypeEnum = match dtype {
-            Type::BF16 | Type::F16 => self.i16().into(),
-            Type::I8 => self.ctx.i8_type().into(),
-            _ => self.ctx.f32_type().into(),
-        };
         let f = st.func;
         let blk = |name| self.ctx.append_basic_block(f, name);
-        let (start, i_hdr, j_hdr, k_init, k_hdr, k_body, k_done, i_next, done) = (
-            blk("mm.start"),
-            blk("mm.i"),
-            blk("mm.j"),
-            blk("mm.kinit"),
-            blk("mm.k"),
-            blk("mm.kbody"),
-            blk("mm.kdone"),
-            blk("mm.inext"),
-            blk("mm.done"),
-        );
+        let (start, done) = (blk("mm.start"), blk("mm.done"));
         let zero = self.c64(0);
         let pos = |v| b.build_int_compare(IntPredicate::SGT, v, zero, "");
         let any = b.build_and(pos(m)?, pos(n)?, "")?;
@@ -1603,85 +1753,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             self.check_hook(st, RT_CONSUME_FUEL, &[units.into()], next)?;
             b.position_at_end(next);
         }
-        let pre = b.get_insert_block().unwrap();
-        b.build_unconditional_branch(i_hdr)?;
-
-        // for i in 0..m
-        b.position_at_end(i_hdr);
-        let i = b.build_phi(self.i64(), "i")?;
-        i.add_incoming(&[(&zero, pre)]);
-        let iv = i.as_basic_value().into_int_value();
-        let more_i = b.build_int_compare(IntPredicate::SLT, iv, m, "")?;
-        b.build_conditional_branch(more_i, j_hdr, done)?;
-
-        // for j in 0..n
-        b.position_at_end(j_hdr);
-        let j = b.build_phi(self.i64(), "j")?;
-        j.add_incoming(&[(&zero, i_hdr)]);
-        let jv = j.as_basic_value().into_int_value();
-        let more_j = b.build_int_compare(IntPredicate::SLT, jv, n, "")?;
-        b.build_conditional_branch(more_j, k_init, i_next)?;
-
-        b.position_at_end(i_next);
-        let i2 = b.build_int_add(iv, self.c64(1), "")?;
-        i.add_incoming(&[(&i2, i_next)]);
-        b.build_unconditional_branch(i_hdr)?;
-
-        let elem_ptr = |base, row, cols, col, es: i64| -> Result<IntValue<'ctx>> {
-            let idx = b.build_int_mul(row, cols, "")?;
-            let idx = b.build_int_add(idx, col, "")?;
-            let off = b.build_int_mul(idx, self.c64(es), "")?;
-            Ok(b.build_int_add(base, off, "")?)
-        };
-
-        b.position_at_end(k_init);
-        let c_ptr = elem_ptr(pc, iv, n, jv, 4)?;
-        let acc0 = self.load(acc_ty, c_ptr)?;
-        b.build_unconditional_branch(k_hdr)?;
-
-        // acc = C[i][j]; for kk in 0..k: acc += A[i][kk] * B[kk][j]
-        b.position_at_end(k_hdr);
-        let kk = b.build_phi(self.i64(), "kk")?;
-        let acc = b.build_phi(acc_ty, "acc")?;
-        kk.add_incoming(&[(&zero, k_init)]);
-        acc.add_incoming(&[(&acc0, k_init)]);
-        let kv = kk.as_basic_value().into_int_value();
-        let more_k = b.build_int_compare(IntPredicate::SLT, kv, k, "")?;
-        b.build_conditional_branch(more_k, k_body, k_done)?;
-
-        b.position_at_end(k_body);
-        let a_raw = self.load(elem_ty, elem_ptr(pa, iv, k, kv, esize)?)?;
-        let b_raw = self.load(elem_ty, elem_ptr(pb, kv, n, jv, esize)?)?;
-        let widen = |v: BasicValueEnum<'ctx>| -> Result<BasicValueEnum<'ctx>> {
-            Ok(match dtype {
-                Type::BF16 => self.bf16_to_f32(v.into_int_value())?,
-                Type::F16 => self.f16_to_f32(v.into_int_value())?,
-                Type::I8 => b
-                    .build_int_s_extend(v.into_int_value(), self.i32(), "")?
-                    .into(),
-                _ => v,
-            })
-        };
-        let (av, bv) = (widen(a_raw)?, widen(b_raw)?);
-        let accv = acc.as_basic_value();
-        let acc2: BasicValueEnum = if is_int {
-            let p = b.build_int_mul(av.into_int_value(), bv.into_int_value(), "")?;
-            b.build_int_add(accv.into_int_value(), p, "")?.into()
-        } else {
-            let p = b.build_float_mul(av.into_float_value(), bv.into_float_value(), "")?;
-            b.build_float_add(accv.into_float_value(), p, "")?.into()
-        };
-        let kk2 = b.build_int_add(kv, self.c64(1), "")?;
-        let body_end = b.get_insert_block().unwrap();
-        kk.add_incoming(&[(&kk2, body_end)]);
-        acc.add_incoming(&[(&acc2, body_end)]);
-        b.build_unconditional_branch(k_hdr)?;
-
-        b.position_at_end(k_done);
-        self.store(accv, elem_ptr(pc, iv, n, jv, 4)?)?;
-        let j2 = b.build_int_add(jv, self.c64(1), "")?;
-        j.add_incoming(&[(&j2, k_done)]);
-        b.build_unconditional_branch(j_hdr)?;
+        let helper = self
+            .module
+            .get_function(&Self::mm_helper_name(dtype))
+            .expect("mm helper defined");
+        let cs = b.build_call(helper, &regs.map(|r| r.into()), "")?;
+        cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+        b.build_unconditional_branch(done)?;
 
         b.position_at_end(done);
         Ok(())
