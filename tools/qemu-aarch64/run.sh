@@ -4,7 +4,8 @@
 # SVE and SME code paths without ARM hardware or a cross C toolchain.
 #
 # Needs: an LLVM-enabled `achainsaw` build, `rustup target add aarch64-unknown-linux-gnu`,
-# and qemu-user (`qemu-aarch64`).
+# and qemu-user (`qemu-aarch64`, or set QEMU to another binary). SME needs QEMU 9.0 or
+# newer: 8.2 mis-emulates some ZA tile accesses.
 #
 # Usage: tools/qemu-aarch64/run.sh [target-features] [vector lengths in bytes...]
 #   tools/qemu-aarch64/run.sh +sve 16 32 64 256       # vector FMA kernel on SVE
@@ -33,7 +34,7 @@ rustc --edition 2021 --target aarch64-unknown-linux-gnu -O -C panic=abort \
 status=0
 for vl in "${lengths[@]}"; do
   echo "== ${features}: vector length $((vl * 8)) bits"
-  qemu-aarch64 -cpu "max,sve-default-vector-length=$vl,sme-default-vector-length=$vl" \
+  "${QEMU:-qemu-aarch64}" -cpu "max,sve-default-vector-length=$vl,sme-default-vector-length=$vl" \
     "$out/mm_harness" || status=1
 done
 exit $status
