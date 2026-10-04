@@ -1,0 +1,115 @@
+# Multi-core matrix-vector product y = A x for a row-major m x k f32 matrix A.
+# `par` splits the rows into blocks of 16 and runs the blocks on all cores; each block
+# writes only its own rows of y. The rows use the vector-length-agnostic dot product of
+# gemv_f32.air.
+fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
+  b0:
+    m15 = add m, 15:i64
+    blocks = udiv m15, 16:i64
+    par blocks, gemv_rows(a, x, y, m, k)
+    ret
+
+# Rows [16 * blk, min(16 * blk + 16, m)).
+fn gemv_rows(blk:i64, a:ptr, x:ptr, y:ptr, m:i64, k:i64)
+  b0:
+    z = cst 0.0:f32
+    zero = splat z:vx
+    w = vl f32
+    row_bytes = mul k, 4:i64
+    first = mul blk, 16:i64
+    end0 = add first, 16:i64
+    end = min end0, m
+    jmp rows(first)
+  rows(i:i64):
+    more_i = lt i, end
+    br more_i, row_init, done
+  row_init:
+    row_off = mul i, row_bytes
+    prow = add a, row_off
+    jmp cols(0:i64, zero)
+  cols(j:i64, acc:vx):
+    more_j = lt j, k
+    br more_j, cols_body, row_done
+  cols_body:
+    rest = sub k, j
+    off = mul j, 4:i64
+    pa = add prow, off
+    px = add x, off
+    va = ldm pa:vx, rest:f32
+    vx0 = ldm px:vx, rest:f32
+    acc2 = vfma va, vx0, acc:f32
+    j2 = add j, w
+    jmp cols(j2, acc2)
+  row_done:
+    s = vsum acc:f32
+    yoff = mul i, 4:i64
+    py = add y, yoff
+    st py, s
+    i2 = add i, 1:i64
+    jmp rows(i2)
+  done:
+    ret
+
+# Self-contained driver for the CLI and MCP (which cannot pass buffers): fills A and x,
+# runs gemv_par `reps` times and returns sum(y). Compare `--threads 1` with the default.
+fn bench(m:i64, k:i64, reps:i64)->f32
+  b0:
+    mk = mul m, k
+    a_bytes = mul mk, 4:i64
+    a = alloc a_bytes
+    x_bytes = mul k, 4:i64
+    x = alloc x_bytes
+    y_bytes = mul m, 4:i64
+    y = alloc y_bytes
+    par m, fill_row(a, k)
+    call fill_row(0:i64, x, k)
+    jmp runs(0:i64)
+  runs(r:i64):
+    more_r = lt r, reps
+    br more_r, run, sum
+  run:
+    call gemv_par(a, x, y, m, k)
+    r2 = add r, 1:i64
+    jmp runs(r2)
+  sum:
+    z = cst 0.0:f32
+    jmp sums(0:i64, z)
+  sums(i:i64, acc:f32):
+    more_i = lt i, m
+    br more_i, sums_body, done
+  sums_body:
+    off = mul i, 4:i64
+    p = add y, off
+    v = ld p:f32
+    acc2 = add acc, v
+    i2 = add i, 1:i64
+    jmp sums(i2, acc2)
+  done:
+    free y
+    free x
+    free a
+    ret acc
+
+# Row i of a k-column matrix at p: element j = ((i + j) mod 7 - 3) / 4.
+fn fill_row(i:i64, p:ptr, k:i64)
+  b0:
+    row_bytes = mul k, 4:i64
+    off = mul i, row_bytes
+    prow = add p, off
+    jmp cols(0:i64)
+  cols(j:i64):
+    more = lt j, k
+    br more, body, done
+  body:
+    s = add i, j
+    r = rem s, 7:i64
+    c = sub r, 3:i64
+    f = itof c:f32
+    v = mul f, 0.25:f32
+    o = mul j, 4:i64
+    q = add prow, o
+    st q, v
+    j2 = add j, 1:i64
+    jmp cols(j2)
+  done:
+    ret

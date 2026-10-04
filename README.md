@@ -19,6 +19,7 @@
 - **Single-Token Mnemonics:** Operators and keywords (`fn`, `cst`, `add`, `mul`, `ld`, `st`, `br`, `jmp`, `ret`) map strictly to single, indivisible tokens in standard BPE vocabularies (OpenAI `cl100k`/`o200k`, Meta LLaMA 3, Google Gemini).
 - **Machine-Native Diagnostic Protocol:** Zero natural-language prose error messages. Validation failures immediately produce structured JSON diagnostics with exact instruction indices, expected types, and candidate replacement patches for single-shot agent self-repair.
 - **Width-Generic SIMD Vectors:** Fixed `v128`/`v256`/`v512` and scalable `vx` vectors with lane-typed ops (`vadd a, b:f32`) over i8/i16/i32/i64/f32/f64 lanes, fused multiply-add, compares and bitwise select, broadcast, lane extraction, and deterministic horizontal reductions (see [Vector Types & Ops](#-vector-types--ops-air-v2)).
+- **One-Line Multi-Core Parallelism:** `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores and joins, with no threads, locks or closures to get wrong (see [Parallel Loops](#-parallel-loops-par)).
 - **Autonomous Dynamic Memory Management:** Built-in bare-metal heap allocator intrinsics (`alloc`, `free`) with 64-bit pointer arithmetic, allowing agents to dynamically allocate, reshape, and reclaim scratchpad buffers.
 - **Sub-10ms Bare-Metal JIT:** Direct in-memory compilation and execution via Cranelift with native C-ABI compatibility for host interop.
 - **High-Performance Memory Model:** Flat linear memory addressing (`ld`/`st`), 64-bit pointer arithmetic, and scalar numeric types (`i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`, `v128`).
@@ -151,6 +152,43 @@ On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32 (a
 | AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
 
 `v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
+
+---
+
+## 🧵 Parallel Loops (`par`)
+
+`par n, f(a, b)` calls `f(i, a, b)` for every `i` in `0..n` across all cores and returns when every call has finished. It is the only parallel construct: no threads, futures, locks or closures. `f` is an ordinary AIR function whose first parameter is the `i64` index, followed by scalar or `ptr` parameters, and that returns nothing. Values the body needs are passed as arguments, exactly like `call`. From [`examples/kernels/gemv_par.air`](examples/kernels/gemv_par.air):
+
+```air
+fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
+  b0:
+    m15 = add m, 15:i64
+    blocks = udiv m15, 16:i64
+    par blocks, gemv_rows(a, x, y, m, k)    # gemv_rows(blk, a, x, y, m, k) does rows 16*blk..16*blk+15
+    ret
+```
+
+The rules:
+- **Write only your own memory.** Calls run concurrently and in any order. Each `i` writes its own memory; to reduce, store per-`i` partial results in an `alloc`'d array and sum them after the `par`.
+- **Give each `i` real work.** A row or a block of thousands of elements works well. Dispatching a `par` costs a few microseconds.
+- **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
+
+How it runs:
+- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 2 ms before parking, so back-to-back `par` loops do not pay thread wake-ups. A helper that found nothing to do parks at once, so it does not slow down a busy thread sharing its core.
+- **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
+- **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
+- **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
+- **Errors and sandbox.** The first failure in any worker stops all of them and is reported from the `par`: `ERR_MEMORY_VIOLATION`, `ERR_STACK_OVERFLOW` or `ERR_OUT_OF_MEMORY`. Sandboxed bodies share the caller's arena and may `alloc`/`free` scratch memory.
+- **Python.** `Kernel.run` releases the GIL, so host callbacks can run on `par` workers, and other Python threads keep running.
+
+Speedup of `gemv_par`'s `bench` driver on a Ryzen 7 8845HS (8 cores, 16 threads), from `achainsaw run examples/kernels/gemv_par.air --func bench --args M,K,REPS --threads T`:
+
+| Shape | Backend | 1 thread | 16 threads | Speedup |
+|---|---|---|---|---|
+| 4096x4096 (64 MB), 50 runs | Cranelift | 632 ms | 75 ms | 8.4x |
+| 4096x4096 (64 MB), 50 runs | LLVM (AVX-512) | 180 ms | 74 ms (8 threads) | 2.4x (memory-bound) |
+| 1024x512 (2 MB), 2000 runs | Cranelift | 685 ms | 83 ms | 8.3x |
+| 1024x512 (2 MB), 2000 runs | LLVM (AVX-512) | 81 ms | 27 ms | 3.1x (2000 `par` dispatches) |
 
 ---
 
@@ -371,8 +409,9 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable |
 | `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
 | `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
+| `gemv_par.air` | `gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | The same on all cores, blocks of 16 rows per `par` index; `bench(m, k, reps)->f32` runs it from the CLI or MCP |
 | `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
-| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). FlashAttention-2 blocks of 64 entries, with both products on `mm` |
+| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). Runs on all cores: one `par` gathers the selected entries, a second runs FlashAttention-2 (blocks of 64 entries, both products on `mm`) for groups of 8 heads |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
 
@@ -382,7 +421,7 @@ python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx
 python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
 
-Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
+Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
@@ -391,6 +430,8 @@ Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM u
 | Softmax, n=1000 | 3.2 µs | 4.3 µs | 3.1 µs |
 | RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
 | GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
+| GEMV f32 with `par`, 512x1024, all cores | 6 µs | 61 µs | 13.5 µs (Ryzen 7 8845HS) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.4–1.6 ms (f32) | 20–21 ms | 1.1–1.2 ms (Ryzen 7 8845HS; 5.1 ms on one core) |
 | GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.39 ms (87 GFLOP/s) |
 
 Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.

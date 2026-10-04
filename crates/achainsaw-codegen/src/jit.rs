@@ -8,13 +8,14 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use std::alloc::Layout;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::backend::Backend;
 use crate::lower::push_abi_params;
-pub use crate::lower::{to_clif_type, LowerConfig, RtValue, SandboxConfig};
+pub use crate::lower::{to_clif_type, LowerConfig, ParConfig, RtValue, SandboxConfig};
 
 static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 static USER_LIBRARIES: Mutex<Vec<Arc<libloading::Library>>> = Mutex::new(Vec::new());
@@ -148,6 +149,15 @@ impl Arena {
     }
 }
 
+// The arena owns its memory; `par` workers share it behind a `Mutex`.
+unsafe impl Send for Arena {}
+
+/// Locks an arena. A panic while it was held cannot leave it inconsistent (every update is
+/// a single assignment or `Vec` operation), so poisoning is ignored.
+fn lock(arena: &Mutex<Arena>) -> std::sync::MutexGuard<'_, Arena> {
+    arena.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         unsafe { std::alloc::dealloc(self.base, self.layout) };
@@ -160,12 +170,16 @@ thread_local! {
     static MEMORY_ALLOCATED: Cell<usize> = const { Cell::new(0) };
     static MEMORY_QUOTA: Cell<usize> = const { Cell::new(0) };
     /// Arena of the sandboxed engine currently executing on this thread, or null.
-    static ACTIVE_ARENA: Cell<*const RefCell<Arena>> = const { Cell::new(std::ptr::null()) };
+    static ACTIVE_ARENA: Cell<*const Mutex<Arena>> = const { Cell::new(std::ptr::null()) };
     /// Lowest stack address sandboxed code may reach; 0 disables the check.
     static STACK_LIMIT: Cell<usize> = const { Cell::new(0) };
     /// Fuel counter of the engine whose code is running on this thread (see
     /// `FuelActivation`), or null.
     static ACTIVE_FUEL: Cell<*const Cell<i64>> = const { Cell::new(std::ptr::null()) };
+    /// `par` region this thread is a worker of, or null.
+    static PAR_REGION: Cell<*const ParRegion> = const { Cell::new(std::ptr::null()) };
+    /// Most threads a `par` started on this thread may use; 0 means the whole pool.
+    static PAR_THREADS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Engine fuel counter value meaning "no budget": never reaches zero in practice.
@@ -194,7 +208,7 @@ fn halted() -> bool {
     CURRENT_STATUS.with(|s| s.get()) != ExecutionStatus::Ok
 }
 
-fn with_active_arena<R>(f: impl FnOnce(&RefCell<Arena>) -> R) -> Option<R> {
+fn with_active_arena<R>(f: impl FnOnce(&Mutex<Arena>) -> R) -> Option<R> {
     let arena = ACTIVE_ARENA.with(|a| a.get());
     // SAFETY: set only by `call_typed` for the duration of a call on its own engine.
     (!arena.is_null()).then(|| f(unsafe { &*arena }))
@@ -302,7 +316,7 @@ extern "C" fn rt_sandbox_check_mm(
         (pb, bytes(k, n, esize)),
     ];
     let bad = with_active_arena(|arena| {
-        let arena = arena.borrow();
+        let arena = lock(arena);
         operands
             .into_iter()
             .find(|&(p, size)| !arena.contains(p, size))
@@ -322,13 +336,12 @@ extern "C" fn rt_sandbox_check_mm(
 /// `OutOfFuel` when the budget runs out, 0 otherwise.
 pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
     if let Some(r) = with_active_fuel(|counter| {
-        let remaining = counter.get().saturating_sub(units.max(0));
-        if remaining <= 0 {
+        if charge(counter, units.max(0)) {
+            0
+        } else {
             raise(ExecutionStatus::OutOfFuel);
-            return 1;
+            1
         }
-        counter.set(remaining);
-        0
     }) {
         return r;
     }
@@ -348,20 +361,421 @@ pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
     })
 }
 
+/// Takes `units` from an inline fuel counter, topping it up from the shared budget when
+/// this thread is a `par` worker. False when the budget cannot cover them.
+fn charge(counter: &Cell<i64>, units: i64) -> bool {
+    let mut left = counter.get().saturating_sub(units);
+    if left <= 0 {
+        if let Some(region) = active_region() {
+            left = left.saturating_add(region.draw(PAR_FUEL_CHUNK.saturating_sub(left)));
+        }
+    }
+    counter.set(left.max(0));
+    left > 0
+}
+
 /// Slow path of the inline fuel check that JIT code runs on every branch (decrement the
 /// engine's counter, continue while it is positive). Reached when the counter hits zero:
 /// either the budget is spent, or `raise` emptied it after a failure. Returns 1 (unwind)
-/// in both cases, recording `OutOfFuel` for the former.
+/// in both cases, recording `OutOfFuel` for the former. A `par` worker first tries to
+/// refill its counter from the shared budget.
 pub extern "C" fn rt_fuel_exhausted() -> i32 {
-    if !halted() {
-        raise(ExecutionStatus::OutOfFuel);
+    if halted() {
+        return 1;
     }
+    if with_active_fuel(|counter| charge(counter, 0)) == Some(true) {
+        return 0;
+    }
+    raise(ExecutionStatus::OutOfFuel);
     1
+}
+
+/// Fuel counter of the code running on this thread, or null when no engine call is active
+/// (code reached through `get_fn_ptr`, which then uses its engine's counter). Called on
+/// entry by functions of modules that use `par`, whose workers each count their own fuel.
+extern "C" fn rt_fuel_counter() -> *const Cell<i64> {
+    ACTIVE_FUEL.with(|a| a.get())
+}
+
+/// Fuel a `par` worker takes from the shared budget at a time. Bounds how long a worker
+/// keeps running after another one fails.
+const PAR_FUEL_CHUNK: i64 = 1 << 16;
+
+/// Stack size of threads that run AIR code: `SANDBOX_STACK_BYTES` of recursion budget plus
+/// headroom for the runtime and host frames.
+pub const EXECUTION_STACK_BYTES: usize = 8 << 20;
+
+/// State shared by the threads running one `par`.
+struct ParRegion {
+    /// Scalar trampoline of the body, `void(u64 *args, u64 *ret)`.
+    tramp: extern "C" fn(*const u64, *mut u64),
+    /// Body arguments; slot 0 is replaced by the index.
+    args: Vec<u64>,
+    count: i64,
+    next: AtomicI64,
+    /// Helper threads that may join (the calling thread always works too).
+    helpers: usize,
+    /// Threads still between joining and leaving; the caller returns once it is 0.
+    inflight: AtomicUsize,
+    caller: std::thread::Thread,
+    /// Fuel budget left for workers to draw from (`UNLIMITED_FUEL` when there is none).
+    fuel: AtomicI64,
+    /// Set by the first failure; workers stop taking indices and fuel.
+    abort: AtomicBool,
+    failure: Mutex<Option<ExecutionStatus>>,
+    arena: *const Mutex<Arena>,
+    sandboxed: bool,
+    /// Heap accounting for non-sandboxed code under a quota (see `rt_malloc`).
+    allocated: AtomicUsize,
+    quota: usize,
+}
+
+// `arena` is the caller's, alive while `inflight` is non-zero; threads that join later
+// find no index left and never use it.
+unsafe impl Send for ParRegion {}
+unsafe impl Sync for ParRegion {}
+
+impl ParRegion {
+    /// Takes up to `want` fuel from the shared budget; 0 once it is spent or aborted.
+    fn draw(&self, want: i64) -> i64 {
+        if want <= 0 || self.abort.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut left = self.fuel.load(Ordering::Acquire);
+        loop {
+            let got = left.min(want).max(0);
+            if got == 0 {
+                return 0;
+            }
+            match self.fuel.compare_exchange_weak(
+                left,
+                left - got,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return got,
+                Err(now) => left = now,
+            }
+        }
+    }
+
+    /// Records the first failure and stops every worker.
+    fn fail(&self, status: ExecutionStatus) {
+        let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if failure.is_none() {
+            *failure = Some(status);
+        }
+        self.abort.store(true, Ordering::Release);
+    }
+
+    /// Runs indices until they run out or a worker fails, and returns whether it ran any. A
+    /// thread counts as in flight from before its first index to after it has returned its
+    /// unused fuel, so the caller, which waits for none to be in flight, sees every result.
+    fn participate(&self, is_caller: bool) -> bool {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        let counter = Cell::new(0);
+        let prev_fuel = ACTIVE_FUEL.with(|a| a.replace(&counter));
+        let prev_region = PAR_REGION.with(|r| r.replace(self));
+        let prev_arena = ACTIVE_ARENA.with(|a| a.replace(self.arena));
+        // The caller keeps the stack limit of its call; helpers start a fresh budget.
+        let prev_limit = (!is_caller).then(|| {
+            let limit = if self.sandboxed {
+                stack_address().saturating_sub(SANDBOX_STACK_BYTES)
+            } else {
+                0
+            };
+            STACK_LIMIT.with(|l| l.replace(limit))
+        });
+        reset_execution_status();
+
+        let mut args = self.args.clone();
+        let mut ret = 0u64;
+        let mut worked = false;
+        while !self.abort.load(Ordering::Relaxed) {
+            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            if i >= self.count {
+                break;
+            }
+            worked = true;
+            // Each index costs one unit, so even bodies without branches are bounded.
+            if !charge(&counter, 1) {
+                raise(ExecutionStatus::OutOfFuel);
+            } else {
+                args[0] = i as u64;
+                (self.tramp)(args.as_ptr(), &mut ret);
+            }
+            if halted() {
+                self.fail(get_execution_status());
+                break;
+            }
+        }
+
+        // Unused fuel goes back to the budget the caller resumes with.
+        self.fuel.fetch_add(counter.get().max(0), Ordering::AcqRel);
+        reset_execution_status();
+        ACTIVE_FUEL.with(|a| a.set(prev_fuel));
+        PAR_REGION.with(|r| r.set(prev_region));
+        ACTIVE_ARENA.with(|a| a.set(prev_arena));
+        if let Some(limit) = prev_limit {
+            STACK_LIMIT.with(|l| l.set(limit));
+        }
+        if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 && !is_caller {
+            self.caller.unpark();
+        }
+        worked
+    }
+}
+
+fn active_region() -> Option<&'static ParRegion> {
+    let region = PAR_REGION.with(|r| r.get());
+    // SAFETY: set only by `participate` while the region is alive.
+    (!region.is_null()).then(|| unsafe { &*region })
+}
+
+/// True on a thread running `par` iterations. Such a thread must not block waiting for an
+/// engine: the call that started the `par` may hold it.
+pub fn in_par_worker() -> bool {
+    active_region().is_some()
+}
+
+/// How long a helper that just ran iterations spins before parking, so back-to-back `par`
+/// loops do not pay a thread wake-up each (tens to hundreds of microseconds on some hosts).
+/// A helper that found nothing to do parks at once: while the loop it missed still runs,
+/// spinning would only slow down a busy thread sharing its core (SMT).
+const PAR_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Helper threads that run `par` iterations next to the calling thread.
+struct ParPool {
+    helpers: Vec<Helper>,
+    /// Bumped for each `par`, together with `job`.
+    epoch: AtomicU64,
+    job: Mutex<(u64, Option<Arc<ParRegion>>)>,
+    /// Held by the thread running a `par` on the pool; others run theirs serially.
+    busy: Mutex<()>,
+}
+
+struct Helper {
+    thread: std::thread::Thread,
+    parked: AtomicBool,
+}
+
+/// Number of threads `par` runs on: `ACHAINSAW_THREADS`, or one per core.
+pub fn par_pool_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("ACHAINSAW_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+    })
+}
+
+/// Process-wide `par` pool: the calling thread plus `par_pool_threads() - 1` helpers,
+/// started on first use.
+fn par_pool() -> &'static ParPool {
+    static POOL: OnceLock<ParPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let helpers = (1..par_pool_threads())
+            .map(|index| {
+                let handle = std::thread::Builder::new()
+                    .name(format!("achainsaw-par-{index}"))
+                    .stack_size(EXECUTION_STACK_BYTES)
+                    .spawn(move || helper_loop(index - 1))
+                    .expect("cannot start a par helper thread");
+                Helper {
+                    thread: handle.thread().clone(),
+                    parked: AtomicBool::new(false),
+                }
+            })
+            .collect();
+        ParPool {
+            helpers,
+            epoch: AtomicU64::new(0),
+            job: Mutex::new((0, None)),
+            busy: Mutex::new(()),
+        }
+    })
+}
+
+/// Waits for each new `par` (spinning, then parked) and joins it unless it is capped below
+/// this helper's index.
+fn helper_loop(index: usize) {
+    let pool = par_pool();
+    let me = &pool.helpers[index];
+    let mut seen = 0u64;
+    let mut spin = PAR_SPIN;
+    loop {
+        let idle_since = std::time::Instant::now();
+        let mut spins = 0u32;
+        while pool.epoch.load(Ordering::SeqCst) == seen {
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(1024) && idle_since.elapsed() >= spin {
+                // Pairs with the dispatcher's epoch store then `parked` load.
+                me.parked.store(true, Ordering::SeqCst);
+                if pool.epoch.load(Ordering::SeqCst) == seen {
+                    std::thread::park();
+                }
+                me.parked.store(false, Ordering::SeqCst);
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        let (epoch, job) = {
+            let slot = pool.job.lock().unwrap_or_else(|e| e.into_inner());
+            (slot.0, slot.1.clone())
+        };
+        seen = epoch;
+        let worked = job.is_some_and(|region| index < region.helpers && region.participate(false));
+        spin = if worked {
+            PAR_SPIN
+        } else {
+            std::time::Duration::ZERO
+        };
+    }
+}
+
+/// Runs `par n, f(args)`: calls the trampoline `tramp` of `f` with `[i, args...]` (`slots`
+/// u64 values at `args`, slot 0 reserved for `i`) for every `i` in `[0, n)`, on this thread
+/// and the pool's helpers, and returns once all calls finish. The caller's fuel budget is
+/// shared by all of them. Returns 1 after recording the first failure on the calling
+/// thread, 0 otherwise. Runs serially inside another `par` (nested), when limited to one
+/// thread, or while another thread's `par` has the pool.
+extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> i32 {
+    if n <= 0 || halted() {
+        return halted() as i32;
+    }
+    // SAFETY: the JIT passes a trampoline address and `slots` initialized u64 values.
+    let tramp: extern "C" fn(*const u64, *mut u64) = unsafe { std::mem::transmute(tramp) };
+    let mut args = unsafe { std::slice::from_raw_parts(args, slots as usize) }.to_vec();
+    let threads = match PAR_THREADS.with(|t| t.get()) {
+        0 => par_pool_threads(),
+        cap => cap.min(par_pool_threads()),
+    };
+    let pool = (active_region().is_none() && threads > 1 && n > 1).then(par_pool);
+    let busy = pool.and_then(|p| p.busy.try_lock().ok());
+
+    let (Some(pool), Some(_busy)) = (pool, busy) else {
+        let mut ret = 0u64;
+        for i in 0..n {
+            let ok = with_active_fuel(|counter| charge(counter, 1)).unwrap_or(true);
+            if !ok {
+                raise(ExecutionStatus::OutOfFuel);
+                return 1;
+            }
+            args[0] = i as u64;
+            tramp(args.as_ptr(), &mut ret);
+            if halted() {
+                return 1;
+            }
+        }
+        return 0;
+    };
+
+    let caller_fuel = ACTIVE_FUEL.with(|a| a.get());
+    // SAFETY: set by `call_typed` for the duration of the call that reached this hook.
+    let caller_fuel = (!caller_fuel.is_null()).then(|| unsafe { &*caller_fuel });
+    let region = Arc::new(ParRegion {
+        tramp,
+        args,
+        count: n,
+        next: AtomicI64::new(0),
+        helpers: threads - 1,
+        inflight: AtomicUsize::new(0),
+        caller: std::thread::current(),
+        fuel: AtomicI64::new(caller_fuel.map_or(UNLIMITED_FUEL, |c| c.get())),
+        abort: AtomicBool::new(false),
+        failure: Mutex::new(None),
+        arena: ACTIVE_ARENA.with(|a| a.get()),
+        sandboxed: STACK_LIMIT.with(|l| l.get()) != 0,
+        allocated: AtomicUsize::new(MEMORY_ALLOCATED.with(|m| m.get())),
+        quota: MEMORY_QUOTA.with(|q| q.get()),
+    });
+    {
+        let mut slot = pool.job.lock().unwrap_or_else(|e| e.into_inner());
+        slot.0 += 1;
+        slot.1 = Some(region.clone());
+        pool.epoch.store(slot.0, Ordering::SeqCst);
+    }
+    for helper in &pool.helpers[..region.helpers] {
+        if helper.parked.load(Ordering::SeqCst) {
+            helper.thread.unpark();
+        }
+    }
+
+    let _ = region.participate(true);
+    // Helpers still finishing an index unpark this thread when the last one leaves.
+    let mut spins = 0u32;
+    while region.inflight.load(Ordering::SeqCst) != 0 {
+        if spins < 1 << 14 {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::park();
+        }
+    }
+    pool.job.lock().unwrap_or_else(|e| e.into_inner()).1 = None;
+
+    if let Some(counter) = caller_fuel {
+        counter.set(region.fuel.load(Ordering::Acquire));
+    }
+    MEMORY_ALLOCATED.with(|m| m.set(region.allocated.load(Ordering::Acquire)));
+    let failure = *region.failure.lock().unwrap_or_else(|e| e.into_inner());
+    match failure {
+        Some(status) => {
+            raise(status);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Adds `size` bytes to the heap accounting of this thread, or of its `par` region;
+/// false (nothing added) when that would exceed a non-zero `quota`.
+fn reserve_allocated(size: usize, quota: usize) -> bool {
+    let fits = |cur: usize| quota == 0 || cur.saturating_add(size) <= quota;
+    if let Some(region) = active_region() {
+        return update_usize(&region.allocated, |cur| fits(cur).then(|| cur + size));
+    }
+    MEMORY_ALLOCATED.with(|m| {
+        let cur = m.get();
+        let ok = fits(cur);
+        if ok {
+            m.set(cur + size);
+        }
+        ok
+    })
+}
+
+fn release_allocated(size: usize) {
+    if let Some(region) = active_region() {
+        update_usize(&region.allocated, |cur| Some(cur.saturating_sub(size)));
+        return;
+    }
+    MEMORY_ALLOCATED.with(|m| m.set(m.get().saturating_sub(size)));
+}
+
+/// Replaces `a` with `f(a)` atomically; false (and no change) when `f` returns `None`.
+fn update_usize(a: &AtomicUsize, f: impl Fn(usize) -> Option<usize>) -> bool {
+    let mut cur = a.load(Ordering::Acquire);
+    loop {
+        let Some(new) = f(cur) else {
+            return false;
+        };
+        match a.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+}
+
+fn memory_quota() -> usize {
+    active_region().map_or_else(|| MEMORY_QUOTA.with(|q| q.get()), |r| r.quota)
 }
 
 unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
     if let Some(ptr) = with_active_arena(|arena| {
-        let mut arena = arena.borrow_mut();
+        let mut arena = lock(arena);
         arena.alloc(size).unwrap_or_else(|| {
             raise(ExecutionStatus::OutOfMemory {
                 requested: size,
@@ -371,14 +785,13 @@ unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
         })
     }) {
         if !ptr.is_null() {
-            MEMORY_ALLOCATED.with(|m| m.set(m.get() + size));
+            reserve_allocated(size, 0);
         }
         return ptr;
     }
 
-    let quota = MEMORY_QUOTA.with(|q| q.get());
-    let current = MEMORY_ALLOCATED.with(|m| m.get());
-    if quota > 0 && current.saturating_add(size) > quota {
+    let quota = memory_quota();
+    if !reserve_allocated(size, quota) {
         raise(ExecutionStatus::OutOfMemory {
             requested: size,
             limit: quota,
@@ -389,6 +802,7 @@ unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
     let total = size + 16;
     let raw = malloc(total);
     if raw.is_null() {
+        release_allocated(size);
         raise(ExecutionStatus::OutOfMemory {
             requested: size,
             limit: quota,
@@ -397,7 +811,6 @@ unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
     }
 
     *(raw as *mut usize) = size;
-    MEMORY_ALLOCATED.with(|m| m.set(current + size));
     raw.add(16)
 }
 
@@ -405,9 +818,9 @@ unsafe extern "C" fn rt_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    if let Some(freed) = with_active_arena(|arena| arena.borrow_mut().free(ptr)) {
+    if let Some(freed) = with_active_arena(|arena| lock(arena).free(ptr)) {
         match freed {
-            Some(size) => MEMORY_ALLOCATED.with(|m| m.set(m.get().saturating_sub(size))),
+            Some(size) => release_allocated(size),
             None => raise(ExecutionStatus::MemoryViolation {
                 addr: ptr as usize,
                 size: 0,
@@ -417,10 +830,7 @@ unsafe extern "C" fn rt_free(ptr: *mut u8) {
     }
     let raw = ptr.sub(16);
     let size = *(raw as *const usize);
-    MEMORY_ALLOCATED.with(|m| {
-        let cur = m.get();
-        m.set(cur.saturating_sub(size));
-    });
+    release_allocated(size);
     free(raw);
 }
 
@@ -615,13 +1025,13 @@ impl Drop for FuelActivation<'_> {
 /// Points the runtime hooks at a sandboxed engine's arena and stack limit for one call,
 /// restoring the previous state when dropped (calls may nest through host callbacks).
 struct SandboxActivation {
-    prev_arena: *const RefCell<Arena>,
+    prev_arena: *const Mutex<Arena>,
     prev_limit: usize,
 }
 
 impl SandboxActivation {
-    fn new(arena: &RefCell<Arena>) -> Self {
-        arena.borrow_mut().reset();
+    fn new(arena: &Mutex<Arena>) -> Self {
+        lock(arena).reset();
         let prev_arena = ACTIVE_ARENA.with(|a| a.replace(arena));
         let limit = stack_address().saturating_sub(SANDBOX_STACK_BYTES);
         let prev_limit = STACK_LIMIT.with(|l| l.replace(limit));
@@ -639,6 +1049,21 @@ impl Drop for SandboxActivation {
     }
 }
 
+/// Caps the threads `par` may use for one call, restoring the previous cap when dropped.
+struct ThreadsActivation(usize);
+
+impl ThreadsActivation {
+    fn new(threads: usize) -> Self {
+        Self(PAR_THREADS.with(|t| t.replace(threads)))
+    }
+}
+
+impl Drop for ThreadsActivation {
+    fn drop(&mut self) {
+        PAR_THREADS.with(|t| t.set(self.0));
+    }
+}
+
 /// Cranelift JIT module plus the ids of the runtime hooks it imports.
 struct CraneliftJit {
     builder_context: FunctionBuilderContext,
@@ -651,6 +1076,8 @@ struct CraneliftJit {
     rt_sandbox_fault_id: FuncId,
     rt_stack_check_id: FuncId,
     rt_sandbox_check_mm_id: FuncId,
+    rt_par_for_id: FuncId,
+    rt_fuel_counter_id: FuncId,
 }
 
 impl CraneliftJit {
@@ -682,6 +1109,8 @@ impl CraneliftJit {
         jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
         jit_builder.symbol("rt_stack_check", rt_stack_check as *const u8);
         jit_builder.symbol("rt_sandbox_check_mm", rt_sandbox_check_mm as *const u8);
+        jit_builder.symbol("rt_par_for", rt_par_for as *const u8);
+        jit_builder.symbol("rt_fuel_counter", rt_fuel_counter as *const u8);
         jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
             reg_lookup.read().unwrap().lookup(name)
         }));
@@ -725,6 +1154,18 @@ impl CraneliftJit {
         let rt_sandbox_check_mm_id =
             module.declare_function("rt_sandbox_check_mm", Linkage::Import, &mm_check_sig)?;
 
+        let mut par_sig = module.make_signature();
+        for _ in 0..4 {
+            par_sig.params.push(AbiParam::new(types::I64));
+        }
+        par_sig.returns.push(AbiParam::new(types::I32));
+        let rt_par_for_id = module.declare_function("rt_par_for", Linkage::Import, &par_sig)?;
+
+        let mut counter_sig = module.make_signature();
+        counter_sig.returns.push(AbiParam::new(types::I64));
+        let rt_fuel_counter_id =
+            module.declare_function("rt_fuel_counter", Linkage::Import, &counter_sig)?;
+
         let ctx = module.make_context();
 
         Ok(Self {
@@ -738,6 +1179,8 @@ impl CraneliftJit {
             rt_sandbox_fault_id,
             rt_stack_check_id,
             rt_sandbox_check_mm_id,
+            rt_par_for_id,
+            rt_fuel_counter_id,
         })
     }
 
@@ -786,6 +1229,24 @@ impl CraneliftJit {
             func_ids.insert(func.name.clone(), func_id);
         }
 
+        // Host calls (and `par`) go through a scalar trampoline; functions that take or
+        // return vectors are only callable from AIR code. Declared up front so `par` can
+        // take their addresses.
+        let mut tramp_ids = HashMap::new();
+        for func in &ir_mod.functions {
+            if func
+                .params
+                .iter()
+                .map(|(_, ty)| ty)
+                .chain(func.ret_type.iter())
+                .any(|t| t.is_vector())
+            {
+                continue;
+            }
+            let tid = crate::lower::declare_trampoline(&mut self.module, &func.name)?;
+            tramp_ids.insert(func.name.clone(), tid);
+        }
+
         // 3. Lower each function and its dynamic invocation trampoline
         let sandbox = sandbox.map(|(arena_base, arena_len)| SandboxConfig {
             arena_base,
@@ -802,9 +1263,14 @@ impl CraneliftJit {
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
             sandbox,
+            par: Some(ParConfig {
+                par_for_id: self.rt_par_for_id,
+                trampolines: tramp_ids.clone(),
+                // `par` workers count fuel in their own counters.
+                fuel_counter_id: ir_mod.uses_par().then_some(self.rt_fuel_counter_id),
+            }),
         };
 
-        let mut tramp_ids = HashMap::new();
         for func in &ir_mod.functions {
             let func_id = func_ids[&func.name];
             crate::lower::lower_function(
@@ -819,26 +1285,18 @@ impl CraneliftJit {
             self.module.define_function(func_id, &mut self.ctx)?;
             self.module.clear_context(&mut self.ctx);
 
-            // Host calls go through a scalar trampoline; functions that take or return
-            // vectors are only callable from AIR code.
-            let param_tys: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-            if param_tys
-                .iter()
-                .chain(func.ret_type.iter())
-                .any(|t| t.is_vector())
-            {
-                continue;
+            if tramp_ids.contains_key(&func.name) {
+                let param_tys: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
+                crate::lower::lower_trampoline(
+                    &mut self.module,
+                    &mut self.ctx,
+                    &mut self.builder_context,
+                    &func.name,
+                    func_id,
+                    &param_tys,
+                    func.ret_type,
+                )?;
             }
-            let tid = crate::lower::lower_trampoline(
-                &mut self.module,
-                &mut self.ctx,
-                &mut self.builder_context,
-                &func.name,
-                func_id,
-                &param_tys,
-                func.ret_type,
-            )?;
-            tramp_ids.insert(func.name.clone(), tid);
         }
 
         // 4. Finalize all JIT definitions
@@ -878,12 +1336,14 @@ pub struct JitEngine {
     backend: Backend,
     codegen: Codegen,
     /// Set by `enable_sandbox`; boxed so its address stays fixed while code runs.
-    sandbox: Option<Box<RefCell<Arena>>>,
+    sandbox: Option<Box<Mutex<Arena>>>,
     pub registry: Arc<RwLock<SymbolRegistry>>,
     pub fuel_enabled: bool,
     /// Fuel counter JIT code decrements inline at every branch; boxed so its address stays
     /// fixed. `call_typed` loads it from the thread's budget for each call.
     fuel: Box<Cell<i64>>,
+    /// Most threads `par` may use (0: the whole pool).
+    threads: usize,
     pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
     function_ptrs: HashMap<String, usize>,
     trampoline_ptrs: HashMap<String, usize>,
@@ -965,6 +1425,7 @@ impl JitEngine {
             registry,
             fuel_enabled: true,
             fuel: Box::new(Cell::new(UNLIMITED_FUEL)),
+            threads: 0,
             signatures: HashMap::new(),
             function_ptrs: HashMap::new(),
             trampoline_ptrs: HashMap::new(),
@@ -992,6 +1453,20 @@ impl JitEngine {
         // Also applies to code called directly through `get_fn_ptr`.
         self.fuel
             .set(fuel.map_or(UNLIMITED_FUEL, |f| f.min(i64::MAX as u64) as i64));
+    }
+
+    /// Limits `par` to `threads` threads (at most the pool size, see [`par_pool_threads`]);
+    /// `None` uses the whole pool. `Some(1)` runs `par` loops serially.
+    pub fn set_threads(&mut self, threads: Option<usize>) {
+        self.threads = threads.unwrap_or(0);
+    }
+
+    /// Threads `par` runs on for this engine.
+    pub fn threads(&self) -> usize {
+        match self.threads {
+            0 => par_pool_threads(),
+            n => n.min(par_pool_threads()),
+        }
     }
 
     pub fn set_fuel_enabled(&mut self, enabled: bool) {
@@ -1022,7 +1497,7 @@ impl JitEngine {
                 "enable_sandbox must be called before compile_module"
             ));
         }
-        self.sandbox = Some(Box::new(RefCell::new(Arena::new(arena_bytes)?)));
+        self.sandbox = Some(Box::new(Mutex::new(Arena::new(arena_bytes)?)));
         Ok(())
     }
 
@@ -1044,7 +1519,7 @@ impl JitEngine {
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
         let sandbox = self.sandbox.as_ref().map(|arena| {
-            let arena = arena.borrow();
+            let arena = lock(arena);
             (arena.base as i64, arena.len() as i64)
         });
         let fuel_counter = self.fuel.as_ptr() as i64;
@@ -1069,6 +1544,8 @@ impl JitEngine {
                     sandbox_fault: rt_sandbox_fault as *const () as usize,
                     stack_check: rt_stack_check as *const () as usize,
                     sandbox_check_mm: rt_sandbox_check_mm as *const () as usize,
+                    par_for: rt_par_for as *const () as usize,
+                    fuel_counter: rt_fuel_counter as *const () as usize,
                 };
                 let opts = achainsaw_llvm::LowerOptions {
                     fuel: self.fuel_enabled,
@@ -1173,6 +1650,7 @@ impl JitEngine {
 
         let _fuel = FuelActivation::new(&self.fuel);
         let _sandbox = self.sandbox.as_deref().map(SandboxActivation::new);
+        let _threads = ThreadsActivation::new(self.threads);
         let tramp_fn: extern "C" fn(*const u64, *mut u64) = std::mem::transmute(tramp_ptr);
         tramp_fn(raw_args.as_ptr(), &mut raw_ret);
 

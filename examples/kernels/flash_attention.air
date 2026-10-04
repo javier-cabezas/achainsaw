@@ -1,4 +1,4 @@
-# FlashAttention decode step for DeepSeek V4 Pro's sparse attention layers.
+# FlashAttention decode step for DeepSeek V4 Pro's sparse attention layers, on all cores.
 #
 # One query token, h query heads sharing a single KV head (MQA): each cached entry is a
 # d-dim vector used as both key and value. The token attends to the nk entries listed in
@@ -11,28 +11,108 @@
 # Shapes (V4 Pro): h = 128, d = 512, scale = 1/sqrt(512). q and kv are bf16, sink is f32,
 # out is f32 [h x d]. Scores and the softmax are kept in f32.
 #
-# FlashAttention-2 structure over blocks of 64 selected entries, with both matrix products
-# on `mm` (AMX tiles, SME outer products, or vector FMAs depending on the CPU):
-#   1. once: transpose q to qt [d x h], so each score block is one mm without a K transpose
-#   2. per block: gather the selected kv rows -> kvb [bc x d] (zero rows for -1)
-#      st = kvb . qt                       scores, transposed [bc x h], via mm
-#      online softmax per head: new running max, rescale factor, running sum, and the
-#      block's probabilities p [h x bc] rounded to bf16 for the second product
-#      ot = p . kvb                        [h x d] via mm
-#      out[r] = out[r] * rescale[r] + ot[r]
-#   3. out[r] /= running_sum[r] + exp(sink[r] - m[r])
+# Heads are independent, so `par` runs groups of 8 heads on all cores (16 tasks for V4 Pro;
+# larger groups make each mm more efficient but leave threads idle):
+#   1. par over blocks of 64 selected entries: gather kv[idx[t]] into kvs [nk x d], zero
+#      rows for -1, once for every group
+#   2. par over head groups, each running FlashAttention-2 over blocks of 64 entries with
+#      both matrix products on `mm` (AMX tiles, SME outer products, or vector FMAs):
+#        once: transpose the group's q to qt [d x g], so each score block is one mm
+#        per block (kvb = the block's rows of kvs):
+#          st = kvb . qt                     scores, transposed [bc x g], via mm
+#          online softmax per head: new running max, rescale factor, running sum, and
+#          the block's probabilities p [g x bc] rounded to bf16 for the second product
+#          ot = p . kvb                      [g x d] via mm
+#          out[r] = out[r] * rescale[r] + ot[r]
+#        out[r] /= running_sum[r] + exp(sink[r] - m[r])
 extfn expf(x:f32)->f32
 
 fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)
   b0:
+    row2 = mul d, 2:i64
+    kvs_bytes = mul nk, row2
+    kvs = alloc kvs_bytes
+    nk63 = add nk, 63:i64
+    blocks = udiv nk63, 64:i64
+    par blocks, gather_block(kv, idx, kvs, nk, d)
+    group = cst 8:i64
+    group1 = sub group, 1:i64
+    h_up = add h, group1
+    groups = udiv h_up, group
+    par groups, attend_heads(q, kvs, idx, sink, out, h, d, nk, scale, group)
+    free kvs
+    ret
+
+# kvs[t] = kv[idx[t]], or zeros for an unused slot, for t in [64 * blk, 64 * blk + 64).
+fn gather_block(blk:i64, kv:ptr, idx:ptr, kvs:ptr, nk:i64, d:i64)
+  b0:
     w8 = vl i8
+    zb = cst 0:i8
+    zvb = splat zb:vx
+    row2 = mul d, 2:i64
+    first = mul blk, 64:i64
+    end0 = add first, 64:i64
+    end = min end0, nk
+    jmp gather(first)
+  gather(gi:i64):
+    gt_more = lt gi, end
+    br gt_more, gather_row, done
+  gather_row:
+    g_ioff = mul gi, 4:i64
+    g_ip = add idx, g_ioff
+    g_ix = ld g_ip:i32
+    g_ix64 = sext g_ix:i64
+    g_valid = ge g_ix64, 0:i64
+    g_doff = mul gi, row2
+    g_dst = add kvs, g_doff
+    g_soff = mul g_ix64, row2
+    g_src = add kv, g_soff
+    br g_valid, copy(0:i64), clear(0:i64)
+  copy(cb:i64):
+    cb_more = lt cb, row2
+    br cb_more, copy_body, gather_next
+  copy_body:
+    cb_rest = sub row2, cb
+    cb_s = add g_src, cb
+    cb_d = add g_dst, cb
+    cb_v = ldm cb_s:vx, cb_rest:i8
+    stm cb_d, cb_v, cb_rest:i8
+    cb2 = add cb, w8
+    jmp copy(cb2)
+  clear(zc:i64):
+    zc_more = lt zc, row2
+    br zc_more, clear_body, gather_next
+  clear_body:
+    zc_rest = sub row2, zc
+    zc_d = add g_dst, zc
+    stm zc_d, zvb, zc_rest:i8
+    zc2 = add zc, w8
+    jmp clear(zc2)
+  gather_next:
+    gi2 = add gi, 1:i64
+    jmp gather(gi2)
+  done:
+    ret
+
+# FlashAttention-2 for heads [g * group, g * group + group), over the gathered entries kvs.
+# Writes only those heads' rows of out.
+fn attend_heads(g:i64, q_all:ptr, kvs:ptr, idx:ptr, sink_all:ptr, out_all:ptr, nh:i64, d:i64, nk:i64, scale:f32, group:i64)
+  b0:
+    r0 = mul g, group
+    left_h = sub nh, r0
+    h = min group, left_h
+    row2 = mul d, 2:i64
+    q_off = mul r0, row2
+    q = add q_all, q_off
+    d4 = mul d, 4:i64
+    out_off = mul r0, d4
+    out = add out_all, out_off
+    sink_off = mul r0, 4:i64
+    sink = add sink_all, sink_off
     w32 = vl f32
     hd = mul h, d
-    row2 = mul d, 2:i64
     qt_bytes = mul hd, 2:i64
     qt = alloc qt_bytes
-    kvb_bytes = mul d, 128:i64
-    kvb = alloc kvb_bytes
     st_bytes = mul h, 256:i64
     sbuf = alloc st_bytes
     p_bytes = mul h, 128:i64
@@ -45,12 +125,10 @@ fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i
     cbuf = alloc h4
     zf = cst 0.0:f32
     zvf = splat zf:vx
-    zb = cst 0:i8
-    zvb = splat zb:vx
     neg_big = cst -1000000000000000000000000000000.0:f32
     jmp tq_rows(0:i64)
 
-  # 1. qt[c][r] = q[r][c]
+  # qt[c][r] = q[r][c]
   tq_rows(tr:i64):
     tr_more = lt tr, h
     br tr_more, tq_row, init_state(0:i64)
@@ -62,8 +140,8 @@ fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i
   tq_body:
     q_i = mul tr, d
     q_i2 = add q_i, tc
-    q_off = mul q_i2, 2:i64
-    q_p = add q, q_off
+    q_eoff = mul q_i2, 2:i64
+    q_p = add q, q_eoff
     q_x = ld q_p:bf16
     t_i = mul tc, h
     t_i2 = add t_i, tr
@@ -99,54 +177,16 @@ fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i
     zo2 = add zo, w32
     jmp zero_out(zo2)
 
-  # 2. One block of up to 64 selected entries.
+  # One block of up to 64 selected entries: kvb [bc x d] = kvs rows j0..j0+bc.
   blocks(j0:i64):
     j_more = lt j0, nk
     br j_more, block_start, finish(0:i64)
   block_start:
     left = sub nk, j0
     bc = min left, 64:i64
-    jmp gather(0:i64)
-
-  # kvb[t] = kv[idx[j0 + t]], or zeros for an unused slot.
-  gather(gi:i64):
-    gt_more = lt gi, bc
-    br gt_more, gather_row, scores_init
-  gather_row:
-    g_i = add j0, gi
-    g_ioff = mul g_i, 4:i64
-    g_ip = add idx, g_ioff
-    g_ix = ld g_ip:i32
-    g_ix64 = sext g_ix:i64
-    g_valid = ge g_ix64, 0:i64
-    g_doff = mul gi, row2
-    g_dst = add kvb, g_doff
-    g_soff = mul g_ix64, row2
-    g_src = add kv, g_soff
-    br g_valid, copy(0:i64), clear(0:i64)
-  copy(cb:i64):
-    cb_more = lt cb, row2
-    br cb_more, copy_body, gather_next
-  copy_body:
-    cb_rest = sub row2, cb
-    cb_s = add g_src, cb
-    cb_d = add g_dst, cb
-    cb_v = ldm cb_s:vx, cb_rest:i8
-    stm cb_d, cb_v, cb_rest:i8
-    cb2 = add cb, w8
-    jmp copy(cb2)
-  clear(zc:i64):
-    zc_more = lt zc, row2
-    br zc_more, clear_body, gather_next
-  clear_body:
-    zc_rest = sub row2, zc
-    zc_d = add g_dst, zc
-    stm zc_d, zvb, zc_rest:i8
-    zc2 = add zc, w8
-    jmp clear(zc2)
-  gather_next:
-    gi2 = add gi, 1:i64
-    jmp gather(gi2)
+    kvb_off = mul j0, row2
+    kvb = add kvs, kvb_off
+    jmp scores_init
 
   # st [bc x h] = kvb [bc x d] . qt [d x h]
   scores_init:
@@ -284,7 +324,7 @@ fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i
     j1 = add j0, 64:i64
     jmp blocks(j1)
 
-  # 3. out[r] /= running_sum[r] + exp(sink[r] - m[r])
+  # out[r] /= running_sum[r] + exp(sink[r] - m[r])
   finish(fr:i64):
     fr_more = lt fr, h
     br fr_more, finish_row, done
@@ -321,7 +361,6 @@ fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i
     jmp finish(fr2)
   done:
     free qt
-    free kvb
     free sbuf
     free pbuf
     free ot

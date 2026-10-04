@@ -35,6 +35,8 @@ pub const RT_CONSUME_FUEL: &str = "__achainsaw_rt_consume_fuel";
 pub const RT_SANDBOX_FAULT: &str = "__achainsaw_rt_sandbox_fault";
 pub const RT_STACK_CHECK: &str = "__achainsaw_rt_stack_check";
 pub const RT_SANDBOX_CHECK_MM: &str = "__achainsaw_rt_sandbox_check_mm";
+pub const RT_PAR_FOR: &str = "__achainsaw_rt_par_for";
+pub const RT_FUEL_COUNTER: &str = "__achainsaw_rt_fuel_counter";
 
 /// Name of the scalar host-call trampoline generated for `func`.
 pub fn trampoline_name(func: &str) -> String {
@@ -191,6 +193,8 @@ pub fn lower_module<'ctx>(
         module: &module,
         builder: ctx.create_builder(),
         opts,
+        // `par` workers count fuel in their own counters.
+        dynamic_fuel: air.uses_par(),
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
@@ -245,6 +249,9 @@ struct ModuleLowerer<'a, 'ctx> {
     module: &'a LModule<'ctx>,
     builder: Builder<'ctx>,
     opts: &'a LowerOptions,
+    /// Functions find their fuel counter on entry (`RT_FUEL_COUNTER`) instead of using
+    /// `LowerOptions::fuel_counter` directly.
+    dynamic_fuel: bool,
 }
 
 /// One AIR register: its LLVM value and AIR type.
@@ -260,6 +267,8 @@ struct FnState<'ctx> {
     trap: Option<BasicBlock<'ctx>>,
     /// Reports a sandbox violation `(addr, size)` and jumps to `trap`.
     fault: Option<(BasicBlock<'ctx>, PhiValue<'ctx>, PhiValue<'ctx>)>,
+    /// Address of this thread's fuel counter, found on entry (see `dynamic_fuel`).
+    fuel_counter: Option<IntValue<'ctx>>,
 }
 
 impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
@@ -462,6 +471,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         );
         decl(RT_STACK_CHECK, i32t.fn_type(&[], false));
         decl(RT_SANDBOX_CHECK_MM, i32t.fn_type(&[i64t.into(); 7], false));
+        decl(RT_PAR_FOR, i32t.fn_type(&[i64t.into(); 4], false));
+        decl(RT_FUEL_COUNTER, i64t.fn_type(&[], false));
     }
 
     fn runtime_fn(&self, name: &str) -> FunctionValue<'ctx> {
@@ -827,7 +838,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         // Decrement the engine's counter in place; only when it reaches zero ask the runtime
         // whether to unwind (budget spent, or a failure was recorded).
         let b = &self.builder;
-        let addr = self.c64(self.opts.fuel_counter as i64);
+        let addr = st
+            .fuel_counter
+            .unwrap_or_else(|| self.c64(self.opts.fuel_counter as i64));
         let fuel = self.load(self.i64().into(), addr)?.into_int_value();
         let left = b.build_int_sub(fuel, self.c64(1), "fuel")?;
         self.store(left.into(), addr)?;
@@ -888,6 +901,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             blocks,
             trap,
             fault,
+            fuel_counter: None,
         };
         for (i, (name, ty)) in func.params.iter().enumerate() {
             st.values
@@ -895,6 +909,22 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
 
         b.position_at_end(entry);
+        let has_branches = func
+            .blocks
+            .iter()
+            .any(|b| !matches!(b.terminator, Terminator::Ret { .. }));
+        if checks && self.dynamic_fuel && has_branches {
+            // This thread's counter, or the engine's when no engine call is active.
+            let active = self
+                .call1(self.runtime_fn(RT_FUEL_COUNTER), &[])?
+                .into_int_value();
+            let none = b.build_int_compare(IntPredicate::EQ, active, self.c64(0), "")?;
+            let engine = self.c64(self.opts.fuel_counter as i64);
+            st.fuel_counter = Some(
+                b.build_select(none, engine, active, "fuel.counter")?
+                    .into_int_value(),
+            );
+        }
         let first = st.blocks[&func.blocks[0].label].0;
         if self.opts.sandbox.is_some() && !self.opts.aot {
             self.check_hook(&st, RT_STACK_CHECK, &[], first)?;
@@ -1296,8 +1326,123 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let regs = [pc, pa, pb, m, n, k].map(|r| self.int(st, r));
                 self.matmul(st, regs, *dtype)?;
             }
+            Instruction::Par {
+                count, func, args, ..
+            } => {
+                let n = self.int(st, count);
+                if self.opts.aot {
+                    self.serial_par(st, n, func, args)?;
+                } else {
+                    self.par(st, n, func, args)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// `par n, f(args)`: packs the arguments in trampoline layout (slot 0 is the index,
+    /// set by the runtime) and hands `f`'s trampoline to `RT_PAR_FOR`.
+    fn par(
+        &self,
+        st: &FnState<'ctx>,
+        n: IntValue<'ctx>,
+        func: &str,
+        args: &[String],
+    ) -> Result<()> {
+        let b = &self.builder;
+        let slots = 1 + args.len() as u32;
+        // In the entry block so a `par` inside a loop reuses one buffer.
+        let entry_b = self.ctx.create_builder();
+        match st.entry.get_terminator() {
+            Some(t) => entry_b.position_before(&t),
+            None => entry_b.position_at_end(st.entry),
+        }
+        let buf = entry_b.build_alloca(self.i64().array_type(slots), "par.args")?;
+        for (j, arg) in args.iter().enumerate() {
+            let (v, ty) = self.val(st, arg);
+            let raw: IntValue = match ty {
+                Type::I32 | Type::I16 | Type::I8 => {
+                    b.build_int_z_extend(v.into_int_value(), self.i64(), "")?
+                }
+                Type::F64 => b.build_bit_cast(v, self.i64(), "")?.into_int_value(),
+                Type::F32 => {
+                    let bits = b.build_bit_cast(v, self.i32(), "")?.into_int_value();
+                    b.build_int_z_extend(bits, self.i64(), "")?
+                }
+                _ => v.into_int_value(),
+            };
+            let slot = unsafe { b.build_gep(self.i64(), buf, &[self.c64(j as i64 + 1)], "")? };
+            b.build_store(slot, raw)?;
+        }
+        let tramp = self.trampoline_fn(func);
+        let tramp =
+            b.build_ptr_to_int(tramp.as_global_value().as_pointer_value(), self.i64(), "")?;
+        let buf = b.build_ptr_to_int(buf, self.i64(), "")?;
+        let hook_args = [tramp, buf, self.c64(slots as i64), n].map(|v| v.into());
+        if st.trap.is_some() {
+            let next = self.ctx.append_basic_block(st.func, "par.done");
+            self.check_hook(st, RT_PAR_FOR, &hook_args, next)?;
+            b.position_at_end(next);
+        } else {
+            self.call(self.runtime_fn(RT_PAR_FOR), &hook_args)?;
+        }
+        Ok(())
+    }
+
+    /// `par n, f(args)` as a counted loop calling `f(i, args)` in order (AOT code, which has
+    /// no runtime to run it in parallel; any order is a valid execution of `par`).
+    fn serial_par(
+        &self,
+        st: &FnState<'ctx>,
+        n: IntValue<'ctx>,
+        func: &str,
+        args: &[String],
+    ) -> Result<()> {
+        let b = &self.builder;
+        let callee = self
+            .module
+            .get_function(func)
+            .ok_or_else(|| anyhow!("Unknown function '{func}' in par"))?;
+        let pre = b.get_insert_block().unwrap();
+        let header = self.ctx.append_basic_block(st.func, "par.header");
+        let body = self.ctx.append_basic_block(st.func, "par.body");
+        let done = self.ctx.append_basic_block(st.func, "par.done");
+        b.build_unconditional_branch(header)?;
+
+        b.position_at_end(header);
+        let i = b.build_phi(self.i64(), "par.i")?;
+        i.add_incoming(&[(&self.c64(0), pre)]);
+        let iv = i.as_basic_value().into_int_value();
+        let more = b.build_int_compare(IntPredicate::SLT, iv, n, "")?;
+        b.build_conditional_branch(more, body, done)?;
+
+        b.position_at_end(body);
+        let mut argv: Vec<BasicMetadataValueEnum> = vec![iv.into()];
+        argv.extend(
+            args.iter()
+                .map(|a| BasicMetadataValueEnum::from(st.values[a].0)),
+        );
+        let cs = b.build_call(callee, &argv, "")?;
+        cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+        let next = b.build_int_add(iv, self.c64(1), "")?;
+        i.add_incoming(&[(&next, b.get_insert_block().unwrap())]);
+        b.build_unconditional_branch(header)?;
+
+        b.position_at_end(done);
+        Ok(())
+    }
+
+    /// Declaration of `func`'s scalar trampoline (defined by `lower_trampoline`).
+    fn trampoline_fn(&self, func: &str) -> FunctionValue<'ctx> {
+        let name = trampoline_name(func);
+        self.module.get_function(&name).unwrap_or_else(|| {
+            let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+            let ty = self
+                .ctx
+                .void_type()
+                .fn_type(&[ptr_t.into(), ptr_t.into()], false);
+            self.module.add_function(&name, ty, Some(Linkage::External))
+        })
     }
 
     fn lower_binary(
@@ -1794,14 +1939,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     /// Cranelift backend (`lower_trampoline`).
     fn lower_trampoline(&self, func: &Function) -> Result<()> {
         let b = &self.builder;
-        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
-        let ty = self
-            .ctx
-            .void_type()
-            .fn_type(&[ptr_t.into(), ptr_t.into()], false);
-        let t = self
-            .module
-            .add_function(&trampoline_name(&func.name), ty, Some(Linkage::External));
+        let t = self.trampoline_fn(&func.name);
         self.add_target_attributes(t);
         b.position_at_end(self.ctx.append_basic_block(t, "entry"));
         let args_ptr = t.get_nth_param(0).unwrap().into_pointer_value();

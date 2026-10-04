@@ -10,12 +10,15 @@ pub const RESERVED_PREFIX: &str = "__achainsaw";
 pub struct Validator {
     // Function table: name -> (param types, return type)
     functions: HashMap<String, (Vec<Type>, Option<Type>)>,
+    /// Names declared with `extfn`, which `par` may not run.
+    externs: HashSet<String>,
 }
 
 impl Validator {
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            externs: HashSet::new(),
         }
     }
 }
@@ -205,6 +208,7 @@ impl Validator {
             let param_types = ext_fn.params.iter().map(|(_, ty)| *ty).collect();
             self.functions
                 .insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
+            self.externs.insert(ext_fn.name.clone());
         }
 
         for func in &module.functions {
@@ -555,6 +559,75 @@ impl Validator {
                         )
                     })?;
                     Self::define(scope, defs, d, rty, *span)?;
+                }
+            }
+            Instruction::Par {
+                count,
+                func,
+                args,
+                span,
+            } => {
+                let count_ty = self.check_reg(ctx, count, scope, *span)?;
+                if count_ty != Type::I64 {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("par count '{count}' must be of type 'i64', found '{count_ty}'"),
+                        *span,
+                    ));
+                }
+                let (param_types, ret_type) = self.functions.get(func).ok_or_else(|| {
+                    Diagnostic::error(
+                        "ERR_UNDEFINED_FUNCTION",
+                        format!("par runs undefined function '{func}'"),
+                        *span,
+                    )
+                })?;
+                let mut expected: Vec<String> = vec!["i64".into()];
+                expected.extend(
+                    args.iter()
+                        .map(|a| scope.get(a).map_or("?".into(), |t| t.to_string())),
+                );
+                let expected = format!("fn {func}({})", expected.join(", "));
+                let signature_error = |message: String| {
+                    Diagnostic::error("ERR_PAR_SIGNATURE", message, *span).with_context(
+                        serde_json::json!({ "function": func, "expected_signature": expected }),
+                    )
+                };
+                if self.externs.contains(func) {
+                    return Err(signature_error(format!(
+                        "par cannot run external function '{func}'; wrap the call in an AIR function"
+                    )));
+                }
+                if param_types.first() != Some(&Type::I64) || ret_type.is_some() {
+                    return Err(signature_error(format!(
+                        "par body '{func}' must take the index (i64) as its first parameter and return nothing"
+                    )));
+                }
+                if args.len() + 1 != param_types.len() {
+                    return Err(Diagnostic::error(
+                        "ERR_ARITY_MISMATCH",
+                        format!(
+                            "par body '{func}' takes {} arguments after the index, received {}",
+                            param_types.len() - 1,
+                            args.len()
+                        ),
+                        *span,
+                    ));
+                }
+                for (arg, &expected_ty) in args.iter().zip(&param_types[1..]) {
+                    let actual_ty = self.check_reg(ctx, arg, scope, *span)?;
+                    if actual_ty != expected_ty {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!("Argument '{arg}' passed to '{func}' has type '{actual_ty}', expected '{expected_ty}'"),
+                            *span,
+                        ));
+                    }
+                    if actual_ty.is_vector() {
+                        return Err(signature_error(format!(
+                            "par cannot pass vector '{arg}' to '{func}'; pass vectors through memory (ptr)"
+                        )));
+                    }
                 }
             }
             Instruction::Splat { dst, src, ty, span } => {

@@ -318,6 +318,30 @@ fn spin()->i32
 }
 
 #[test]
+fn caller_stops_after_a_violation_in_a_par_worker() {
+    // Workers share the arena; one of them leaves it, and the spinning caller must stop.
+    let src = r#"
+fn poke(i:i64, p:ptr)
+  b0:
+    off = mul i, 4096:i64
+    q = add p, off
+    st q, i
+    ret
+
+fn spin()->i32
+  b0:
+    p = alloc 64:i64
+    jmp b1
+  b1:
+    par 16:i64, poke(p)
+    jmp b1
+"#;
+    let mut e = sandboxed(src);
+    e.set_fuel(None);
+    expect_violation(&e, "spin", &[]);
+}
+
+#[test]
 fn sandbox_must_be_enabled_before_compiling() {
     let module = parse_and_validate("fn f()\n  b0:\n    ret\n").unwrap();
     let mut e = JitEngine::new().unwrap();

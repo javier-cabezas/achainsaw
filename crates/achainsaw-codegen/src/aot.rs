@@ -135,6 +135,7 @@ impl AotCompiler {
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
             sandbox: None,
+            par: None,
         };
 
         for func in &ir_mod.functions {

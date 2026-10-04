@@ -146,6 +146,17 @@ def make_cases():
         verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
     ))
 
+    def verify_gemv_par(k):
+        yg[:] = np.nan
+        k.run("gemv_par", A, xg, yg, gm, gk)
+        return float(np.max(np.abs(yg - gemv_ref)) / np.max(np.abs(gemv_ref)))
+
+    cases.append(dict(
+        name="gemv_par", label=f"GEMV f32, all cores via par ({gm}x{gk})",
+        run=lambda k: k.run("gemv_par", A, xg, yg, gm, gk),
+        verify=verify_gemv_par, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
+    ))
+
     n = 256
     Ab = bf16_bits(rng.standard_normal((n, n)))
     Bb = bf16_bits(rng.standard_normal((n, n)))
@@ -185,7 +196,7 @@ def make_cases():
     qn, kvn = bf16_values(fq), bf16_values(fkv)
 
     def verify_flash(k):
-        k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
+        k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
         return float(np.max(np.abs(fout - flash_ref)) / np.max(np.abs(flash_ref)))
 
     def np_flash():
@@ -196,7 +207,7 @@ def make_cases():
 
     cases.append(dict(
         name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
-        run=lambda k: k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
+        run=lambda k: k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
         verify=verify_flash, tol=1e-2,
         # NumPy has no bf16 matmul; compare with f32 on the same values (multithreaded BLAS).
         numpy=np_flash, flops=2 * 2 * fh * fnk * fd,

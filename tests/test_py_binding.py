@@ -417,6 +417,93 @@ fn test_fma(x:i32, y:i32, z:i32)->i32
         self.assertIn("ret x", opt_code)
 
 
+    PAR_SQUARES = """fn fill(i:i64, out:ptr, scale:f32)
+  b0:
+    f = itof i:f32
+    v = mul f, f
+    w = mul v, scale
+    off = mul i, 4:i64
+    q = add out, off
+    st q, w
+    ret
+
+fn squares(out:ptr, n:i64, scale:f32)
+  b0:
+    par n, fill(out, scale)
+    ret
+"""
+
+    def test_par_over_numpy_buffer(self):
+        """`par` fills a NumPy array from all cores; one thread gives the same result."""
+        kernel = achainsaw.compile(self.PAR_SQUARES)
+        self.assertGreaterEqual(kernel.threads, 1)
+        want = np.arange(10000, dtype=np.float32) ** 2 * np.float32(0.5)
+        for threads in [None, 1, 2]:
+            kernel.set_threads(threads)
+            out = np.zeros(10000, dtype=np.float32)
+            kernel.run("squares", out, 10000, 0.5)
+            np.testing.assert_array_equal(out, want)
+        self.assertEqual(kernel.threads, 2 if kernel.threads >= 2 else 1)
+        with self.assertRaises(ValueError):
+            kernel.set_threads(0)
+
+    def test_par_host_callback_from_workers(self):
+        """Host callbacks run on `par` workers while the caller has released the GIL."""
+        import ctypes
+        import threading
+        import time
+        cb_ty = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)
+        threads_seen = set()
+
+        def triple(x):
+            threads_seen.add(threading.get_ident())
+            # Sleeping releases the GIL, so callbacks on other workers overlap, and the
+            # calling thread cannot finish every index before the helpers join.
+            time.sleep(0.002)
+            return 3 * x
+
+        cb = cb_ty(triple)
+        achainsaw.register_symbol("py_triple", ctypes.cast(cb, ctypes.c_void_p).value)
+        kernel = achainsaw.compile(
+            "extfn py_triple(x:i64)->i64\n"
+            "fn body(i:i64, out:ptr)\n  b0:\n    v = call py_triple(i)\n"
+            "    off = mul i, 8:i64\n    q = add out, off\n    st q, v\n    ret\n"
+            "fn run(out:ptr, n:i64)\n  b0:\n    par n, body(out)\n    ret\n"
+        )
+        # A `par` runs serially while another thread's `par` has the pool, so retry.
+        for _ in range(5):
+            threads_seen.clear()
+            out = np.zeros(64, dtype=np.int64)
+            kernel.run("run", out, 64)
+            np.testing.assert_array_equal(out, 3 * np.arange(64, dtype=np.int64))
+            if len(threads_seen) > 1:
+                break
+        if kernel.threads > 1:
+            self.assertGreater(len(threads_seen), 1)
+
+    def test_par_kernel_from_python_threads(self):
+        """Python threads share one kernel: calls release the GIL and take turns."""
+        from concurrent.futures import ThreadPoolExecutor
+        kernel = achainsaw.compile(self.PAR_SQUARES)
+        want = np.arange(5000, dtype=np.float32) ** 2
+
+        def job(_):
+            out = np.zeros(5000, dtype=np.float32)
+            kernel.run("squares", out, 5000, 1.0)
+            return np.array_equal(out, want)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            self.assertTrue(all(pool.map(job, range(16))))
+
+    def test_par_signature_diagnostic(self):
+        res = achainsaw.check(
+            "fn body(i:i32)\n  b0:\n    ret\nfn run()\n  b0:\n    par 4:i64, body()\n    ret\n"
+        )
+        self.assertEqual(res.get("status"), "error")
+        self.assertEqual(res.get("error_code"), "ERR_PAR_SIGNATURE")
+        self.assertEqual(res["context"]["expected_signature"], "fn body(i64)")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -283,3 +283,22 @@ fn fuel_runs_out_at_the_same_point() {
     }
     assert_eq!(remaining[0], remaining[1]);
 }
+
+/// `par` gives the same results and uses the same fuel on both backends.
+#[test]
+fn par_agrees() {
+    let src = "fn work(i:i64, p:ptr)\n  b0:\n    jmp b1(0:i64, 0:i64)\n  b1(j:i64, acc:i64):\n    c = lt j, i\n    br c, b2, b3\n  b2:\n    acc2 = add acc, j\n    j2 = add j, 1:i64\n    jmp b1(j2, acc2)\n  b3:\n    off = mul i, 8:i64\n    q = add p, off\n    st q, acc\n    ret\n\nfn run(n:i64)->i64\n  b0:\n    bytes = mul n, 8:i64\n    p = alloc bytes\n    par n, work(p)\n    last = sub n, 1:i64\n    off = mul last, 8:i64\n    q = add p, off\n    v = ld q:i64\n    free p\n    ret v\n";
+    let module = parse_and_validate(src).unwrap();
+    let features = CpuFeatures::effective().unwrap();
+    let mut results = Vec::new();
+    for backend in [Backend::Cranelift, Backend::Llvm] {
+        let mut e = JitEngine::with_backend(backend, &features).unwrap();
+        e.compile_module(&module).unwrap();
+        e.set_fuel(Some(10_000_000));
+        let r = unsafe { e.call_typed("run", &[RtValue::I64(500)]) }.unwrap();
+        results.push((bits(r), achainsaw_codegen::get_remaining_fuel()));
+        e.set_fuel(None);
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0].0, 499 * 498 / 2);
+}
