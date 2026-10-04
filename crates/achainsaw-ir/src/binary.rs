@@ -9,10 +9,8 @@ use crate::types::Type;
 use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"\x00AIR";
-/// Current AIRB version. Version 2 added v256/v512/vx and lane-typed vector ops;
-/// version 3 added f16/bf16, masked loads/stores, and `mm`. Older files still decode.
-pub const VERSION: u16 = 3;
-const MIN_VERSION: u16 = 1;
+/// AIRB format version. Files with any other version are rejected.
+pub const VERSION: u16 = 1;
 
 /// Serializes an in-memory AIR `Module` into compact AIRB binary bytes.
 ///
@@ -167,10 +165,8 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(dst);
                         out.push_str(" = splat ");
                         out.push_str(src);
-                        if *ty != Type::V128 {
-                            out.push(':');
-                            out.push_str(ty.as_str());
-                        }
+                        out.push(':');
+                        out.push_str(ty.as_str());
                     }
                     Instruction::ExtractLane {
                         dst, vec, lane, ty, ..
@@ -649,7 +645,7 @@ impl BinaryEncoder {
             Instruction::Splat { dst, src, ty, .. } => {
                 self.buf.push(0x07);
                 self.push_regs(&[dst, src]);
-                self.buf.push(encode_type(*ty)); // since v2
+                self.buf.push(encode_type(*ty));
             }
             Instruction::ExtractLane {
                 dst, vec, lane, ty, ..
@@ -884,7 +880,6 @@ struct BinaryDecoder<'a> {
     bytes: &'a [u8],
     pos: usize,
     strings: Vec<String>,
-    version: u16,
 }
 
 impl<'a> BinaryDecoder<'a> {
@@ -893,7 +888,6 @@ impl<'a> BinaryDecoder<'a> {
             bytes,
             pos: 0,
             strings: Vec::new(),
-            version: VERSION,
         }
     }
 
@@ -963,12 +957,11 @@ impl<'a> BinaryDecoder<'a> {
 
         // 2. Version
         let version = self.read_u16()?;
-        if !(MIN_VERSION..=VERSION).contains(&version) {
+        if version != VERSION {
             return Err(self.err(format!(
-                "Unsupported AIRB version: expected {MIN_VERSION} to {VERSION}, got {version}"
+                "Unsupported AIRB version: expected {VERSION}, got {version}"
             )));
         }
-        self.version = version;
 
         // Flags
         let _flags = self.read_u16()?;
@@ -1121,17 +1114,6 @@ impl<'a> BinaryDecoder<'a> {
                 let dst = self.read_string()?;
                 let lhs = self.read_string()?;
                 let rhs = self.read_string()?;
-                // Codes 17-23 were the v1 `vfadd`..`vimul` ops.
-                if let Some((op, lane)) = decode_legacy_vector_op(code) {
-                    return Ok(Instruction::VBinary {
-                        op,
-                        dst,
-                        lhs,
-                        rhs,
-                        lane,
-                        span,
-                    });
-                }
                 let op = decode_binary_op(code)
                     .ok_or_else(|| self.err("Invalid binary op code in AIRB"))?;
                 Ok(Instruction::Binary {
@@ -1177,11 +1159,7 @@ impl<'a> BinaryDecoder<'a> {
             0x07 => {
                 let dst = self.read_string()?;
                 let src = self.read_string()?;
-                let ty = if self.version >= 2 {
-                    self.read_vector_type()?
-                } else {
-                    Type::V128
-                };
+                let ty = self.read_vector_type()?;
                 Ok(Instruction::Splat { dst, src, ty, span })
             }
             0x08 => {
@@ -1472,17 +1450,17 @@ fn encode_binary_op(op: BinaryOp) -> u8 {
         BinaryOp::Gt => 14,
         BinaryOp::Le => 15,
         BinaryOp::Ge => 16,
-        BinaryOp::Min => 24,
-        BinaryOp::Max => 25,
-        BinaryOp::Umin => 26,
-        BinaryOp::Umax => 27,
-        BinaryOp::Udiv => 28,
-        BinaryOp::Urem => 29,
-        BinaryOp::Ushr => 30,
-        BinaryOp::Ult => 31,
-        BinaryOp::Ugt => 32,
-        BinaryOp::Ule => 33,
-        BinaryOp::Uge => 34,
+        BinaryOp::Min => 17,
+        BinaryOp::Max => 18,
+        BinaryOp::Umin => 19,
+        BinaryOp::Umax => 20,
+        BinaryOp::Udiv => 21,
+        BinaryOp::Urem => 22,
+        BinaryOp::Ushr => 23,
+        BinaryOp::Ult => 24,
+        BinaryOp::Ugt => 25,
+        BinaryOp::Ule => 26,
+        BinaryOp::Uge => 27,
     }
 }
 
@@ -1504,17 +1482,17 @@ fn decode_binary_op(code: u8) -> Option<BinaryOp> {
         14 => Some(BinaryOp::Gt),
         15 => Some(BinaryOp::Le),
         16 => Some(BinaryOp::Ge),
-        24 => Some(BinaryOp::Min),
-        25 => Some(BinaryOp::Max),
-        26 => Some(BinaryOp::Umin),
-        27 => Some(BinaryOp::Umax),
-        28 => Some(BinaryOp::Udiv),
-        29 => Some(BinaryOp::Urem),
-        30 => Some(BinaryOp::Ushr),
-        31 => Some(BinaryOp::Ult),
-        32 => Some(BinaryOp::Ugt),
-        33 => Some(BinaryOp::Ule),
-        34 => Some(BinaryOp::Uge),
+        17 => Some(BinaryOp::Min),
+        18 => Some(BinaryOp::Max),
+        19 => Some(BinaryOp::Umin),
+        20 => Some(BinaryOp::Umax),
+        21 => Some(BinaryOp::Udiv),
+        22 => Some(BinaryOp::Urem),
+        23 => Some(BinaryOp::Ushr),
+        24 => Some(BinaryOp::Ult),
+        25 => Some(BinaryOp::Ugt),
+        26 => Some(BinaryOp::Ule),
+        27 => Some(BinaryOp::Uge),
         _ => None,
     }
 }
@@ -1599,33 +1577,17 @@ fn encode_vector_reduce_op(op: VectorReduceOp) -> u8 {
     match op {
         VectorReduceOp::Sum => 1,
         VectorReduceOp::Max => 2,
-        VectorReduceOp::Min => 4,
+        VectorReduceOp::Min => 3,
     }
 }
 
 fn decode_vector_reduce_op(code: u8) -> Option<VectorReduceOp> {
     match code {
-        // 3 was v1 `visum`, now the same `vsum` op with an i32 lane type.
-        1 | 3 => Some(VectorReduceOp::Sum),
+        1 => Some(VectorReduceOp::Sum),
         2 => Some(VectorReduceOp::Max),
-        4 => Some(VectorReduceOp::Min),
+        3 => Some(VectorReduceOp::Min),
         _ => None,
     }
-}
-
-/// v1 encoded `vfadd`..`vimul` as binary op codes 17-23.
-fn decode_legacy_vector_op(code: u8) -> Option<(VBinOp, Type)> {
-    let name = match code {
-        17 => "vfadd",
-        18 => "vfsub",
-        19 => "vfmul",
-        20 => "vfdiv",
-        21 => "viadd",
-        22 => "visub",
-        23 => "vimul",
-        _ => return None,
-    };
-    VBinOp::from_legacy(name)
 }
 
 fn encode_vbin_op(op: VBinOp) -> u8 {

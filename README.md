@@ -77,7 +77,7 @@ fn dot(p0:ptr, p1:ptr, n:i64)->f32
 
 ---
 
-## 🧮 Vector Types & Ops (AIR v2)
+## 🧮 Vector Types & Ops
 
 Vectors are untyped bit containers; every vector op names the lane type it works on, so one register can be read as `f32` lanes by one op and as `i32` lanes by the next.
 
@@ -90,7 +90,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 |---|---|---|
 | Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
 | Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
-| Broadcast | `v = splat x:v512` (plain `splat x` is `v128`) | i8 to f64 |
+| Broadcast | `v = splat x:v512` (the vector type is required) | i8 to f64 |
 | Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
 | Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
@@ -100,7 +100,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
 | Lane count | `n = vl f32` | Any |
 
-Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths. The pre-v2 spellings (`vfadd`, `viadd`, `vfsum`, `visum`, `vfmax`, ...) still parse and print in canonical form.
+Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths.
 
 Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
 ```air
@@ -217,7 +217,7 @@ achainsaw bench examples/fibonacci.air --iters 200
 ```
 
 ### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
-AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. The current format is AIRB v3 (v2 added the wide vector types and ops; v3 added `f16`/`bf16`, `ldm`/`stm`, and `mm`); older files still load:
+AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. Every AIR construct round-trips through AIRB, and files carry a format version that decoders check:
 ```bash
 # Assemble text AIR to compact binary bytecode (.airb)
 achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
@@ -442,7 +442,7 @@ import numpy as np
 kernel = achainsaw.compile("""
 fn simd_scale(p:ptr, factor:f32, n:i64)
   b0:
-    vfactor = splat factor
+    vfactor = splat factor:v128
     zero = cst 0:i64
     jmp b1(zero)
   b1(i:i64):
@@ -453,7 +453,7 @@ fn simd_scale(p:ptr, factor:f32, n:i64)
     off = mul i, sixteen
     elem_ptr = add p, off
     v = ld elem_ptr:v128
-    vscaled = vfmul v, vfactor
+    vscaled = vmul v, vfactor:f32
     st elem_ptr, vscaled
     one = cst 1:i64
     next_i = add i, one

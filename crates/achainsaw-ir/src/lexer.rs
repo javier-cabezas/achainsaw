@@ -24,11 +24,10 @@ pub enum TokenKind {
     Select,
     Cast(crate::ast::CastOp),
     Unary(crate::ast::UnaryOp),
-    VectorReduce(crate::ast::VectorReduceOp),
 
-    /// AIR v2 mnemonics (`vadd`, `vfma`, `veq`, `vsel`, `vsum`, `vl`, legacy `vfadd`, ...).
+    /// Vector mnemonics (`vadd`, `vfma`, `veq`, `vsel`, `vsum`, `vl`, `ldm`, `mm`, ...).
     /// They keep their text because they are only keywords right after `=`; elsewhere
-    /// they remain valid register names, so pre-v2 programs using them still parse.
+    /// they remain valid register names.
     VOp(String),
 
     // Symbols
@@ -324,13 +323,9 @@ impl<'a> Lexer<'a> {
                 "sqrt" => TokenKind::Unary(crate::ast::UnaryOp::Sqrt),
                 "neg" => TokenKind::Unary(crate::ast::UnaryOp::Neg),
                 "abs" => TokenKind::Unary(crate::ast::UnaryOp::Abs),
-                "vfsum" | "visum" | "vfmax" => TokenKind::VectorReduce(
-                    crate::ast::VectorReduceOp::from_str_opt(&ident).unwrap(),
-                ),
                 "vadd" | "vsub" | "vmul" | "vdiv" | "vmin" | "vmax" | "vand" | "vor" | "vxor"
                 | "vfma" | "veq" | "vne" | "vlt" | "vgt" | "vle" | "vge" | "vsel" | "vsum"
-                | "vmaxr" | "vminr" | "vl" | "ldm" | "stm" | "mm" | "vfadd" | "vfsub" | "vfmul"
-                | "vfdiv" | "viadd" | "visub" | "vimul" => TokenKind::VOp(ident),
+                | "vmaxr" | "vminr" | "vl" | "ldm" | "stm" | "mm" => TokenKind::VOp(ident),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
                 | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "min" | "max" | "umin" | "umax"
                 | "udiv" | "urem" | "ushr" | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),

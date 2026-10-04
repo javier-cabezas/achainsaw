@@ -1,4 +1,4 @@
-//! AIR v2 vector syntax, validation, AIRB v2 encoding, and backward compatibility.
+//! Vector syntax, validation, and AIRB encoding.
 
 use achainsaw_ir::opt::optimize_module;
 use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
@@ -9,10 +9,6 @@ fn err_code(src: &str) -> String {
         Ok(_) => panic!("expected an error for:\n{src}"),
         Err(d) => d.error_code,
     }
-}
-
-fn roundtrip_text(src: &str) -> String {
-    to_air_text(&parse_and_validate(src).expect("valid"))
 }
 
 const ALL_OPS: &str = r#"
@@ -45,22 +41,16 @@ fn k(pa:ptr, po:ptr)->f64
 "#;
 
 #[test]
-fn every_example_airb_decodes_including_v1() {
+fn every_example_airb_decodes() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-    // Kernels assembled before AIRB v2, kept unchanged as decoder compatibility fixtures.
-    let v1 = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1");
     let mut checked = 0;
-    let mut v1_files = 0;
-    for dir in [examples.clone(), examples.join("kernels"), v1] {
+    for dir in [examples.clone(), examples.join("kernels")] {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let airb = entry.unwrap().path();
             if airb.extension().is_none_or(|e| e != "airb") {
                 continue;
             }
             let bytes = std::fs::read(&airb).unwrap();
-            if u16::from_le_bytes([bytes[4], bytes[5]]) == 1 {
-                v1_files += 1;
-            }
             let decoded = decode_module(&bytes).unwrap_or_else(|d| panic!("{airb:?}: {d:?}"));
             let source = std::fs::read_to_string(airb.with_extension("air")).unwrap();
             let parsed = parse_and_validate(&source).unwrap();
@@ -69,38 +59,50 @@ fn every_example_airb_decodes_including_v1() {
         }
     }
     assert!(checked >= 7, "only {checked} .airb files found");
-    assert!(v1_files >= 5, "only {v1_files} v1 .airb fixtures left");
 }
 
 #[test]
-fn legacy_vector_syntax_normalizes_to_v2() {
-    let text = roundtrip_text(
-        "fn k(x:f32, n:i32)->f32\n  b0:\n    a = splat x\n    b = vfadd a, a\n    c = vfmul b, a\n    d = vfsub c, a\n    e = vfdiv d, a\n    i = splat n\n    j = viadd i, i\n    k = vimul j, i\n    l = visub k, i\n    s = visum l:i32\n    t = vfsum e:f32\n    u = vfmax e:f32\n    r = add t, u\n    ret r\n",
+fn airb_with_another_version_is_rejected() {
+    let module = parse_and_validate("fn f()->i32\n  b0:\n    ret 1:i32\n").unwrap();
+    let mut bytes = encode_module(&module).unwrap();
+    bytes[4..6].copy_from_slice(&(achainsaw_ir::binary::VERSION + 1).to_le_bytes());
+    let err = decode_module(&bytes).unwrap_err();
+    assert!(
+        err.message.contains("Unsupported AIRB version"),
+        "{}",
+        err.message
     );
-    for expected in [
-        "a = splat x\n",
-        "b = vadd a, a:f32",
-        "c = vmul b, a:f32",
-        "d = vsub c, a:f32",
-        "e = vdiv d, a:f32",
-        "j = vadd i, i:i32",
-        "k = vmul j, i:i32",
-        "l = vsub k, i:i32",
-        "s = vsum l:i32",
-        "t = vsum e:f32",
-        "u = vmaxr e:f32",
+}
+
+#[test]
+fn removed_spellings_are_rejected() {
+    // Every vector op names its types: no untyped `splat`, no `vfadd`-style aliases.
+    assert_eq!(
+        err_code("fn k(x:f32)\n  b0:\n    a = splat x\n    ret\n"),
+        "ERR_EXPECTED_TYPE"
+    );
+    for alias in [
+        "vfadd a, a",
+        "viadd a, a",
+        "vfsum a:f32",
+        "visum a:i32",
+        "vfmax a:f32",
     ] {
-        assert!(text.contains(expected), "missing '{expected}' in:\n{text}");
+        let src = format!("fn k(x:f32)\n  b0:\n    a = splat x:v128\n    b = {alias}\n    ret\n");
+        assert!(
+            parse_and_validate(&src).is_err(),
+            "`{alias}` should not parse"
+        );
     }
 }
 
 #[test]
-fn v2_text_and_airb_round_trip() {
+fn text_and_airb_round_trip() {
     let module = parse_and_validate(ALL_OPS).unwrap();
     let text = to_air_text(&module);
     // Canonical text re-parses to the same program.
     assert_eq!(to_air_text(&parse_and_validate(&text).unwrap()), text);
-    // AIRB v2 preserves every new instruction.
+    // AIRB preserves every instruction.
     let bytes = encode_module(&module).unwrap();
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
@@ -247,7 +249,7 @@ fn k(p:ptr, x:i32)
 }
 
 // ---------------------------------------------------------------------------------------
-// f16/bf16, ldm/stm, mm (AIRB v3)
+// f16/bf16, ldm/stm, mm
 // ---------------------------------------------------------------------------------------
 
 const MASKED_HALF_MM: &str = r#"

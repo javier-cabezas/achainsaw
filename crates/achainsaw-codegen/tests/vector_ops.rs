@@ -1,4 +1,4 @@
-//! AIR v2 vector ops on the backend selected by `ACHAINSAW_BACKEND` (Cranelift by default).
+//! Vector ops on the backend selected by `ACHAINSAW_BACKEND` (Cranelift by default).
 //!
 //! Every op x lane type x width combination the validator accepts must:
 //! - compile for x86_64 (each ISA level this host reaches via the JIT, and every x86-64

@@ -54,9 +54,9 @@ fn test_type_conversions_and_intrinsics_parsing_and_binary() {
         us = ushr a, 1:i32
         is_lt = ult a, 10:i32
 
-        vsum = vfsum v:f32
-        vmax = vfmax v:f32
-        vis = visum v:i32
+        vsum = vsum v:f32
+        vmax = vmaxr v:f32
+        vis = vsum v:i32
         ret i_val
     "#;
     let module = parse_and_validate(code).expect("should parse and validate phase 4 instructions");

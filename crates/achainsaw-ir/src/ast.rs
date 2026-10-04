@@ -145,20 +145,6 @@ impl VBinOp {
         Self::ALL.iter().copied().find(|op| op.as_str() == s)
     }
 
-    /// Pre-v2 spellings (`vfadd`, `viadd`, ...) with their implied lane type.
-    pub fn from_legacy(s: &str) -> Option<(Self, Type)> {
-        match s {
-            "vfadd" => Some((VBinOp::Add, Type::F32)),
-            "vfsub" => Some((VBinOp::Sub, Type::F32)),
-            "vfmul" => Some((VBinOp::Mul, Type::F32)),
-            "vfdiv" => Some((VBinOp::Div, Type::F32)),
-            "viadd" => Some((VBinOp::Add, Type::I32)),
-            "visub" => Some((VBinOp::Sub, Type::I32)),
-            "vimul" => Some((VBinOp::Mul, Type::I32)),
-            _ => None,
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             VBinOp::Add => "vadd",
@@ -295,11 +281,10 @@ pub enum VectorReduceOp {
 }
 
 impl VectorReduceOp {
-    /// Accepts the canonical names and the pre-v2 aliases `vfsum`, `visum`, `vfmax`.
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
-            "vsum" | "vfsum" | "visum" => Some(VectorReduceOp::Sum),
-            "vmaxr" | "vfmax" => Some(VectorReduceOp::Max),
+            "vsum" => Some(VectorReduceOp::Sum),
+            "vmaxr" => Some(VectorReduceOp::Max),
             "vminr" => Some(VectorReduceOp::Min),
             _ => None,
         }
@@ -399,7 +384,7 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
-    // AIR v2 lane-typed vector ops. `lane` is the scalar lane type.
+    // Lane-typed vector ops. `lane` is the scalar lane type.
     VBinary {
         op: VBinOp,
         dst: String,
