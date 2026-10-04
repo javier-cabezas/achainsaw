@@ -134,7 +134,30 @@ pub const DEFAULT_SANDBOX_MEMORY_MB: usize = 64;
 /// Largest `max_memory_mb` that `air_run` accepts.
 pub const MAX_SANDBOX_MEMORY_MB: usize = 4096;
 
+/// Stack for the thread that runs `air_run` code: the sandbox's recursion budget plus
+/// headroom, independent of the host thread (Windows main threads only get 1 MiB).
+const EXECUTION_STACK_BYTES: usize = 8 << 20;
+
 pub fn execute_ir(
+    module: &Module,
+    func_name: &str,
+    args: &[f64],
+    fuel: Option<u64>,
+    max_memory_mb: Option<usize>,
+) -> Result<Value> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("air_run".into())
+            .stack_size(EXECUTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb)
+            })?
+            .join()
+            .map_err(|_| anyhow!("air_run execution thread panicked"))?
+    })
+}
+
+fn execute_ir_on_this_thread(
     module: &Module,
     func_name: &str,
     args: &[f64],

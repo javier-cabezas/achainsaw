@@ -737,7 +737,8 @@ impl JitEngine {
     /// (at least `MIN_SANDBOX_ARENA_BYTES`), every `ld`/`st`/`ldm`/`stm`/`mm` access and
     /// `free` is checked against it, and recursion is capped at `SANDBOX_STACK_BYTES`.
     /// Violations halt execution with `ERR_MEMORY_VIOLATION` or `ERR_STACK_OVERFLOW`
-    /// instead of crashing the process. Must be called before `compile_module`.
+    /// instead of crashing the process. Must be called before `compile_module`, and calls
+    /// need a thread with comfortably more than `SANDBOX_STACK_BYTES` of free stack.
     pub fn enable_sandbox(&mut self, arena_bytes: usize) -> Result<()> {
         if !self.signatures.is_empty() {
             return Err(anyhow!(
