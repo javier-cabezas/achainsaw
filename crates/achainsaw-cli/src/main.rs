@@ -1,6 +1,7 @@
 use achainsaw_codegen::cpu::{self, IsaLevel};
 use achainsaw_codegen::{
-    compile_object, link_shared_library, AotObject, AotTarget, Backend, JitEngine, RtValue,
+    compile_assembly, compile_object, link_shared_library, AotObject, AotTarget, Backend,
+    JitEngine, RtValue,
 };
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
@@ -126,6 +127,10 @@ enum Commands {
         /// Link into shared library (.so / .dll) using host C compiler
         #[arg(long, default_value_t = false)]
         shared: bool,
+        /// Output kind: obj (native object, default) or asm (target assembly text, written
+        /// to a .s file; needs the llvm backend)
+        #[arg(long, default_value = "obj", value_parser = ["obj", "asm"])]
+        emit: String,
         /// Emit structured machine-readable JSON telemetry
         #[arg(long, default_value_t = true)]
         json: bool,
@@ -346,18 +351,33 @@ fn main() {
             target_cpu,
             target_features,
             shared,
+            emit,
             json,
-        } => match run_build(
-            &input,
-            output,
-            &AotTarget {
-                triple: target,
-                cpu: target_cpu,
-                features: target_features,
-            },
-            shared,
-            backend,
-        ) {
+        } => match if emit == "asm" {
+            run_build_asm(
+                &input,
+                output,
+                &AotTarget {
+                    triple: target,
+                    cpu: target_cpu,
+                    features: target_features,
+                },
+                shared,
+                backend,
+            )
+        } else {
+            run_build(
+                &input,
+                output,
+                &AotTarget {
+                    triple: target,
+                    cpu: target_cpu,
+                    features: target_features,
+                },
+                shared,
+                backend,
+            )
+        } {
             Ok(stats) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
@@ -633,6 +653,39 @@ fn run_optimize(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Val
         "total_optimizations": stats.total_optimizations(),
         "iterations": stats.iterations,
         "code": optimized_code,
+    }))
+}
+
+/// `build --emit asm`: writes target assembly (LLVM backend) to `output` or `<input>.s`.
+fn run_build_asm(
+    input: &Path,
+    output: Option<PathBuf>,
+    target: &AotTarget,
+    shared: bool,
+    backend: Option<&str>,
+) -> Result<serde_json::Value> {
+    if shared {
+        return Err(anyhow!(
+            "[ERR_UNSUPPORTED_EMIT] --shared cannot be combined with --emit asm"
+        ));
+    }
+    let module = load_module(input)
+        .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
+    let backend = Backend::resolve_for(backend, &module)?;
+    let (asm, triple) = compile_assembly(&module, target, backend)?;
+    let out = output.unwrap_or_else(|| input.with_extension("s"));
+    fs::write(&out, &asm)?;
+    Ok(json!({
+        "status": "ok",
+        "input": input.to_string_lossy(),
+        "output": out.to_string_lossy(),
+        "object_bytes": asm.len(),
+        "shared": false,
+        "emit": "asm",
+        "backend": backend.as_str(),
+        "target": triple,
+        "target_cpu": target.cpu,
+        "target_features": target.features,
     }))
 }
 

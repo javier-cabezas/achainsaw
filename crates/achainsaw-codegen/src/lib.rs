@@ -4,7 +4,9 @@ pub mod cpu;
 pub mod jit;
 pub mod lower;
 
-pub use aot::{compile_object, link_shared_library, AotCompiler, AotObject, AotTarget};
+pub use aot::{
+    compile_assembly, compile_object, link_shared_library, AotCompiler, AotObject, AotTarget,
+};
 pub use backend::{uses_wide_vectors, Backend};
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,

@@ -1,0 +1,20 @@
+# The kernels mm_harness.rs links against.
+fn mm_bf16(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
+  b0:
+    mm c, a, b, m, n, k:bf16
+    ret
+
+fn mm_f16(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
+  b0:
+    mm c, a, b, m, n, k:f16
+    ret
+
+fn mm_f32(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
+  b0:
+    mm c, a, b, m, n, k:f32
+    ret
+
+fn mm_i8(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
+  b0:
+    mm c, a, b, m, n, k:i8
+    ret

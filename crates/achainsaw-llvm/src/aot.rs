@@ -13,6 +13,25 @@ pub fn compile_object(
     spec: &TargetSpec,
     opts: &LowerOptions,
 ) -> Result<(Vec<u8>, String)> {
+    emit(air, spec, opts, FileType::Object)
+}
+
+/// Like [`compile_object`], but returns target assembly text.
+pub fn compile_assembly(
+    air: &Module,
+    spec: &TargetSpec,
+    opts: &LowerOptions,
+) -> Result<(String, String)> {
+    let (bytes, triple) = emit(air, spec, opts, FileType::Assembly)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), triple))
+}
+
+fn emit(
+    air: &Module,
+    spec: &TargetSpec,
+    opts: &LowerOptions,
+    file_type: FileType,
+) -> Result<(Vec<u8>, String)> {
     let tm = target_machine(spec, false)?;
     let ctx = Context::create();
     let opts = LowerOptions {
@@ -26,7 +45,7 @@ pub fn compile_object(
     let module = lower_module(&ctx, air, &opts)?;
     optimize(&module, &tm)?;
     let buf = tm
-        .write_to_memory_buffer(&module, FileType::Object)
+        .write_to_memory_buffer(&module, file_type)
         .map_err(|e| anyhow::anyhow!("LLVM object emission failed: {e}"))?;
     let triple = tm.get_triple().as_str().to_string_lossy().into_owned();
     Ok((buf.as_slice().to_vec(), triple))

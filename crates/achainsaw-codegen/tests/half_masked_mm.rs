@@ -455,17 +455,36 @@ fn mm_operand(rng: &mut Rng, len: usize, dtype: Type) -> (Vec<u8>, Vec<f64>) {
 
 #[test]
 fn mm_matches_reference() {
+    check_mm(host_levels());
+}
+
+/// `mm` at the host's full ISA only (matrix engines and widest vectors): CI reruns this under
+/// QEMU at several SVE/SME vector lengths.
+#[test]
+fn mm_at_host_vector_length() {
+    let features = CpuFeatures::effective().unwrap();
+    let level = features.max_level().expect("host ISA level");
+    check_mm(vec![(level, features)]);
+}
+
+fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
     let shapes = [
         (1, 1, 1),
         (3, 5, 7),
         (4, 8, 16),
         (16, 16, 32),
         (7, 1, 33),
+        // Strip and tile edges for 128-2048-bit vectors, 16x16 AMX tiles and SME's ZA.
+        (5, 15, 9),
+        (17, 17, 31),
+        (3, 33, 64),
+        (2, 65, 3),
+        (33, 70, 67),
         (2, 9, 0),
         (0, 4, 4),
         (-1, 3, 3),
     ];
-    for (level, features) in host_levels() {
+    for (level, features) in levels {
         let engine = jit(MM, &features);
         for dtype in [Type::BF16, Type::F16, Type::F32, Type::I8] {
             let f: MmFn =
@@ -605,5 +624,89 @@ fn new_ops_compile_for_every_llvm_target() {
         let obj = compile_object(&module, &target, Backend::Llvm)
             .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
         assert!(!obj.bytes.is_empty());
+    }
+}
+
+/// Each target gets the `mm` kernel its hardware supports, visible in the assembly: AMX on
+/// Sapphire/Granite Rapids (AMX-FP16 only on Granite Rapids), SME outer products on SME
+/// targets, and vector FMAs elsewhere. AMX code cannot run on the CI hosts, so this (plus the
+/// LLVM verifier) is its only check.
+#[cfg(feature = "llvm")]
+#[test]
+fn mm_kernels_match_target_matrix_engines() {
+    use achainsaw_codegen::{compile_assembly, Backend};
+    let module = parse_and_validate(MM).unwrap();
+    /// (triple, cpu, features, instructions expected, instructions not expected)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+    let cases: &[Case] = &[
+        (
+            "x86_64-unknown-linux-gnu",
+            "sapphirerapids",
+            "",
+            &["ldtilecfg", "tdpbf16ps", "tdpbssd", "tilestored", "vfmadd"],
+            &["tdpfp16ps"],
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "graniterapids",
+            "",
+            &["tdpbf16ps", "tdpbssd", "tdpfp16ps"],
+            &[],
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "x86-64-v4",
+            "",
+            &["vfmadd", "zmm"],
+            &["tdpbf16ps"],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "generic",
+            "+sve,+sme",
+            &["smstart", "fmopa", "bfmopa", "smopa", "smstop"],
+            &[],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "neoverse-v2",
+            "",
+            &["whilelo"],
+            &["fmopa", "smstart"],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "generic",
+            "",
+            &["fmla"],
+            &["whilelo", "fmopa"],
+        ),
+    ];
+    for (triple, cpu, features, want, not_want) in cases {
+        let target = AotTarget {
+            triple: Some((*triple).into()),
+            cpu: Some((*cpu).into()),
+            features: (!features.is_empty()).then(|| (*features).into()),
+        };
+        let (asm, _) = compile_assembly(&module, &target, Backend::Llvm)
+            .unwrap_or_else(|e| panic!("{cpu} {features}: {e}"));
+        for w in *want {
+            assert!(
+                asm.contains(w),
+                "{cpu} {features}: expected `{w}` in assembly"
+            );
+        }
+        for w in *not_want {
+            assert!(
+                !asm.contains(w),
+                "{cpu} {features}: unexpected `{w}` in assembly"
+            );
+        }
     }
 }
