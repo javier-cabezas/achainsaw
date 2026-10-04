@@ -125,10 +125,12 @@ jobs:
           ACHAINSAW_BACKEND: llvm
 
       # Scalable vectors must work at every SVE vector length, not just the runner's
-      # 128 bits: rerun the vector tests under QEMU at 256, 512 and 2048 bits (also exercising
-      # SME detection, which `-cpu max` provides).
+      # 128 bits: rerun the vx tests (the code that depends on the length) under QEMU at 256,
+      # 512 and 2048 bits. Everything else already ran natively above; QEMU also emulates
+      # LLVM itself, so the full suites would take hours.
       - name: SVE vector-length sweep under QEMU
         if: runner.arch == 'ARM64'
+        timeout-minutes: 30
         run: |
           sudo apt-get install -y qemu-user
           cargo test -p achainsaw-codegen --features llvm --no-run
@@ -136,7 +138,7 @@ jobs:
             echo "::group::SVE vector length $((vl_bytes * 8)) bits"
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -cpu max,sve-default-vector-length=$vl_bytes" \
               cargo test -p achainsaw-codegen --features llvm \
-                --test vector_ops --test half_masked_mm --test sandbox --test backend_parity
+                --test vector_ops --test half_masked_mm -- at_host_vector_length
             echo "::endgroup::"
           done
         env:

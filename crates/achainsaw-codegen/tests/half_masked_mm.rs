@@ -243,10 +243,25 @@ fn bytes_of(w: Type, engine: &JitEngine) -> usize {
 
 #[test]
 fn masked_load_store_semantics() {
+    check_masked_semantics(&WIDTHS, host_levels());
+}
+
+/// `ldm`/`stm` on `vx` at the host's full ISA, including the guard-page check: what changes
+/// with the vector length (CI reruns it under QEMU at several SVE lengths).
+#[test]
+fn vx_masked_ops_at_host_vector_length() {
+    let features = CpuFeatures::effective().unwrap();
+    let level = features.max_level().expect("host ISA level");
+    check_masked_semantics(&[Type::Vx], vec![(level, features)]);
+    #[cfg(unix)]
+    check_masked_tail_page(&[Type::Vx]);
+}
+
+fn check_masked_semantics(widths: &[Type], levels: Vec<(IsaLevel, CpuFeatures)>) {
     let src = masked_module();
-    for (level, features) in host_levels() {
+    for (level, features) in levels {
         let engine = jit(&src, &features);
-        for w in WIDTHS {
+        for &w in widths {
             for l in LANES {
                 let width = bytes_of(w, &engine);
                 let s = l.byte_size();
@@ -298,6 +313,11 @@ fn masked_load_store_semantics() {
 #[cfg(unix)]
 #[test]
 fn masked_ops_never_touch_memory_past_the_tail() {
+    check_masked_tail_page(&WIDTHS);
+}
+
+#[cfg(unix)]
+fn check_masked_tail_page(widths: &[Type]) {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let base = unsafe {
         libc::mmap(
@@ -317,8 +337,8 @@ fn masked_ops_never_touch_memory_past_the_tail() {
         0
     );
 
-    let engine = jit(&masked_module(), &CpuFeatures::host());
-    for w in WIDTHS {
+    let engine = jit(&masked_module(), &CpuFeatures::effective().unwrap());
+    for &w in widths {
         for l in LANES {
             let s = l.byte_size();
             let width = bytes_of(w, &engine);

@@ -537,11 +537,26 @@ fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
 
 #[test]
 fn vector_ops_match_reference_at_every_isa_level() {
-    let kernels = all_kernels();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
     let levels = host_levels();
     assert!(!levels.is_empty());
+    check_against_reference(&all_kernels(), levels);
+}
 
+/// Only the `vx` kernels, at the host's full ISA: what changes with the vector length, and
+/// small enough to run under emulation (CI reruns it under QEMU at several SVE lengths).
+#[test]
+fn vx_ops_match_reference_at_host_vector_length() {
+    let kernels: Vec<Kernel> = all_kernels()
+        .into_iter()
+        .filter(|k| k.width() == Type::Vx)
+        .collect();
+    let features = CpuFeatures::effective().unwrap();
+    let level = features.max_level().expect("host ISA level");
+    check_against_reference(&kernels, vec![(level, features)]);
+}
+
+fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeatures)>) {
+    let module = parse_and_validate(&module_source(kernels)).expect("kernels validate");
     for (level, features) in levels {
         let mut engine = JitEngine::with_features(&features).expect("JIT init");
         engine
@@ -555,7 +570,7 @@ fn vector_ops_match_reference_at_every_isa_level() {
             )
         };
 
-        for k in &kernels {
+        for k in kernels {
             let f: KernelFn = unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
             let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
             for trial in 0..TRIALS {
