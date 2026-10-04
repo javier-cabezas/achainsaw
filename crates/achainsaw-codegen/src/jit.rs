@@ -116,6 +116,25 @@ pub fn check_execution_status() -> Result<()> {
     }
 }
 
+/// Charges `units` of fuel at once for bulk operations (`mm`). Same contract as
+/// `rt_check_fuel`: returns 1 and records `OutOfFuel` when the budget runs out.
+pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
+    FUEL_REMAINING.with(|f| {
+        let fuel = f.get();
+        if fuel < 0 {
+            return 0;
+        }
+        let remaining = fuel.saturating_sub(units.max(0));
+        if remaining <= 0 {
+            f.set(0);
+            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            return 1;
+        }
+        f.set(remaining);
+        0
+    })
+}
+
 pub extern "C" fn rt_check_fuel() -> i32 {
     FUEL_REMAINING.with(|f| {
         let fuel = f.get();
@@ -340,6 +359,7 @@ pub struct JitEngine {
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
     rt_check_fuel_id: FuncId,
+    rt_consume_fuel_id: FuncId,
     pub registry: Arc<RwLock<SymbolRegistry>>,
     pub fuel_enabled: bool,
     pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
@@ -375,6 +395,7 @@ impl JitEngine {
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
         jit_builder.symbol("rt_free", rt_free as *const u8);
         jit_builder.symbol("rt_check_fuel", rt_check_fuel as *const u8);
+        jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
         jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
             reg_lookup.read().unwrap().lookup(name)
         }));
@@ -395,6 +416,12 @@ impl JitEngine {
         let rt_check_fuel_id =
             module.declare_function("rt_check_fuel", Linkage::Import, &fuel_sig)?;
 
+        let mut consume_sig = module.make_signature();
+        consume_sig.params.push(AbiParam::new(types::I64));
+        consume_sig.returns.push(AbiParam::new(types::I32));
+        let rt_consume_fuel_id =
+            module.declare_function("rt_consume_fuel", Linkage::Import, &consume_sig)?;
+
         let ctx = module.make_context();
 
         Ok(Self {
@@ -404,6 +431,7 @@ impl JitEngine {
             rt_malloc_id,
             rt_free_id,
             rt_check_fuel_id,
+            rt_consume_fuel_id,
             registry,
             fuel_enabled: true,
             signatures: HashMap::new(),
@@ -493,6 +521,7 @@ impl JitEngine {
             } else {
                 None
             },
+            fuel_consume_func_id: self.fuel_enabled.then_some(self.rt_consume_fuel_id),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
         };

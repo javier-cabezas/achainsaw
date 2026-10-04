@@ -439,6 +439,37 @@ pub enum Instruction {
         lane: Type,
         span: Span,
     },
+    /// Tail-masked load: `v = ldm p:vx, n:f32` loads the first `min(max(n, 0), lanes)`
+    /// lanes and zeroes the rest. Memory past those lanes is never accessed.
+    MaskedLoad {
+        dst: String,
+        ptr: String,
+        count: String,
+        ty: Type,
+        lane: Type,
+        span: Span,
+    },
+    /// Tail-masked store: `stm p, v, n:f32` writes only the first `min(max(n, 0), lanes)` lanes.
+    MaskedStore {
+        ptr: String,
+        val: String,
+        count: String,
+        lane: Type,
+        span: Span,
+    },
+    /// Matrix multiply-accumulate `mm pc, pa, pb, m, n, k:bf16`:
+    /// `C[m x n] += A[m x k] * B[k x n]`, all row-major and contiguous. A and B hold
+    /// `dtype` elements; C is f32, or i32 when `dtype` is i8.
+    MatMul {
+        pc: String,
+        pa: String,
+        pb: String,
+        m: String,
+        n: String,
+        k: String,
+        dtype: Type,
+        span: Span,
+    },
 }
 
 impl Instruction {
@@ -459,9 +490,13 @@ impl Instruction {
             | Instruction::VFma { dst, .. }
             | Instruction::VCmp { dst, .. }
             | Instruction::VSelect { dst, .. }
-            | Instruction::VLen { dst, .. } => Some(dst),
+            | Instruction::VLen { dst, .. }
+            | Instruction::MaskedLoad { dst, .. } => Some(dst),
             Instruction::Call { dst, .. } => dst.as_deref(),
-            Instruction::Store { .. } | Instruction::Free { .. } => None,
+            Instruction::Store { .. }
+            | Instruction::Free { .. }
+            | Instruction::MaskedStore { .. }
+            | Instruction::MatMul { .. } => None,
         }
     }
 
@@ -494,6 +529,19 @@ impl Instruction {
                 ..
             }
             | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+            Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
+            Instruction::MaskedStore {
+                ptr, val, count, ..
+            } => vec![ptr, val, count],
+            Instruction::MatMul {
+                pc,
+                pa,
+                pb,
+                m,
+                n,
+                k,
+                ..
+            } => vec![pc, pa, pb, m, n, k],
         }
     }
 
@@ -526,6 +574,19 @@ impl Instruction {
                 ..
             }
             | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+            Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
+            Instruction::MaskedStore {
+                ptr, val, count, ..
+            } => vec![ptr, val, count],
+            Instruction::MatMul {
+                pc,
+                pa,
+                pb,
+                m,
+                n,
+                k,
+                ..
+            } => vec![pc, pa, pb, m, n, k],
         }
     }
 }

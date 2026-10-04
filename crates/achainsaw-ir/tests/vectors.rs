@@ -101,7 +101,10 @@ fn v2_text_and_airb_round_trip() {
     assert_eq!(to_air_text(&parse_and_validate(&text).unwrap()), text);
     // AIRB v2 preserves every new instruction.
     let bytes = encode_module(&module).unwrap();
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 2);
+    assert_eq!(
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        achainsaw_ir::binary::VERSION
+    );
     assert_eq!(to_air_text(&decode_module(&bytes).unwrap()), text);
     assert!(text.contains("w = splat __imm_0:v512"), "{text}");
     assert!(text.contains("n = vl f32"));
@@ -239,5 +242,179 @@ fn k(p:ptr, x:i32)
     assert!(
         parse_and_validate(&text).is_ok(),
         "optimized output re-validates:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// f16/bf16, ldm/stm, mm (AIRB v3)
+// ---------------------------------------------------------------------------------------
+
+const MASKED_HALF_MM: &str = r#"
+fn k(p:ptr, q:ptr, n:i64)
+  b0:
+    v = ldm p:vx, n:f32
+    w = ldm p:v512, 3:i64
+    stm q, v, n:f32
+    stm q, w, 5:i8
+    mm q, p, p, 4, n, 16:i64:bf16
+    mm q, p, p, n, n, n:i8
+    h = ld p:f16
+    f = fext h:f32
+    b = ftrunc f:bf16
+    st q, b
+    i = bitcast b:i16
+    g = bitcast i:f16
+    s = select n, g, h
+    st q, s
+    ret
+"#;
+
+#[test]
+fn masked_half_mm_syntax_round_trips() {
+    let module = parse_and_validate(MASKED_HALF_MM).unwrap();
+    let text = to_air_text(&module);
+    for expected in [
+        "v = ldm p:vx, n:f32",
+        "w = ldm p:v512, __imm_0:i64",
+        "stm q, v, n:f32",
+        "stm q, w, __imm_1:i8",
+        "mm q, p, p, __imm_2, n, __imm_3:bf16",
+        "mm q, p, p, n, n, n:i8",
+        "f = fext h:f32",
+        "b = ftrunc f:bf16",
+    ] {
+        assert!(text.contains(expected), "missing '{expected}' in:\n{text}");
+    }
+    assert_eq!(to_air_text(&parse_and_validate(&text).unwrap()), text);
+    let bytes = encode_module(&module).unwrap();
+    assert_eq!(to_air_text(&decode_module(&bytes).unwrap()), text);
+    // The literal counts became i64 immediates; `16:i64:bf16` kept its explicit type.
+    let consts: Vec<String> = text
+        .lines()
+        .filter(|l| l.contains("cst"))
+        .map(str::trim)
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        consts,
+        [
+            "__imm_0 = cst 3:i64",
+            "__imm_1 = cst 5:i64",
+            "__imm_2 = cst 4:i64",
+            "__imm_3 = cst 16:i64"
+        ]
+    );
+}
+
+#[test]
+fn ldm_stm_mm_remain_valid_register_names() {
+    let src =
+        "fn k(ldm:i32)->i32\n  b0:\n    stm = add ldm, ldm\n    mm = mul stm, ldm\n    ret mm\n";
+    assert!(parse_and_validate(src).is_ok());
+}
+
+#[test]
+fn masked_and_mm_type_rules() {
+    let with = |body: &str| format!("fn k(p:ptr, n:i64, c:i32, x:f32)\n  b0:\n{body}    ret\n");
+    assert_eq!(
+        err_code(&with("    v = ldm p:vx, c:f32\n    st p, v\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    v = ldm p:f32, n:f32\n    st p, v\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    v = ldm p:vx, n:bf16\n    st p, v\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&with("    v = ldm n:vx, n:f32\n    st p, v\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    stm p, x, n:f32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    v = ldm p:vx, n\n    st p, v\n")),
+        "ERR_EXPECTED_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&with("    mm p, p, p, n, n, n:i32\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&with("    mm p, p, p, c, n, n:f32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    mm p, n, p, n, n, n:f32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    mm p, p, p, n, n, n\n")),
+        "ERR_EXPECTED_LANE_TYPE"
+    );
+}
+
+#[test]
+fn half_types_are_storage_only() {
+    let with = |body: &str| format!("fn k(p:ptr)\n  b0:\n    h = ld p:f16\n{body}    ret\n");
+    assert!(parse_and_validate(&with(
+        "    f = fext h:f32\n    g = ftrunc f:f16\n    st p, g\n"
+    ))
+    .is_ok());
+    assert_eq!(
+        err_code(&with("    s = add h, h\n    st p, s\n")),
+        "ERR_INVALID_OP_FOR_TYPE"
+    );
+    assert_eq!(
+        err_code(&with("    s = lt h, h\n    st p, s\n")),
+        "ERR_INVALID_OP_FOR_TYPE"
+    );
+    assert_eq!(
+        err_code(&with("    s = neg h\n    st p, s\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    f = fext h:f64\n    st p, f\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    f = itof h:f32\n    st p, f\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&with("    v = splat h:v128\n    st p, v\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr)\n  b0:\n    c = cst 1.0:bf16\n    st p, c\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code("fn k(h:f16)\n  b0:\n    ret\n"),
+        "ERR_HALF_IN_SIGNATURE"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr)->bf16\n  b0:\n    h = ld p:bf16\n    ret h\n"),
+        "ERR_HALF_IN_SIGNATURE"
+    );
+    assert_eq!(
+        err_code("extfn e(h:f16)\nfn k()\n  b0:\n    ret\n"),
+        "ERR_HALF_IN_SIGNATURE"
+    );
+}
+
+#[test]
+fn masked_loads_and_mm_survive_dead_code_elimination() {
+    let src = "fn k(p:ptr, n:i64)\n  b0:\n    unused = ldm p:v256, n:f32\n    mm p, p, p, n, n, n:f32\n    ret\n";
+    let mut module = parse_and_validate(src).unwrap();
+    optimize_module(&mut module);
+    let text = to_air_text(&module);
+    assert!(
+        text.contains("unused = ldm") && text.contains("mm p, p, p"),
+        "{text}"
     );
 }

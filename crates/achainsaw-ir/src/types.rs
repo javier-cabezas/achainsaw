@@ -9,6 +9,10 @@ pub enum Type {
     I64,
     F32,
     F64,
+    /// IEEE 754 binary16. Storage-only: load, store, and convert with `fext`/`ftrunc`.
+    F16,
+    /// bfloat16 (the top 16 bits of an f32). Storage-only, like `f16`.
+    BF16,
     Ptr,
     /// 128-bit SIMD vector. Vectors are untyped bit containers; each vector op
     /// names the lane type it operates on (`vadd a, b:f32`).
@@ -34,6 +38,8 @@ impl Type {
             "i64" => Some(Type::I64),
             "f32" => Some(Type::F32),
             "f64" => Some(Type::F64),
+            "f16" => Some(Type::F16),
+            "bf16" => Some(Type::BF16),
             "ptr" => Some(Type::Ptr),
             "v128" => Some(Type::V128),
             "v256" => Some(Type::V256),
@@ -59,7 +65,7 @@ impl Type {
     pub fn bit_width(&self) -> Option<u32> {
         match self {
             Type::I8 => Some(8),
-            Type::I16 => Some(16),
+            Type::I16 | Type::F16 | Type::BF16 => Some(16),
             Type::I32 | Type::F32 => Some(32),
             Type::I64 | Type::F64 | Type::Ptr => Some(64),
             Type::V128 => Some(128),
@@ -76,6 +82,11 @@ impl Type {
             Type::Vx => (MIN_VX_BITS / 8) as usize,
             other => (other.bit_width().unwrap_or(0) / 8) as usize,
         }
+    }
+
+    /// 16-bit storage float types (`f16`, `bf16`).
+    pub fn is_half(&self) -> bool {
+        matches!(self, Type::F16 | Type::BF16)
     }
 
     pub fn is_vector(&self) -> bool {
@@ -139,6 +150,8 @@ impl Type {
             Type::I64 => "i64",
             Type::F32 => "f32",
             Type::F64 => "f64",
+            Type::F16 => "f16",
+            Type::BF16 => "bf16",
             Type::Ptr => "ptr",
             Type::V128 => "v128",
             Type::V256 => "v256",

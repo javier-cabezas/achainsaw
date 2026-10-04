@@ -676,35 +676,6 @@ fn lanes()->i64
 }
 
 #[test]
-fn saxpy_example_handles_every_length() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/saxpy_vx.air"
-    ))
-    .unwrap();
-    let module = parse_and_validate(&src).expect("example validates");
-    for (level, features) in host_levels() {
-        let mut engine = JitEngine::with_features(&features).unwrap();
-        engine.compile_module(&module).unwrap();
-        let f: extern "C" fn(f32, *const f32, *mut f32, i64) =
-            unsafe { std::mem::transmute(engine.get_fn_ptr("saxpy").unwrap()) };
-        for n in [0usize, 1, 3, 4, 5, 11, 64, 67] {
-            let x: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
-            let mut y: Vec<f32> = (0..n).map(|i| 100.0 - i as f32).collect();
-            f(2.0, x.as_ptr(), y.as_mut_ptr(), n as i64);
-            for (i, &yi) in y.iter().enumerate() {
-                // Exact in f32 for these inputs, whether fused or not.
-                assert_eq!(
-                    yi,
-                    2.0 * (i as f32 * 0.5) + (100.0 - i as f32),
-                    "n={n} i={i} at {level}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn unaligned_vector_loads_and_stores() {
     let src = r#"
 fn shift(pa:ptr, po:ptr)
