@@ -91,7 +91,7 @@ class TestChainsawPy(unittest.TestCase):
                 k = achainsaw.compile(f.read())
             a = np.arange(8, dtype=np.float32)
             b = np.ones(8, dtype=np.float32)
-            self.assertAlmostEqual(k.run("simd_dot", a, b, 2), 28.0, places=5)
+            self.assertAlmostEqual(k.run("simd_dot", a, b, 8), 28.0, places=5)
         finally:
             achainsaw.set_isa_cap(None)
         self.assertIsNone(achainsaw.get_isa_cap())
@@ -107,11 +107,11 @@ class TestChainsawPy(unittest.TestCase):
             code = f.read()
         k = achainsaw.compile(code)
 
-        # 2 vectors of 4xf32 (8 elements)
+        # 8 elements: two 4-lane vectors
         a = np.array([1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5], dtype=np.float32)
         b = np.array([2.0, 3.0, 4.0, 5.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float32)
 
-        res = k.run("simd_dot", a, b, 2)
+        res = k.run("simd_dot", a, b, 8)
         expected = float(np.dot(a, b))
         self.assertAlmostEqual(res, expected, places=5)
 

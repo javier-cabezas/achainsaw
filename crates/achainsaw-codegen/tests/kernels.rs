@@ -215,3 +215,86 @@ fn gemm_bf16_matches_reference() {
         }
     }
 }
+
+/// One decode step of DeepSeek V4 Pro's sparse MQA attention (FlashAttention-2 blocks over
+/// the selected KV entries, with a per-head sink), against an f64 reference on the same
+/// bf16 inputs. The kernel rounds the probabilities to bf16 before multiplying by V, as
+/// FlashAttention does, so each output may differ by about 2^-8 of its weighted magnitude.
+#[test]
+fn flash_attention_matches_reference() {
+    type Attn =
+        extern "C" fn(*const u16, *const u16, *const i32, *const f32, *mut f32, i64, i64, i64, f32);
+    let bf16 = |v: f32| ((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u16;
+    let val = |h: u16| f32::from_bits((h as u32) << 16) as f64;
+    // (heads, head dim, cache entries, selected entries, unused slots)
+    let shapes = [
+        (1, 8, 4, 1, 0),
+        (3, 40, 50, 17, 2),
+        (5, 17, 300, 130, 7),
+        // DeepSeek V4 Pro: 128 heads, 512-dim shared K=V entries, window 128 + top-1024.
+        (128, 512, 4096, 1152, 64),
+    ];
+    for (level, engine) in engines("flash_attention") {
+        let k: Attn = unsafe { std::mem::transmute(engine.get_fn_ptr("flash_attention").unwrap()) };
+        let mut rng = Rng(21);
+        for (h, d, cache, nk, unused) in shapes {
+            let q: Vec<u16> = rng.vec(h * d).into_iter().map(bf16).collect();
+            let kv: Vec<u16> = rng.vec(cache * d).into_iter().map(bf16).collect();
+            let sink: Vec<f32> = rng.vec(h);
+            let mut idx: Vec<i32> = (0..nk).map(|t| ((t * 7919 + 13) % cache) as i32).collect();
+            for u in 0..unused {
+                idx[(u * 37 + 5) % nk] = -1;
+            }
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut out = vec![0.0f32; h * d];
+            k(
+                q.as_ptr(),
+                kv.as_ptr(),
+                idx.as_ptr(),
+                sink.as_ptr(),
+                out.as_mut_ptr(),
+                h as i64,
+                d as i64,
+                nk as i64,
+                scale,
+            );
+
+            let valid: Vec<usize> = idx
+                .iter()
+                .filter(|&&i| i >= 0)
+                .map(|&i| i as usize)
+                .collect();
+            for r in 0..h {
+                let scores: Vec<f64> = valid
+                    .iter()
+                    .map(|&e| {
+                        let dot: f64 = (0..d).map(|c| val(q[r * d + c]) * val(kv[e * d + c])).sum();
+                        dot * scale as f64
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(-1e30f64, f64::max);
+                let p: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let den = p.iter().sum::<f64>() + (sink[r] as f64 - m).exp();
+                for c in 0..d {
+                    let num: f64 = valid
+                        .iter()
+                        .zip(&p)
+                        .map(|(&e, w)| w * val(kv[e * d + c]))
+                        .sum();
+                    let mag: f64 = valid
+                        .iter()
+                        .zip(&p)
+                        .map(|(&e, w)| w * val(kv[e * d + c]).abs())
+                        .sum();
+                    let want = num / den;
+                    let got = out[r * d + c] as f64;
+                    let tol = mag / den / 128.0 + 1e-6;
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "flash_attention h={h} d={d} nk={nk} out[{r},{c}] at {level}: got {got}, want {want}, tol {tol}"
+                    );
+                }
+            }
+        }
+    }
+}

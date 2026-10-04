@@ -220,13 +220,13 @@ achainsaw bench examples/fibonacci.air --iters 200
 AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. Every AIR construct round-trips through AIRB, and files carry a format version that decoders check:
 ```bash
 # Assemble text AIR to compact binary bytecode (.airb)
-achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
+achainsaw assemble examples/fibonacci.air -o examples/fibonacci.airb --json
 
 # Direct execution of pre-parsed binary bytecode
-achainsaw run examples/simd_vector_dot.airb --func simd_dot --args 1 --json
+achainsaw run examples/fibonacci.airb --func fib --args 30 --json
 
 # Disassemble binary bytecode back into canonical text AIR
-achainsaw disassemble examples/simd_vector_dot.airb
+achainsaw disassemble examples/fibonacci.airb
 ```
 
 ### 6. Model Context Protocol (MCP) Server (`achainsaw mcp`)
@@ -372,6 +372,7 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
 | `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
 | `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
+| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). FlashAttention-2 blocks of 64 entries, with both products on `mm` |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
 
@@ -626,12 +627,17 @@ achainsaw/
 │   ├── achainsaw-codegen/      # Cranelift JIT engine & AOT native object / DLL compiler
 │   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
-├── examples/
-│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV, GEMM (bf16)
+├── examples/                   # Each .air has matching .airb bytecode
+│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, bf16 GEMM, flash attention
+│   ├── fibonacci.air           # Iterative Fibonacci (branches, block parameters)
 │   ├── sum_loop.air            # Iterative accumulator loop
-│   ├── fibonacci.air           # Branching Fibonacci kernel
-│   ├── simd_vector_dot.air     # 128-bit SIMD hardware dot product kernel
-│   └── ffi_math_intrinsics.air # FFI and C standard math intrinsics kernel
+│   ├── dot_product.air         # Scalar dot product with pointer arithmetic
+│   ├── simd_vector_dot.air     # Fixed-width 128-bit SIMD dot product (v128, vfma, vsum)
+│   ├── saxpy_vx.air            # Vector-length-agnostic SAXPY (vx, vl, masked tails)
+│   ├── ffi_math_intrinsics.air # Calling C math functions via extfn
+│   ├── opt_demo.air            # Input for `achainsaw opt`
+│   ├── infinite_loop.air       # Stopped by the fuel budget (ERR_OUT_OF_FUEL)
+│   └── py_numpy_simd.py        # Calling a kernel on NumPy arrays from Python
 ├── benchmarks/
 │   └── benchmark_kernels.py    # 5,000-iteration BLAS benchmark and verification suite
 ├── tests/
