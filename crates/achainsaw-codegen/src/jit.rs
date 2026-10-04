@@ -441,14 +441,22 @@ impl ParRegion {
         if want <= 0 || self.abort.load(Ordering::Relaxed) {
             return 0;
         }
-        let mut got = 0;
-        let _ = self
-            .fuel
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                got = left.min(want).max(0);
-                (got > 0).then_some(left - got)
-            });
-        got
+        let mut left = self.fuel.load(Ordering::Acquire);
+        loop {
+            let got = left.min(want).max(0);
+            if got == 0 {
+                return 0;
+            }
+            match self.fuel.compare_exchange_weak(
+                left,
+                left - got,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return got,
+                Err(now) => left = now,
+            }
+        }
     }
 
     /// Records the first failure and stops every worker.
@@ -720,12 +728,7 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
 fn reserve_allocated(size: usize, quota: usize) -> bool {
     let fits = |cur: usize| quota == 0 || cur.saturating_add(size) <= quota;
     if let Some(region) = active_region() {
-        return region
-            .allocated
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                fits(cur).then(|| cur + size)
-            })
-            .is_ok();
+        return update_usize(&region.allocated, |cur| fits(cur).then(|| cur + size));
     }
     MEMORY_ALLOCATED.with(|m| {
         let cur = m.get();
@@ -739,14 +742,24 @@ fn reserve_allocated(size: usize, quota: usize) -> bool {
 
 fn release_allocated(size: usize) {
     if let Some(region) = active_region() {
-        let _ = region
-            .allocated
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(size))
-            });
+        update_usize(&region.allocated, |cur| Some(cur.saturating_sub(size)));
         return;
     }
     MEMORY_ALLOCATED.with(|m| m.set(m.get().saturating_sub(size)));
+}
+
+/// Replaces `a` with `f(a)` atomically; false (and no change) when `f` returns `None`.
+fn update_usize(a: &AtomicUsize, f: impl Fn(usize) -> Option<usize>) -> bool {
+    let mut cur = a.load(Ordering::Acquire);
+    loop {
+        let Some(new) = f(cur) else {
+            return false;
+        };
+        match a.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
 }
 
 fn memory_quota() -> usize {

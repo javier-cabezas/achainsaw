@@ -451,11 +451,15 @@ fn squares(out:ptr, n:i64, scale:f32)
         """Host callbacks run on `par` workers while the caller has released the GIL."""
         import ctypes
         import threading
+        import time
         cb_ty = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)
         threads_seen = set()
 
         def triple(x):
             threads_seen.add(threading.get_ident())
+            # Sleeping releases the GIL, so callbacks on other workers overlap, and the
+            # calling thread cannot finish every index before the helpers join.
+            time.sleep(0.002)
             return 3 * x
 
         cb = cb_ty(triple)
@@ -466,9 +470,14 @@ fn squares(out:ptr, n:i64, scale:f32)
             "    off = mul i, 8:i64\n    q = add out, off\n    st q, v\n    ret\n"
             "fn run(out:ptr, n:i64)\n  b0:\n    par n, body(out)\n    ret\n"
         )
-        out = np.zeros(256, dtype=np.int64)
-        kernel.run("run", out, 256)
-        np.testing.assert_array_equal(out, 3 * np.arange(256, dtype=np.int64))
+        # A `par` runs serially while another thread's `par` has the pool, so retry.
+        for _ in range(5):
+            threads_seen.clear()
+            out = np.zeros(64, dtype=np.int64)
+            kernel.run("run", out, 64)
+            np.testing.assert_array_equal(out, 3 * np.arange(64, dtype=np.int64))
+            if len(threads_seen) > 1:
+                break
         if kernel.threads > 1:
             self.assertGreater(len(threads_seen), 1)
 
