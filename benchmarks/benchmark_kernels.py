@@ -1,16 +1,26 @@
 """
-Chainsaw-BLAS: High-Performance Agent AI Kernel Library Benchmark & Verification.
-Benchmarks 128-bit SIMD AIR kernels against NumPy and pure Python:
-1. Cosine Similarity (Embedding search & RAG retrieval)
-2. Euclidean Distance (L2 Nearest Neighbor search)
-3. Numerically Stable Softmax (Attention head weighting)
-4. RMSNorm (Transformer token normalization for LLaMA/Mistral/Gemma)
-5. GEMV (Matrix-Vector linear projection)
+Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/.
+
+Every kernel is checked against NumPy, then timed on each available code generation
+backend (Cranelift, and LLVM when the build has it) and, with --isa all, at every ISA
+level this machine reaches (for example sse, avx, avx2 and avx512 on an AVX-512 host).
+The kernels are vector-length agnostic, so the same source runs 128-bit vectors on
+Cranelift and up to 512-bit (or SVE-scalable) vectors on LLVM.
+
+    python benchmarks/benchmark_kernels.py                  # host ISA, all backends
+    python benchmarks/benchmark_kernels.py --isa all        # sweep ISA levels too
+    python benchmarks/benchmark_kernels.py --quick          # short run (CI)
+    python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
+
+Exits non-zero if any kernel disagrees with NumPy.
 """
 
+import argparse
+import json
 import os
 import sys
 import time
+
 import numpy as np
 
 # Ensure achainsaw module is accessible
@@ -19,166 +29,216 @@ import achainsaw
 
 KERNELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels"))
 
+ISA_ORDER = {
+    "x86_64": ["sse", "avx", "avx2", "avx512", "amx"],
+    "aarch64": ["neon", "sve", "sve2", "sme"],
+}
 
-def benchmark_op(func, iters=5000):
-    # Warmup
-    for _ in range(50):
+
+def source(name):
+    with open(os.path.join(KERNELS_DIR, name + ".air"), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def bf16_bits(x):
+    """Round f32 values to bfloat16 (nearest-even) and return the raw u16 bits."""
+    b = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+def bf16_values(bits):
+    return (bits.astype(np.uint32) << 16).view(np.float32)
+
+
+def time_call(func, budget_s, min_iters=5):
+    """Average seconds per call, running for about `budget_s` after a short warm-up."""
+    for _ in range(3):
         func()
-    t0 = time.perf_counter()
-    for _ in range(iters):
+    iters, t0 = 0, time.perf_counter()
+    while True:
         func()
-    t1 = time.perf_counter()
-    total_sec = t1 - t0
-    avg_us = (total_sec / iters) * 1e6
-    ops_sec = iters / total_sec
-    return avg_us, ops_sec
+        iters += 1
+        elapsed = time.perf_counter() - t0
+        if iters >= min_iters and elapsed >= budget_s:
+            return elapsed / iters
 
 
-def run_benchmarks():
-    print("=" * 80)
-    print("CHAINSAW-BLAS: HIGH-PERFORMANCE AGENT AI KERNEL BENCHMARKS")
-    print("=" * 80)
+def make_cases():
+    """Each case: name, label, kernel source, args builder, verify(kernel) -> max error,
+    tolerance, NumPy baseline, and the work per call (for GFLOP/s)."""
+    rng = np.random.default_rng(42)
+    cases = []
 
-    # -------------------------------------------------------------------------
-    # 1. Cosine Similarity
-    # -------------------------------------------------------------------------
-    cos_path = os.path.join(KERNELS_DIR, "cosine_similarity.air")
-    with open(cos_path, "r", encoding="utf-8") as f:
-        cos_source = f.read()
+    dim = 1024  # embedding size of common text-embedding models
+    a = rng.standard_normal(dim).astype(np.float32)
+    b = rng.standard_normal(dim).astype(np.float32)
+    cos_ref = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+    cases.append(dict(
+        name="cosine_similarity", label=f"Cosine similarity (n={dim})",
+        run=lambda k: k(a, b, dim),
+        verify=lambda k: abs(k(a, b, dim) - cos_ref), tol=1e-5,
+        numpy=lambda: np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12),
+        flops=6 * dim,
+    ))
 
-    cos_kernel = achainsaw.compile(cos_source)
-    dim = 1024  # 1024-dim embedding (standard for OpenAI text-embedding-3 / Voyage)
-    vecs = dim // 4
+    l2_ref = float(np.linalg.norm(a - b))
+    cases.append(dict(
+        name="euclidean_distance", label=f"Euclidean distance (n={dim})",
+        run=lambda k: k(a, b, dim),
+        verify=lambda k: abs(k(a, b, dim) - l2_ref) / l2_ref, tol=1e-5,
+        numpy=lambda: np.linalg.norm(a - b),
+        flops=3 * dim,
+    ))
 
-    np.random.seed(42)
-    a = np.random.randn(dim).astype(np.float32)
-    b = np.random.randn(dim).astype(np.float32)
+    sm_n = 1000
+    x_sm = (rng.standard_normal(sm_n) * 4.0).astype(np.float32)
+    out_sm = np.zeros(sm_n, dtype=np.float32)
+    e = np.exp(x_sm.astype(np.float64) - x_sm.max())
+    sm_ref = e / e.sum()
 
-    # Verification
-    air_cos = cos_kernel(a, b, vecs)
-    np_cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
-    err_cos = abs(air_cos - np_cos)
-    assert err_cos < 1e-4, f"Cosine similarity mismatch: AIR={air_cos} vs NP={np_cos}"
+    def verify_softmax(k):
+        k(x_sm, out_sm, sm_n)
+        return float(np.max(np.abs(out_sm - sm_ref)))
 
-    us_cos_air, ops_cos_air = benchmark_op(lambda: cos_kernel(a, b, vecs))
-    us_cos_np, ops_cos_np = benchmark_op(lambda: np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+    def np_softmax():
+        z = np.exp(x_sm - x_sm.max())
+        return z / z.sum()
 
-    print(f"\n[1] Cosine Similarity (dim={dim}):")
-    print(f"    Verification: Max Error = {err_cos:.2e} [PASS]")
-    print(f"    achainsaw (SIMD JIT): {us_cos_air:6.2f} µs | {ops_cos_air:10,.0f} ops/sec")
-    print(f"    NumPy (Standard):     {us_cos_np:6.2f} µs | {ops_cos_np:10,.0f} ops/sec")
-    print(f"    Speedup vs NumPy:     {us_cos_np / us_cos_air:6.2f}x")
+    cases.append(dict(
+        name="softmax", label=f"Softmax (n={sm_n})",
+        run=lambda k: k(x_sm, out_sm, sm_n),
+        verify=verify_softmax, tol=1e-6, numpy=np_softmax, flops=4 * sm_n,
+    ))
 
-    # -------------------------------------------------------------------------
-    # 2. Euclidean Distance (L2)
-    # -------------------------------------------------------------------------
-    l2_path = os.path.join(KERNELS_DIR, "euclidean_distance.air")
-    with open(l2_path, "r", encoding="utf-8") as f:
-        l2_source = f.read()
+    rms_n = 4096
+    x_r = rng.standard_normal(rms_n).astype(np.float32)
+    w_r = rng.uniform(0.8, 1.2, rms_n).astype(np.float32)
+    out_r = np.zeros(rms_n, dtype=np.float32)
+    xd = x_r.astype(np.float64)
+    rms_ref = xd / np.sqrt(np.mean(xd * xd) + 1e-6) * w_r
 
-    l2_kernel = achainsaw.compile(l2_source)
-    air_l2 = l2_kernel(a, b, vecs)
-    np_l2 = float(np.linalg.norm(a - b))
-    err_l2 = abs(air_l2 - np_l2)
-    assert err_l2 < 1e-4, f"L2 distance mismatch: AIR={air_l2} vs NP={np_l2}"
+    def verify_rms(k):
+        k(x_r, w_r, out_r, rms_n)
+        return float(np.max(np.abs(out_r - rms_ref)))
 
-    us_l2_air, ops_l2_air = benchmark_op(lambda: l2_kernel(a, b, vecs))
-    us_l2_np, ops_l2_np = benchmark_op(lambda: np.linalg.norm(a - b))
+    cases.append(dict(
+        name="rmsnorm", label=f"RMSNorm (n={rms_n})",
+        run=lambda k: k(x_r, w_r, out_r, rms_n),
+        verify=verify_rms, tol=1e-5,
+        numpy=lambda: x_r / np.sqrt(np.mean(x_r * x_r) + 1e-6) * w_r,
+        flops=4 * rms_n,
+    ))
 
-    print(f"\n[2] Euclidean Distance L2 (dim={dim}):")
-    print(f"    Verification: Max Error = {err_l2:.2e} [PASS]")
-    print(f"    achainsaw (SIMD JIT): {us_l2_air:6.2f} µs | {ops_l2_air:10,.0f} ops/sec")
-    print(f"    NumPy (Standard):     {us_l2_np:6.2f} µs | {ops_l2_np:10,.0f} ops/sec")
-    print(f"    Speedup vs NumPy:     {us_l2_np / us_l2_air:6.2f}x")
+    gm, gk = 512, 1024
+    A = rng.standard_normal((gm, gk)).astype(np.float32)
+    xg = rng.standard_normal(gk).astype(np.float32)
+    yg = np.zeros(gm, dtype=np.float32)
+    gemv_ref = A.astype(np.float64) @ xg.astype(np.float64)
 
-    # -------------------------------------------------------------------------
-    # 3. Softmax
-    # -------------------------------------------------------------------------
-    sm_path = os.path.join(KERNELS_DIR, "softmax.air")
-    with open(sm_path, "r", encoding="utf-8") as f:
-        sm_source = f.read()
+    def verify_gemv(k):
+        k(A, xg, yg, gm, gk)
+        return float(np.max(np.abs(yg - gemv_ref)) / np.max(np.abs(gemv_ref)))
 
-    sm_kernel = achainsaw.compile(sm_source)
-    sm_dim = 256  # 256-token attention sequence
-    x_sm = np.random.randn(sm_dim).astype(np.float32)
-    out_air_sm = np.zeros(sm_dim, dtype=np.float32)
+    cases.append(dict(
+        name="gemv_f32", label=f"GEMV f32 ({gm}x{gk})",
+        run=lambda k: k(A, xg, yg, gm, gk),
+        verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
+    ))
 
-    sm_kernel(x_sm, out_air_sm, sm_dim)
-    shift_x = x_sm - np.max(x_sm)
-    np_sm = np.exp(shift_x) / np.sum(np.exp(shift_x))
-    err_sm = float(np.max(np.abs(out_air_sm - np_sm)))
-    assert err_sm < 1e-4, f"Softmax mismatch: max error = {err_sm}"
+    n = 256
+    Ab = bf16_bits(rng.standard_normal((n, n)))
+    Bb = bf16_bits(rng.standard_normal((n, n)))
+    Af, Bf = bf16_values(Ab), bf16_values(Bb)
+    C = np.zeros((n, n), dtype=np.float32)
+    gemm_ref = Af.astype(np.float64) @ Bf.astype(np.float64)
 
-    us_sm_air, ops_sm_air = benchmark_op(lambda: sm_kernel(x_sm, out_air_sm, sm_dim))
-    us_sm_np, ops_sm_np = benchmark_op(lambda: np.exp(x_sm - np.max(x_sm)) / np.sum(np.exp(x_sm - np.max(x_sm))))
+    def verify_gemm(k):
+        C[:] = 0.0
+        k(C, Ab, Bb, n, n, n)
+        return float(np.max(np.abs(C - gemm_ref)) / np.max(np.abs(gemm_ref)))
 
-    print(f"\n[3] Softmax (tokens={sm_dim}):")
-    print(f"    Verification: Max Error = {err_sm:.2e} [PASS]")
-    print(f"    achainsaw (JIT):      {us_sm_air:6.2f} µs | {ops_sm_air:10,.0f} ops/sec")
-    print(f"    NumPy (Standard):     {us_sm_np:6.2f} µs | {ops_sm_np:10,.0f} ops/sec")
-    print(f"    Speedup vs NumPy:     {us_sm_np / us_sm_air:6.2f}x")
+    cases.append(dict(
+        name="gemm_bf16", label=f"GEMM bf16->f32 ({n}x{n}x{n})",
+        run=lambda k: k(C, Ab, Bb, n, n, n),
+        verify=verify_gemm, tol=1e-4,
+        # NumPy has no bf16 matmul; compare with its f32 matmul on the same values.
+        numpy=lambda: Af @ Bf, flops=2 * n * n * n,
+    ))
+    return cases
 
-    # -------------------------------------------------------------------------
-    # 4. RMSNorm
-    # -------------------------------------------------------------------------
-    rms_path = os.path.join(KERNELS_DIR, "rmsnorm.air")
-    with open(rms_path, "r", encoding="utf-8") as f:
-        rms_source = f.read()
 
-    rms_kernel = achainsaw.compile(rms_source)
-    rms_dim = 1024
-    rms_vecs = rms_dim // 4
-    x_rms = np.random.randn(rms_dim).astype(np.float32)
-    w_rms = np.random.uniform(0.8, 1.2, size=rms_dim).astype(np.float32)
-    out_air_rms = np.zeros(rms_dim, dtype=np.float32)
+def isa_levels(mode):
+    report = achainsaw.cpu_features()
+    host = report["host"]
+    order = ISA_ORDER.get(host["arch"], [])
+    top = host.get("max_isa")
+    if mode == "host" or top not in order:
+        return [None]
+    if mode == "all":
+        return order[: order.index(top) + 1]
+    return [level.strip() for level in mode.split(",")]
 
-    rms_kernel(x_rms, w_rms, out_air_rms, rms_vecs, float(1.0 / rms_dim))
-    np_rms = (x_rms / np.sqrt(np.mean(x_rms**2) + 1e-6)) * w_rms
-    err_rms = float(np.max(np.abs(out_air_rms - np_rms)))
-    assert err_rms < 1e-4, f"RMSNorm mismatch: max error = {err_rms}"
 
-    us_rms_air, ops_rms_air = benchmark_op(lambda: rms_kernel(x_rms, w_rms, out_air_rms, rms_vecs, float(1.0 / rms_dim)))
-    us_rms_np, ops_rms_np = benchmark_op(lambda: (x_rms / np.sqrt(np.mean(x_rms**2) + 1e-6)) * w_rms)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--backends", default="all",
+                        help="comma-separated backends, or 'all' available (default)")
+    parser.add_argument("--isa", default="host",
+                        help="'host' (default), 'all' reachable levels, or a comma list")
+    parser.add_argument("--quick", action="store_true", help="short timing runs (CI)")
+    parser.add_argument("--json", metavar="PATH", help="also write results as JSON")
+    args = parser.parse_args()
 
-    print(f"\n[4] RMSNorm (dim={rms_dim}):")
-    print(f"    Verification: Max Error = {err_rms:.2e} [PASS]")
-    print(f"    achainsaw (SIMD JIT): {us_rms_air:6.2f} µs | {ops_rms_air:10,.0f} ops/sec")
-    print(f"    NumPy (Standard):     {us_rms_np:6.2f} µs | {ops_rms_np:10,.0f} ops/sec")
-    print(f"    Speedup vs NumPy:     {us_rms_np / us_rms_air:6.2f}x")
+    available = achainsaw.available_backends()
+    backends = available if args.backends == "all" else args.backends.split(",")
+    levels = isa_levels(args.isa)
+    budget = 0.02 if args.quick else 0.3
+    cases = make_cases()
+    original_cap = achainsaw.get_isa_cap()
 
-    # -------------------------------------------------------------------------
-    # 5. GEMV (Matrix-Vector Multiplication)
-    # -------------------------------------------------------------------------
-    gemv_path = os.path.join(KERNELS_DIR, "gemv_f32.air")
-    with open(gemv_path, "r", encoding="utf-8") as f:
-        gemv_source = f.read()
+    print("=" * 96)
+    print("CHAINSAW-BLAS KERNEL BENCHMARKS")
+    print(f"backends: {', '.join(backends)}  |  ISA levels: "
+          f"{', '.join(l or 'host' for l in levels)}  |  host: "
+          f"{achainsaw.cpu_features()['host']['max_isa']}")
+    print("=" * 96)
 
-    gemv_kernel = achainsaw.compile(gemv_source)
-    M = 128
-    K = 512
-    k_vecs = K // 4
-    A = np.random.randn(M, K).astype(np.float32)
-    x_gemv = np.random.randn(K).astype(np.float32)
-    y_air = np.zeros(M, dtype=np.float32)
+    results, failures = [], []
+    configs = [(b, l) for b in backends for l in levels]
+    for case in cases:
+        src = source(case["name"])
+        np_s = time_call(case["numpy"], budget)
+        row = dict(kernel=case["name"], label=case["label"], numpy_us=np_s * 1e6, runs=[])
+        print(f"\n{case['label']}")
+        print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  {case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
+        for backend, level in configs:
+            achainsaw.set_isa_cap(level)
+            kernel = achainsaw.compile(src, backend=backend)
+            err = case["verify"](kernel)
+            ok = err <= case["tol"]
+            if not ok:
+                failures.append(f"{case['name']} on {backend}/{level or 'host'}: error {err:.2e}")
+            secs = time_call(lambda: case["run"](kernel), budget)
+            tag = f"{backend}@{level or 'host'}"
+            print(f"    {tag:<22} {secs * 1e6:10.2f} us  {case['flops'] / secs / 1e9:8.2f} GFLOP/s"
+                  f"  {np_s / secs:6.2f}x NumPy  err {err:.1e} {'PASS' if ok else 'FAIL'}")
+            row["runs"].append(dict(backend=backend, isa=level or "host", us=secs * 1e6,
+                                    gflops=case["flops"] / secs / 1e9, error=err, ok=ok))
+        results.append(row)
+    achainsaw.set_isa_cap(original_cap)
 
-    gemv_kernel(A, x_gemv, y_air, M, k_vecs)
-    np_gemv = np.dot(A, x_gemv)
-    err_gemv = float(np.max(np.abs(y_air - np_gemv)))
-    assert err_gemv < 1e-3, f"GEMV mismatch: max error = {err_gemv}"
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(dict(backends=backends, isa_levels=[l or "host" for l in levels],
+                           cpu=achainsaw.cpu_features(), results=results), f, indent=2)
 
-    us_gemv_air, ops_gemv_air = benchmark_op(lambda: gemv_kernel(A, x_gemv, y_air, M, k_vecs))
-    us_gemv_np, ops_gemv_np = benchmark_op(lambda: np.dot(A, x_gemv))
-
-    print(f"\n[5] GEMV (M={M}, K={K}):")
-    print(f"    Verification: Max Error = {err_gemv:.2e} [PASS]")
-    print(f"    achainsaw (SIMD JIT): {us_gemv_air:6.2f} µs | {ops_gemv_air:10,.0f} ops/sec")
-    print(f"    NumPy (Standard):     {us_gemv_np:6.2f} µs | {ops_gemv_np:10,.0f} ops/sec")
-    print(f"    Speedup vs NumPy:     {us_gemv_np / us_gemv_air:6.2f}x")
-
-    print("\n" + "=" * 80)
-    print("[SUCCESS] ALL 5 KERNELS PASSED NUMERICAL VERIFICATION & BENCHMARKS!")
-    print("=" * 80)
+    print("\n" + "=" * 96)
+    if failures:
+        print("[FAIL] " + "; ".join(failures))
+        sys.exit(1)
+    print(f"[SUCCESS] ALL {len(cases)} KERNELS PASSED NUMERICAL VERIFICATION "
+          f"ON {len(configs)} BACKEND/ISA CONFIGURATIONS")
 
 
 if __name__ == "__main__":
-    run_benchmarks()
+    main()

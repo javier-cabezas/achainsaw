@@ -1,0 +1,47 @@
+# Root-Mean-Square Normalization (RMSNorm) Kernel (128-bit SIMD, Modernized Phase 4)
+# Computes: y_i = (x_i / sqrt(mean(x^2) + eps)) * w_i
+# Used in modern LLM architectures (LLaMA, Mistral, Gemma)
+fn rmsnorm(p_x:ptr, p_w:ptr, p_out:ptr, n_vecs:i64, inv_n:f32)->f32
+  b0:
+    zero_f = cst 0.0:f32
+    vacc_sq = splat zero_f
+    jmp b_sum_loop(0:i64, vacc_sq)
+  b_sum_loop(i:i64, acc_sq:v128):
+    cond_sum = lt i, n_vecs
+    br cond_sum, b_sum_body, b_sum_done
+  b_sum_body:
+    off_i = mul i, 16:i64
+    px_i = add p_x, off_i
+    vx_i = ld px_i:v128
+    vsq_i = vfmul vx_i, vx_i
+    next_acc = vfadd acc_sq, vsq_i
+    next_i = add i, 1:i64
+    jmp b_sum_loop(next_i, next_acc)
+  b_sum_done:
+    sum_sq = vfsum acc_sq:f32
+
+    # Calculate RMS scale
+    mean_sq = mul sum_sq, inv_n
+    mean_eps = add mean_sq, 0.000001:f32
+    rms = sqrt mean_eps
+    inv_rms = div 1.0:f32, rms
+    vinv_rms = splat inv_rms
+
+    jmp b_norm_loop(0:i64, vinv_rms, inv_rms)
+  b_norm_loop(j:i64, v_scale:v128, final_inv_rms:f32):
+    cond_norm = lt j, n_vecs
+    br cond_norm, b_norm_body, b_norm_done(final_inv_rms)
+  b_norm_body:
+    off_j = mul j, 16:i64
+    px_j = add p_x, off_j
+    pw_j = add p_w, off_j
+    pout_j = add p_out, off_j
+    vx_j = ld px_j:v128
+    vw_j = ld pw_j:v128
+    vnorm = vfmul vx_j, v_scale
+    vy = vfmul vnorm, vw_j
+    st pout_j, vy
+    next_j = add j, 1:i64
+    jmp b_norm_loop(next_j, v_scale, final_inv_rms)
+  b_norm_done(res_inv_rms:f32):
+    ret res_inv_rms

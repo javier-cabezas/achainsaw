@@ -1,39 +1,39 @@
-# Matrix-Vector Multiplication (GEMV) Kernel (128-bit SIMD, Modernized Phase 4)
-# Computes: y = A * x where A is M x (4 * k_vecs) row-major matrix
-fn gemv(p_a:ptr, p_x:ptr, p_y:ptr, m:i64, k_vecs:i64)->i64
+# Matrix-vector product y = A x for a row-major m x k f32 matrix A.
+# Each row is a vector-length-agnostic dot product with a masked load for the final
+# partial vector.
+fn gemv(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
-    jmp b_row_loop(0:i64)
-  b_row_loop(i:i64):
-    cond_row = lt i, m
-    br cond_row, b_row_init, b_row_done
-  b_row_init:
-    row_bytes = mul k_vecs, 16:i64
-    row_offset = mul i, row_bytes
-    zero_f = cst 0.0:f32
-    vdot = splat zero_f
-    jmp b_col_loop(0:i64, vdot, row_offset, i)
-  b_col_loop(j:i64, acc:v128, r_off:i64, cur_i:i64):
-    cond_col = lt j, k_vecs
-    br cond_col, b_col_body, b_col_done(acc, cur_i)
-  b_col_body:
-    col_off = mul j, 16:i64
-    a_elem_off = add r_off, col_off
-    p_a_cur = add p_a, a_elem_off
-    p_x_cur = add p_x, col_off
-    va = ld p_a_cur:v128
-    vx = ld p_x_cur:v128
-    vprod = vfmul va, vx
-    next_acc = vfadd acc, vprod
-    next_j = add j, 1:i64
-    jmp b_col_loop(next_j, next_acc, r_off, cur_i)
-  b_col_done(final_acc:v128, done_i:i64):
-    row_sum = vfsum final_acc:f32
-
-    y_off = mul done_i, 4:i64
-    p_y_cur = add p_y, y_off
-    st p_y_cur, row_sum
-
-    next_i = add done_i, 1:i64
-    jmp b_row_loop(next_i)
-  b_row_done:
-    ret m
+    z = cst 0.0:f32
+    zero = splat z:vx
+    w = vl f32
+    row_bytes = mul k, 4:i64
+    jmp rows(0:i64)
+  rows(i:i64):
+    more_i = lt i, m
+    br more_i, row_init, done
+  row_init:
+    row_off = mul i, row_bytes
+    prow = add a, row_off
+    jmp cols(0:i64, zero)
+  cols(j:i64, acc:vx):
+    more_j = lt j, k
+    br more_j, cols_body, row_done
+  cols_body:
+    rest = sub k, j
+    off = mul j, 4:i64
+    pa = add prow, off
+    px = add x, off
+    va = ldm pa:vx, rest:f32
+    vx0 = ldm px:vx, rest:f32
+    acc2 = vfma va, vx0, acc:f32
+    j2 = add j, w
+    jmp cols(j2, acc2)
+  row_done:
+    s = vsum acc:f32
+    yoff = mul i, 4:i64
+    py = add y, yoff
+    st py, s
+    i2 = add i, 1:i64
+    jmp rows(i2)
+  done:
+    ret
