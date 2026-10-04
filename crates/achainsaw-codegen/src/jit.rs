@@ -1185,7 +1185,7 @@ impl JitEngine {
         }
     }
 
-    // High-level runner helpers for convenience and backwards-compatibility
+    // Typed convenience wrappers around `call_typed`
     pub unsafe fn run_i32_to_i32(&self, name: &str, arg: i32) -> Result<i32> {
         match self.call_typed(name, &[RtValue::I32(arg)])? {
             Some(RtValue::I32(v)) => Ok(v),

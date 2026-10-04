@@ -543,21 +543,6 @@ impl<'a> Parser<'a> {
                 span,
             });
         }
-        if let Some((op, lane)) = VBinOp::from_legacy(name) {
-            // Pre-v2 syntax carries no lane suffix: `vfadd a, b`.
-            let lhs = self.parse_operand(instructions, None)?;
-            self.expect(TokenKind::Comma)?;
-            let rhs = self.parse_operand(instructions, None)?;
-            self.expect_eol()?;
-            return Ok(Instruction::VBinary {
-                op,
-                dst,
-                lhs,
-                rhs,
-                lane,
-                span,
-            });
-        }
         if name == "vsel" {
             let mask = self.parse_operand(instructions, None)?;
             self.expect(TokenKind::Comma)?;
@@ -768,13 +753,16 @@ impl<'a> Parser<'a> {
             TokenKind::Splat => {
                 self.advance();
                 let src = self.parse_operand(instructions, None)?;
-                // Optional vector width: `splat x:v256`; plain `splat x` is v128.
-                let ty = if self.peek_kind() == &TokenKind::Colon {
-                    self.advance();
-                    self.parse_type()?
-                } else {
-                    Type::V128
-                };
+                // The vector type is required: `splat x:v128`, `splat x:vx`.
+                if self.peek_kind() != &TokenKind::Colon {
+                    return Err(Diagnostic::error(
+                        "ERR_EXPECTED_TYPE",
+                        "splat needs its vector type, e.g. `v = splat x:v128` or `v = splat x:vx`",
+                        self.peek().span,
+                    ));
+                }
+                self.advance();
+                let ty = self.parse_type()?;
                 self.expect_eol()?;
                 Ok(Instruction::Splat {
                     dst,
@@ -857,20 +845,6 @@ impl<'a> Parser<'a> {
                     op,
                     dst,
                     src,
-                    span: dst_span,
-                })
-            }
-            TokenKind::VectorReduce(op) => {
-                self.advance();
-                let src = self.parse_operand(instructions, Some(Type::V128))?;
-                self.expect(TokenKind::Colon)?;
-                let ty = self.parse_type()?;
-                self.expect_eol()?;
-                Ok(Instruction::VectorReduce {
-                    op,
-                    dst,
-                    src,
-                    ty,
                     span: dst_span,
                 })
             }

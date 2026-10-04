@@ -3,7 +3,7 @@
 fn simd_dot(p0:ptr, p1:ptr, n:i64)->f32
   b0:
     zero_f = cst 0.0:f32
-    vzero = splat zero_f
+    vzero = splat zero_f:v128
     zero_i = cst 0:i64
     jmp b1(zero_i, vzero)
   b1(i:i64, vacc:v128):
@@ -17,8 +17,8 @@ fn simd_dot(p0:ptr, p1:ptr, n:i64)->f32
     b_ptr = add p1, byte_off
     va = ld a_ptr:v128
     vb = ld b_ptr:v128
-    vprod = vfmul va, vb
-    next_vacc = vfadd vacc, vprod
+    vprod = vmul va, vb:f32
+    next_vacc = vadd vacc, vprod:f32
     one = cst 1:i64
     next_i = add i, one
     jmp b1(next_i, next_vacc)

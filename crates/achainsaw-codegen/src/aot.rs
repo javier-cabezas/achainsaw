@@ -351,11 +351,11 @@ mod tests {
     const SIMD_CODE: &str = r#"
     fn scale(x:f32, y:f32)->f32
       b0:
-        vx = splat x
-        vy = splat y
-        vp = vfmul vx, vy
-        vs = vfadd vp, vx
-        s = vfsum vs:f32
+        vx = splat x:v128
+        vy = splat y:v128
+        vp = vmul vx, vy:f32
+        vs = vadd vp, vx:f32
+        s = vsum vs:f32
         ret s
     "#;
 

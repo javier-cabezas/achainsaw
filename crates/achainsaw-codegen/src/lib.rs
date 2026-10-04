@@ -113,12 +113,12 @@ fn dot(p0:ptr, p1:ptr, n:i64)->f32
         let code = r#"
 fn simd_kernel(x:f32, y:f32)->f32
   b0:
-    vx = splat x
-    vy = splat y
-    vsum = vfadd vx, vy
+    vx = splat x:v128
+    vy = splat y:v128
+    vsum = vadd vx, vy:f32
     two = cst 2.0:f32
-    vtwo = splat two
-    vprod = vfmul vsum, vtwo
+    vtwo = splat two:v128
+    vprod = vmul vsum, vtwo:f32
     lane0 = extlane vprod, 0:f32
     lane1 = extlane vprod, 1:f32
     res = add lane0, lane1
@@ -143,13 +143,13 @@ fn simd_kernel(x:f32, y:f32)->f32
         let code = r#"
 fn mix(x:f32, y:f32, n:i32)->f32
   b0:
-    vx = splat x
-    vy = splat y
-    vs = vfadd vx, vy
-    vp = vfmul vs, vy
-    s = vfsum vp:f32
-    vn = splat n
-    vi = viadd vn, vn
+    vx = splat x:v128
+    vy = splat y:v128
+    vs = vadd vx, vy:f32
+    vp = vmul vs, vy:f32
+    s = vsum vp:f32
+    vn = splat n:v128
+    vi = vadd vn, vn:i32
     li = extlane vi, 3:i32
     fi = itof li:f32
     m = max s, fi
@@ -174,9 +174,9 @@ fn mix(x:f32, y:f32, n:i32)->f32
             unsafe {
                 let ptr = engine.get_fn_ptr("mix").expect("mix");
                 let f: extern "C" fn(f32, f32, i32) -> f32 = std::mem::transmute(ptr);
-                // vfsum((1+3)*3 x4) = 48; 2n = 100 -> max = 100 -> sqrt = 10
+                // vsum((1+3)*3 x4) = 48; 2n = 100 -> max = 100 -> sqrt = 10
                 assert_eq!(f(1.0, 3.0, 50), 10.0, "at ISA level {level}");
-                // vfsum((2+2)*2 x4) = 32; 2n = 2 -> max = 32
+                // vsum((2+2)*2 x4) = 32; 2n = 2 -> max = 32
                 assert!(
                     (f(2.0, 2.0, 1) - 32f32.sqrt()).abs() < 1e-6,
                     "at ISA level {level}"

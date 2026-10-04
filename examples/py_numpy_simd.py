@@ -23,7 +23,7 @@ def example_zero_copy_simd():
     # AIR SIMD Kernel: In-place scalar multiplication across 128-bit vector lanes
     air_kernel = """fn simd_scale(p:ptr, factor:f32, n:i64)
   b0:
-    vfactor = splat factor
+    vfactor = splat factor:v128
     zero = cst 0:i64
     jmp b1(zero)
   b1(i:i64):
@@ -34,7 +34,7 @@ def example_zero_copy_simd():
     off = mul i, sixteen
     elem_ptr = add p, off
     v = ld elem_ptr:v128
-    vscaled = vfmul v, vfactor
+    vscaled = vmul v, vfactor:f32
     st elem_ptr, vscaled
     one = cst 1:i64
     next_i = add i, one

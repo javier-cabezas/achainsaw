@@ -79,13 +79,13 @@ fn test_jit_vector_reductions() {
     fn reduce_sum(ptr:ptr)->f32
       b0:
         v = ld ptr:v128
-        res = vfsum v:f32
+        res = vsum v:f32
         ret res
 
     fn reduce_max(ptr:ptr)->f32
       b0:
         v = ld ptr:v128
-        res = vfmax v:f32
+        res = vmaxr v:f32
         ret res
     "#;
     let module = parse_and_validate(code).unwrap();
