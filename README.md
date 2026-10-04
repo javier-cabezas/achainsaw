@@ -174,7 +174,7 @@ The rules:
 - **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
 
 How it runs:
-- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Idle helpers spin for 2 ms before parking, so back-to-back `par` loops do not pay thread wake-ups.
+- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 2 ms before parking, so back-to-back `par` loops do not pay thread wake-ups. A helper that found nothing to do parks at once, so it does not slow down a busy thread sharing its core.
 - **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
 - **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
 - **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
@@ -411,7 +411,7 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
 | `gemv_par.air` | `gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | The same on all cores, blocks of 16 rows per `par` index; `bench(m, k, reps)->f32` runs it from the CLI or MCP |
 | `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
-| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). FlashAttention-2 blocks of 64 entries, with both products on `mm` |
+| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). Runs on all cores: one `par` gathers the selected entries, a second runs FlashAttention-2 (blocks of 64 entries, both products on `mm`) for groups of 8 heads |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
 
@@ -421,7 +421,7 @@ python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx
 python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
 
-Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
+Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
@@ -431,6 +431,7 @@ Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM u
 | RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
 | GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
 | GEMV f32 with `par`, 512x1024, all cores | 6 µs | 61 µs | 13.5 µs (Ryzen 7 8845HS) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.4–1.6 ms (f32) | 20–21 ms | 1.1–1.2 ms (Ryzen 7 8845HS; 5.1 ms on one core) |
 | GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.39 ms (87 GFLOP/s) |
 
 Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.

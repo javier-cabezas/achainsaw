@@ -196,7 +196,7 @@ def make_cases():
     qn, kvn = bf16_values(fq), bf16_values(fkv)
 
     def verify_flash(k):
-        k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
+        k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
         return float(np.max(np.abs(fout - flash_ref)) / np.max(np.abs(flash_ref)))
 
     def np_flash():
@@ -207,7 +207,7 @@ def make_cases():
 
     cases.append(dict(
         name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
-        run=lambda k: k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
+        run=lambda k: k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
         verify=verify_flash, tol=1e-2,
         # NumPy has no bf16 matmul; compare with f32 on the same values (multithreaded BLAS).
         numpy=np_flash, flops=2 * 2 * fh * fnk * fd,

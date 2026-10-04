@@ -468,10 +468,10 @@ impl ParRegion {
         self.abort.store(true, Ordering::Release);
     }
 
-    /// Runs indices until they run out or a worker fails. A thread counts as in flight from
-    /// before its first index to after it has returned its unused fuel, so the caller, which
-    /// waits for none to be in flight, sees every result.
-    fn participate(&self, is_caller: bool) {
+    /// Runs indices until they run out or a worker fails, and returns whether it ran any. A
+    /// thread counts as in flight from before its first index to after it has returned its
+    /// unused fuel, so the caller, which waits for none to be in flight, sees every result.
+    fn participate(&self, is_caller: bool) -> bool {
         self.inflight.fetch_add(1, Ordering::SeqCst);
         let counter = Cell::new(0);
         let prev_fuel = ACTIVE_FUEL.with(|a| a.replace(&counter));
@@ -490,11 +490,13 @@ impl ParRegion {
 
         let mut args = self.args.clone();
         let mut ret = 0u64;
+        let mut worked = false;
         while !self.abort.load(Ordering::Relaxed) {
             let i = self.next.fetch_add(1, Ordering::SeqCst);
             if i >= self.count {
                 break;
             }
+            worked = true;
             // Each index costs one unit, so even bodies without branches are bounded.
             if !charge(&counter, 1) {
                 raise(ExecutionStatus::OutOfFuel);
@@ -520,6 +522,7 @@ impl ParRegion {
         if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 && !is_caller {
             self.caller.unpark();
         }
+        worked
     }
 }
 
@@ -535,8 +538,10 @@ pub fn in_par_worker() -> bool {
     active_region().is_some()
 }
 
-/// How long an idle helper spins before parking, so back-to-back `par` loops do not pay a
-/// thread wake-up each (tens to hundreds of microseconds on some hosts).
+/// How long a helper that just ran iterations spins before parking, so back-to-back `par`
+/// loops do not pay a thread wake-up each (tens to hundreds of microseconds on some hosts).
+/// A helper that found nothing to do parks at once: while the loop it missed still runs,
+/// spinning would only slow down a busy thread sharing its core (SMT).
 const PAR_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Helper threads that run `par` iterations next to the calling thread.
@@ -599,12 +604,13 @@ fn helper_loop(index: usize) {
     let pool = par_pool();
     let me = &pool.helpers[index];
     let mut seen = 0u64;
+    let mut spin = PAR_SPIN;
     loop {
         let idle_since = std::time::Instant::now();
         let mut spins = 0u32;
         while pool.epoch.load(Ordering::SeqCst) == seen {
             spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(1024) && idle_since.elapsed() > PAR_SPIN {
+            if spins.is_multiple_of(1024) && idle_since.elapsed() >= spin {
                 // Pairs with the dispatcher's epoch store then `parked` load.
                 me.parked.store(true, Ordering::SeqCst);
                 if pool.epoch.load(Ordering::SeqCst) == seen {
@@ -620,11 +626,12 @@ fn helper_loop(index: usize) {
             (slot.0, slot.1.clone())
         };
         seen = epoch;
-        if let Some(region) = job {
-            if index < region.helpers {
-                region.participate(false);
-            }
-        }
+        let worked = job.is_some_and(|region| index < region.helpers && region.participate(false));
+        spin = if worked {
+            PAR_SPIN
+        } else {
+            std::time::Duration::ZERO
+        };
     }
 }
 
@@ -696,7 +703,7 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
         }
     }
 
-    region.participate(true);
+    let _ = region.participate(true);
     // Helpers still finishing an index unpark this thread when the last one leaves.
     let mut spins = 0u32;
     while region.inflight.load(Ordering::SeqCst) != 0 {

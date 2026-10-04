@@ -264,6 +264,9 @@ fn flash_attention_matches_reference() {
         (1, 8, 4, 1, 0),
         (3, 40, 50, 17, 2),
         (5, 17, 300, 130, 7),
+        // Five head groups of 8, the last one partial; no selected entries at all.
+        (37, 24, 200, 70, 3),
+        (2, 8, 4, 0, 0),
         // DeepSeek V4 Pro: 128 heads, 512-dim shared K=V entries, window 128 + top-1024.
         (128, 512, 4096, 1152, 64),
     ];
