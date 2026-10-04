@@ -46,7 +46,13 @@ def test_mcp_server():
     init_res = send_req(init_req)
     assert init_res["id"] == 1, f"Init failed: {init_res}"
     assert init_res["result"]["serverInfo"]["name"] == "achainsaw-mcp"
+    assert init_res["result"]["protocolVersion"] == "2024-11-05"
+    assert "air_check" in init_res["result"]["instructions"]
     print("[PASS] MCP initialize")
+
+    # 1b. Initialized notification (no response expected)
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    proc.stdin.flush()
 
     # 2. Ping
     ping_res = send_req({"jsonrpc": "2.0", "id": 2, "method": "ping"})
@@ -61,6 +67,7 @@ def test_mcp_server():
     assert "air_run" in tool_names
     assert "air_assemble" in tool_names
     assert "air_disassemble" in tool_names
+    assert "air_target" in tool_names
     print(f"[PASS] MCP tools/list ({len(tools)} tools: {', '.join(tool_names)})")
 
     # 4. Tool Call: air_check
@@ -167,6 +174,36 @@ def test_mcp_server():
     assert "ERR_OUT_OF_FUEL" in err_text
     print("[PASS] MCP tools/call air_run fuel trap enforcement")
 
+    # 8b. Sandbox: out-of-bounds access and unbounded recursion are errors, and the
+    # server keeps running afterwards (later requests below still succeed).
+    sandbox_cases = [
+        ("ERR_MEMORY_VIOLATION", """fn main()->i32
+  b0:
+    p = alloc 16:i64
+    q = add p, 1048576:i64
+    v = ld q:i32
+    ret v
+"""),
+        ("ERR_STACK_OVERFLOW", """fn main()->i32
+  b0:
+    r = call main()
+    ret r
+"""),
+    ]
+    for i, (code, air) in enumerate(sandbox_cases):
+        res = send_req({
+            "jsonrpc": "2.0",
+            "id": 80 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "air_run",
+                "arguments": {"code": air, "max_memory_mb": 1}
+            }
+        })
+        assert res["result"]["isError"] is True
+        assert code in res["result"]["content"][0]["text"]
+        print(f"[PASS] MCP tools/call air_run sandbox {code}")
+
     # 9. Tool Call: air_optimize
     unopt_air = """fn opt_me(x:i32)->i32
   b0:
@@ -192,7 +229,24 @@ def test_mcp_server():
     assert "ret x" in opt_payload["code"]
     print("[PASS] MCP tools/call air_optimize")
 
+    # 10. Tool Call: air_target
+    target_res = send_req({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "air_target", "arguments": {}}
+    })
+    assert target_res["result"]["isError"] is False
+    target_payload = json.loads(target_res["result"]["content"][0]["text"])
+    assert target_payload["status"] == "ok"
+    assert isinstance(target_payload["host"]["features"], list)
+    assert target_payload["backends"]["cranelift"]["vector_bits"] == 128
+    print(f"[PASS] MCP tools/call air_target (max_isa={target_payload['host']['max_isa']})")
     proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
     print("All MCP end-to-end integration tests passed!")
 
 

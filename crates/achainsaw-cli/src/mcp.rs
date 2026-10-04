@@ -1,4 +1,4 @@
-use achainsaw_codegen::JitEngine;
+use achainsaw_codegen::{JitEngine, RtValue};
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::{
     decode_module, encode_module, parse_and_validate, to_air_text, Module, Type, Validator,
@@ -9,6 +9,59 @@ use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// MCP protocol revisions this server speaks, newest first.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// AIR primer returned in the `initialize` result. MCP clients such as Claude Code and
+/// Claude Desktop inject it into the model context, so agents can write valid AIR
+/// without having seen the language before. Keep in sync with the parser and validator.
+pub const SERVER_INSTRUCTIONS: &str = "\
+achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features, which backends are available, and each backend's vx width.
+
+AIR syntax:
+- Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits: 128 on cranelift, up to 512 or SVE-scalable on llvm; always get the lane count via `vl`, never assume it). Vectors are untyped bits; each vector op names its lane type.
+- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`.
+- First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
+- One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
+- Each block ends with exactly one terminator: `jmp b(args)` | `br cond, b_then(args), b_else(args)` | `ret v` | `ret`.
+- Constants: `x = cst 5:i32`, `f = cst 1.5:f32`. Operands may be inline immediates: `y = add x, 1:i32`.
+- Binary (operands must share a type): add sub mul div rem and or xor shl shr min max udiv urem ushr umin umax.
+- Compare -> i32 0/1: eq ne lt gt le ge ult ugt ule uge.
+- Pointers: `p2 = add p, off` with off:i64; `v = ld p:f32`; `st p, v`; `p = alloc n` (n:i64 bytes); `free p`.
+- Other: `s = select c, a, b`; unary neg abs sqrt; casts `itof x:f32` ftoi sext zext trunc fext ftrunc bitcast (`dst = op src:ty`).
+- Vectors: `v = ld p:v256`, `st p, v` (any alignment); `v = splat x:v256` (plain `splat x` is v128); `r = vadd a, b:f32` (vsub vmul vdiv vmin vmax vand vor vxor; lane types i8 i16 i32 i64 f32 f64, but vmul has no i8, vdiv is float-only, vmin/vmax have no i64); `r = vfma a, b, c:f32` (a*b+c, f32/f64); `m = vlt a, b:f32` (veq vne vgt vle vge, all-ones lanes when true); `r = vsel m, a, b`; `s = vsum v:f32` (vmaxr vminr); `e = extlane v, 7:f32`; `n = vl f32` (i64 lanes in vx); tail-masked `v = ldm p:vx, n:f32` / `stm p, v, n:f32` touch only the first n lanes (rest of a load is zero).
+- Matmul: `mm pc, pa, pb, m, n, k:bf16` does C[m x n] += A[m x k] * B[k x n], row-major contiguous; dtype bf16/f16/f32 with f32 C, or i8 with i32 C; m n k are i64; costs 1 fuel per 1024 multiply-adds; on llvm it uses AMX/SME/full-width FMA kernels. vx cannot appear in function signatures; extfn takes no v256/v512. Legacy vfadd/viadd/vfsum/visum/vfmax still parse.
+- Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
+- Comments: `#` or `//`. Names starting with `__` are reserved.
+
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); auto uses llvm for wide-vector or mm code when available. vx width (and so `vl`) depends on the backend and CPU; fixed-width results are identical on both.
+
+Example:
+fn sum_to(n:i64)->i64
+  b0:
+    jmp b1(0:i64, 0:i64)
+  b1(i:i64, acc:i64):
+    c = lt i, n
+    br c, b2, b3
+  b2:
+    acc2 = add acc, i
+    i2 = add i, 1:i64
+    jmp b1(i2, acc2)
+  b3:
+    ret acc
+";
+
+/// Picks the protocol version for the `initialize` response: the client's requested
+/// version if we support it, otherwise our latest (the client then decides whether to proceed).
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|&&v| v == r))
+        .copied()
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
 
 pub fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -76,121 +129,129 @@ pub fn load_module_from_code(code: &str) -> Result<Module, Diagnostic> {
     parse_and_validate(trimmed)
 }
 
+/// Sandbox arena size for `air_run` when `max_memory_mb` is not given.
+pub const DEFAULT_SANDBOX_MEMORY_MB: usize = 64;
+/// Largest `max_memory_mb` that `air_run` accepts.
+pub const MAX_SANDBOX_MEMORY_MB: usize = 4096;
+
+/// Stack for the thread that runs `air_run` code: the sandbox's recursion budget plus
+/// headroom, independent of the host thread (Windows main threads only get 1 MiB).
+const EXECUTION_STACK_BYTES: usize = 8 << 20;
+
 pub fn execute_ir(
     module: &Module,
     func_name: &str,
     args: &[f64],
     fuel: Option<u64>,
     max_memory_mb: Option<usize>,
+    backend: Option<&str>,
 ) -> Result<Value> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("air_run".into())
+            .stack_size(EXECUTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                execute_ir_on_this_thread(module, func_name, args, fuel, max_memory_mb, backend)
+            })?
+            .join()
+            .map_err(|_| anyhow!("air_run execution thread panicked"))?
+    })
+}
+
+fn execute_ir_on_this_thread(
+    module: &Module,
+    func_name: &str,
+    args: &[f64],
+    fuel: Option<u64>,
+    max_memory_mb: Option<usize>,
+    backend: Option<&str>,
+) -> Result<Value> {
+    const ALLOWED_EXTERNALS: &[&str] = &[
+        "sinf", "cosf", "tanf", "sqrtf", "expf", "logf", "powf", "fabsf", "floorf", "ceilf",
+        "roundf", "sin", "cos", "tan", "sqrt", "exp", "log", "pow", "fabs", "floor", "ceil",
+        "round",
+    ];
+
+    for ext in &module.extern_functions {
+        if !ALLOWED_EXTERNALS.contains(&ext.name.as_str()) {
+            return Err(anyhow!(
+                "[ERR_UNAUTHORIZED_EXTERN] External function '{}' is not permitted by MCP security allowlist",
+                ext.name
+            ));
+        }
+    }
+
     let func = module
         .functions
         .iter()
         .find(|f| f.name == func_name)
         .ok_or_else(|| anyhow!("Function '{func_name}' not defined in module"))?;
 
+    // Sandboxed code can only reach its own arena, so a pointer from the caller is
+    // never valid; reject it up front with a clear message.
+    if let Some((name, _)) = func.params.iter().find(|(_, ty)| *ty == Type::Ptr) {
+        return Err(anyhow!(
+            "[ERR_PTR_ARGUMENT] air_run cannot pass pointer parameter '{name}'; allocate buffers inside the function with alloc"
+        ));
+    }
+
+    let memory_mb = max_memory_mb.unwrap_or(DEFAULT_SANDBOX_MEMORY_MB);
+    if memory_mb > MAX_SANDBOX_MEMORY_MB {
+        return Err(anyhow!(
+            "max_memory_mb must be at most {MAX_SANDBOX_MEMORY_MB}, got {memory_mb}"
+        ));
+    }
+    let arena_bytes = memory_mb * 1024 * 1024;
+
     let t1 = Instant::now();
-    let mut engine = JitEngine::new()?;
-    if let Some(f) = fuel {
-        engine.set_fuel(Some(f));
-    }
-    if let Some(mb) = max_memory_mb {
-        engine.set_memory_quota(mb * 1024 * 1024);
-    }
+    let mut engine = JitEngine::for_module(backend, module)?;
+    // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
+    let effective_fuel = fuel.or(Some(1_000_000));
+    engine.set_fuel(effective_fuel);
+    // Bounds-check all memory accesses and cap recursion so untrusted code cannot
+    // touch or crash the server process.
+    engine.enable_sandbox(arena_bytes)?;
     engine.compile_module(module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
-    let func_ptr = engine
-        .get_fn_ptr(func_name)
-        .ok_or_else(|| anyhow!("Function pointer for '{func_name}' not found"))?;
+    let mut rt_args = Vec::with_capacity(func.params.len());
+    for (i, (_, p_ty)) in func.params.iter().enumerate() {
+        let val_num = args.get(i).copied().unwrap_or(0.0);
+        let rt_val = match p_ty {
+            Type::I8 => RtValue::I8(val_num as i8),
+            Type::I16 => RtValue::I16(val_num as i16),
+            Type::I32 => RtValue::I32(val_num as i32),
+            Type::I64 => RtValue::I64(val_num as i64),
+            Type::Ptr => unreachable!("rejected above"),
+            Type::F32 => RtValue::F32(val_num as f32),
+            Type::F64 => RtValue::F64(val_num),
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
+                return Err(anyhow!("Cannot pass {p_ty} directly via MCP"))
+            }
+        };
+        rt_args.push(rt_val);
+    }
 
     let t2 = Instant::now();
-    achainsaw_codegen::reset_execution_status();
-
-    let res_val: Value = unsafe {
-        match (func.params.len(), func.ret_type) {
-            (0, None) => {
-                let f: extern "C" fn() = std::mem::transmute(func_ptr);
-                f();
-                json!(null)
-            }
-            (0, Some(Type::I32)) => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::I64)) => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::F32)) => {
-                let f: extern "C" fn() -> f32 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (0, Some(Type::F64)) => {
-                let f: extern "C" fn() -> f64 = std::mem::transmute(func_ptr);
-                json!(f())
-            }
-            (1, Some(Type::I32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i32;
-                let f: extern "C" fn(i32) -> i32 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::I64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i64;
-                let f: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::F32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as f32;
-                let f: extern "C" fn(f32) -> f32 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (1, Some(Type::F64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0);
-                let f: extern "C" fn(f64) -> f64 = std::mem::transmute(func_ptr);
-                json!(f(arg0))
-            }
-            (2, Some(Type::I32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i32;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as i32;
-                let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::I64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as i64;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as i64;
-                let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::F32)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0) as f32;
-                let arg1 = args.get(1).copied().unwrap_or(0.0) as f32;
-                let f: extern "C" fn(f32, f32) -> f32 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            (2, Some(Type::F64)) => {
-                let arg0 = args.first().copied().unwrap_or(0.0);
-                let arg1 = args.get(1).copied().unwrap_or(0.0);
-                let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(func_ptr);
-                json!(f(arg0, arg1))
-            }
-            _ => {
-                return Err(anyhow!(
-                    "Function signature ({:?} params -> {:?}) not directly invokable via standard MCP runner",
-                    func.params.len(),
-                    func.ret_type
-                ));
-            }
-        }
-    };
-
-    achainsaw_codegen::check_execution_status()?;
+    let res_rt = unsafe { engine.call_typed(func_name, &rt_args)? };
     let exec_time_us = t2.elapsed().as_micros();
+
+    let res_val = match res_rt {
+        Some(RtValue::I8(n)) => json!(n),
+        Some(RtValue::I16(n)) => json!(n),
+        Some(RtValue::I32(n)) => json!(n),
+        Some(RtValue::I64(n)) => json!(n),
+        Some(RtValue::Ptr(p)) => json!(p),
+        Some(RtValue::F32(f)) => json!(f),
+        Some(RtValue::F64(f)) => json!(f),
+        None => json!(null),
+    };
 
     Ok(json!({
         "status": "ok",
         "function": func_name,
         "result": res_val,
+        "backend": engine.backend().as_str(),
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,
     }))
@@ -302,7 +363,8 @@ pub fn handle_air_run(arguments: &Value) -> Value {
         }
     };
 
-    match execute_ir(&module, func, &args, fuel, max_memory_mb) {
+    let backend = arguments.get("backend").and_then(|v| v.as_str());
+    match execute_ir(&module, func, &args, fuel, max_memory_mb, backend) {
         Ok(val) => json_tool_result(val),
         Err(e) => json_tool_error(json!({
             "status": "error",
@@ -319,7 +381,20 @@ pub fn handle_air_assemble(arguments: &Value) -> Value {
     };
     match parse_and_validate(code) {
         Ok(module) => {
-            let binary = encode_module(&module);
+            let binary = match encode_module(&module) {
+                Ok(b) => b,
+                Err(diag) => {
+                    return json_tool_error(serde_json::from_str(&diag.to_json()).unwrap_or_else(
+                        |_| {
+                            json!({
+                                "status": "error",
+                                "error_code": diag.error_code,
+                                "message": diag.message
+                            })
+                        },
+                    ));
+                }
+            };
             let b64 = b64_encode(&binary);
             let ratio = (binary.len() as f64) / (code.len().max(1) as f64);
             json_tool_result(json!({
@@ -401,6 +476,32 @@ pub fn handle_air_optimize(arguments: &Value) -> Value {
     }))
 }
 
+pub fn handle_air_target(_arguments: &Value) -> Value {
+    match achainsaw_codegen::cpu::target_report() {
+        Ok(report) => json_tool_result(report),
+        Err(e) => json_tool_error(json!({
+            "status": "error",
+            "error_code": "ERR_CPU_DETECTION",
+            "message": e.to_string(),
+        })),
+    }
+}
+
+pub fn handle_initialize(params: &Value) -> Value {
+    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+    json!({
+        "protocolVersion": negotiate_protocol_version(requested),
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "achainsaw-mcp",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "instructions": SERVER_INSTRUCTIONS
+    })
+}
+
 pub fn get_tools_list() -> Value {
     json!({
         "tools": [
@@ -441,9 +542,14 @@ pub fn get_tools_list() -> Value {
                             "type": "integer",
                             "description": "Loop fuel instruction budget (prevents infinite loops)"
                         },
+                        "backend": {
+                            "type": "string",
+                            "enum": ["auto", "cranelift", "llvm"],
+                            "description": "Code generator. auto (default) uses llvm for modules with v256/v512/vx/mm when this build has it, else cranelift; llvm compiles in milliseconds instead of microseconds but uses the full vector width"
+                        },
                         "max_memory_mb": {
                             "type": "integer",
-                            "description": "Maximum heap memory quota in megabytes"
+                            "description": "Sandbox memory available to alloc, in megabytes (default 64)"
                         }
                     },
                     "required": ["code"]
@@ -475,6 +581,14 @@ pub fn get_tools_list() -> Value {
                         }
                     },
                     "required": ["binary_base64"]
+                }
+            },
+            {
+                "name": "air_target",
+                "description": "Report the host CPU's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and the vector width each code generation backend uses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             },
             {
@@ -540,19 +654,11 @@ pub fn run_mcp_server() -> Result<()> {
 
         let response = match method {
             "initialize" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "achainsaw-mcp",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }
+                    "result": handle_initialize(&params)
                 })
             }
             "ping" => {
@@ -583,6 +689,7 @@ pub fn run_mcp_server() -> Result<()> {
                     "air_assemble" => handle_air_assemble(&arguments),
                     "air_disassemble" => handle_air_disassemble(&arguments),
                     "air_optimize" => handle_air_optimize(&arguments),
+                    "air_target" => handle_air_target(&arguments),
                     unknown => error_response(&format!("Unknown tool: '{unknown}'")),
                 };
 
@@ -635,6 +742,63 @@ mod tests {
             let decoded = b64_decode(&encoded).expect("decode failed");
             assert_eq!(*data, &decoded[..]);
         }
+    }
+
+    #[test]
+    fn test_protocol_version_negotiation() {
+        assert_eq!(negotiate_protocol_version(Some("2024-11-05")), "2024-11-05");
+        assert_eq!(negotiate_protocol_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(
+            negotiate_protocol_version(Some("1999-01-01")),
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+        assert_eq!(
+            negotiate_protocol_version(None),
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+    }
+
+    #[test]
+    fn test_mcp_initialize() {
+        let res = handle_initialize(&json!({ "protocolVersion": "2025-06-18" }));
+        assert_eq!(res["protocolVersion"], "2025-06-18");
+        assert_eq!(res["serverInfo"]["name"], "achainsaw-mcp");
+        assert!(res["capabilities"]["tools"].is_object());
+        assert_eq!(res["instructions"], SERVER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn test_server_instructions_example_is_valid_air() {
+        let example = SERVER_INSTRUCTIONS
+            .split_once("Example:\n")
+            .expect("instructions must contain an example")
+            .1;
+        let res = handle_air_run(&json!({
+            "code": example,
+            "func": "sum_to",
+            "args": [10]
+        }));
+        assert_eq!(res["isError"], false, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["result"], 45);
+    }
+
+    #[test]
+    fn test_mcp_air_target() {
+        let res = handle_air_target(&json!({}));
+        assert_eq!(res["isError"], false);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["status"], "ok");
+        assert!(report["host"]["features"].is_array());
+        assert_eq!(report["backends"]["cranelift"]["vector_bits"], 128);
+        let tools = get_tools_list();
+        assert!(tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "air_target"));
     }
 
     #[test]
@@ -694,6 +858,100 @@ mod tests {
         assert_eq!(res["isError"], true);
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ERR_OUT_OF_FUEL"));
+    }
+
+    #[test]
+    fn test_mcp_air_run_backend_choice() {
+        let code = "fn main(x:i32)->i32\n  b0:\n    y = add x, 1:i32\n    ret y\n";
+        for backend in achainsaw_codegen::Backend::available() {
+            let res = handle_air_run(&json!({
+                "code": code, "args": [41], "backend": backend.as_str()
+            }));
+            assert_eq!(res["isError"], false, "{res}");
+            let text = res["content"][0]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(payload["result"], 42);
+            assert_eq!(payload["backend"], backend.as_str());
+        }
+        let text = run_error_text(json!({ "code": code, "backend": "gcc" }));
+        assert!(text.contains("ERR_UNKNOWN_BACKEND"), "{text}");
+        if !achainsaw_codegen::Backend::Llvm.is_available() {
+            let text = run_error_text(json!({ "code": code, "backend": "llvm" }));
+            assert!(text.contains("ERR_BACKEND_UNAVAILABLE"), "{text}");
+        }
+    }
+
+    fn run_error_text(arguments: Value) -> String {
+        let res = handle_air_run(&arguments);
+        assert_eq!(res["isError"], true, "{res}");
+        res["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_mcp_air_run_uses_alloc_memory() {
+        let code = r#"
+        fn main(n:i64)->i64
+          b0:
+            bytes = mul n, 8:i64
+            p = alloc bytes
+            jmp b1(0:i64)
+          b1(i:i64):
+            c = lt i, n
+            br c, b2, b3
+          b2:
+            off = mul i, 8:i64
+            q = add p, off
+            st q, i
+            i2 = add i, 1:i64
+            jmp b1(i2)
+          b3:
+            last = sub bytes, 8:i64
+            q2 = add p, last
+            v = ld q2:i64
+            free p
+            ret v
+        "#;
+        let res = handle_air_run(&json!({ "code": code, "args": [1000] }));
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"result\": 999"));
+    }
+
+    #[test]
+    fn test_mcp_air_run_rejects_pointer_arguments() {
+        let code = "fn main(p:ptr)->i32\n  b0:\n    v = ld p:i32\n    ret v\n";
+        let text = run_error_text(json!({ "code": code, "args": [4096] }));
+        assert!(text.contains("ERR_PTR_ARGUMENT"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_memory_violation() {
+        // A pointer made from a constant, and one walked past the end of an allocation.
+        let forged = "fn main()->i32\n  b0:\n    p = cst 4096:ptr\n    x = cst 1:i32\n    st p, x\n    ret x\n";
+        let text = run_error_text(json!({ "code": forged }));
+        assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+
+        let overrun = "fn main()->i32\n  b0:\n    p = alloc 16:i64\n    q = add p, 1048576:i64\n    v = ld q:i32\n    ret v\n";
+        let text = run_error_text(json!({ "code": overrun, "max_memory_mb": 1 }));
+        assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_stack_overflow() {
+        let code = "fn main()->i32\n  b0:\n    r = call main()\n    ret r\n";
+        let text = run_error_text(json!({ "code": code }));
+        assert!(text.contains("ERR_STACK_OVERFLOW"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_memory_limit() {
+        let code = "fn main()->i32\n  b0:\n    p = alloc 2097152:i64\n    ret 0:i32\n";
+        let text = run_error_text(json!({ "code": code, "max_memory_mb": 1 }));
+        assert!(text.contains("ERR_OUT_OF_MEMORY"), "{text}");
+        let text = run_error_text(json!({ "code": code, "max_memory_mb": 1u64 << 40 }));
+        assert!(text.contains("max_memory_mb"), "{text}");
     }
 
     #[test]

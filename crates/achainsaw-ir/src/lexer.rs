@@ -1,4 +1,4 @@
-use crate::diag::Span;
+use crate::diag::{Diagnostic, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -19,6 +19,17 @@ pub enum TokenKind {
 
     // Operators
     Op(String),
+
+    // Phase 4 Keywords
+    Select,
+    Cast(crate::ast::CastOp),
+    Unary(crate::ast::UnaryOp),
+    VectorReduce(crate::ast::VectorReduceOp),
+
+    /// AIR v2 mnemonics (`vadd`, `vfma`, `veq`, `vsel`, `vsum`, `vl`, legacy `vfadd`, ...).
+    /// They keep their text because they are only keywords right after `=`; elsewhere
+    /// they remain valid register names, so pre-v2 programs using them still parse.
+    VOp(String),
 
     // Symbols
     Colon,
@@ -94,7 +105,7 @@ impl<'a> Lexer<'a> {
             .unwrap_or(self.source.len())
     }
 
-    pub fn next_token(&mut self) -> Result<Token, String> {
+    pub fn next_token(&mut self) -> Result<Token, Diagnostic> {
         // Skip horizontal whitespace and comments
         while let Some(c) = self.peek() {
             if c == ' ' || c == '\t' || c == '\r' {
@@ -178,6 +189,37 @@ impl<'a> Lexer<'a> {
             });
         }
 
+        // `-inf` (a register can never start with '-', so this is unambiguous)
+        if c == '-' && self.peek_next() == Some('i') {
+            self.advance();
+            let mut ident = String::new();
+            while let Some(ch) = self.peek() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ident.push(self.advance().unwrap());
+                } else {
+                    break;
+                }
+            }
+            let span = Span {
+                start: start_pos,
+                end: self.current_byte_pos(),
+                line: start_line,
+                column: start_col,
+            };
+            return if ident == "inf" {
+                Ok(Token {
+                    kind: TokenKind::FloatLit(f64::NEG_INFINITY),
+                    span,
+                })
+            } else {
+                Err(Diagnostic::error(
+                    "ERR_LEXICAL",
+                    format!("Unexpected token '-{ident}' at {start_line}:{start_col}"),
+                    span,
+                ))
+            };
+        }
+
         // Number (integer or float, signed or unsigned)
         if c.is_ascii_digit()
             || (c == '-' && self.peek_next().is_some_and(|next| next.is_ascii_digit()))
@@ -196,6 +238,20 @@ impl<'a> Lexer<'a> {
                 {
                     is_float = true;
                     num_str.push(self.advance().unwrap());
+                } else if (ch == 'e' || ch == 'E') && self.exponent_follows() {
+                    is_float = true;
+                    num_str.push(self.advance().unwrap());
+                    if matches!(self.peek(), Some('+') | Some('-')) {
+                        num_str.push(self.advance().unwrap());
+                    }
+                    while let Some(d) = self.peek() {
+                        if d.is_ascii_digit() {
+                            num_str.push(self.advance().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    break;
                 } else {
                     break;
                 }
@@ -209,17 +265,21 @@ impl<'a> Lexer<'a> {
             };
 
             return if is_float {
-                let val: f64 = num_str
-                    .parse()
-                    .map_err(|e| format!("Invalid float {num_str}: {e}"))?;
+                let val: f64 = num_str.parse().map_err(|e| {
+                    Diagnostic::error("ERR_LEXICAL", format!("Invalid float {num_str}: {e}"), span)
+                })?;
                 Ok(Token {
                     kind: TokenKind::FloatLit(val),
                     span,
                 })
             } else {
-                let val: i64 = num_str
-                    .parse()
-                    .map_err(|e| format!("Invalid integer {num_str}: {e}"))?;
+                let val: i64 = num_str.parse().map_err(|e| {
+                    Diagnostic::error(
+                        "ERR_LEXICAL",
+                        format!("Invalid integer {num_str}: {e}"),
+                        span,
+                    )
+                })?;
                 Ok(Token {
                     kind: TokenKind::IntLit(val),
                     span,
@@ -252,9 +312,28 @@ impl<'a> Lexer<'a> {
                 "extlane" => TokenKind::Extlane,
                 "alloc" => TokenKind::Alloc,
                 "free" => TokenKind::Free,
+                "select" => TokenKind::Select,
+                "itof" => TokenKind::Cast(crate::ast::CastOp::Itof),
+                "ftoi" => TokenKind::Cast(crate::ast::CastOp::Ftoi),
+                "sext" => TokenKind::Cast(crate::ast::CastOp::Sext),
+                "zext" => TokenKind::Cast(crate::ast::CastOp::Zext),
+                "trunc" => TokenKind::Cast(crate::ast::CastOp::Trunc),
+                "fext" => TokenKind::Cast(crate::ast::CastOp::Fext),
+                "ftrunc" => TokenKind::Cast(crate::ast::CastOp::Ftrunc),
+                "bitcast" => TokenKind::Cast(crate::ast::CastOp::Bitcast),
+                "sqrt" => TokenKind::Unary(crate::ast::UnaryOp::Sqrt),
+                "neg" => TokenKind::Unary(crate::ast::UnaryOp::Neg),
+                "abs" => TokenKind::Unary(crate::ast::UnaryOp::Abs),
+                "vfsum" | "visum" | "vfmax" => TokenKind::VectorReduce(
+                    crate::ast::VectorReduceOp::from_str_opt(&ident).unwrap(),
+                ),
+                "vadd" | "vsub" | "vmul" | "vdiv" | "vmin" | "vmax" | "vand" | "vor" | "vxor"
+                | "vfma" | "veq" | "vne" | "vlt" | "vgt" | "vle" | "vge" | "vsel" | "vsum"
+                | "vmaxr" | "vminr" | "vl" | "ldm" | "stm" | "mm" | "vfadd" | "vfsub" | "vfmul"
+                | "vfdiv" | "viadd" | "visub" | "vimul" => TokenKind::VOp(ident),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
-                | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "vfadd" | "vfsub" | "vfmul"
-                | "vfdiv" | "viadd" | "visub" | "vimul" => TokenKind::Op(ident),
+                | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "min" | "max" | "umin" | "umax"
+                | "udiv" | "urem" | "ushr" | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),
                 _ => TokenKind::Ident(ident),
             };
 
@@ -269,12 +348,33 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        Err(format!(
-            "Unexpected character: '{c}' at {start_line}:{start_col}"
+        // Consume the offending character so the span has non-zero width.
+        self.advance();
+        Err(Diagnostic::error(
+            "ERR_LEXICAL",
+            format!("Unexpected character: '{c}' at {start_line}:{start_col}"),
+            Span {
+                start: start_pos,
+                end: self.current_byte_pos(),
+                line: start_line,
+                column: start_col,
+            },
         ))
     }
 
-    pub fn tokenize_all(&mut self) -> Result<Vec<Token>, String> {
+    /// True if the cursor is at an `e`/`E` that starts a valid exponent (`e5`, `e-5`, `E+5`).
+    fn exponent_follows(&self) -> bool {
+        match self.chars.get(self.cursor + 1).map(|&(_, c)| c) {
+            Some(d) if d.is_ascii_digit() => true,
+            Some('+') | Some('-') => self
+                .chars
+                .get(self.cursor + 2)
+                .is_some_and(|&(_, d)| d.is_ascii_digit()),
+            _ => false,
+        }
+    }
+
+    pub fn tokenize_all(&mut self) -> Result<Vec<Token>, Diagnostic> {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token()?;

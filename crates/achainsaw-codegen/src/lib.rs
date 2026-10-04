@@ -1,12 +1,19 @@
 pub mod aot;
+pub mod backend;
+pub mod cpu;
 pub mod jit;
+pub mod lower;
 
-pub use aot::{link_shared_library, AotCompiler};
+pub use aot::{
+    compile_assembly, compile_object, link_shared_library, AotCompiler, AotObject, AotTarget,
+};
+pub use backend::{uses_wide_vectors, Backend};
 pub use jit::{
     check_execution_status, get_allocated_memory, get_execution_status, get_global_symbol_address,
     get_remaining_fuel, load_global_library, register_global_symbol, reset_execution_status,
-    set_execution_fuel, set_memory_quota, to_clif_type, ExecutionStatus, JitEngine, SymbolRegistry,
+    set_execution_fuel, set_memory_quota, ExecutionStatus, JitEngine, SymbolRegistry,
 };
+pub use lower::{lower_function, to_clif_type, RtValue};
 
 #[cfg(test)]
 mod tests {
@@ -128,6 +135,56 @@ fn simd_kernel(x:f32, y:f32)->f32
             let res = f(3.0, 4.0);
             assert!((res - 28.0).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_jit_runs_at_every_supported_isa_level() {
+        use crate::cpu::{CpuFeatures, IsaLevel};
+        let code = r#"
+fn mix(x:f32, y:f32, n:i32)->f32
+  b0:
+    vx = splat x
+    vy = splat y
+    vs = vfadd vx, vy
+    vp = vfmul vs, vy
+    s = vfsum vp:f32
+    vn = splat n
+    vi = viadd vn, vn
+    li = extlane vi, 3:i32
+    fi = itof li:f32
+    m = max s, fi
+    r = sqrt m
+    ret r
+"#;
+        let module = parse_and_validate(code).expect("IR valid");
+        let host = CpuFeatures::host();
+        let levels: Vec<IsaLevel> = IsaLevel::names()
+            .iter()
+            .map(|n| n.parse::<IsaLevel>().unwrap())
+            .filter(|l| l.arch() == host.arch)
+            .collect();
+        let mut tested = 0;
+        for level in levels {
+            let features = host.capped(level).unwrap();
+            if features.max_level() != Some(level) {
+                continue; // host does not reach this tier
+            }
+            let mut engine = JitEngine::with_features(&features).expect("JIT init");
+            engine.compile_module(&module).expect("compile");
+            unsafe {
+                let ptr = engine.get_fn_ptr("mix").expect("mix");
+                let f: extern "C" fn(f32, f32, i32) -> f32 = std::mem::transmute(ptr);
+                // vfsum((1+3)*3 x4) = 48; 2n = 100 -> max = 100 -> sqrt = 10
+                assert_eq!(f(1.0, 3.0, 50), 10.0, "at ISA level {level}");
+                // vfsum((2+2)*2 x4) = 32; 2n = 2 -> max = 32
+                assert!(
+                    (f(2.0, 2.0, 1) - 32f32.sqrt()).abs() < 1e-6,
+                    "at ISA level {level}"
+                );
+            }
+            tested += 1;
+        }
+        assert!(tested >= 1);
     }
 
     #[test]

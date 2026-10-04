@@ -1,5 +1,5 @@
 use achainsaw_codegen::{
-    get_global_symbol_address, load_global_library, register_global_symbol, JitEngine,
+    get_global_symbol_address, load_global_library, register_global_symbol, JitEngine, RtValue,
 };
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
@@ -11,6 +11,7 @@ use pyo3::types::{PyDict, PyTuple};
 use std::collections::HashMap;
 
 create_exception!(achainsaw, CompilationError, PyException);
+create_exception!(achainsaw, ExecutionError, CompilationError);
 
 struct BufferGuard {
     view: pyo3::ffi::Py_buffer,
@@ -40,6 +41,12 @@ impl PyKernel {
         self.engine.lookup_symbol(name).map(|ptr| ptr as usize)
     }
 
+    /// Code generator that compiled this kernel ("cranelift" or "llvm").
+    #[getter]
+    pub fn backend(&self) -> &'static str {
+        self.engine.backend().as_str()
+    }
+
     #[pyo3(signature = (fuel=None))]
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
         self.engine.set_fuel(fuel);
@@ -56,7 +63,7 @@ impl PyKernel {
         func_name: &str,
         args: &Bound<'_, PyTuple>,
     ) -> PyResult<PyObject> {
-        let (param_types, ret_type) = self.signatures.get(func_name).ok_or_else(|| {
+        let (param_types, _ret_type) = self.signatures.get(func_name).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("Function '{func_name}' not found"))
         })?;
 
@@ -69,17 +76,107 @@ impl PyKernel {
             )));
         }
 
-        let fn_ptr = self.engine.get_fn_ptr(func_name).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Function '{func_name}' has no compiled code pointer"
-            ))
+        let mut rt_args = Vec::with_capacity(param_types.len());
+        let mut _buffers: Vec<BufferGuard> = Vec::new();
+
+        for (i, &ty) in param_types.iter().enumerate() {
+            let arg = args.get_item(i)?;
+            let rt_val = match ty {
+                Type::Ptr => {
+                    let mut view: pyo3::ffi::Py_buffer = unsafe { std::mem::zeroed() };
+                    let is_writable_buffer = unsafe {
+                        pyo3::ffi::PyObject_GetBuffer(
+                            arg.as_ptr(),
+                            &mut view,
+                            pyo3::ffi::PyBUF_WRITABLE | pyo3::ffi::PyBUF_ND,
+                        ) == 0
+                    };
+
+                    let is_buffer = if is_writable_buffer {
+                        true
+                    } else {
+                        unsafe { pyo3::ffi::PyErr_Clear() };
+                        unsafe {
+                            pyo3::ffi::PyObject_GetBuffer(
+                                arg.as_ptr(),
+                                &mut view,
+                                pyo3::ffi::PyBUF_SIMPLE,
+                            ) == 0
+                        }
+                    };
+
+                    if is_buffer {
+                        let ptr = view.buf as usize;
+                        _buffers.push(BufferGuard { view });
+                        RtValue::Ptr(ptr)
+                    } else {
+                        unsafe {
+                            pyo3::ffi::PyErr_Clear();
+                        }
+                        if let Ok(ai) = arg.getattr("__array_interface__") {
+                            if let Ok(data) = ai.get_item("data") {
+                                if let Ok(tuple) = data.extract::<(usize, bool)>() {
+                                    RtValue::Ptr(tuple.0)
+                                } else if let Ok(tuple) = data.extract::<(i64, bool)>() {
+                                    RtValue::Ptr(tuple.0 as usize)
+                                } else {
+                                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                                        "Argument {i} expected pointer or buffer, found {:?}",
+                                        arg
+                                    )));
+                                }
+                            } else {
+                                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                                    "Argument {i} expected pointer or buffer, found {:?}",
+                                    arg
+                                )));
+                            }
+                        } else if let Ok(val) = arg.extract::<usize>() {
+                            RtValue::Ptr(val)
+                        } else if let Ok(val) = arg.extract::<i64>() {
+                            RtValue::Ptr(val as usize)
+                        } else {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                                "Argument {i} expected pointer or buffer (NumPy array), found {:?}",
+                                arg
+                            )));
+                        }
+                    }
+                }
+                Type::I8 => RtValue::I8(arg.extract()?),
+                Type::I16 => RtValue::I16(arg.extract()?),
+                Type::I32 => RtValue::I32(arg.extract()?),
+                Type::I64 => RtValue::I64(arg.extract()?),
+                Type::F32 => RtValue::F32(arg.extract()?),
+                Type::F64 => RtValue::F64(arg.extract()?),
+                Type::V128 | Type::V256 | Type::V512 | Type::Vx | Type::F16 | Type::BF16 => {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "Direct passing of {ty} arguments across Python boundary not supported; pass by pointer (ptr)",
+                    )));
+                }
+            };
+            rt_args.push(rt_val);
+        }
+
+        let res_rt = unsafe { self.engine.call_typed(func_name, &rt_args) }.map_err(|e| {
+            check_execution_status_py(py).err().unwrap_or_else(|| {
+                let err_type = py.get_type_bound::<ExecutionError>();
+                PyErr::from_value_bound(err_type.call1((e.to_string(),)).unwrap())
+            })
         })?;
 
-        // Extract native arguments
-        // On x86_64 C ABI (Windows and SysV):
-        // Integers and pointers are passed in general purpose registers (rcx/rdx/r8/r9 or rdi/rsi/rdx/rcx/r8/r9).
-        // Floats are passed in XMM0-XMM3.
-        dispatch_call(py, fn_ptr, param_types, ret_type, args)
+        drop(_buffers);
+
+        match res_rt {
+            Some(RtValue::I8(n)) => Ok(n.into_py(py)),
+            Some(RtValue::I16(n)) => Ok(n.into_py(py)),
+            Some(RtValue::I32(n)) => Ok(n.into_py(py)),
+            Some(RtValue::I64(n)) => Ok(n.into_py(py)),
+            Some(RtValue::Ptr(p)) => Ok(p.into_py(py)),
+            Some(RtValue::F32(f)) => Ok(f.into_py(py)),
+            Some(RtValue::F64(f)) => Ok(f.into_py(py)),
+            None => Ok(py.None()),
+        }
     }
 
     #[pyo3(signature = (*args))]
@@ -100,264 +197,8 @@ impl PyKernel {
             return self.run(py, "main", args);
         }
         Err(pyo3::exceptions::PyValueError::new_err(
-            "Kernel has multiple functions. Specify function name as first argument or call kernel.run('func_name', ...)"
+            "Kernel has multiple functions. Specify function name as first argument or call kernel.run('func_name', ...)",
         ))
-    }
-}
-
-fn dispatch_call(
-    py: Python<'_>,
-    fn_ptr: *const u8,
-    param_types: &[Type],
-    ret_type: &Option<Type>,
-    args: &Bound<'_, PyTuple>,
-) -> PyResult<PyObject> {
-    // Collect pointer or 64-bit integer values
-    let mut i_vals: Vec<i64> = Vec::new();
-    let mut f_vals: Vec<f64> = Vec::new();
-
-    // Keep active PyBuffer guards alive during call
-    let mut _buffers: Vec<BufferGuard> = Vec::new();
-
-    for (i, &ty) in param_types.iter().enumerate() {
-        let arg = args.get_item(i)?;
-        match ty {
-            Type::Ptr => {
-                // Try Python buffer protocol first
-                let mut view: pyo3::ffi::Py_buffer = unsafe { std::mem::zeroed() };
-                let is_buffer = unsafe {
-                    pyo3::ffi::PyObject_GetBuffer(arg.as_ptr(), &mut view, pyo3::ffi::PyBUF_SIMPLE)
-                        == 0
-                };
-
-                if is_buffer {
-                    let ptr = view.buf as i64;
-                    _buffers.push(BufferGuard { view });
-                    i_vals.push(ptr);
-                } else {
-                    unsafe {
-                        pyo3::ffi::PyErr_Clear();
-                    }
-                    // Try __array_interface__ (NumPy, PyTorch, CuPy)
-                    if let Ok(ai) = arg.getattr("__array_interface__") {
-                        if let Ok(data) = ai.get_item("data") {
-                            if let Ok(tuple) = data.extract::<(i64, bool)>() {
-                                i_vals.push(tuple.0);
-                                continue;
-                            }
-                        }
-                    }
-                    if let Ok(val) = arg.extract::<i64>() {
-                        i_vals.push(val);
-                    } else if let Ok(val) = arg.extract::<usize>() {
-                        i_vals.push(val as i64);
-                    } else {
-                        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                            "Argument {i} expected pointer or buffer (NumPy array), found {:?}",
-                            arg
-                        )));
-                    }
-                }
-            }
-            Type::I64 => {
-                let val: i64 = arg.extract()?;
-                i_vals.push(val);
-            }
-            Type::I32 => {
-                let val: i32 = arg.extract()?;
-                i_vals.push(val as i64);
-            }
-            Type::I16 => {
-                let val: i16 = arg.extract()?;
-                i_vals.push(val as i64);
-            }
-            Type::I8 => {
-                let val: i8 = arg.extract()?;
-                i_vals.push(val as i64);
-            }
-            Type::F32 => {
-                let val: f32 = arg.extract()?;
-                f_vals.push(val as f64);
-            }
-            Type::F64 => {
-                let val: f64 = arg.extract()?;
-                f_vals.push(val);
-            }
-            Type::V128 => {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "Direct passing of v128 register arguments across Python boundary not supported; pass by pointer (ptr)",
-                ));
-            }
-        }
-    }
-
-    // Dynamic execution dispatch based on parameter pattern
-    unsafe {
-        achainsaw_codegen::reset_execution_status();
-        let res = match (param_types, ret_type) {
-            // Void returns
-            ([], None) => {
-                let f: extern "C" fn() = std::mem::transmute(fn_ptr);
-                f();
-                Ok(py.None())
-            }
-            ([Type::Ptr | Type::I64], None) => {
-                let f: extern "C" fn(i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0]);
-                Ok(py.None())
-            }
-            ([Type::Ptr | Type::I64, Type::Ptr | Type::I64], None) => {
-                let f: extern "C" fn(i64, i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], i_vals[1]);
-                Ok(py.None())
-            }
-            ([Type::Ptr | Type::I64, Type::I32], None) => {
-                let f: extern "C" fn(i64, i32) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], i_vals[1] as i32);
-                Ok(py.None())
-            }
-            ([Type::Ptr | Type::I64, Type::F32, Type::I64 | Type::I32], None) => {
-                let f: extern "C" fn(i64, f32, i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], f_vals[0] as f32, i_vals[1]);
-                Ok(py.None())
-            }
-            ([Type::Ptr, Type::Ptr, Type::I64 | Type::I32], None) => {
-                let f: extern "C" fn(i64, i64, i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], i_vals[1], i_vals[2]);
-                Ok(py.None())
-            }
-            ([Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32], None) => {
-                let f: extern "C" fn(i64, i64, i64, i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], i_vals[1], i_vals[2], i_vals[3]);
-                Ok(py.None())
-            }
-            (
-                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32],
-                None,
-            ) => {
-                let f: extern "C" fn(i64, i64, i64, i64, i64) = std::mem::transmute(fn_ptr);
-                f(i_vals[0], i_vals[1], i_vals[2], i_vals[3], i_vals[4]);
-                Ok(py.None())
-            }
-
-            // Integer returns
-            ([], Some(Type::I32)) => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f().into_py(py))
-            }
-            ([Type::I32 | Type::I64], Some(Type::I32)) => {
-                let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0] as i32).into_py(py))
-            }
-            ([Type::Ptr], Some(Type::I32)) => {
-                let f: extern "C" fn(i64) -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0]).into_py(py))
-            }
-            ([Type::Ptr, Type::I32 | Type::I64], Some(Type::I32)) => {
-                let f: extern "C" fn(i64, i32) -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0], i_vals[1] as i32).into_py(py))
-            }
-            ([Type::I32 | Type::I64, Type::I32 | Type::I64], Some(Type::I32)) => {
-                let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0] as i32, i_vals[1] as i32).into_py(py))
-            }
-            (
-                [Type::I32 | Type::I64, Type::I32 | Type::I64, Type::I32 | Type::I64],
-                Some(Type::I32),
-            ) => {
-                let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0] as i32, i_vals[1] as i32, i_vals[2] as i32).into_py(py))
-            }
-            ([Type::Ptr | Type::I64], Some(Type::I64)) => {
-                let f: extern "C" fn(i64) -> i64 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0]).into_py(py))
-            }
-            ([Type::Ptr | Type::I64, Type::Ptr | Type::I64], Some(Type::I64)) => {
-                let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(fn_ptr);
-                Ok(f(i_vals[0], i_vals[1]).into_py(py))
-            }
-            (
-                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::I64 | Type::I32],
-                Some(Type::I64),
-            ) => {
-                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, i64) -> i64 =
-                    std::mem::transmute(fn_ptr);
-                let res = f(
-                    i_vals[0] as *const u8,
-                    i_vals[1] as *const u8,
-                    i_vals[2] as *const u8,
-                    i_vals[3],
-                    i_vals[4],
-                );
-                Ok(res.into_py(py))
-            }
-
-            // Float returns
-            ([Type::F32], Some(Type::F32)) => {
-                let f: extern "C" fn(f32) -> f32 = std::mem::transmute(fn_ptr);
-                Ok(f(f_vals[0] as f32).into_py(py))
-            }
-            ([Type::F64], Some(Type::F64)) => {
-                let f: extern "C" fn(f64) -> f64 = std::mem::transmute(fn_ptr);
-                Ok(f(f_vals[0]).into_py(py))
-            }
-            ([Type::F32, Type::F32], Some(Type::F32)) => {
-                let f: extern "C" fn(f32, f32) -> f32 = std::mem::transmute(fn_ptr);
-                Ok(f(f_vals[0] as f32, f_vals[1] as f32).into_py(py))
-            }
-            ([Type::F64, Type::F64], Some(Type::F64)) => {
-                let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(fn_ptr);
-                Ok(f(f_vals[0], f_vals[1]).into_py(py))
-            }
-            ([Type::Ptr, Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
-                let f: extern "C" fn(*const u8, *const u8, i64) -> f32 =
-                    std::mem::transmute(fn_ptr);
-                let res = f(i_vals[0] as *const u8, i_vals[1] as *const u8, i_vals[2]);
-                Ok(res.into_py(py))
-            }
-            (
-                [Type::Ptr, Type::Ptr, Type::Ptr, Type::I64 | Type::I32, Type::F32],
-                Some(Type::F32),
-            ) => {
-                let f: extern "C" fn(*const u8, *const u8, *const u8, i64, f32) -> f32 =
-                    std::mem::transmute(fn_ptr);
-                let res = f(
-                    i_vals[0] as *const u8,
-                    i_vals[1] as *const u8,
-                    i_vals[2] as *const u8,
-                    i_vals[3],
-                    f_vals[0] as f32,
-                );
-                Ok(res.into_py(py))
-            }
-            ([Type::Ptr, Type::I64 | Type::I32], Some(Type::F32)) => {
-                let f: extern "C" fn(*const u8, i64) -> f32 = std::mem::transmute(fn_ptr);
-                let res = f(i_vals[0] as *const u8, i_vals[1]);
-                Ok(res.into_py(py))
-            }
-            ([Type::Ptr], Some(Type::F32)) => {
-                let f: extern "C" fn(*const u8) -> f32 = std::mem::transmute(fn_ptr);
-                let res = f(i_vals[0] as *const u8);
-                Ok(res.into_py(py))
-            }
-
-            // Pointer returns
-            ([], Some(Type::Ptr)) => {
-                let f: extern "C" fn() -> *mut u8 = std::mem::transmute(fn_ptr);
-                Ok((f() as usize).into_py(py))
-            }
-            ([Type::I64 | Type::I32], Some(Type::Ptr)) => {
-                let f: extern "C" fn(i64) -> *mut u8 = std::mem::transmute(fn_ptr);
-                Ok((f(i_vals[0]) as usize).into_py(py))
-            }
-
-            _ => Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-                "Signature with params {:?} and return {:?} not yet mapped in dispatcher",
-                param_types, ret_type
-            ))),
-        };
-        check_execution_status_py(py)?;
-        res
     }
 }
 
@@ -366,10 +207,9 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
         let status = achainsaw_codegen::get_execution_status();
         match status {
             achainsaw_codegen::ExecutionStatus::OutOfFuel => {
-                let err_type = py.get_type_bound::<CompilationError>();
-                let err_instance = err_type
-                    .call1(("[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted",))
-                    .unwrap();
+                let err_type = py.get_type_bound::<ExecutionError>();
+                let msg = "[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted";
+                let err_instance = err_type.call1((msg,)).unwrap();
                 let diag = serde_json::json!({
                     "status": "error",
                     "error_code": "ERR_OUT_OF_FUEL",
@@ -384,7 +224,7 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
                 PyErr::from_value_bound(err_instance)
             }
             achainsaw_codegen::ExecutionStatus::OutOfMemory { requested, limit } => {
-                let err_type = py.get_type_bound::<CompilationError>();
+                let err_type = py.get_type_bound::<ExecutionError>();
                 let msg = format!(
                     "[ERR_OUT_OF_MEMORY] Allocation of {requested} bytes exceeded memory quota of {limit} bytes"
                 );
@@ -406,7 +246,10 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
                 }
                 PyErr::from_value_bound(err_instance)
             }
-            _ => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+            _ => {
+                let err_type = py.get_type_bound::<ExecutionError>();
+                PyErr::from_value_bound(err_type.call1((e.to_string(),)).unwrap())
+            }
         }
     })
 }
@@ -453,7 +296,7 @@ pub fn check(py: Python<'_>, source: &str) -> PyResult<PyObject> {
 #[pyfunction]
 pub fn assemble(py: Python<'_>, source: &str) -> PyResult<PyObject> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
-    let bytes = encode_module(&module);
+    let bytes = encode_module(&module).map_err(|d| diagnostic_to_py_err(py, d))?;
     Ok(pyo3::types::PyBytes::new_bound(py, &bytes).into_py(py))
 }
 
@@ -463,48 +306,51 @@ pub fn disassemble(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
     Ok(to_air_text(&module))
 }
 
+fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResult<PyKernel> {
+    let runtime_err = |e: anyhow::Error| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
+
+    let mut signatures = HashMap::new();
+    for func in &module.functions {
+        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
+        signatures.insert(func.name.clone(), (p_types, func.ret_type));
+    }
+
+    let mut engine = JitEngine::for_module(backend, module).map_err(runtime_err)?;
+    engine.compile_module(module).map_err(runtime_err)?;
+
+    Ok(PyKernel { engine, signatures })
+}
+
+/// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default: follows
+/// ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else Cranelift).
 #[pyfunction]
-pub fn compile_binary(py: Python<'_>, bytes: &[u8]) -> PyResult<PyKernel> {
+#[pyo3(signature = (bytes, backend=None))]
+pub fn compile_binary(py: Python<'_>, bytes: &[u8], backend: Option<&str>) -> PyResult<PyKernel> {
     let module = decode_module(bytes).map_err(|d| diagnostic_to_py_err(py, d))?;
     let mut validator = achainsaw_ir::Validator::new();
     validator
         .validate_module(&module)
         .map_err(|d| diagnostic_to_py_err(py, d))?;
-
-    let mut signatures = HashMap::new();
-    for func in &module.functions {
-        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-        signatures.insert(func.name.clone(), (p_types, func.ret_type));
-    }
-
-    let mut engine =
-        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    engine
-        .compile_module(&module)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    Ok(PyKernel { engine, signatures })
+    build_kernel(&module, backend)
 }
 
+/// Compiles AIR source text. `backend` is "cranelift", "llvm" or "auto" (the default:
+/// follows ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else
+/// Cranelift).
 #[pyfunction]
-pub fn compile(py: Python<'_>, source: &str) -> PyResult<PyKernel> {
+#[pyo3(signature = (source, backend=None))]
+pub fn compile(py: Python<'_>, source: &str, backend: Option<&str>) -> PyResult<PyKernel> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
+    build_kernel(&module, backend)
+}
 
-    let mut signatures = HashMap::new();
-    for func in &module.functions {
-        let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-        signatures.insert(func.name.clone(), (p_types, func.ret_type));
-    }
-
-    let mut engine =
-        JitEngine::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    engine
-        .compile_module(&module)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    Ok(PyKernel { engine, signatures })
+/// Backends compiled into this build, e.g. ["cranelift", "llvm"].
+#[pyfunction]
+pub fn available_backends() -> Vec<&'static str> {
+    achainsaw_codegen::Backend::available()
+        .iter()
+        .map(|b| b.as_str())
+        .collect()
 }
 
 #[pyfunction]
@@ -566,6 +412,36 @@ pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
     Ok(dict.into_py(py))
 }
 
+/// Host CPU vector features, active ISA cap, and backend vector widths.
+#[pyfunction]
+pub fn cpu_features(py: Python<'_>) -> PyResult<PyObject> {
+    let report = achainsaw_codegen::cpu::target_report()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let parsed = py
+        .import_bound("json")?
+        .call_method1("loads", (report.to_string(),))?;
+    Ok(parsed.into_py(py))
+}
+
+/// Caps the vector ISA for kernels compiled afterwards (`None` removes the cap).
+#[pyfunction]
+#[pyo3(signature = (level))]
+pub fn set_isa_cap(level: Option<&str>) -> PyResult<()> {
+    let cap = level
+        .map(|l| l.parse::<achainsaw_codegen::cpu::IsaLevel>())
+        .transpose()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    achainsaw_codegen::cpu::set_isa_cap(cap)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction]
+pub fn get_isa_cap() -> PyResult<Option<String>> {
+    achainsaw_codegen::cpu::isa_cap()
+        .map(|c| c.map(|l| l.as_str().to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
@@ -573,8 +449,10 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "CompilationError",
         m.py().get_type_bound::<CompilationError>(),
     )?;
+    m.add("ExecutionError", m.py().get_type_bound::<ExecutionError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(available_backends, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;
     m.add_function(wrap_pyfunction!(assemble, m)?)?;
     m.add_function(wrap_pyfunction!(disassemble, m)?)?;
@@ -587,5 +465,8 @@ fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_memory_quota, m)?)?;
     m.add_function(wrap_pyfunction!(get_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_features, m)?)?;
+    m.add_function(wrap_pyfunction!(set_isa_cap, m)?)?;
+    m.add_function(wrap_pyfunction!(get_isa_cap, m)?)?;
     Ok(())
 }

@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Code Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-rust:
+    name: Rust Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace --verbose
+
+  test-llvm:
+    name: LLVM Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The arm64 runners (Neoverse N2) have SVE2, so the scalable `vx` path runs natively.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      LLVM_FEATURES: achainsaw/llvm,achainsaw-codegen/llvm,achainsaw-llvm/llvm,achainsaw-py/llvm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 22
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev libzstd-dev zlib1g-dev
+          "$LLVM_SYS_221_PREFIX/bin/llvm-config" --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy lints with LLVM
+        run: cargo clippy --workspace --all-targets --features "$LLVM_FEATURES" -- -D warnings
+
+      - name: Report target features
+        run: cargo run -q --bin achainsaw --features achainsaw/llvm -- cpu
+
+      # The whole suite runs twice: Cranelift (default) and LLVM (ACHAINSAW_BACKEND), so both
+      # backends are held to the same tests. backend_parity.rs compares them directly.
+      - name: Rust tests (Cranelift backend)
+        run: cargo test --workspace --features "$LLVM_FEATURES"
+
+      - name: Rust tests (LLVM backend)
+        run: cargo test --workspace --features "$LLVM_FEATURES"
+        env:
+          ACHAINSAW_BACKEND: llvm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and install achainsaw Python package with LLVM
+        run: |
+          python -m pip install --upgrade pip maturin numpy
+          python -m pip install .
+        env:
+          MATURIN_PEP517_ARGS: --features llvm
+
+      - name: Python, MCP and AOT end-to-end tests (LLVM backend)
+        run: |
+          cargo build --bin achainsaw --features achainsaw/llvm
+          python tests/test_py_binding.py
+          python tests/test_mcp_e2e.py
+          python tests/test_aot_e2e.py
+          python benchmarks/benchmark_kernels.py --quick
+        env:
+          ACHAINSAW_BACKEND: llvm
+
+      # SME emulation needs QEMU 9+ (Ubuntu 24.04's 8.2 mis-emulates ZA tile accesses), so fetch
+      # the newest 10.x qemu-user (a static binary) from the Ubuntu archive for this runner.
+      - name: Install QEMU 10
+        run: |
+          arch=$(dpkg --print-architecture)
+          case "$arch" in
+            amd64) pool=http://archive.ubuntu.com/ubuntu/pool/universe/q/qemu ;;
+            arm64) pool=http://ports.ubuntu.com/ubuntu-ports/pool/universe/q/qemu ;;
+          esac
+          ver=$(curl -fsSL "$pool/" | grep -oE "qemu-user_10\.[^\"_]*_${arch}\.deb" \
+            | sed -E "s/qemu-user_(.*)_${arch}\.deb/\1/" | sort -uV | tail -1)
+          curl -fsSL -o /tmp/qemu-user.deb "$pool/qemu-user_${ver}_${arch}.deb"
+          dpkg-deb -x /tmp/qemu-user.deb /tmp/qemu
+          /tmp/qemu/usr/bin/qemu-aarch64 --version
+          echo "QEMU=/tmp/qemu/usr/bin/qemu-aarch64" >> "$GITHUB_ENV"
+
+      # AOT-compiled AArch64 mm kernels (SVE vector FMAs, SME outer products, NEON) run in a
+      # freestanding harness under QEMU, on x86 too: see tools/qemu-aarch64/run.sh.
+      - name: AArch64 mm kernels under QEMU (AOT harness)
+        if: runner.arch == 'X64'
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo build --bin achainsaw --features achainsaw/llvm
+          tools/qemu-aarch64/run.sh +neon 16
+          tools/qemu-aarch64/run.sh +sve 16 32 256
+          tools/qemu-aarch64/run.sh +sve,+sme 16 32 256
+
+      # Scalable vectors must work at every SVE vector length, not just the runner's
+      # 128 bits: rerun the vx and mm tests (the code that depends on the length) under QEMU
+      # at 256, 512 and 2048 bits. `-cpu max` also has SME, so `mm` uses the SME kernel
+      # there, at the same streaming vector length. Everything else already ran natively above; QEMU also emulates
+      # LLVM itself, so the full suites would take hours.
+      - name: SVE vector-length sweep under QEMU
+        if: runner.arch == 'ARM64'
+        timeout-minutes: 30
+        run: |
+          cargo test -p achainsaw-codegen --features llvm --no-run
+          for vl_bytes in 32 64 256; do
+            echo "::group::SVE vector length $((vl_bytes * 8)) bits"
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="$QEMU -cpu max,sve-default-vector-length=$vl_bytes,sme-default-vector-length=$vl_bytes" \
+              cargo test -p achainsaw-codegen --features llvm \
+                --test vector_ops --test half_masked_mm -- at_host_vector_length
+            echo "::endgroup::"
+          done
+        env:
+          ACHAINSAW_BACKEND: llvm
+
+  test-python:
+    name: Python Tests (${{ matrix.os }}, Py ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install maturin numpy
+
+      - name: Build and install achainsaw Python package
+        run: |
+          python -m pip install .
+
+      - name: Run Python unit tests
+        run: python tests/test_py_binding.py
+
+      - name: Build CLI binary for MCP & AOT tests
+        run: cargo build --bin achainsaw
+
+      - name: Run MCP server end-to-end integration tests
+        run: python tests/test_mcp_e2e.py
+
+      - name: Run Ahead-Of-Time (AOT) compilation tests
+        run: python tests/test_aot_e2e.py
+
+      - name: Run Chainsaw-BLAS benchmark verification
+        run: python benchmarks/benchmark_kernels.py --quick

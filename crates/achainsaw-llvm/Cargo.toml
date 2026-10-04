@@ -1,0 +1,22 @@
+[package]
+name = "achainsaw-llvm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Optional LLVM backend for achainsaw (JIT and AOT)"
+
+[features]
+# Without this feature the crate is empty, so the workspace builds without LLVM installed.
+llvm = ["dep:inkwell"]
+
+[dependencies]
+achainsaw-ir = { path = "../achainsaw-ir" }
+anyhow = { workspace = true }
+inkwell = { version = "0.10", features = ["llvm22-1-prefer-dynamic"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

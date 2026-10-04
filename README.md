@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml)
 [![Release](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 > **High-Performance, Token-Minimal Compiler Toolchain Designed Exclusively for AI Agents**
 
@@ -18,7 +18,7 @@
 - **Linear SSA / Three-Address Code (TAC):** Zero nested expressions (`(+ (* a b) c)`). Eliminates bracket/parenthesis balancing errors and allows causal transformer attention heads to track dependencies with forward sequential ease.
 - **Single-Token Mnemonics:** Operators and keywords (`fn`, `cst`, `add`, `mul`, `ld`, `st`, `br`, `jmp`, `ret`) map strictly to single, indivisible tokens in standard BPE vocabularies (OpenAI `cl100k`/`o200k`, Meta LLaMA 3, Google Gemini).
 - **Machine-Native Diagnostic Protocol:** Zero natural-language prose error messages. Validation failures immediately produce structured JSON diagnostics with exact instruction indices, expected types, and candidate replacement patches for single-shot agent self-repair.
-- **Universal 128-bit SIMD Primitives:** Hardware-accelerated vectorization (`v128`) supporting 4 parallel single-precision floats (`vfadd`, `vfmul`, `vfsub`, `vfdiv`), 4 parallel 32-bit integers (`viadd`, `vimul`), `splat` broadcast, and lane extraction (`extlane`). *(Architecturally designed for future extension to `v256` AVX2 and `v512` AVX-512).*
+- **Width-Generic SIMD Vectors:** Fixed `v128`/`v256`/`v512` and scalable `vx` vectors with lane-typed ops (`vadd a, b:f32`) over i8/i16/i32/i64/f32/f64 lanes, fused multiply-add, compares and bitwise select, broadcast, lane extraction, and deterministic horizontal reductions (see [Vector Types & Ops](#-vector-types--ops-air-v2)).
 - **Autonomous Dynamic Memory Management:** Built-in bare-metal heap allocator intrinsics (`alloc`, `free`) with 64-bit pointer arithmetic, allowing agents to dynamically allocate, reshape, and reclaim scratchpad buffers.
 - **Sub-10ms Bare-Metal JIT:** Direct in-memory compilation and execution via Cranelift with native C-ABI compatibility for host interop.
 - **High-Performance Memory Model:** Flat linear memory addressing (`ld`/`st`), 64-bit pointer arithmetic, and scalar numeric types (`i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`, `v128`).
@@ -74,6 +74,83 @@ fn dot(p0:ptr, p1:ptr, n:i64)->f32
   b3:
     ret acc
 ```
+
+---
+
+## 🧮 Vector Types & Ops (AIR v2)
+
+Vectors are untyped bit containers; every vector op names the lane type it works on, so one register can be read as `f32` lanes by one op and as `i32` lanes by the next.
+
+| Type | Width | Notes |
+|---|---|---|
+| `v128`, `v256`, `v512` | 128/256/512 bits | Fixed width; usable in AIR function signatures |
+| `vx` | Target maximum (at least 128 bits) | Scalable; `n = vl f32` gives its lane count. Not allowed in signatures |
+
+| Op | Syntax | Lane types |
+|---|---|---|
+| Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
+| Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
+| Broadcast | `v = splat x:v512` (plain `splat x` is `v128`) | i8 to f64 |
+| Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
+| Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
+| Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
+| Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
+| Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
+| Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
+| Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
+| Lane count | `n = vl f32` | Any |
+
+Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths. The pre-v2 spellings (`vfadd`, `viadd`, `vfsum`, `visum`, `vfmax`, ...) still parse and print in canonical form.
+
+Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
+```air
+fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
+  b0:
+    va = splat a:vx
+    w = vl f32
+    jmp vloop(0:i64)
+  vloop(i:i64):
+    more = lt i, n
+    br more, vbody, done
+  vbody:
+    rest = sub n, i
+    off = mul i, 4:i64
+    px = add x, off
+    py = add y, off
+    xv = ldm px:vx, rest:f32
+    yv = ldm py:vx, rest:f32
+    r = vfma va, xv, yv:f32
+    stm py, r, rest:f32
+    i2 = add i, w
+    jmp vloop(i2)
+  done:
+    ret
+```
+
+**Half-precision storage types:** `f16` (IEEE binary16) and `bf16` (bfloat16) can be loaded, stored, and converted (`f = fext h:f32`, `h = ftrunc f:bf16`, rounding to nearest-even), but not used in arithmetic or function signatures; convert to `f32` first.
+
+**Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
+
+On the LLVM backend, `mm` uses the best kernel the target has:
+
+| Target | `mm` kernel |
+|---|---|
+| x86 with AMX (Sapphire/Emerald Rapids: bf16, i8; Granite Rapids: also f16) | 16x16 AMX tiles (`tdpbf16ps`, `tdpbssd`, `tdpfp16ps`) |
+| AArch64 with SME (e.g. Apple M4) | ZA-tile outer products (`fmopa`, `bfmopa`, `smopa`) in streaming mode |
+| Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), 4 rows of C per B strip |
+
+On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32 (about 50x Cranelift's scalar loop), 90 for bf16, 70 GOP/s for i8, and 29 for f16. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
+
+**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
+
+| Target (LLVM backend) | `vx` | Masked `ldm`/`stm` |
+|---|---|---|
+| x86_64 with AVX-512F | 512 bits (zmm) | AVX-512 k-masks |
+| x86_64 with AVX2 | 256 bits (ymm) | `vmaskmov` |
+| x86_64 SSE/AVX only, AArch64 NEON (including Apple M4) | 128 bits | per-lane |
+| AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
+
+`v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
 
 ---
 
@@ -140,7 +217,7 @@ achainsaw bench examples/fibonacci.air --iters 200
 ```
 
 ### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
-AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading:
+AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. The current format is AIRB v3 (v2 added the wide vector types and ops; v3 added `f16`/`bf16`, `ldm`/`stm`, and `mm`); older files still load:
 ```bash
 # Assemble text AIR to compact binary bytecode (.airb)
 achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
@@ -160,10 +237,39 @@ achainsaw mcp
 
 **Exposed MCP Tools:**
 - **`air_check`**: Validates AIR textual IR or base64 AIRB bytecode syntax and SSA invariants. Returns structured diagnostic metrics or error payloads with line/column pointers and self-repair hints.
-- **`air_run`**: JIT compiles and executes AIR functions with arguments, loop fuel budget, and memory quota sandboxing.
+- **`air_run`**: JIT compiles and executes AIR functions with arguments, loop fuel budget, and memory quota sandboxing. Code runs in a sandbox: memory comes only from `alloc` within a private arena (`max_memory_mb`, default 64), out-of-bounds accesses and bad `free`s fail with `ERR_MEMORY_VIOLATION`, unbounded recursion with `ERR_STACK_OVERFLOW`, and pointer parameters are rejected.
 - **`air_assemble`**: Assembles textual AIR into compact base64-encoded AIRB bytecode with compression metrics.
 - **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
 - **`air_optimize`**: Optimizes IR using constant folding, algebraic simplification, branch folding, and DCE to a fixpoint.
+- **`air_target`**: Reports the host's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and each backend's vector width (see [CPU Features & ISA Targeting](#9-cpu-features--isa-targeting-achainsaw-cpu)).
+
+The `initialize` response includes server `instructions`, a compact AIR syntax primer that MCP clients inject into the model's context. That lets an agent write valid AIR on the first attempt without this README.
+
+#### Using with Claude Code
+The repository ships a project-scoped [`.mcp.json`](.mcp.json) that runs the server via `cargo run --release`. Build once so the first startup does not exceed the MCP connection timeout, then start Claude Code in the repo and approve the `achainsaw` server when prompted:
+```bash
+cargo build --release -p achainsaw
+claude
+```
+
+To make the tools available in every project, register an installed binary at user scope instead:
+```bash
+cargo install --path crates/achainsaw-cli
+claude mcp add --scope user achainsaw -- achainsaw mcp
+```
+
+#### Using with Claude Desktop
+Add the server to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`), using the absolute path to the binary, then restart Claude Desktop:
+```json
+{
+  "mcpServers": {
+    "achainsaw": {
+      "command": "/absolute/path/to/achainsaw",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ### 7. IR Optimization Engine (`achainsaw opt`)
 Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks:
@@ -211,24 +317,104 @@ achainsaw build examples/fibonacci.air --shared --json
 }
 ```
 
+### 9. CPU Features & ISA Targeting (`achainsaw cpu`)
+Report the host's vector ISA features (feature names use LLVM spelling), the active ISA cap, and the vector width each code generation backend uses:
+```bash
+achainsaw cpu
+```
+
+```json
+{
+  "status": "ok",
+  "host": {
+    "arch": "x86_64",
+    "features": ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16", "avx", "f16c", "avx2", "fma", "...", "avx512f", "avx512vl", "avx512bw", "avx512bf16"],
+    "max_isa": "avx512",
+    "native_vector_bits": 512,
+    "sve_vector_bits": null,
+    "sme_vector_bits": null
+  },
+  "isa_cap": null,
+  "effective": { "...": "host features after the ISA cap" },
+  "backends": {
+    "cranelift": { "available": true, "vector_bits": 128, "unused_features": ["f16c", "avx512bw", "avx512cd", "avx512bf16"] },
+    "llvm": { "available": false }
+  }
+}
+```
+
+Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available) and runs `v256`/`v512`/`vx` programs as 128-bit operations. The LLVM backend, when built in, uses every enabled feature, and `backends.llvm` reports `"available": true` with its `vx` width (`vector_bits`) and whether `vx` is scalable (`vx_scalable`, on SVE).
+
+**Cap the ISA level** to exercise lower tiers on a more capable machine (for example, AVX2 code on an AVX-512 host). Levels: `sse`, `avx`, `avx2`, `avx512`, `amx` (x86_64) and `neon`, `sve`, `sve2`, `sme` (AArch64):
+```bash
+achainsaw run examples/sum_loop.air --func sum_to_n --args 100 --isa avx2
+ACHAINSAW_MAX_ISA=sse achainsaw mcp      # every JIT compilation in the server is capped
+```
+
+**Target a specific CPU in AOT builds** with LLVM CPU names and feature strings. `+feature` also enables its prerequisites and `-feature` disables everything that depends on it, as in LLVM. Features the backend cannot use are listed in `ignored_features`:
+```bash
+achainsaw build examples/kernels/gemv_f32.air --target-cpu x86-64-v3
+achainsaw build examples/kernels/gemv_f32.air --target-cpu znver4 --target-features -avx512f
+achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphirerapids --emit asm   # writes gemv_f32.s
+```
+
 ---
 
 ## ⚡ Chainsaw-BLAS: High-Performance Agent AI Kernel Library
 
-`achainsaw` ships with pre-compiled, mathematically verified AI kernels in `examples/kernels/` targeting LLM inference primitives, vector search, and token normalization:
+`examples/kernels/` holds verified kernels for LLM inference, vector search, and normalization. They are vector-length agnostic: each processes `vl` lanes per step with FMAs and finishes with masked `ldm`/`stm`, so the same source runs 128-bit vectors on Cranelift and AVX2/AVX-512/SVE-width vectors on LLVM. Every kernel takes element counts, and each `.air` file has matching `.airb` bytecode.
 
-| Kernel | Source | Bytecode | Primary Use Case | Numerical Error |
-|---|---|---|---|---|
-| **Cosine Similarity** | `cosine_similarity.air` | `.airb` | High-throughput embedding search & RAG | `< 1e-7` |
-| **Euclidean Distance (L2)** | `euclidean_distance.air` | `.airb` | Vector quantization & nearest neighbors | `0.00e+00` |
-| **Numerically Stable Softmax** | `softmax.air` | `.airb` | Attention head weighting ($\exp(x_i - \max)/\sum \exp$) | `< 1e-8` |
-| **RMSNorm** | `rmsnorm.air` | `.airb` | Transformer token normalization (LLaMA, Mistral, Gemma) | `< 5e-7` |
-| **GEMV (f32)** | `gemv_f32.air` | `.airb` | Matrix-vector linear projection | `< 3e-5` |
+| Kernel | Signature | Use case |
+|---|---|---|
+| `cosine_similarity.air` | `(a:ptr, b:ptr, n:i64)->f32` | Embedding search and RAG |
+| `euclidean_distance.air` | `(a:ptr, b:ptr, n:i64)->f32` | Nearest neighbors, vector quantization |
+| `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable |
+| `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
+| `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
+| `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
 
-Run the kernel benchmarks and numerical accuracy verification suite:
+`crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
+
 ```bash
-python benchmarks/benchmark_kernels.py
+python benchmarks/benchmark_kernels.py                  # host ISA, every available backend
+python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx2/avx512 (or neon/sve/...)
+python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
+
+Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
+
+| Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
+|---|---|---|---|
+| Cosine similarity, n=1024 | 2.4 µs | 1.1 µs | 0.5 µs |
+| Euclidean distance, n=1024 | 1.4 µs | 1.0 µs | 0.5 µs |
+| Softmax, n=1000 | 3.2 µs | 4.3 µs | 3.1 µs |
+| RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
+| GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
+| GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.39 ms (87 GFLOP/s) |
+
+Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.
+
+### 10. Choosing a Backend (`--backend`)
+Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
+
+| Backend | Compile latency (release, simple kernel) | Code | Availability |
+|---|---|---|---|
+| `cranelift` | ~0.2–0.3 ms | 128-bit vectors | always |
+| `llvm` | ~5–7 ms | fully optimized; full-width AVX2/AVX-512/SVE vectors (`vx` up to 512 bits or scalable) | builds with the `llvm` feature |
+
+Pick one with `--backend` on `run`, `bench` and `build`, the `ACHAINSAW_BACKEND` environment variable, `backend=` in Python, or the `backend` argument of MCP `air_run`. `auto` (the default) uses LLVM, when it is built in, for modules that use `v256`, `v512`, `vx`/`vl` or `mm`, and Cranelift otherwise, so scalar code keeps sub-millisecond compiles. For example, [`examples/saxpy_vx.air`](examples/saxpy_vx.air) on an AVX-512 machine runs 3–4x faster on LLVM.
+
+```bash
+# Build with the LLVM backend (needs LLVM 22, e.g. apt install llvm-22-dev)
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+cargo build --release -p achainsaw --features llvm
+
+achainsaw --backend llvm run examples/fibonacci.air --func fib --args 30
+achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu znver4 --shared
+ACHAINSAW_BACKEND=llvm achainsaw mcp     # every air_run in the server uses LLVM
+```
+
+AOT builds with `--backend llvm` accept the same `--target`, `--target-cpu` and `--target-features` options and can use every feature (nothing ends up in `ignored_features`). `crates/achainsaw-codegen/tests/backend_parity.rs` checks that both backends agree bit for bit, including on division by zero, out-of-range shifts, NaN handling, and saturating conversions.
 
 ---
 
@@ -238,6 +424,10 @@ For AI agent orchestrators (LangGraph, AutoGen, CrewAI, DSPy), `achainsaw` provi
 
 ### Installation / Build
 ```bash
+pip install .                                     # or, with the LLVM backend:
+MATURIN_PEP517_ARGS="--features llvm" pip install .
+# then: achainsaw.compile(src, backend="llvm"); achainsaw.available_backends()
+
 cargo build --release -p achainsaw-py
 cp target/release/achainsaw.dll achainsaw.pyd  # Windows
 # or cp target/release/libachainsaw.so achainsaw.so  # Linux
@@ -297,6 +487,16 @@ except achainsaw.CompilationError as e:
         diag["context"]["available_registers"][0]
     )
     k = achainsaw.compile(repaired_code)
+```
+
+### CPU Features & ISA Cap in Python
+```python
+report = achainsaw.cpu_features()       # same report as `achainsaw cpu`
+print(report["host"]["max_isa"])        # e.g. "avx512"
+
+achainsaw.set_isa_cap("avx2")           # kernels compiled from now on use at most AVX2
+kernel = achainsaw.compile(air_kernel)
+achainsaw.set_isa_cap(None)             # remove the cap
 ```
 
 ### Binary Bytecode (AIRB) in Python
@@ -427,7 +627,7 @@ achainsaw/
 │   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
 ├── examples/
-│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV
+│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV, GEMM (bf16)
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── fibonacci.air           # Branching Fibonacci kernel
 │   ├── simd_vector_dot.air     # 128-bit SIMD hardware dot product kernel
@@ -465,4 +665,4 @@ achainsaw/
 
 ## 📜 License
 
-Dual-licensed under MIT or Apache-2.0.
+Licensed under the [Apache License, Version 2.0](LICENSE).

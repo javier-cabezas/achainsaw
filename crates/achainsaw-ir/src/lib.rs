@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod binary;
+pub mod cfg;
 pub mod diag;
 pub mod lexer;
 pub mod opt;
@@ -81,7 +82,7 @@ fn compute_wave(freq:f32)->f32
         assert_eq!(module.functions.len(), 1);
 
         // Binary roundtrip
-        let bytes = encode_module(&module);
+        let bytes = encode_module(&module).expect("Should encode with extern_functions");
         let decoded = decode_module(&bytes).expect("Should decode with extern_functions");
         assert_eq!(decoded.extern_functions.len(), 2);
         assert_eq!(decoded.extern_functions[0].name, "sinf");
@@ -116,7 +117,7 @@ fn simd_scale(p:ptr, factor:f32, n:i64)
     ret
 "#;
         let original_module = parse_and_validate(code).expect("Valid AIR");
-        let bytes = encode_module(&original_module);
+        let bytes = encode_module(&original_module).expect("Valid encode");
 
         // Verify magic and minimum size
         assert!(bytes.starts_with(b"\x00AIR"));
