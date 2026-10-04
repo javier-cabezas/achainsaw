@@ -194,8 +194,14 @@ pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> 
         }
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
-            let spec = cpu::llvm_aot_target(target)?;
-            let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec)?;
+            let (spec, features) = cpu::llvm_aot_target(target)?;
+            let (vx, vector_width) = features.llvm_vector_shape(false);
+            let opts = achainsaw_llvm::LowerOptions {
+                vx,
+                vector_width,
+                ..Default::default()
+            };
+            let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec, &opts)?;
             Ok(AotObject {
                 bytes,
                 triple,

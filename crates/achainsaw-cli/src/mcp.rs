@@ -19,10 +19,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 /// without having seen the language before. Keep in sync with the parser and validator.
 pub const SERVER_INSTRUCTIONS: &str = "\
 achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
-Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features and which backends are available (Cranelift generates 128-bit vector code; LLVM, when built in, uses native widths for v256/v512).
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features, which backends are available, and each backend's vx width.
 
 AIR syntax:
-- Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits, lane count via `vl`). Vectors are untyped bits; each vector op names its lane type.
+- Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits: 128 on cranelift, up to 512 or SVE-scalable on llvm; always get the lane count via `vl`, never assume it). Vectors are untyped bits; each vector op names its lane type.
 - Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`.
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
 - One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
@@ -37,7 +37,7 @@ AIR syntax:
 - Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
 - Comments: `#` or `//`. Names starting with `__` are reserved.
 
-air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); results are identical on both.
+air_run: `func` defaults to \"main\"; `args` are numbers coerced to the parameter types (ptr and vector params are not allowed); fuel defaults to 1000000 and ERR_OUT_OF_FUEL means a runaway loop. Code runs sandboxed: memory must come from `alloc` (max_memory_mb, default 64), ERR_MEMORY_VIOLATION means an ld/st/ldm/stm/mm outside that memory or a free of a pointer alloc did not return, and ERR_STACK_OVERFLOW means unbounded recursion. `backend` picks the code generator (auto/cranelift/llvm; air_target lists the available ones); auto uses llvm for wide-vector or mm code when available. vx width (and so `vl`) depends on the backend and CPU; fixed-width results are identical on both.
 
 Example:
 fn sum_to(n:i64)->i64
@@ -204,7 +204,7 @@ fn execute_ir_on_this_thread(
     let arena_bytes = memory_mb * 1024 * 1024;
 
     let t1 = Instant::now();
-    let mut engine = JitEngine::for_backend(backend)?;
+    let mut engine = JitEngine::for_module(backend, module)?;
     // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
     let effective_fuel = fuel.or(Some(1_000_000));
     engine.set_fuel(effective_fuel);
@@ -545,7 +545,7 @@ pub fn get_tools_list() -> Value {
                         "backend": {
                             "type": "string",
                             "enum": ["auto", "cranelift", "llvm"],
-                            "description": "Code generator (default auto = cranelift; llvm compiles slower but optimizes fully, if this build has it)"
+                            "description": "Code generator. auto (default) uses llvm for modules with v256/v512/vx/mm when this build has it, else cranelift; llvm compiles in milliseconds instead of microseconds but uses the full vector width"
                         },
                         "max_memory_mb": {
                             "type": "integer",
