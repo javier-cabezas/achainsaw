@@ -7,12 +7,13 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
-use std::cell::Cell;
+use std::alloc::Layout;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::lower::push_abi_params;
-pub use crate::lower::{to_clif_type, LowerConfig, RtValue};
+pub use crate::lower::{to_clif_type, LowerConfig, RtValue, SandboxConfig};
 
 static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 static USER_LIBRARIES: Mutex<Vec<Arc<libloading::Library>>> = Mutex::new(Vec::new());
@@ -60,7 +61,96 @@ extern "C" {
 pub enum ExecutionStatus {
     Ok,
     OutOfFuel,
-    OutOfMemory { requested: usize, limit: usize },
+    OutOfMemory {
+        requested: usize,
+        limit: usize,
+    },
+    /// Sandboxed code accessed `size` bytes at `addr` outside its arena, or freed a
+    /// pointer that is not a live allocation (`size` 0).
+    MemoryViolation {
+        addr: usize,
+        size: usize,
+    },
+    /// Sandboxed code exceeded `SANDBOX_STACK_BYTES` of call stack.
+    StackOverflow,
+}
+
+/// Call stack sandboxed code may use before it halts with `ERR_STACK_OVERFLOW`.
+pub const SANDBOX_STACK_BYTES: usize = 1 << 20;
+/// Smallest sandbox arena; masked accesses assume a vector always fits.
+pub const MIN_SANDBOX_ARENA_BYTES: usize = 4096;
+
+/// Memory owned by a sandboxed engine. `alloc` bump-allocates from it, and every access
+/// that sandboxed code makes is bounds-checked against `[base, base + len)`. Live
+/// allocations are tracked here, outside the arena, so sandboxed code cannot forge them.
+struct Arena {
+    base: *mut u8,
+    layout: Layout,
+    top: usize,
+    /// `(offset, size)` of live allocations, in increasing offset order.
+    live: Vec<(usize, usize)>,
+}
+
+impl Arena {
+    fn new(len: usize) -> Result<Self> {
+        let len = len.max(MIN_SANDBOX_ARENA_BYTES);
+        // Alignment 16 lets the allocator use calloc, so untouched pages stay uncommitted.
+        let layout = Layout::from_size_align(len, 16)?;
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return Err(anyhow!(
+                "[ERR_OUT_OF_MEMORY] Cannot reserve a {len}-byte sandbox arena"
+            ));
+        }
+        Ok(Self {
+            base,
+            layout,
+            top: 0,
+            live: Vec::new(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.layout.size()
+    }
+
+    fn reset(&mut self) {
+        self.top = 0;
+        self.live.clear();
+    }
+
+    /// True when `[addr, addr + size)` lies inside the arena.
+    fn contains(&self, addr: usize, size: usize) -> bool {
+        let off = addr.wrapping_sub(self.base as usize);
+        size <= self.len() && off <= self.len() - size
+    }
+
+    fn alloc(&mut self, size: usize) -> Option<*mut u8> {
+        let start = self.top.checked_add(15)? & !15;
+        let end = start.checked_add(size)?;
+        if end > self.len() {
+            return None;
+        }
+        self.top = end;
+        self.live.push((start, size));
+        Some(unsafe { self.base.add(start) })
+    }
+
+    /// Releases a live allocation and returns its size. Freeing the most recent
+    /// allocation gives its space back, so alloc/free loops do not exhaust the arena.
+    fn free(&mut self, ptr: *mut u8) -> Option<usize> {
+        let off = (ptr as usize).wrapping_sub(self.base as usize);
+        let idx = self.live.iter().rposition(|&(o, _)| o == off)?;
+        let (_, size) = self.live.remove(idx);
+        self.top = self.live.last().map_or(0, |&(o, s)| o + s);
+        Some(size)
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.base, self.layout) };
+    }
 }
 
 thread_local! {
@@ -68,6 +158,37 @@ thread_local! {
     static FUEL_REMAINING: Cell<i64> = const { Cell::new(-1) };
     static MEMORY_ALLOCATED: Cell<usize> = const { Cell::new(0) };
     static MEMORY_QUOTA: Cell<usize> = const { Cell::new(0) };
+    /// Arena of the sandboxed engine currently executing on this thread, or null.
+    static ACTIVE_ARENA: Cell<*const RefCell<Arena>> = const { Cell::new(std::ptr::null()) };
+    /// Lowest stack address sandboxed code may reach; 0 disables the check.
+    static STACK_LIMIT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Records `status` unless an earlier failure is already recorded, so the first cause
+/// (e.g. an allocation failure) is reported rather than its consequences.
+fn raise(status: ExecutionStatus) {
+    CURRENT_STATUS.with(|s| {
+        if s.get() == ExecutionStatus::Ok {
+            s.set(status);
+        }
+    });
+}
+
+fn halted() -> bool {
+    CURRENT_STATUS.with(|s| s.get()) != ExecutionStatus::Ok
+}
+
+fn with_active_arena<R>(f: impl FnOnce(&RefCell<Arena>) -> R) -> Option<R> {
+    let arena = ACTIVE_ARENA.with(|a| a.get());
+    // SAFETY: set only by `call_typed` for the duration of a call on its own engine.
+    (!arena.is_null()).then(|| f(unsafe { &*arena }))
+}
+
+/// Approximate current stack pointer.
+#[inline(never)]
+fn stack_address() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
 }
 
 pub fn set_execution_fuel(fuel: Option<u64>) {
@@ -113,6 +234,71 @@ pub fn check_execution_status() -> Result<()> {
         ExecutionStatus::OutOfMemory { requested, limit } => Err(anyhow!(
             "[ERR_OUT_OF_MEMORY] Allocation of {requested} bytes exceeded memory quota of {limit} bytes"
         )),
+        ExecutionStatus::MemoryViolation { addr, size: 0 } => Err(anyhow!(
+            "[ERR_MEMORY_VIOLATION] free of {addr:#x}, which is not a live allocation"
+        )),
+        ExecutionStatus::MemoryViolation { addr, size } => Err(anyhow!(
+            "[ERR_MEMORY_VIOLATION] Access of {size} bytes at {addr:#x} is outside memory obtained from alloc"
+        )),
+        ExecutionStatus::StackOverflow => Err(anyhow!(
+            "[ERR_STACK_OVERFLOW] Execution halted: call stack exceeded {SANDBOX_STACK_BYTES} bytes (unbounded recursion?)"
+        )),
+    }
+}
+
+/// Sandbox bounds-check failure: records the violation; the caller then unwinds.
+extern "C" fn rt_sandbox_fault(addr: usize, size: usize) {
+    raise(ExecutionStatus::MemoryViolation { addr, size });
+}
+
+/// Called on entry to every sandboxed function; returns 1 (and records
+/// `StackOverflow`) once the stack grows past the limit set by `call_typed`.
+extern "C" fn rt_stack_check() -> i32 {
+    let limit = STACK_LIMIT.with(|l| l.get());
+    if limit != 0 && stack_address() < limit {
+        raise(ExecutionStatus::StackOverflow);
+        return 1;
+    }
+    0
+}
+
+/// Bounds-checks the three operands of `mm` before it runs (positive dimensions only).
+/// Returns 1 and records a violation if any matrix leaves the arena, including when
+/// its byte size overflows.
+extern "C" fn rt_sandbox_check_mm(
+    pc: usize,
+    pa: usize,
+    pb: usize,
+    m: i64,
+    n: i64,
+    k: i64,
+    esize: i64,
+) -> i32 {
+    let bytes = |rows: i64, cols: i64, es: i64| {
+        (rows as usize)
+            .checked_mul(cols as usize)
+            .and_then(|e| e.checked_mul(es as usize))
+            .unwrap_or(usize::MAX)
+    };
+    let operands = [
+        (pc, bytes(m, n, 4)),
+        (pa, bytes(m, k, esize)),
+        (pb, bytes(k, n, esize)),
+    ];
+    let bad = with_active_arena(|arena| {
+        let arena = arena.borrow();
+        operands
+            .into_iter()
+            .find(|&(p, size)| !arena.contains(p, size))
+    });
+    match bad {
+        Some(Some((addr, size))) => {
+            raise(ExecutionStatus::MemoryViolation { addr, size });
+            1
+        }
+        Some(None) => 0,
+        // Not sandboxed: nothing to check.
+        None => 0,
     }
 }
 
@@ -127,7 +313,7 @@ pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
         let remaining = fuel.saturating_sub(units.max(0));
         if remaining <= 0 {
             f.set(0);
-            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            raise(ExecutionStatus::OutOfFuel);
             return 1;
         }
         f.set(remaining);
@@ -135,19 +321,25 @@ pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
     })
 }
 
+/// Charged on every branch. Also returns 1 once any failure has been recorded, so code
+/// that keeps running after a callee unwound (e.g. on a memory violation) stops at its
+/// next branch.
 pub extern "C" fn rt_check_fuel() -> i32 {
+    if halted() {
+        return 1;
+    }
     FUEL_REMAINING.with(|f| {
         let fuel = f.get();
         if fuel < 0 {
             return 0;
         }
         if fuel <= 0 {
-            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            raise(ExecutionStatus::OutOfFuel);
             return 1;
         }
         f.set(fuel - 1);
         if fuel - 1 <= 0 {
-            CURRENT_STATUS.with(|s| s.set(ExecutionStatus::OutOfFuel));
+            raise(ExecutionStatus::OutOfFuel);
             return 1;
         }
         0
@@ -155,14 +347,28 @@ pub extern "C" fn rt_check_fuel() -> i32 {
 }
 
 unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
+    if let Some(ptr) = with_active_arena(|arena| {
+        let mut arena = arena.borrow_mut();
+        arena.alloc(size).unwrap_or_else(|| {
+            raise(ExecutionStatus::OutOfMemory {
+                requested: size,
+                limit: arena.len(),
+            });
+            std::ptr::null_mut()
+        })
+    }) {
+        if !ptr.is_null() {
+            MEMORY_ALLOCATED.with(|m| m.set(m.get() + size));
+        }
+        return ptr;
+    }
+
     let quota = MEMORY_QUOTA.with(|q| q.get());
     let current = MEMORY_ALLOCATED.with(|m| m.get());
     if quota > 0 && current.saturating_add(size) > quota {
-        CURRENT_STATUS.with(|s| {
-            s.set(ExecutionStatus::OutOfMemory {
-                requested: size,
-                limit: quota,
-            })
+        raise(ExecutionStatus::OutOfMemory {
+            requested: size,
+            limit: quota,
         });
         return std::ptr::null_mut();
     }
@@ -170,11 +376,9 @@ unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
     let total = size + 16;
     let raw = malloc(total);
     if raw.is_null() {
-        CURRENT_STATUS.with(|s| {
-            s.set(ExecutionStatus::OutOfMemory {
-                requested: size,
-                limit: quota,
-            })
+        raise(ExecutionStatus::OutOfMemory {
+            requested: size,
+            limit: quota,
         });
         return std::ptr::null_mut();
     }
@@ -186,6 +390,16 @@ unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
 
 unsafe extern "C" fn rt_free(ptr: *mut u8) {
     if ptr.is_null() {
+        return;
+    }
+    if let Some(freed) = with_active_arena(|arena| arena.borrow_mut().free(ptr)) {
+        match freed {
+            Some(size) => MEMORY_ALLOCATED.with(|m| m.set(m.get().saturating_sub(size))),
+            None => raise(ExecutionStatus::MemoryViolation {
+                addr: ptr as usize,
+                size: 0,
+            }),
+        }
         return;
     }
     let raw = ptr.sub(16);
@@ -352,6 +566,33 @@ impl SymbolRegistry {
     }
 }
 
+/// Points the runtime hooks at a sandboxed engine's arena and stack limit for one call,
+/// restoring the previous state when dropped (calls may nest through host callbacks).
+struct SandboxActivation {
+    prev_arena: *const RefCell<Arena>,
+    prev_limit: usize,
+}
+
+impl SandboxActivation {
+    fn new(arena: &RefCell<Arena>) -> Self {
+        arena.borrow_mut().reset();
+        let prev_arena = ACTIVE_ARENA.with(|a| a.replace(arena));
+        let limit = stack_address().saturating_sub(SANDBOX_STACK_BYTES);
+        let prev_limit = STACK_LIMIT.with(|l| l.replace(limit));
+        Self {
+            prev_arena,
+            prev_limit,
+        }
+    }
+}
+
+impl Drop for SandboxActivation {
+    fn drop(&mut self) {
+        ACTIVE_ARENA.with(|a| a.set(self.prev_arena));
+        STACK_LIMIT.with(|l| l.set(self.prev_limit));
+    }
+}
+
 pub struct JitEngine {
     builder_context: FunctionBuilderContext,
     ctx: cranelift_codegen::Context,
@@ -360,6 +601,11 @@ pub struct JitEngine {
     rt_free_id: FuncId,
     rt_check_fuel_id: FuncId,
     rt_consume_fuel_id: FuncId,
+    rt_sandbox_fault_id: FuncId,
+    rt_stack_check_id: FuncId,
+    rt_sandbox_check_mm_id: FuncId,
+    /// Set by `enable_sandbox`; boxed so its address stays fixed while code runs.
+    sandbox: Option<Box<RefCell<Arena>>>,
     pub registry: Arc<RwLock<SymbolRegistry>>,
     pub fuel_enabled: bool,
     pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
@@ -384,6 +630,9 @@ impl JitEngine {
         // v256/v512 values span 2/4 vector registers, more than ABIs return in registers;
         // spill extra return values through an implicit struct-return pointer.
         flag_builder.set("enable_multi_ret_implicit_sret", "true")?;
+        // Probe large stack frames page by page so they cannot skip over the guard page.
+        flag_builder.set("enable_probestack", "true")?;
+        flag_builder.set("probestack_strategy", "inline")?;
 
         let isa =
             crate::cpu::native_isa_builder(features)?.finish(settings::Flags::new(flag_builder))?;
@@ -396,6 +645,9 @@ impl JitEngine {
         jit_builder.symbol("rt_free", rt_free as *const u8);
         jit_builder.symbol("rt_check_fuel", rt_check_fuel as *const u8);
         jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
+        jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
+        jit_builder.symbol("rt_stack_check", rt_stack_check as *const u8);
+        jit_builder.symbol("rt_sandbox_check_mm", rt_sandbox_check_mm as *const u8);
         jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
             reg_lookup.read().unwrap().lookup(name)
         }));
@@ -422,6 +674,23 @@ impl JitEngine {
         let rt_consume_fuel_id =
             module.declare_function("rt_consume_fuel", Linkage::Import, &consume_sig)?;
 
+        let mut fault_sig = module.make_signature();
+        fault_sig.params.push(AbiParam::new(types::I64));
+        fault_sig.params.push(AbiParam::new(types::I64));
+        let rt_sandbox_fault_id =
+            module.declare_function("rt_sandbox_fault", Linkage::Import, &fault_sig)?;
+
+        let rt_stack_check_id =
+            module.declare_function("rt_stack_check", Linkage::Import, &fuel_sig)?;
+
+        let mut mm_check_sig = module.make_signature();
+        for _ in 0..7 {
+            mm_check_sig.params.push(AbiParam::new(types::I64));
+        }
+        mm_check_sig.returns.push(AbiParam::new(types::I32));
+        let rt_sandbox_check_mm_id =
+            module.declare_function("rt_sandbox_check_mm", Linkage::Import, &mm_check_sig)?;
+
         let ctx = module.make_context();
 
         Ok(Self {
@@ -432,6 +701,10 @@ impl JitEngine {
             rt_free_id,
             rt_check_fuel_id,
             rt_consume_fuel_id,
+            rt_sandbox_fault_id,
+            rt_stack_check_id,
+            rt_sandbox_check_mm_id,
+            sandbox: None,
             registry,
             fuel_enabled: true,
             signatures: HashMap::new(),
@@ -458,6 +731,26 @@ impl JitEngine {
 
     pub fn get_allocated_memory(&self) -> usize {
         get_allocated_memory()
+    }
+
+    /// Runs untrusted code safely: `alloc` draws from a private `arena_bytes` arena
+    /// (at least `MIN_SANDBOX_ARENA_BYTES`), every `ld`/`st`/`ldm`/`stm`/`mm` access and
+    /// `free` is checked against it, and recursion is capped at `SANDBOX_STACK_BYTES`.
+    /// Violations halt execution with `ERR_MEMORY_VIOLATION` or `ERR_STACK_OVERFLOW`
+    /// instead of crashing the process. Must be called before `compile_module`, and calls
+    /// need a thread with comfortably more than `SANDBOX_STACK_BYTES` of free stack.
+    pub fn enable_sandbox(&mut self, arena_bytes: usize) -> Result<()> {
+        if !self.signatures.is_empty() {
+            return Err(anyhow!(
+                "enable_sandbox must be called before compile_module"
+            ));
+        }
+        self.sandbox = Some(Box::new(RefCell::new(Arena::new(arena_bytes)?)));
+        Ok(())
+    }
+
+    pub fn is_sandboxed(&self) -> bool {
+        self.sandbox.is_some()
     }
 
     pub fn register_symbol(&self, name: impl Into<String>, ptr: *const u8) {
@@ -515,15 +808,24 @@ impl JitEngine {
         }
 
         // 3. Lower each function and its dynamic invocation trampoline
+        let sandbox = self.sandbox.as_ref().map(|arena| {
+            let arena = arena.borrow();
+            SandboxConfig {
+                arena_base: arena.base as i64,
+                arena_len: arena.len() as i64,
+                fault_id: self.rt_sandbox_fault_id,
+                stack_check_id: self.rt_stack_check_id,
+                mm_check_id: self.rt_sandbox_check_mm_id,
+            }
+        });
         let config = LowerConfig {
-            fuel_check_func_id: if self.fuel_enabled {
-                Some(self.rt_check_fuel_id)
-            } else {
-                None
-            },
+            // Sandboxed code always checks at branches so it stops after a violation.
+            fuel_check_func_id: (self.fuel_enabled || sandbox.is_some())
+                .then_some(self.rt_check_fuel_id),
             fuel_consume_func_id: self.fuel_enabled.then_some(self.rt_consume_fuel_id),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
+            sandbox,
         };
 
         for func in &ir_mod.functions {
@@ -624,6 +926,7 @@ impl JitEngine {
         let mut raw_ret: u64 = 0;
         reset_execution_status();
 
+        let _sandbox = self.sandbox.as_deref().map(SandboxActivation::new);
         let tramp_fn: extern "C" fn(*const u64, *mut u64) = std::mem::transmute(tramp_ptr);
         tramp_fn(raw_args.as_ptr(), &mut raw_ret);
 

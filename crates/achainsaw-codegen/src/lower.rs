@@ -227,6 +227,15 @@ fn mm_widen(builder: &mut FunctionBuilder, dtype: Type, v: ClifValue) -> ClifVal
 }
 
 /// Number of `lane` lanes in a vector of type `ty` on this backend.
+/// Bytes a plain `ld`/`st` of `ty` touches.
+fn access_bytes(ty: Type) -> usize {
+    if ty.is_vector() {
+        part_count(ty) * 16
+    } else {
+        ty.byte_size()
+    }
+}
+
 fn lanes_of(ty: Type, lane: Type) -> i64 {
     (part_count(ty) * 16 / lane.byte_size()) as i64
 }
@@ -309,6 +318,7 @@ fn store_parts(builder: &mut FunctionBuilder, ptr: ClifValue, parts: &[ClifValue
 /// `n` lanes into a zeroed stack slot, so memory past them is never touched.
 fn emit_masked_load(
     builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
     ptr: ClifValue,
     count: ClifValue,
     ty: Type,
@@ -316,6 +326,10 @@ fn emit_masked_load(
 ) -> Parts {
     let lanes = lanes_of(ty, lane);
     let n = clamp_count(builder, count, lanes);
+    if guard.is_some() {
+        let bytes = builder.ins().imul_imm_s(n, lane.byte_size() as i64);
+        emit_bounds_check(builder, guard, ptr, bytes);
+    }
     let full_blk = builder.create_block();
     let part_blk = builder.create_block();
     let merge = builder.create_block();
@@ -345,6 +359,7 @@ fn emit_masked_load(
 /// `stm p, v, n:lane`: writes only the first `n` lanes.
 fn emit_masked_store(
     builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
     ptr: ClifValue,
     parts: &[ClifValue],
     count: ClifValue,
@@ -353,6 +368,10 @@ fn emit_masked_store(
 ) {
     let lanes = lanes_of(ty, lane);
     let n = clamp_count(builder, count, lanes);
+    if guard.is_some() {
+        let bytes = builder.ins().imul_imm_s(n, lane.byte_size() as i64);
+        emit_bounds_check(builder, guard, ptr, bytes);
+    }
     let full_blk = builder.create_block();
     let part_blk = builder.create_block();
     let done = builder.create_block();
@@ -375,6 +394,56 @@ fn emit_masked_store(
 fn jump_with(builder: &mut FunctionBuilder, target: ClifBlock, vals: &[ClifValue]) {
     let args: Vec<BlockArg> = vals.iter().copied().map(BlockArg::Value).collect();
     builder.ins().jump(target, &args);
+}
+
+/// Sandbox arena bounds, and the block that reports a violation `(addr, size)` and unwinds.
+#[derive(Clone, Copy)]
+struct Guard {
+    base: i64,
+    len: i64,
+    fault: ClifBlock,
+}
+
+/// Branches to the fault block unless `[ptr, ptr + size)` lies inside the arena or
+/// `size` is 0, leaving the builder in the passing block. `size` must not exceed
+/// `MIN_SANDBOX_ARENA_BYTES`.
+fn emit_bounds_check(
+    builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
+    ptr: ClifValue,
+    size: ClifValue,
+) {
+    let Some(g) = guard else { return };
+    let base = c64(builder, g.base);
+    let off = builder.ins().isub(ptr, base);
+    let len = c64(builder, g.len);
+    let room = builder.ins().isub(len, size);
+    let fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, off, room);
+    let empty = builder.ins().icmp_imm_u(IntCC::Equal, size, 0);
+    let ok = builder.ins().bor(fits, empty);
+    let pass = builder.create_block();
+    builder.ins().brif(
+        ok,
+        pass,
+        &[],
+        g.fault,
+        &[BlockArg::Value(ptr), BlockArg::Value(size)],
+    );
+    builder.switch_to_block(pass);
+}
+
+fn emit_bounds_check_const(
+    builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
+    ptr: ClifValue,
+    size: usize,
+) {
+    if guard.is_some() {
+        let size = c64(builder, size as i64);
+        emit_bounds_check(builder, guard, ptr, size);
+    }
 }
 
 /// Pointer to element `row * cols + col` of a row-major matrix with `esize`-byte elements.
@@ -532,11 +601,14 @@ fn bitcast_flags() -> MemFlagsData {
 
 /// `mm pc, pa, pb, m, n, k:dtype`: `C[m x n] += A[m x k] * B[k x n]` as an inline loop
 /// nest accumulating in f32 (i32 for i8) over `k` in order. Non-positive dimensions are a
-/// no-op. With `fuel`, charges one unit per 1024 multiply-adds before starting.
+/// no-op. With `bounds`, `rt_sandbox_check_mm` validates all three matrices first. With
+/// `fuel`, charges one unit per 1024 multiply-adds before starting. Either one failing
+/// branches to its block and leaves C untouched.
 fn emit_matmul(
     builder: &mut FunctionBuilder,
     regs: &[ClifValue],
     dtype: Type,
+    bounds: Option<(cranelift_codegen::ir::FuncRef, ClifBlock)>,
     fuel: Option<(cranelift_codegen::ir::FuncRef, ClifBlock)>,
 ) {
     let (pc, pa, pb, m, n, k) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
@@ -571,6 +643,14 @@ fn emit_matmul(
 
     builder.switch_to_block(start);
     let zero = c64(builder, 0);
+    if let Some((check, trap)) = bounds {
+        let es = c64(builder, esize);
+        let call = builder.ins().call(check, &[pc, pa, pb, m, n, k, es]);
+        let bad = builder.inst_results(call)[0];
+        let checked = builder.create_block();
+        builder.ins().brif(bad, trap, &[], checked, &[]);
+        builder.switch_to_block(checked);
+    }
     if let Some((consume, trap)) = fuel {
         // units = m*n*k / 1024 + 1, computed in f64 and saturated so huge shapes cannot wrap.
         let mf = builder.ins().fcvt_from_sint(types::F64, m);
@@ -657,6 +737,20 @@ pub struct LowerConfig {
     pub fuel_consume_func_id: Option<FuncId>,
     pub rt_malloc_id: FuncId,
     pub rt_free_id: FuncId,
+    /// Bounds-check memory accesses and cap stack depth (JIT only; see `JitEngine::enable_sandbox`).
+    pub sandbox: Option<SandboxConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxConfig {
+    pub arena_base: i64,
+    pub arena_len: i64,
+    /// `rt_sandbox_fault(addr: i64, size: i64)`.
+    pub fault_id: FuncId,
+    /// `rt_stack_check() -> i32`, called on function entry.
+    pub stack_check_id: FuncId,
+    /// `rt_sandbox_check_mm(pc, pa, pb, m, n, k, esize) -> i32`.
+    pub mm_check_id: FuncId,
 }
 
 pub fn lower_function<M: ClifModule>(
@@ -697,11 +791,20 @@ pub fn lower_function<M: ClifModule>(
         }
     }
 
-    let fuel_trap_block = if config.fuel_check_func_id.is_some() {
-        Some(builder.create_block())
-    } else {
-        None
-    };
+    // Returns zeroes once a runtime check fails; `call_typed` then reports the status.
+    let fuel_trap_block = (config.fuel_check_func_id.is_some() || config.sandbox.is_some())
+        .then(|| builder.create_block());
+
+    let guard = config.sandbox.map(|sb| {
+        let fault = builder.create_block();
+        builder.append_block_param(fault, types::I64); // addr
+        builder.append_block_param(fault, types::I64); // size
+        Guard {
+            base: sb.arena_base,
+            len: sb.arena_len,
+            fault,
+        }
+    });
 
     // Values map: SSA register name -> (Cranelift parts, Type)
     let mut values: Values = HashMap::new();
@@ -722,7 +825,16 @@ pub fn lower_function<M: ClifModule>(
     // Jump from synthetic entry to function's first block
     let first_block_label = &func.blocks[0].label;
     let first_block = *clif_blocks.get(first_block_label).unwrap();
-    builder.ins().jump(first_block, &[]);
+    if let (Some(sb), Some(trap_block)) = (config.sandbox, fuel_trap_block) {
+        let callee = module.declare_func_in_func(sb.stack_check_id, builder.func);
+        let call_inst = builder.ins().call(callee, &[]);
+        let overflow = builder.inst_results(call_inst)[0];
+        builder
+            .ins()
+            .brif(overflow, trap_block, &[], first_block, &[]);
+    } else {
+        builder.ins().jump(first_block, &[]);
+    }
 
     // Translate each AIR block
     for block in &func.blocks {
@@ -993,6 +1105,7 @@ pub fn lower_function<M: ClifModule>(
                 }
                 Instruction::Load { dst, ptr, ty, .. } => {
                     let (ptr_val, _) = scalar(&values, ptr);
+                    emit_bounds_check_const(&mut builder, guard, ptr_val, access_bytes(*ty));
                     let mut loaded = Vec::with_capacity(part_count(*ty));
                     if ty.is_vector() {
                         for k in 0..part_count(*ty) {
@@ -1017,6 +1130,7 @@ pub fn lower_function<M: ClifModule>(
                 Instruction::Store { ptr, val, .. } => {
                     let (ptr_val, _) = scalar(&values, ptr);
                     let (val_parts, val_ty) = parts(&values, val);
+                    emit_bounds_check_const(&mut builder, guard, ptr_val, access_bytes(val_ty));
                     let flags = if val_ty.is_vector() {
                         user_mem_flags()
                     } else {
@@ -1259,7 +1373,8 @@ pub fn lower_function<M: ClifModule>(
                 } => {
                     let (ptr_val, _) = scalar(&values, ptr);
                     let (count_val, _) = scalar(&values, count);
-                    let parts = emit_masked_load(&mut builder, ptr_val, count_val, *ty, *lane);
+                    let parts =
+                        emit_masked_load(&mut builder, guard, ptr_val, count_val, *ty, *lane);
                     values.insert(dst.clone(), (parts, *ty));
                 }
                 Instruction::MaskedStore {
@@ -1272,7 +1387,15 @@ pub fn lower_function<M: ClifModule>(
                     let (ptr_val, _) = scalar(&values, ptr);
                     let (count_val, _) = scalar(&values, count);
                     let (val_parts, val_ty) = parts(&values, val);
-                    emit_masked_store(&mut builder, ptr_val, &val_parts, count_val, val_ty, *lane);
+                    emit_masked_store(
+                        &mut builder,
+                        guard,
+                        ptr_val,
+                        &val_parts,
+                        count_val,
+                        val_ty,
+                        *lane,
+                    );
                 }
                 Instruction::MatMul {
                     pc,
@@ -1294,7 +1417,14 @@ pub fn lower_function<M: ClifModule>(
                         }
                         _ => None,
                     };
-                    emit_matmul(&mut builder, &regs, *dtype, fuel);
+                    let bounds = match (config.sandbox, fuel_trap_block) {
+                        (Some(sb), Some(trap)) => Some((
+                            module.declare_func_in_func(sb.mm_check_id, builder.func),
+                            trap,
+                        )),
+                        _ => None,
+                    };
+                    emit_matmul(&mut builder, &regs, *dtype, bounds, fuel);
                 }
                 Instruction::VLen { dst, lane, .. } => {
                     let lanes = VECTOR_PART_BITS / lane.bit_width().unwrap_or(32);
@@ -1376,6 +1506,14 @@ pub fn lower_function<M: ClifModule>(
                 }
             }
         }
+    }
+
+    if let (Some(g), Some(sb), Some(trap_block)) = (guard, config.sandbox, fuel_trap_block) {
+        builder.switch_to_block(g.fault);
+        let fault_args = builder.block_params(g.fault).to_vec();
+        let callee = module.declare_func_in_func(sb.fault_id, builder.func);
+        builder.ins().call(callee, &fault_args);
+        builder.ins().jump(trap_block, &[]);
     }
 
     if let Some(trap_block) = fuel_trap_block {
