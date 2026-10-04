@@ -41,12 +41,19 @@ fn k(pa:ptr, po:ptr)->f64
 "#;
 
 #[test]
-fn every_example_airb_decodes() {
+fn every_example_has_a_matching_airb() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
     let mut checked = 0;
     for dir in [examples.clone(), examples.join("kernels")] {
         for entry in std::fs::read_dir(&dir).unwrap() {
-            let airb = entry.unwrap().path();
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "air") {
+                assert!(
+                    path.with_extension("airb").exists(),
+                    "{path:?} has no .airb; run `achainsaw assemble` on it"
+                );
+            }
+            let airb = path;
             if airb.extension().is_none_or(|e| e != "airb") {
                 continue;
             }

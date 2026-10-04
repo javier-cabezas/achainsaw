@@ -1,0 +1,331 @@
+# FlashAttention decode step for DeepSeek V4 Pro's sparse attention layers.
+#
+# One query token, h query heads sharing a single KV head (MQA): each cached entry is a
+# d-dim vector used as both key and value. The token attends to the nk entries listed in
+# `idx` (V4 Pro: the 128-entry sliding window plus the indexer's top-1024 compressed
+# entries, nk = 1152; -1 marks an unused slot). A learned per-head sink logit joins the
+# softmax denominator only:
+#   out[r] = sum_t p[r,t] * kv[idx[t]] / (sum_t p[r,t] + exp(sink[r] - m[r]))
+#   p[r,t] = exp(scale * q[r] . kv[idx[t]] - m[r]),  m[r] = max_t scale * q[r] . kv[idx[t]]
+#
+# Shapes (V4 Pro): h = 128, d = 512, scale = 1/sqrt(512). q and kv are bf16, sink is f32,
+# out is f32 [h x d]. Scores and the softmax are kept in f32.
+#
+# FlashAttention-2 structure over blocks of 64 selected entries, with both matrix products
+# on `mm` (AMX tiles, SME outer products, or vector FMAs depending on the CPU):
+#   1. once: transpose q to qt [d x h], so each score block is one mm without a K transpose
+#   2. per block: gather the selected kv rows -> kvb [bc x d] (zero rows for -1)
+#      st = kvb . qt                       scores, transposed [bc x h], via mm
+#      online softmax per head: new running max, rescale factor, running sum, and the
+#      block's probabilities p [h x bc] rounded to bf16 for the second product
+#      ot = p . kvb                        [h x d] via mm
+#      out[r] = out[r] * rescale[r] + ot[r]
+#   3. out[r] /= running_sum[r] + exp(sink[r] - m[r])
+extfn expf(x:f32)->f32
+
+fn flash_attention(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)
+  b0:
+    w8 = vl i8
+    w32 = vl f32
+    hd = mul h, d
+    row2 = mul d, 2:i64
+    qt_bytes = mul hd, 2:i64
+    qt = alloc qt_bytes
+    kvb_bytes = mul d, 128:i64
+    kvb = alloc kvb_bytes
+    st_bytes = mul h, 256:i64
+    sbuf = alloc st_bytes
+    p_bytes = mul h, 128:i64
+    pbuf = alloc p_bytes
+    ot_bytes = mul hd, 4:i64
+    ot = alloc ot_bytes
+    h4 = mul h, 4:i64
+    mbuf = alloc h4
+    lbuf = alloc h4
+    cbuf = alloc h4
+    zf = cst 0.0:f32
+    zvf = splat zf:vx
+    zb = cst 0:i8
+    zvb = splat zb:vx
+    neg_big = cst -1000000000000000000000000000000.0:f32
+    jmp tq_rows(0:i64)
+
+  # 1. qt[c][r] = q[r][c]
+  tq_rows(tr:i64):
+    tr_more = lt tr, h
+    br tr_more, tq_row, init_state(0:i64)
+  tq_row:
+    jmp tq_cols(0:i64)
+  tq_cols(tc:i64):
+    tc_more = lt tc, d
+    br tc_more, tq_body, tq_next
+  tq_body:
+    q_i = mul tr, d
+    q_i2 = add q_i, tc
+    q_off = mul q_i2, 2:i64
+    q_p = add q, q_off
+    q_x = ld q_p:bf16
+    t_i = mul tc, h
+    t_i2 = add t_i, tr
+    t_off = mul t_i2, 2:i64
+    t_p = add qt, t_off
+    st t_p, q_x
+    tc2 = add tc, 1:i64
+    jmp tq_cols(tc2)
+  tq_next:
+    tr2 = add tr, 1:i64
+    jmp tq_rows(tr2)
+
+  # Running max, running sum, and the output start at -1e30, 0, and 0.
+  init_state(ir:i64):
+    ir_more = lt ir, h
+    br ir_more, init_body, zero_out(0:i64)
+  init_body:
+    ir_off = mul ir, 4:i64
+    ir_m = add mbuf, ir_off
+    st ir_m, neg_big
+    ir_l = add lbuf, ir_off
+    st ir_l, zf
+    ir2 = add ir, 1:i64
+    jmp init_state(ir2)
+  zero_out(zo:i64):
+    zo_more = lt zo, hd
+    br zo_more, zero_out_body, blocks(0:i64)
+  zero_out_body:
+    zo_rest = sub hd, zo
+    zo_off = mul zo, 4:i64
+    zo_p = add out, zo_off
+    stm zo_p, zvf, zo_rest:f32
+    zo2 = add zo, w32
+    jmp zero_out(zo2)
+
+  # 2. One block of up to 64 selected entries.
+  blocks(j0:i64):
+    j_more = lt j0, nk
+    br j_more, block_start, finish(0:i64)
+  block_start:
+    left = sub nk, j0
+    bc = min left, 64:i64
+    jmp gather(0:i64)
+
+  # kvb[t] = kv[idx[j0 + t]], or zeros for an unused slot.
+  gather(gi:i64):
+    gt_more = lt gi, bc
+    br gt_more, gather_row, scores_init
+  gather_row:
+    g_i = add j0, gi
+    g_ioff = mul g_i, 4:i64
+    g_ip = add idx, g_ioff
+    g_ix = ld g_ip:i32
+    g_ix64 = sext g_ix:i64
+    g_valid = ge g_ix64, 0:i64
+    g_doff = mul gi, row2
+    g_dst = add kvb, g_doff
+    g_soff = mul g_ix64, row2
+    g_src = add kv, g_soff
+    br g_valid, copy(0:i64), clear(0:i64)
+  copy(cb:i64):
+    cb_more = lt cb, row2
+    br cb_more, copy_body, gather_next
+  copy_body:
+    cb_rest = sub row2, cb
+    cb_s = add g_src, cb
+    cb_d = add g_dst, cb
+    cb_v = ldm cb_s:vx, cb_rest:i8
+    stm cb_d, cb_v, cb_rest:i8
+    cb2 = add cb, w8
+    jmp copy(cb2)
+  clear(zc:i64):
+    zc_more = lt zc, row2
+    br zc_more, clear_body, gather_next
+  clear_body:
+    zc_rest = sub row2, zc
+    zc_d = add g_dst, zc
+    stm zc_d, zvb, zc_rest:i8
+    zc2 = add zc, w8
+    jmp clear(zc2)
+  gather_next:
+    gi2 = add gi, 1:i64
+    jmp gather(gi2)
+
+  # st [bc x h] = kvb [bc x d] . qt [d x h]
+  scores_init:
+    sc_n = mul bc, h
+    jmp scores_zero(0:i64)
+  scores_zero(sz:i64):
+    sz_more = lt sz, sc_n
+    br sz_more, scores_zero_body, scores_mm
+  scores_zero_body:
+    sz_rest = sub sc_n, sz
+    sz_off = mul sz, 4:i64
+    sz_p = add sbuf, sz_off
+    stm sz_p, zvf, sz_rest:f32
+    sz2 = add sz, w32
+    jmp scores_zero(sz2)
+  scores_mm:
+    mm sbuf, kvb, qt, bc, h, d:bf16
+    jmp heads(0:i64)
+
+  # Online softmax for head r over this block.
+  heads(sr:i64):
+    sr_more = lt sr, h
+    br sr_more, head_start, pv_init
+  head_start:
+    sr_off = mul sr, 4:i64
+    sr_mp = add mbuf, sr_off
+    m_old = ld sr_mp:f32
+    jmp block_max(0:i64, m_old)
+  block_max(mt:i64, cur:f32):
+    mt_more = lt mt, bc
+    br mt_more, block_max_body, block_max_done(cur)
+  block_max_body:
+    mt_i = add j0, mt
+    mt_ioff = mul mt_i, 4:i64
+    mt_ip = add idx, mt_ioff
+    mt_ix = ld mt_ip:i32
+    mt_valid = ge mt_ix, 0:i32
+    mt_si = mul mt, h
+    mt_si2 = add mt_si, sr
+    mt_soff = mul mt_si2, 4:i64
+    mt_sp = add sbuf, mt_soff
+    mt_s = ld mt_sp:f32
+    mt_ss = mul mt_s, scale
+    mt_max = max cur, mt_ss
+    cur2 = select mt_valid, mt_max, cur
+    mt2 = add mt, 1:i64
+    jmp block_max(mt2, cur2)
+  block_max_done(m_new:f32):
+    st sr_mp, m_new
+    dm = sub m_old, m_new
+    rescale = call expf(dm)
+    sr_cp = add cbuf, sr_off
+    st sr_cp, rescale
+    sr_lp = add lbuf, sr_off
+    l_old = ld sr_lp:f32
+    l_scaled = mul l_old, rescale
+    jmp probs(0:i64, l_scaled)
+  probs(pt:i64, lsum:f32):
+    pt_more = lt pt, bc
+    br pt_more, probs_body, probs_done(lsum)
+  probs_body:
+    pt_i = add j0, pt
+    pt_ioff = mul pt_i, 4:i64
+    pt_ip = add idx, pt_ioff
+    pt_ix = ld pt_ip:i32
+    pt_valid = ge pt_ix, 0:i32
+    pt_si = mul pt, h
+    pt_si2 = add pt_si, sr
+    pt_soff = mul pt_si2, 4:i64
+    pt_sp = add sbuf, pt_soff
+    pt_s = ld pt_sp:f32
+    pt_ss = mul pt_s, scale
+    pt_x = sub pt_ss, m_new
+    pt_e = call expf(pt_x)
+    pt_p = select pt_valid, pt_e, zf
+    pt_b = ftrunc pt_p:bf16
+    pt_pi = mul sr, bc
+    pt_pi2 = add pt_pi, pt
+    pt_poff = mul pt_pi2, 2:i64
+    pt_pp = add pbuf, pt_poff
+    st pt_pp, pt_b
+    lsum2 = add lsum, pt_p
+    pt2 = add pt, 1:i64
+    jmp probs(pt2, lsum2)
+  probs_done(l_new:f32):
+    st sr_lp, l_new
+    sr2 = add sr, 1:i64
+    jmp heads(sr2)
+
+  # ot [h x d] = p [h x bc] . kvb [bc x d], then out = out * rescale + ot.
+  pv_init:
+    jmp pv_zero(0:i64)
+  pv_zero(oz:i64):
+    oz_more = lt oz, hd
+    br oz_more, pv_zero_body, pv_mm
+  pv_zero_body:
+    oz_rest = sub hd, oz
+    oz_off = mul oz, 4:i64
+    oz_p = add ot, oz_off
+    stm oz_p, zvf, oz_rest:f32
+    oz2 = add oz, w32
+    jmp pv_zero(oz2)
+  pv_mm:
+    mm ot, pbuf, kvb, h, d, bc:bf16
+    jmp merge_rows(0:i64)
+  merge_rows(ar:i64):
+    ar_more = lt ar, h
+    br ar_more, merge_row, block_next
+  merge_row:
+    ar_off = mul ar, 4:i64
+    ar_cp = add cbuf, ar_off
+    ar_c = ld ar_cp:f32
+    ar_vc = splat ar_c:vx
+    ar_base = mul ar, d
+    jmp merge_cols(0:i64)
+  merge_cols(ac:i64):
+    ac_more = lt ac, d
+    br ac_more, merge_body, merge_next
+  merge_body:
+    ac_rest = sub d, ac
+    ac_i = add ar_base, ac
+    ac_off = mul ac_i, 4:i64
+    ac_op = add out, ac_off
+    ac_tp = add ot, ac_off
+    ac_o = ldm ac_op:vx, ac_rest:f32
+    ac_t = ldm ac_tp:vx, ac_rest:f32
+    ac_new = vfma ac_o, ar_vc, ac_t:f32
+    stm ac_op, ac_new, ac_rest:f32
+    ac2 = add ac, w32
+    jmp merge_cols(ac2)
+  merge_next:
+    ar2 = add ar, 1:i64
+    jmp merge_rows(ar2)
+  block_next:
+    j1 = add j0, 64:i64
+    jmp blocks(j1)
+
+  # 3. out[r] /= running_sum[r] + exp(sink[r] - m[r])
+  finish(fr:i64):
+    fr_more = lt fr, h
+    br fr_more, finish_row, done
+  finish_row:
+    fr_off = mul fr, 4:i64
+    fr_mp = add mbuf, fr_off
+    fr_m = ld fr_mp:f32
+    fr_lp = add lbuf, fr_off
+    fr_l = ld fr_lp:f32
+    fr_sp = add sink, fr_off
+    fr_s = ld fr_sp:f32
+    fr_x = sub fr_s, fr_m
+    fr_e = call expf(fr_x)
+    fr_den = add fr_l, fr_e
+    fr_inv = div 1.0:f32, fr_den
+    fr_vinv = splat fr_inv:vx
+    fr_base = mul fr, d
+    jmp finish_cols(0:i64)
+  finish_cols(fc:i64):
+    fc_more = lt fc, d
+    br fc_more, finish_body, finish_next
+  finish_body:
+    fc_rest = sub d, fc
+    fc_i = add fr_base, fc
+    fc_off = mul fc_i, 4:i64
+    fc_p = add out, fc_off
+    fc_o = ldm fc_p:vx, fc_rest:f32
+    fc_n = vmul fc_o, fr_vinv:f32
+    stm fc_p, fc_n, fc_rest:f32
+    fc2 = add fc, w32
+    jmp finish_cols(fc2)
+  finish_next:
+    fr2 = add fr, 1:i64
+    jmp finish(fr2)
+  done:
+    free qt
+    free kvb
+    free sbuf
+    free pbuf
+    free ot
+    free mbuf
+    free lbuf
+    free cbuf
+    ret

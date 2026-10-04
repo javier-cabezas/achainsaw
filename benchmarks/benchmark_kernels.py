@@ -1,5 +1,6 @@
 """
-Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/.
+Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/,
+including flash attention at DeepSeek V4 Pro's decode size.
 
 Every kernel is checked against NumPy, then timed on each available code generation
 backend (Cranelift, and LLVM when the build has it) and, with --isa all, at every ISA
@@ -163,6 +164,42 @@ def make_cases():
         verify=verify_gemm, tol=1e-4,
         # NumPy has no bf16 matmul; compare with its f32 matmul on the same values.
         numpy=lambda: Af @ Bf, flops=2 * n * n * n,
+    ))
+    # One decode step of DeepSeek V4 Pro's sparse attention: 128 query heads share one
+    # 512-dim KV head (K = V) and attend to 1152 selected cache entries (sliding window 128
+    # plus the indexer's top-1024), with a per-head attention sink.
+    fh, fd, fcache, fnk = 128, 512, 4096, 1152
+    fq = bf16_bits(rng.standard_normal((fh, fd)))
+    fkv = bf16_bits(rng.standard_normal((fcache, fd)))
+    fidx = rng.choice(fcache, size=fnk, replace=False).astype(np.int32)
+    fsink = rng.standard_normal(fh).astype(np.float32)
+    fout = np.zeros((fh, fd), dtype=np.float32)
+    fscale = np.float32(1.0 / np.sqrt(fd))
+    qf, kvf = bf16_values(fq).astype(np.float64), bf16_values(fkv).astype(np.float64)
+    sel = kvf[fidx]
+    scores = (qf @ sel.T) * float(fscale)
+    mx = scores.max(axis=1, keepdims=True)
+    pr = np.exp(scores - mx)
+    den = pr.sum(axis=1, keepdims=True) + np.exp(fsink[:, None].astype(np.float64) - mx)
+    flash_ref = (pr @ sel) / den
+    qn, kvn = bf16_values(fq), bf16_values(fkv)
+
+    def verify_flash(k):
+        k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
+        return float(np.max(np.abs(fout - flash_ref)) / np.max(np.abs(flash_ref)))
+
+    def np_flash():
+        s = (qn @ kvn[fidx].T) * fscale
+        m = s.max(axis=1, keepdims=True)
+        e = np.exp(s - m)
+        return (e @ kvn[fidx]) / (e.sum(axis=1, keepdims=True) + np.exp(fsink[:, None] - m))
+
+    cases.append(dict(
+        name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
+        run=lambda k: k(fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
+        verify=verify_flash, tol=1e-2,
+        # NumPy has no bf16 matmul; compare with f32 on the same values (multithreaded BLAS).
+        numpy=np_flash, flops=2 * 2 * fh * fnk * fd,
     ))
     return cases
 
