@@ -36,6 +36,12 @@ pub fn binary_result_type(
     use BinaryOp::*;
     let mismatch = |msg: String| Err(("ERR_TYPE_MISMATCH", msg));
 
+    if lhs.is_half() || rhs.is_half() {
+        return Err((
+            "ERR_INVALID_OP_FOR_TYPE",
+            format!("Operation '{op:?}' is not defined for '{lhs}' and '{rhs}'; f16/bf16 are storage types, convert with 'fext x:f32' first"),
+        ));
+    }
     if lhs.is_vector() || rhs.is_vector() {
         return mismatch(format!(
             "Scalar op '{op:?}' cannot be applied to vectors (found '{lhs}' and '{rhs}'); use a lane-typed vector op such as 'vadd a, b:f32'"
@@ -106,6 +112,18 @@ pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
     }
 }
 
+const ALL_LANES: &[Type] = &[
+    Type::I8,
+    Type::I16,
+    Type::I32,
+    Type::I64,
+    Type::F32,
+    Type::F64,
+];
+
+/// Element types supported by `mm`.
+pub const MM_DTYPES: &[Type] = &[Type::BF16, Type::F16, Type::I8, Type::F32];
+
 /// Lane types supported by `vfma`.
 pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
 
@@ -126,6 +144,14 @@ fn check_signature_type(
     is_extern: bool,
     span: Span,
 ) -> Result<(), Diagnostic> {
+    if ty.is_half() {
+        return Err(Diagnostic::error(
+            "ERR_HALF_IN_SIGNATURE",
+            format!("Function '{func}' uses '{ty}' in its signature; f16/bf16 are storage types, pass f32 or a pointer instead"),
+            span,
+        )
+        .with_context(serde_json::json!({ "function": func })));
+    }
     if ty == Type::Vx {
         return Err(Diagnostic::error(
             "ERR_SCALABLE_IN_SIGNATURE",
@@ -644,7 +670,7 @@ impl Validator {
                         src_ty
                     }
                     UnaryOp::Neg | UnaryOp::Abs => {
-                        if src_ty.is_vector() || src_ty == Type::Ptr {
+                        if src_ty.is_vector() || src_ty.is_half() || src_ty == Type::Ptr {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
                                 format!("Operation '{op:?}' is not supported for '{src_ty}'"),
@@ -724,19 +750,27 @@ impl Validator {
                         }
                     }
                     CastOp::Fext => {
-                        if src_ty != Type::F32 || *ty != Type::F64 {
+                        let ok = matches!(
+                            (src_ty, *ty),
+                            (Type::F32, Type::F64) | (Type::F16 | Type::BF16, Type::F32)
+                        );
+                        if !ok {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
-                                format!("fext requires f32 -> f64, found '{src_ty}' -> '{ty}'"),
+                                format!("fext requires f32 -> f64 or f16/bf16 -> f32, found '{src_ty}' -> '{ty}'"),
                                 *span,
                             ));
                         }
                     }
                     CastOp::Ftrunc => {
-                        if src_ty != Type::F64 || *ty != Type::F32 {
+                        let ok = matches!(
+                            (src_ty, *ty),
+                            (Type::F64, Type::F32) | (Type::F32, Type::F16 | Type::BF16)
+                        );
+                        if !ok {
                             return Err(Diagnostic::error(
                                 "ERR_TYPE_MISMATCH",
-                                format!("ftrunc requires f64 -> f32, found '{src_ty}' -> '{ty}'"),
+                                format!("ftrunc requires f64 -> f32 or f32 -> f16/bf16, found '{src_ty}' -> '{ty}'"),
                                 *span,
                             ));
                         }
@@ -772,19 +806,7 @@ impl Validator {
                 span,
             } => {
                 self.check_vector(ctx, src, scope, *span)?;
-                Self::check_lane(
-                    op.as_str(),
-                    *ty,
-                    &[
-                        Type::I8,
-                        Type::I16,
-                        Type::I32,
-                        Type::I64,
-                        Type::F32,
-                        Type::F64,
-                    ],
-                    *span,
-                )?;
+                Self::check_lane(op.as_str(), *ty, ALL_LANES, *span)?;
                 Self::define(scope, defs, dst, *ty, *span)?;
             }
             Instruction::VBinary {
@@ -820,19 +842,7 @@ impl Validator {
                 lane,
                 span,
             } => {
-                Self::check_lane(
-                    op.as_str(),
-                    *lane,
-                    &[
-                        Type::I8,
-                        Type::I16,
-                        Type::I32,
-                        Type::I64,
-                        Type::F32,
-                        Type::F64,
-                    ],
-                    *span,
-                )?;
+                Self::check_lane(op.as_str(), *lane, ALL_LANES, *span)?;
                 let vec_ty =
                     self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
                 Self::define(scope, defs, dst, vec_ty, *span)?;
@@ -853,20 +863,72 @@ impl Validator {
                 )?;
                 Self::define(scope, defs, dst, vec_ty, *span)?;
             }
-            Instruction::VLen { dst, lane, span } => {
-                Self::check_lane(
-                    "vl",
-                    *lane,
-                    &[
-                        Type::I8,
-                        Type::I16,
-                        Type::I32,
+            Instruction::MaskedLoad {
+                dst,
+                ptr,
+                count,
+                ty,
+                lane,
+                span,
+            } => {
+                self.check_typed(ctx, ptr, Type::Ptr, "ldm pointer", scope, *span)?;
+                self.check_typed(ctx, count, Type::I64, "ldm lane count", scope, *span)?;
+                if !ty.is_vector() {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("ldm loads a vector (v128, v256, v512, vx), found '{ty}'"),
+                        *span,
+                    ));
+                }
+                Self::check_lane("ldm", *lane, ALL_LANES, *span)?;
+                Self::define(scope, defs, dst, *ty, *span)?;
+            }
+            Instruction::MaskedStore {
+                ptr,
+                val,
+                count,
+                lane,
+                span,
+            } => {
+                self.check_typed(ctx, ptr, Type::Ptr, "stm pointer", scope, *span)?;
+                self.check_vector(ctx, val, scope, *span)?;
+                self.check_typed(ctx, count, Type::I64, "stm lane count", scope, *span)?;
+                Self::check_lane("stm", *lane, ALL_LANES, *span)?;
+            }
+            Instruction::MatMul {
+                pc,
+                pa,
+                pb,
+                m,
+                n,
+                k,
+                dtype,
+                span,
+            } => {
+                for (reg, what) in [(pc, "C"), (pa, "A"), (pb, "B")] {
+                    self.check_typed(
+                        ctx,
+                        reg,
+                        Type::Ptr,
+                        &format!("mm {what} pointer"),
+                        scope,
+                        *span,
+                    )?;
+                }
+                for (reg, what) in [(m, "m"), (n, "n"), (k, "k")] {
+                    self.check_typed(
+                        ctx,
+                        reg,
                         Type::I64,
-                        Type::F32,
-                        Type::F64,
-                    ],
-                    *span,
-                )?;
+                        &format!("mm dimension {what}"),
+                        scope,
+                        *span,
+                    )?;
+                }
+                Self::check_lane("mm", *dtype, MM_DTYPES, *span)?;
+            }
+            Instruction::VLen { dst, lane, span } => {
+                Self::check_lane("vl", *lane, ALL_LANES, *span)?;
                 Self::define(scope, defs, dst, Type::I64, *span)?;
             }
         }
@@ -881,6 +943,28 @@ impl Validator {
                 span,
             )
             .with_context(serde_json::json!({ "op": op, "lane": lane.as_str(), "supported": allowed.iter().map(|t| t.as_str()).collect::<Vec<_>>() })));
+        }
+        Ok(())
+    }
+
+    /// Checks that `name` is a register of type `expected`.
+    fn check_typed(
+        &self,
+        ctx: &FnCtx,
+        name: &str,
+        expected: Type,
+        what: &str,
+        scope: &Visible,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let ty = self.check_reg(ctx, name, scope, span)?;
+        if ty != expected {
+            return Err(Diagnostic::error(
+                "ERR_TYPE_MISMATCH",
+                format!("{what} '{name}' must be '{expected}', found '{ty}'"),
+                span,
+            )
+            .with_context(serde_json::json!({ "target": name, "expected": expected.as_str(), "found": ty.as_str() })));
         }
         Ok(())
     }

@@ -89,6 +89,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Op | Syntax | Lane types |
 |---|---|---|
 | Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
+| Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
 | Broadcast | `v = splat x:v512` (plain `splat x` is `v128`) | i8 to f64 |
 | Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
@@ -101,7 +102,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 
 Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths. The pre-v2 spellings (`vfadd`, `viadd`, `vfsum`, `visum`, `vfmax`, ...) still parse and print in canonical form.
 
-Vector-length-agnostic code processes `vl` lanes per iteration, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
+Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
 ```air
 fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
   b0:
@@ -109,23 +110,28 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
     w = vl f32
     jmp vloop(0:i64)
   vloop(i:i64):
-    rest = sub n, i
-    full = ge rest, w
-    br full, vbody, tail(i)
+    more = lt i, n
+    br more, vbody, done
   vbody:
+    rest = sub n, i
     off = mul i, 4:i64
     px = add x, off
     py = add y, off
-    xv = ld px:vx
-    yv = ld py:vx
+    xv = ldm px:vx, rest:f32
+    yv = ldm py:vx, rest:f32
     r = vfma va, xv, yv:f32
-    st py, r
+    stm py, r, rest:f32
     i2 = add i, w
     jmp vloop(i2)
-  # tail(j:i64): scalar loop for the last n % vl elements (see the example file)
+  done:
+    ret
 ```
 
-**Backend support:** the Cranelift backend runs every vector program today, splitting `v256`/`v512` into 128-bit operations and treating `vx` as 128 bits. Native 256/512-bit (AVX2, AVX-512) and scalable (SVE) code generation is planned for an opt-in LLVM backend; programs written against `vl` will widen automatically.
+**Half-precision storage types:** `f16` (IEEE binary16) and `bf16` (bfloat16) can be loaded, stored, and converted (`f = fext h:f32`, `h = ftrunc f:bf16`, rounding to nearest-even), but not used in arithmetic or function signatures; convert to `f32` first.
+
+**Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
+
+**Backend support:** the Cranelift backend runs every vector program today, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. Native 256/512-bit (AVX2, AVX-512), scalable (SVE), and matrix-engine (AMX, SME) code generation is planned for an opt-in LLVM backend; programs written against `vl` and `mm` will speed up without changes.
 
 ---
 
@@ -192,7 +198,7 @@ achainsaw bench examples/fibonacci.air --iters 200
 ```
 
 ### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
-AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. The current format is AIRB v2 (adds the v2 vector types and ops); v1 files still load:
+AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. The current format is AIRB v3 (v2 added the wide vector types and ops; v3 added `f16`/`bf16`, `ldm`/`stm`, and `mm`); older files still load:
 ```bash
 # Assemble text AIR to compact binary bytecode (.airb)
 achainsaw assemble examples/simd_vector_dot.air -o examples/simd_vector_dot.airb --json
