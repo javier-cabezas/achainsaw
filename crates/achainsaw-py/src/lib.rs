@@ -7,8 +7,10 @@ use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::IntoPyObjectExt;
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 create_exception!(achainsaw, CompilationError, PyException);
 create_exception!(achainsaw, ExecutionError, CompilationError);
@@ -27,8 +29,28 @@ impl Drop for BufferGuard {
 
 #[pyclass(name = "Kernel")]
 pub struct PyKernel {
-    engine: JitEngine,
+    /// pyo3 requires `#[pyclass]` types to be `Sync`; the engine (JIT state, fuel counter)
+    /// is not, so calls go through a mutex. Calls already hold the GIL, so the lock is never
+    /// contended; `try_lock` turns re-entry (a host callback calling the same kernel while it
+    /// runs) into a Python error instead of a deadlock.
+    engine: Mutex<JitEngine>,
     signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
+}
+
+impl PyKernel {
+    fn engine(&self) -> PyResult<MutexGuard<'_, JitEngine>> {
+        match self.engine.try_lock() {
+            Ok(guard) => Ok(guard),
+            // A panic during an earlier call (raised in Python as PanicException) poisons the
+            // lock but leaves the engine intact.
+            Err(std::sync::TryLockError::Poisoned(p)) => Ok(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "kernel is already running on this thread (re-entrant call from a host callback)",
+                ))
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -37,23 +59,25 @@ impl PyKernel {
         self.signatures.keys().cloned().collect()
     }
 
-    pub fn lookup_symbol(&self, name: &str) -> Option<usize> {
-        self.engine.lookup_symbol(name).map(|ptr| ptr as usize)
+    pub fn lookup_symbol(&self, name: &str) -> PyResult<Option<usize>> {
+        Ok(self.engine()?.lookup_symbol(name).map(|ptr| ptr as usize))
     }
 
     /// Code generator that compiled this kernel ("cranelift" or "llvm").
     #[getter]
-    pub fn backend(&self) -> &'static str {
-        self.engine.backend().as_str()
+    pub fn backend(&self) -> PyResult<&'static str> {
+        Ok(self.engine()?.backend().as_str())
     }
 
     #[pyo3(signature = (fuel=None))]
-    pub fn set_fuel(&mut self, fuel: Option<u64>) {
-        self.engine.set_fuel(fuel);
+    pub fn set_fuel(&self, fuel: Option<u64>) -> PyResult<()> {
+        self.engine()?.set_fuel(fuel);
+        Ok(())
     }
 
-    pub fn set_memory_quota(&self, quota_bytes: usize) {
-        self.engine.set_memory_quota(quota_bytes);
+    pub fn set_memory_quota(&self, quota_bytes: usize) -> PyResult<()> {
+        self.engine()?.set_memory_quota(quota_bytes);
+        Ok(())
     }
 
     #[pyo3(signature = (func_name, *args))]
@@ -62,7 +86,7 @@ impl PyKernel {
         py: Python<'_>,
         func_name: &str,
         args: &Bound<'_, PyTuple>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (param_types, _ret_type) = self.signatures.get(func_name).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("Function '{func_name}' not found"))
         })?;
@@ -158,29 +182,29 @@ impl PyKernel {
             rt_args.push(rt_val);
         }
 
-        let res_rt = unsafe { self.engine.call_typed(func_name, &rt_args) }.map_err(|e| {
+        let res_rt = unsafe { self.engine()?.call_typed(func_name, &rt_args) }.map_err(|e| {
             check_execution_status_py(py).err().unwrap_or_else(|| {
-                let err_type = py.get_type_bound::<ExecutionError>();
-                PyErr::from_value_bound(err_type.call1((e.to_string(),)).unwrap())
+                let err_type = py.get_type::<ExecutionError>();
+                PyErr::from_value(err_type.call1((e.to_string(),)).unwrap())
             })
         })?;
 
         drop(_buffers);
 
         match res_rt {
-            Some(RtValue::I8(n)) => Ok(n.into_py(py)),
-            Some(RtValue::I16(n)) => Ok(n.into_py(py)),
-            Some(RtValue::I32(n)) => Ok(n.into_py(py)),
-            Some(RtValue::I64(n)) => Ok(n.into_py(py)),
-            Some(RtValue::Ptr(p)) => Ok(p.into_py(py)),
-            Some(RtValue::F32(f)) => Ok(f.into_py(py)),
-            Some(RtValue::F64(f)) => Ok(f.into_py(py)),
+            Some(RtValue::I8(n)) => n.into_py_any(py),
+            Some(RtValue::I16(n)) => n.into_py_any(py),
+            Some(RtValue::I32(n)) => n.into_py_any(py),
+            Some(RtValue::I64(n)) => n.into_py_any(py),
+            Some(RtValue::Ptr(p)) => p.into_py_any(py),
+            Some(RtValue::F32(f)) => f.into_py_any(py),
+            Some(RtValue::F64(f)) => f.into_py_any(py),
             None => Ok(py.None()),
         }
     }
 
     #[pyo3(signature = (*args))]
-    pub fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<PyObject> {
+    pub fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
         if !args.is_empty() {
             if let Ok(name) = args.get_item(0)?.extract::<String>() {
                 if self.signatures.contains_key(&name) {
@@ -207,7 +231,7 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
         let status = achainsaw_codegen::get_execution_status();
         match status {
             achainsaw_codegen::ExecutionStatus::OutOfFuel => {
-                let err_type = py.get_type_bound::<ExecutionError>();
+                let err_type = py.get_type::<ExecutionError>();
                 let msg = "[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted";
                 let err_instance = err_type.call1((msg,)).unwrap();
                 let diag = serde_json::json!({
@@ -216,15 +240,15 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
                     "message": "Execution halted: loop fuel budget exhausted",
                 });
                 if let Ok(py_dict) = py
-                    .import_bound("json")
+                    .import("json")
                     .and_then(|m| m.call_method1("loads", (diag.to_string(),)))
                 {
                     let _ = err_instance.setattr("diagnostic", py_dict);
                 }
-                PyErr::from_value_bound(err_instance)
+                PyErr::from_value(err_instance)
             }
             achainsaw_codegen::ExecutionStatus::OutOfMemory { requested, limit } => {
-                let err_type = py.get_type_bound::<ExecutionError>();
+                let err_type = py.get_type::<ExecutionError>();
                 let msg = format!(
                     "[ERR_OUT_OF_MEMORY] Allocation of {requested} bytes exceeded memory quota of {limit} bytes"
                 );
@@ -239,65 +263,65 @@ fn check_execution_status_py(py: Python<'_>) -> PyResult<()> {
                     }
                 });
                 if let Ok(py_dict) = py
-                    .import_bound("json")
+                    .import("json")
                     .and_then(|m| m.call_method1("loads", (diag.to_string(),)))
                 {
                     let _ = err_instance.setattr("diagnostic", py_dict);
                 }
-                PyErr::from_value_bound(err_instance)
+                PyErr::from_value(err_instance)
             }
             _ => {
-                let err_type = py.get_type_bound::<ExecutionError>();
-                PyErr::from_value_bound(err_type.call1((e.to_string(),)).unwrap())
+                let err_type = py.get_type::<ExecutionError>();
+                PyErr::from_value(err_type.call1((e.to_string(),)).unwrap())
             }
         }
     })
 }
 
 fn diagnostic_to_py_err(py: Python<'_>, diag: Diagnostic) -> PyErr {
-    let err_type = py.get_type_bound::<CompilationError>();
+    let err_type = py.get_type::<CompilationError>();
     let err_instance = err_type
         .call1((format!("[{}] {}", diag.error_code, diag.message),))
         .unwrap();
 
     let diag_json = serde_json::to_string(&diag).unwrap_or_else(|_| "{}".to_string());
     if let Ok(py_dict) = py
-        .import_bound("json")
+        .import("json")
         .and_then(|m| m.call_method1("loads", (diag_json,)))
     {
         let _ = err_instance.setattr("diagnostic", py_dict);
     }
 
-    PyErr::from_value_bound(err_instance)
+    PyErr::from_value(err_instance)
 }
 
 #[pyfunction]
-pub fn check(py: Python<'_>, source: &str) -> PyResult<PyObject> {
+pub fn check(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
     match parse_and_validate(source) {
         Ok(module) => {
-            let dict = PyDict::new_bound(py);
+            let dict = PyDict::new(py);
             dict.set_item("status", "ok")?;
             let func_names: Vec<String> = module.functions.iter().map(|f| f.name.clone()).collect();
             dict.set_item("functions", func_names)?;
             dict.set_item("function_count", module.functions.len())?;
             let block_count: usize = module.functions.iter().map(|f| f.blocks.len()).sum();
             dict.set_item("block_count", block_count)?;
-            Ok(dict.into_py(py))
+            Ok(dict.into_any().unbind())
         }
         Err(diag) => {
             let diag_json = serde_json::to_string(&diag).unwrap_or_else(|_| "{}".to_string());
-            let json_mod = py.import_bound("json")?;
+            let json_mod = py.import("json")?;
             let parsed = json_mod.call_method1("loads", (diag_json,))?;
-            Ok(parsed.into_py(py))
+            Ok(parsed.unbind())
         }
     }
 }
 
 #[pyfunction]
-pub fn assemble(py: Python<'_>, source: &str) -> PyResult<PyObject> {
+pub fn assemble(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
     let bytes = encode_module(&module).map_err(|d| diagnostic_to_py_err(py, d))?;
-    Ok(pyo3::types::PyBytes::new_bound(py, &bytes).into_py(py))
+    Ok(PyBytes::new(py, &bytes).into_any().unbind())
 }
 
 #[pyfunction]
@@ -318,7 +342,10 @@ fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResul
     let mut engine = JitEngine::for_module(backend, module).map_err(runtime_err)?;
     engine.compile_module(module).map_err(runtime_err)?;
 
-    Ok(PyKernel { engine, signatures })
+    Ok(PyKernel {
+        engine: Mutex::new(engine),
+        signatures,
+    })
 }
 
 /// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default: follows
@@ -396,12 +423,12 @@ pub fn version() -> &'static str {
 
 #[pyfunction]
 #[pyo3(signature = (source))]
-pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
+pub fn optimize(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
     let mut module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
     let stats = achainsaw_ir::opt::optimize_module(&mut module);
     let optimized_code = to_air_text(&module);
 
-    let dict = pyo3::types::PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("code", optimized_code)?;
     dict.set_item("constants_folded", stats.constants_folded)?;
     dict.set_item("algebraic_simplifications", stats.algebraic_simplifications)?;
@@ -409,18 +436,18 @@ pub fn optimize(py: Python<'_>, source: &str) -> PyResult<PyObject> {
     dict.set_item("dead_instructions_removed", stats.dead_instructions_removed)?;
     dict.set_item("dead_blocks_removed", stats.dead_blocks_removed)?;
     dict.set_item("total_optimizations", stats.total_optimizations())?;
-    Ok(dict.into_py(py))
+    Ok(dict.into_any().unbind())
 }
 
 /// Host CPU vector features, active ISA cap, and backend vector widths.
 #[pyfunction]
-pub fn cpu_features(py: Python<'_>) -> PyResult<PyObject> {
+pub fn cpu_features(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let report = achainsaw_codegen::cpu::target_report()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let parsed = py
-        .import_bound("json")?
+        .import("json")?
         .call_method1("loads", (report.to_string(),))?;
-    Ok(parsed.into_py(py))
+    Ok(parsed.unbind())
 }
 
 /// Caps the vector ISA for kernels compiled afterwards (`None` removes the cap).
@@ -445,11 +472,8 @@ pub fn get_isa_cap() -> PyResult<Option<String>> {
 #[pymodule]
 fn achainsaw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
-    m.add(
-        "CompilationError",
-        m.py().get_type_bound::<CompilationError>(),
-    )?;
-    m.add("ExecutionError", m.py().get_type_bound::<ExecutionError>())?;
+    m.add("CompilationError", m.py().get_type::<CompilationError>())?;
+    m.add("ExecutionError", m.py().get_type::<ExecutionError>())?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(available_backends, m)?)?;
