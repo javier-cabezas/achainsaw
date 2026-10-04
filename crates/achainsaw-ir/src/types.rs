@@ -10,10 +10,20 @@ pub enum Type {
     F32,
     F64,
     Ptr,
-    /// 128-bit universal SIMD vector (4xf32, 4xi32, etc.)
-    /// Architecture is extensible to V256 and V512 in future phases.
+    /// 128-bit SIMD vector. Vectors are untyped bit containers; each vector op
+    /// names the lane type it operates on (`vadd a, b:f32`).
     V128,
+    /// 256-bit SIMD vector.
+    V256,
+    /// 512-bit SIMD vector.
+    V512,
+    /// Scalable vector: the widest the target supports (at least 128 bits), fixed per
+    /// compiled module. `vl <lane>` returns its lane count at runtime.
+    Vx,
 }
+
+/// Minimum width of a scalable `vx` vector on every backend.
+pub const MIN_VX_BITS: u32 = 128;
 
 impl Type {
     pub fn from_str_token(s: &str) -> Option<Self> {
@@ -26,6 +36,9 @@ impl Type {
             "f64" => Some(Type::F64),
             "ptr" => Some(Type::Ptr),
             "v128" => Some(Type::V128),
+            "v256" => Some(Type::V256),
+            "v512" => Some(Type::V512),
+            "vx" => Some(Type::Vx),
             _ => None,
         }
     }
@@ -41,7 +54,8 @@ impl Type {
         }
     }
 
-    /// Total bit width of any type.
+    /// Total bit width of any type. `None` for the scalable `vx`, whose width
+    /// depends on the target.
     pub fn bit_width(&self) -> Option<u32> {
         match self {
             Type::I8 => Some(8),
@@ -49,18 +63,41 @@ impl Type {
             Type::I32 | Type::F32 => Some(32),
             Type::I64 | Type::F64 | Type::Ptr => Some(64),
             Type::V128 => Some(128),
+            Type::V256 => Some(256),
+            Type::V512 => Some(512),
+            Type::Vx => None,
         }
     }
 
-    /// Size in bytes in memory or registers.
+    /// Size in bytes in memory or registers. For `vx` this is the guaranteed
+    /// minimum (16); the actual size depends on the target.
     pub fn byte_size(&self) -> usize {
         match self {
-            Type::I8 => 1,
-            Type::I16 => 2,
-            Type::I32 | Type::F32 => 4,
-            Type::I64 | Type::F64 | Type::Ptr => 8,
-            Type::V128 => 16,
+            Type::Vx => (MIN_VX_BITS / 8) as usize,
+            other => (other.bit_width().unwrap_or(0) / 8) as usize,
         }
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Type::V128 | Type::V256 | Type::V512 | Type::Vx)
+    }
+
+    /// Scalar types that can be vector lanes.
+    pub fn is_lane(&self) -> bool {
+        matches!(
+            self,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64
+        )
+    }
+
+    /// Lanes of type `self` that a vector of type `vec` is guaranteed to hold
+    /// (for `vx`, the count at its minimum width).
+    pub fn lanes_in(&self, vec: Type) -> Option<u32> {
+        if !self.is_lane() || !vec.is_vector() {
+            return None;
+        }
+        let vec_bits = vec.bit_width().unwrap_or(MIN_VX_BITS);
+        Some(vec_bits / self.bit_width()?)
     }
 
     pub fn is_int(&self) -> bool {
@@ -69,17 +106,6 @@ impl Type {
 
     pub fn is_float(&self) -> bool {
         matches!(self, Type::F32 | Type::F64)
-    }
-
-    /// Number of lanes a 128-bit vector has when viewed as this scalar type.
-    pub fn lane_count(&self) -> Option<u32> {
-        match self {
-            Type::I8 => Some(16),
-            Type::I16 => Some(8),
-            Type::I32 | Type::F32 => Some(4),
-            Type::I64 | Type::F64 => Some(2),
-            _ => None,
-        }
     }
 
     /// True if integer literal `n` is representable in this type, as either a signed
@@ -115,6 +141,9 @@ impl Type {
             Type::F64 => "f64",
             Type::Ptr => "ptr",
             Type::V128 => "v128",
+            Type::V256 => "v256",
+            Type::V512 => "v512",
+            Type::Vx => "vx",
         }
     }
 }

@@ -65,7 +65,7 @@ impl<'a> Parser<'a> {
 
     fn expect_ident(&mut self) -> Result<(String, Span), Diagnostic> {
         match self.peek_kind().clone() {
-            TokenKind::Ident(s) | TokenKind::Op(s) => {
+            TokenKind::Ident(s) | TokenKind::Op(s) | TokenKind::VOp(s) => {
                 let span = self.advance().span;
                 Ok((s, span))
             }
@@ -102,7 +102,7 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(Diagnostic::error(
                         "ERR_UNKNOWN_TYPE",
-                        format!("Unknown type: '{s}'. Expected one of: i8, i16, i32, i64, f32, f64, ptr, v128"),
+                        format!("Unknown type: '{s}'. Expected one of: i8, i16, i32, i64, f32, f64, ptr, v128, v256, v512, vx"),
                         self.peek().span,
                     ))
                 }
@@ -201,7 +201,7 @@ impl<'a> Parser<'a> {
                 });
                 Ok(imm_reg)
             }
-            TokenKind::Ident(name) => {
+            TokenKind::Ident(name) | TokenKind::VOp(name) => {
                 self.advance();
                 Ok(name)
             }
@@ -415,6 +415,121 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses the operands of a vector op whose mnemonic `name` was just consumed.
+    fn parse_vector_op(
+        &mut self,
+        name: &str,
+        dst: String,
+        span: Span,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Instruction, Diagnostic> {
+        if name == "vl" {
+            let lane = self.parse_type()?;
+            self.expect_eol()?;
+            return Ok(Instruction::VLen { dst, lane, span });
+        }
+        if let Some(op) = VectorReduceOp::from_str_opt(name) {
+            let src = self.parse_operand(instructions, Some(Type::V128))?;
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            self.expect_eol()?;
+            return Ok(Instruction::VectorReduce {
+                op,
+                dst,
+                src,
+                ty,
+                span,
+            });
+        }
+        if let Some((op, lane)) = VBinOp::from_legacy(name) {
+            // Pre-v2 syntax carries no lane suffix: `vfadd a, b`.
+            let lhs = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let rhs = self.parse_operand(instructions, None)?;
+            self.expect_eol()?;
+            return Ok(Instruction::VBinary {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                span,
+            });
+        }
+        if name == "vsel" {
+            let mask = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let then_val = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let else_val = self.parse_operand(instructions, None)?;
+            self.expect_eol()?;
+            return Ok(Instruction::VSelect {
+                dst,
+                mask,
+                then_val,
+                else_val,
+                span,
+            });
+        }
+
+        let arity = if name == "vfma" { 3 } else { 2 };
+        let mut regs = Vec::with_capacity(arity);
+        for i in 0..arity {
+            if i > 0 {
+                self.expect(TokenKind::Comma)?;
+            }
+            regs.push(self.parse_operand(instructions, None)?);
+        }
+        if self.peek_kind() != &TokenKind::Colon {
+            return Err(Diagnostic::error(
+                "ERR_EXPECTED_LANE_TYPE",
+                format!("Vector op '{name}' needs a lane type suffix, e.g. '{name} a, b:f32'"),
+                self.peek().span,
+            ));
+        }
+        self.advance();
+        let lane = self.parse_type()?;
+        self.expect_eol()?;
+
+        let mut regs = regs.into_iter();
+        let mut next = || regs.next().unwrap();
+        if name == "vfma" {
+            return Ok(Instruction::VFma {
+                dst,
+                a: next(),
+                b: next(),
+                c: next(),
+                lane,
+                span,
+            });
+        }
+        if let Some(op) = VCmpOp::from_str_opt(name) {
+            return Ok(Instruction::VCmp {
+                op,
+                dst,
+                lhs: next(),
+                rhs: next(),
+                lane,
+                span,
+            });
+        }
+        let op = VBinOp::from_str_opt(name).ok_or_else(|| {
+            Diagnostic::error(
+                "ERR_UNKNOWN_OP",
+                format!("Unknown vector op '{name}'"),
+                span,
+            )
+        })?;
+        Ok(Instruction::VBinary {
+            op,
+            dst,
+            lhs: next(),
+            rhs: next(),
+            lane,
+            span,
+        })
+    }
+
     fn parse_instruction(
         &mut self,
         instructions: &mut Vec<Instruction>,
@@ -533,12 +648,24 @@ impl<'a> Parser<'a> {
             TokenKind::Splat => {
                 self.advance();
                 let src = self.parse_operand(instructions, None)?;
+                // Optional vector width: `splat x:v256`; plain `splat x` is v128.
+                let ty = if self.peek_kind() == &TokenKind::Colon {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    Type::V128
+                };
                 self.expect_eol()?;
                 Ok(Instruction::Splat {
                     dst,
                     src,
+                    ty,
                     span: dst_span,
                 })
+            }
+            TokenKind::VOp(name) => {
+                self.advance();
+                self.parse_vector_op(&name, dst, dst_span, instructions)
             }
             TokenKind::Extlane => {
                 self.advance();
@@ -650,7 +777,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(Diagnostic::error(
                 "ERR_EXPECTED_RVALUE",
-                format!("Expected cst, ld, call, alloc, splat, extlane, select, cast, unary, or binary op after '=', found {:?}", self.peek_kind()),
+                format!("Expected cst, ld, call, alloc, splat, extlane, select, cast, unary, binary op, or vector op after '=', found {:?}", self.peek_kind()),
                 self.peek().span,
             )),
         }

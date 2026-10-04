@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::lower::push_abi_params;
 pub use crate::lower::{to_clif_type, LowerConfig, RtValue};
 
 static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
@@ -360,6 +361,9 @@ impl JitEngine {
         flag_builder.set("use_colocated_libcalls", "false")?;
         flag_builder.set("is_pic", "false")?;
         flag_builder.set("opt_level", "speed")?;
+        // v256/v512 values span 2/4 vector registers, more than ABIs return in registers;
+        // spill extra return values through an implicit struct-return pointer.
+        flag_builder.set("enable_multi_ret_implicit_sret", "true")?;
 
         let isa =
             crate::cpu::native_isa_builder(features)?.finish(settings::Flags::new(flag_builder))?;
@@ -448,10 +452,10 @@ impl JitEngine {
         for ext_fn in &ir_mod.extern_functions {
             let mut sig = self.module.make_signature();
             for (_, p_ty) in &ext_fn.params {
-                sig.params.push(AbiParam::new(to_clif_type(*p_ty)));
+                push_abi_params(&mut sig.params, *p_ty);
             }
             if let Some(r_ty) = ext_fn.ret_type {
-                sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
+                push_abi_params(&mut sig.returns, r_ty);
             }
             func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
 
@@ -465,10 +469,10 @@ impl JitEngine {
         for func in &ir_mod.functions {
             let mut sig = self.module.make_signature();
             for (_, p_ty) in &func.params {
-                sig.params.push(AbiParam::new(to_clif_type(*p_ty)));
+                push_abi_params(&mut sig.params, *p_ty);
             }
             if let Some(r_ty) = func.ret_type {
-                sig.returns.push(AbiParam::new(to_clif_type(r_ty)));
+                push_abi_params(&mut sig.returns, r_ty);
             }
             func_returns.insert(func.name.clone(), func.ret_type);
 
@@ -507,7 +511,12 @@ impl JitEngine {
             self.module.define_function(func_id, &mut self.ctx)?;
             self.module.clear_context(&mut self.ctx);
 
+            // Host calls go through a scalar trampoline; functions that take or return
+            // vectors are only callable from AIR code.
             let (param_tys, ret_ty) = &self.signatures[&func.name];
+            if param_tys.iter().chain(ret_ty.iter()).any(|t| t.is_vector()) {
+                continue;
+            }
             crate::lower::lower_trampoline(
                 &mut self.module,
                 &mut self.ctx,
@@ -561,6 +570,14 @@ impl JitEngine {
             .get(name)
             .ok_or_else(|| anyhow!("Function '{name}' not found"))?;
 
+        let tramp_ptr = self
+            .trampoline_ptrs
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!("Function '{name}' takes or returns vectors, so it can only be called from AIR code; pass vectors through memory (ptr) instead")
+            })?;
+
         if args.len() != param_types.len() {
             return Err(anyhow!(
                 "Function '{name}' expects {} arguments, received {}",
@@ -574,12 +591,6 @@ impl JitEngine {
             let raw = arg.to_u64(ty).map_err(|e| anyhow!("Argument {i}: {e}"))?;
             raw_args.push(raw);
         }
-
-        let tramp_ptr = self
-            .trampoline_ptrs
-            .get(name)
-            .copied()
-            .ok_or_else(|| anyhow!("No trampoline found for function '{name}'"))?;
 
         let mut raw_ret: u64 = 0;
         reset_execution_status();

@@ -22,7 +22,7 @@ achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to na
 Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features (backends currently generate 128-bit vector code).
 
 AIR syntax:
-- Types: i8 i16 i32 i64 f32 f64 ptr v128 (4 x f32 or 4 x i32).
+- Types: i8 i16 i32 i64 f32 f64 ptr; vectors v128 v256 v512 vx (scalable, >=128 bits, lane count via `vl`). Vectors are untyped bits; each vector op names its lane type.
 - Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`.
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
 - One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
@@ -32,7 +32,7 @@ AIR syntax:
 - Compare -> i32 0/1: eq ne lt gt le ge ult ugt ule uge.
 - Pointers: `p2 = add p, off` with off:i64; `v = ld p:f32`; `st p, v`; `p = alloc n` (n:i64 bytes); `free p`.
 - Other: `s = select c, a, b`; unary neg abs sqrt; casts `itof x:f32` ftoi sext zext trunc fext ftrunc bitcast (`dst = op src:ty`).
-- SIMD: `v = splat f`; vfadd vfsub vfmul vfdiv viadd visub vimul; `e = extlane v, 0:f32`; reductions `vfsum v:f32` vfmax visum.
+- Vectors: `v = ld p:v256`, `st p, v` (any alignment); `v = splat x:v256` (plain `splat x` is v128); `r = vadd a, b:f32` (vsub vmul vdiv vmin vmax vand vor vxor; lane types i8 i16 i32 i64 f32 f64, but vmul has no i8, vdiv is float-only, vmin/vmax have no i64); `r = vfma a, b, c:f32` (a*b+c, f32/f64); `m = vlt a, b:f32` (veq vne vgt vle vge, all-ones lanes when true); `r = vsel m, a, b`; `s = vsum v:f32` (vmaxr vminr); `e = extlane v, 7:f32`; `n = vl f32` (i64 lanes in vx). vx cannot appear in function signatures; extfn takes no v256/v512. Legacy vfadd/viadd/vfsum/visum/vfmax still parse.
 - Calls: `r = call f(a, b)` or `call f(a)`; external C functions need `extfn sinf(x:f32)->f32` at the top. air_run only permits C math externs (sinf cosf tanf sqrtf expf logf powf fabsf floorf ceilf roundf and f64 sin cos tan sqrt exp log pow fabs floor ceil round).
 - Comments: `#` or `//`. Names starting with `__` are reserved.
 
@@ -179,7 +179,9 @@ pub fn execute_ir(
             Type::Ptr => RtValue::Ptr(val_num as usize),
             Type::F32 => RtValue::F32(val_num as f32),
             Type::F64 => RtValue::F64(val_num),
-            Type::V128 => return Err(anyhow!("Cannot pass v128 register directly via MCP")),
+            Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+                return Err(anyhow!("Cannot pass {p_ty} vector directly via MCP"))
+            }
         };
         rt_args.push(rt_val);
     }
