@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::backend::Backend;
 use crate::lower::push_abi_params;
 pub use crate::lower::{to_clif_type, LowerConfig, RtValue, SandboxConfig};
 
@@ -593,7 +594,8 @@ impl Drop for SandboxActivation {
     }
 }
 
-pub struct JitEngine {
+/// Cranelift JIT module plus the ids of the runtime hooks it imports.
+struct CraneliftJit {
     builder_context: FunctionBuilderContext,
     ctx: cranelift_codegen::Context,
     module: JITModule,
@@ -604,25 +606,13 @@ pub struct JitEngine {
     rt_sandbox_fault_id: FuncId,
     rt_stack_check_id: FuncId,
     rt_sandbox_check_mm_id: FuncId,
-    /// Set by `enable_sandbox`; boxed so its address stays fixed while code runs.
-    sandbox: Option<Box<RefCell<Arena>>>,
-    pub registry: Arc<RwLock<SymbolRegistry>>,
-    pub fuel_enabled: bool,
-    pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
-    function_ptrs: HashMap<String, usize>,
-    trampoline_ptrs: HashMap<String, usize>,
 }
 
-unsafe impl Send for JitEngine {}
-
-impl JitEngine {
-    /// JIT engine for the host CPU, honoring the ISA cap (`ACHAINSAW_MAX_ISA`).
-    pub fn new() -> Result<Self> {
-        Self::with_features(&crate::cpu::CpuFeatures::effective()?)
-    }
-
-    /// JIT engine restricted to `features`, which must be a subset of the host's.
-    pub fn with_features(features: &crate::cpu::CpuFeatures) -> Result<Self> {
+impl CraneliftJit {
+    fn new(
+        features: &crate::cpu::CpuFeatures,
+        registry: &Arc<RwLock<SymbolRegistry>>,
+    ) -> Result<Self> {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false")?;
         flag_builder.set("is_pic", "false")?;
@@ -637,8 +627,7 @@ impl JitEngine {
         let isa =
             crate::cpu::native_isa_builder(features)?.finish(settings::Flags::new(flag_builder))?;
 
-        let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
-        let reg_lookup = Arc::clone(&registry);
+        let reg_lookup = Arc::clone(registry);
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
@@ -704,6 +693,205 @@ impl JitEngine {
             rt_sandbox_fault_id,
             rt_stack_check_id,
             rt_sandbox_check_mm_id,
+        })
+    }
+
+    /// Compiles `ir_mod` and returns `(name, function, trampoline)` addresses.
+    fn compile(
+        &mut self,
+        ir_mod: &Module,
+        fuel_enabled: bool,
+        sandbox: Option<(i64, i64)>,
+    ) -> Result<Vec<(String, usize, Option<usize>)>> {
+        let mut func_ids = HashMap::new();
+        let mut func_returns = HashMap::new();
+
+        // 1. Declare external functions (Linkage::Import)
+        for ext_fn in &ir_mod.extern_functions {
+            let mut sig = self.module.make_signature();
+            for (_, p_ty) in &ext_fn.params {
+                push_abi_params(&mut sig.params, *p_ty);
+            }
+            if let Some(r_ty) = ext_fn.ret_type {
+                push_abi_params(&mut sig.returns, r_ty);
+            }
+            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
+
+            let func_id = self
+                .module
+                .declare_function(&ext_fn.name, Linkage::Import, &sig)?;
+            func_ids.insert(ext_fn.name.clone(), func_id);
+        }
+
+        // 2. Declare internal functions (Linkage::Export)
+        for func in &ir_mod.functions {
+            let mut sig = self.module.make_signature();
+            for (_, p_ty) in &func.params {
+                push_abi_params(&mut sig.params, *p_ty);
+            }
+            if let Some(r_ty) = func.ret_type {
+                push_abi_params(&mut sig.returns, r_ty);
+            }
+            func_returns.insert(func.name.clone(), func.ret_type);
+
+            let func_id = self
+                .module
+                .declare_function(&func.name, Linkage::Export, &sig)?;
+            func_ids.insert(func.name.clone(), func_id);
+        }
+
+        // 3. Lower each function and its dynamic invocation trampoline
+        let sandbox = sandbox.map(|(arena_base, arena_len)| SandboxConfig {
+            arena_base,
+            arena_len,
+            fault_id: self.rt_sandbox_fault_id,
+            stack_check_id: self.rt_stack_check_id,
+            mm_check_id: self.rt_sandbox_check_mm_id,
+        });
+        let config = LowerConfig {
+            // Sandboxed code always checks at branches so it stops after a violation.
+            fuel_check_func_id: (fuel_enabled || sandbox.is_some())
+                .then_some(self.rt_check_fuel_id),
+            fuel_consume_func_id: fuel_enabled.then_some(self.rt_consume_fuel_id),
+            rt_malloc_id: self.rt_malloc_id,
+            rt_free_id: self.rt_free_id,
+            sandbox,
+        };
+
+        let mut tramp_ids = HashMap::new();
+        for func in &ir_mod.functions {
+            let func_id = func_ids[&func.name];
+            crate::lower::lower_function(
+                &mut self.module,
+                &mut self.ctx,
+                &mut self.builder_context,
+                func,
+                &func_ids,
+                &func_returns,
+                &config,
+            )?;
+            self.module.define_function(func_id, &mut self.ctx)?;
+            self.module.clear_context(&mut self.ctx);
+
+            // Host calls go through a scalar trampoline; functions that take or return
+            // vectors are only callable from AIR code.
+            let param_tys: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
+            if param_tys
+                .iter()
+                .chain(func.ret_type.iter())
+                .any(|t| t.is_vector())
+            {
+                continue;
+            }
+            let tid = crate::lower::lower_trampoline(
+                &mut self.module,
+                &mut self.ctx,
+                &mut self.builder_context,
+                &func.name,
+                func_id,
+                &param_tys,
+                func.ret_type,
+            )?;
+            tramp_ids.insert(func.name.clone(), tid);
+        }
+
+        // 4. Finalize all JIT definitions
+        self.module.finalize_definitions()?;
+
+        // 5. Collect pointers
+        Ok(ir_mod
+            .functions
+            .iter()
+            .map(|func| {
+                let ptr = self.module.get_finalized_function(func_ids[&func.name]) as usize;
+                let tramp = tramp_ids
+                    .get(&func.name)
+                    .map(|tid| self.module.get_finalized_function(*tid) as usize);
+                (func.name.clone(), ptr, tramp)
+            })
+            .collect())
+    }
+}
+
+/// Code generator behind a `JitEngine`.
+enum Codegen {
+    Cranelift(Box<CraneliftJit>),
+    #[cfg(feature = "llvm")]
+    Llvm {
+        target: achainsaw_llvm::TargetSpec,
+        /// One LLJIT per `compile_module` call; kept alive so earlier code stays valid.
+        modules: Vec<achainsaw_llvm::LlvmJit>,
+    },
+}
+
+pub struct JitEngine {
+    backend: Backend,
+    codegen: Codegen,
+    /// Set by `enable_sandbox`; boxed so its address stays fixed while code runs.
+    sandbox: Option<Box<RefCell<Arena>>>,
+    pub registry: Arc<RwLock<SymbolRegistry>>,
+    pub fuel_enabled: bool,
+    pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
+    function_ptrs: HashMap<String, usize>,
+    trampoline_ptrs: HashMap<String, usize>,
+}
+
+unsafe impl Send for JitEngine {}
+
+impl JitEngine {
+    /// JIT engine for the host CPU, honoring the ISA cap (`ACHAINSAW_MAX_ISA`). Uses the
+    /// backend named by `ACHAINSAW_BACKEND`, or Cranelift.
+    pub fn new() -> Result<Self> {
+        Self::with_features(&crate::cpu::CpuFeatures::effective()?)
+    }
+
+    /// JIT engine restricted to `features`, which must be a subset of the host's. Uses the
+    /// backend named by `ACHAINSAW_BACKEND`, or Cranelift.
+    pub fn with_features(features: &crate::cpu::CpuFeatures) -> Result<Self> {
+        Self::with_backend(Backend::resolve(None)?, features)
+    }
+
+    /// JIT engine for the (capped) host using a backend chosen by name: `cranelift`,
+    /// `llvm`, or `auto`/`None` (see [`Backend::resolve`]).
+    pub fn for_backend(choice: Option<&str>) -> Result<Self> {
+        Self::with_backend(
+            Backend::resolve(choice)?,
+            &crate::cpu::CpuFeatures::effective()?,
+        )
+    }
+
+    /// JIT engine using `backend` for the host CPU restricted to `features`.
+    pub fn with_backend(backend: Backend, features: &crate::cpu::CpuFeatures) -> Result<Self> {
+        let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
+        let codegen = match backend {
+            Backend::Cranelift => {
+                Codegen::Cranelift(Box::new(CraneliftJit::new(features, &registry)?))
+            }
+            #[cfg(feature = "llvm")]
+            Backend::Llvm => {
+                // Same host-subset rule as Cranelift: JIT code must run on this CPU.
+                crate::cpu::native_isa_builder(features)?;
+                let (cpu, features) = features.llvm_target();
+                Codegen::Llvm {
+                    target: achainsaw_llvm::TargetSpec {
+                        triple: None,
+                        cpu,
+                        features,
+                    },
+                    modules: Vec::new(),
+                }
+            }
+            #[cfg(not(feature = "llvm"))]
+            Backend::Llvm => {
+                // `Backend::resolve` already rejects this; keep the error for direct callers.
+                return Err(anyhow!(
+                    "[ERR_BACKEND_UNAVAILABLE] The llvm backend is not in this build"
+                ));
+            }
+        };
+        Ok(Self {
+            backend,
+            codegen,
             sandbox: None,
             registry,
             fuel_enabled: true,
@@ -711,6 +899,11 @@ impl JitEngine {
             function_ptrs: HashMap::new(),
             trampoline_ptrs: HashMap::new(),
         })
+    }
+
+    /// Backend generating this engine's code.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
@@ -766,118 +959,69 @@ impl JitEngine {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
-        let mut func_ids = HashMap::new();
-        let mut func_returns = HashMap::new();
-
-        // 1. Declare external functions (Linkage::Import)
-        for ext_fn in &ir_mod.extern_functions {
-            let mut sig = self.module.make_signature();
-            for (_, p_ty) in &ext_fn.params {
-                push_abi_params(&mut sig.params, *p_ty);
+        let sandbox = self.sandbox.as_ref().map(|arena| {
+            let arena = arena.borrow();
+            (arena.base as i64, arena.len() as i64)
+        });
+        let compiled = match &mut self.codegen {
+            Codegen::Cranelift(clif) => clif.compile(ir_mod, self.fuel_enabled, sandbox)?,
+            #[cfg(feature = "llvm")]
+            Codegen::Llvm { target, modules } => {
+                let hooks = achainsaw_llvm::RuntimeHooks {
+                    malloc: rt_malloc as *const () as usize,
+                    free: rt_free as *const () as usize,
+                    check_fuel: rt_check_fuel as *const () as usize,
+                    consume_fuel: rt_consume_fuel as *const () as usize,
+                    sandbox_fault: rt_sandbox_fault as *const () as usize,
+                    stack_check: rt_stack_check as *const () as usize,
+                    sandbox_check_mm: rt_sandbox_check_mm as *const () as usize,
+                };
+                let opts = achainsaw_llvm::LowerOptions {
+                    fuel: self.fuel_enabled,
+                    sandbox: sandbox.map(|(base, len)| achainsaw_llvm::SandboxBounds {
+                        base: base as u64,
+                        len: len as u64,
+                    }),
+                    ..Default::default()
+                };
+                // Functions from earlier modules first, then registered symbols.
+                let earlier = &self.function_ptrs;
+                let registry = &self.registry;
+                let resolve = |name: &str| {
+                    earlier
+                        .get(name)
+                        .copied()
+                        .or_else(|| registry.read().unwrap().lookup(name).map(|p| p as usize))
+                };
+                let jit =
+                    achainsaw_llvm::LlvmJit::compile(ir_mod, target, &opts, &hooks, &resolve)?;
+                let out = ir_mod
+                    .functions
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.clone(),
+                            jit.function(&f.name).expect("compiled function"),
+                            jit.trampoline(&f.name),
+                        )
+                    })
+                    .collect();
+                modules.push(jit);
+                out
             }
-            if let Some(r_ty) = ext_fn.ret_type {
-                push_abi_params(&mut sig.returns, r_ty);
-            }
-            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
+        };
 
-            let func_id = self
-                .module
-                .declare_function(&ext_fn.name, Linkage::Import, &sig)?;
-            func_ids.insert(ext_fn.name.clone(), func_id);
-        }
-
-        // 2. Declare internal functions (Linkage::Export)
         for func in &ir_mod.functions {
-            let mut sig = self.module.make_signature();
-            for (_, p_ty) in &func.params {
-                push_abi_params(&mut sig.params, *p_ty);
-            }
-            if let Some(r_ty) = func.ret_type {
-                push_abi_params(&mut sig.returns, r_ty);
-            }
-            func_returns.insert(func.name.clone(), func.ret_type);
-
-            let func_id = self
-                .module
-                .declare_function(&func.name, Linkage::Export, &sig)?;
-            func_ids.insert(func.name.clone(), func_id);
-
             let param_tys: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
             self.signatures
                 .insert(func.name.clone(), (param_tys, func.ret_type));
         }
-
-        // 3. Lower each function and its dynamic invocation trampoline
-        let sandbox = self.sandbox.as_ref().map(|arena| {
-            let arena = arena.borrow();
-            SandboxConfig {
-                arena_base: arena.base as i64,
-                arena_len: arena.len() as i64,
-                fault_id: self.rt_sandbox_fault_id,
-                stack_check_id: self.rt_stack_check_id,
-                mm_check_id: self.rt_sandbox_check_mm_id,
-            }
-        });
-        let config = LowerConfig {
-            // Sandboxed code always checks at branches so it stops after a violation.
-            fuel_check_func_id: (self.fuel_enabled || sandbox.is_some())
-                .then_some(self.rt_check_fuel_id),
-            fuel_consume_func_id: self.fuel_enabled.then_some(self.rt_consume_fuel_id),
-            rt_malloc_id: self.rt_malloc_id,
-            rt_free_id: self.rt_free_id,
-            sandbox,
-        };
-
-        for func in &ir_mod.functions {
-            let func_id = func_ids[&func.name];
-            crate::lower::lower_function(
-                &mut self.module,
-                &mut self.ctx,
-                &mut self.builder_context,
-                func,
-                &func_ids,
-                &func_returns,
-                &config,
-            )?;
-            self.module.define_function(func_id, &mut self.ctx)?;
-            self.module.clear_context(&mut self.ctx);
-
-            // Host calls go through a scalar trampoline; functions that take or return
-            // vectors are only callable from AIR code.
-            let (param_tys, ret_ty) = &self.signatures[&func.name];
-            if param_tys.iter().chain(ret_ty.iter()).any(|t| t.is_vector()) {
-                continue;
-            }
-            crate::lower::lower_trampoline(
-                &mut self.module,
-                &mut self.ctx,
-                &mut self.builder_context,
-                &func.name,
-                func_id,
-                param_tys,
-                *ret_ty,
-            )?;
-        }
-
-        // 4. Finalize all JIT definitions
-        self.module.finalize_definitions()?;
-
-        // 5. Cache pointers
-        for func in &ir_mod.functions {
-            let func_id = func_ids[&func.name];
-            let ptr = self.module.get_finalized_function(func_id);
-            self.function_ptrs.insert(func.name.clone(), ptr as usize);
-
-            let tramp_name = format!("__achainsaw_trampoline_{}", func.name);
-            if let Some(cranelift_module::FuncOrDataId::Func(tid)) =
-                self.module.get_name(&tramp_name)
-            {
-                let tptr = self.module.get_finalized_function(tid);
-                self.trampoline_ptrs
-                    .insert(func.name.clone(), tptr as usize);
+        for (name, ptr, tramp) in compiled {
+            self.function_ptrs.insert(name.clone(), ptr);
+            if let Some(t) = tramp {
+                self.trampoline_ptrs.insert(name, t);
             }
         }
-
         Ok(())
     }
 
@@ -885,12 +1029,15 @@ impl JitEngine {
         if let Some(&ptr) = self.function_ptrs.get(name) {
             return Some(ptr as *const u8);
         }
-        let func_id = self.module.get_name(name)?;
-        match func_id {
-            cranelift_module::FuncOrDataId::Func(fid) => {
-                Some(self.module.get_finalized_function(fid))
-            }
-            _ => None,
+        match &self.codegen {
+            Codegen::Cranelift(clif) => match clif.module.get_name(name)? {
+                cranelift_module::FuncOrDataId::Func(fid) => {
+                    Some(clif.module.get_finalized_function(fid))
+                }
+                _ => None,
+            },
+            #[cfg(feature = "llvm")]
+            Codegen::Llvm { .. } => None,
         }
     }
 

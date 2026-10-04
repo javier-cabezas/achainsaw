@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::cpu;
 use crate::lower::{lower_function, push_abi_params, LowerConfig};
 use achainsaw_ir::ast::Module;
@@ -164,6 +165,47 @@ impl AotCompiler {
         let bytes = self.finish()?;
         std::fs::write(path, &bytes)?;
         Ok(bytes.len())
+    }
+}
+
+/// An AOT-compiled object file.
+#[derive(Debug, Clone)]
+pub struct AotObject {
+    pub bytes: Vec<u8>,
+    /// Triple the object was compiled for.
+    pub triple: String,
+    /// Requested features the backend could not use (always empty for LLVM).
+    pub ignored_features: Vec<&'static str>,
+}
+
+/// Compiles `ir_mod` to a native object for `target` with `backend`.
+pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> Result<AotObject> {
+    match backend {
+        Backend::Cranelift => {
+            let mut compiler = AotCompiler::with_target(target)?;
+            let triple = compiler.triple();
+            let ignored_features = compiler.ignored_features().to_vec();
+            compiler.compile_module(ir_mod)?;
+            Ok(AotObject {
+                bytes: compiler.finish()?,
+                triple,
+                ignored_features,
+            })
+        }
+        #[cfg(feature = "llvm")]
+        Backend::Llvm => {
+            let spec = cpu::llvm_aot_target(target)?;
+            let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec)?;
+            Ok(AotObject {
+                bytes,
+                triple,
+                ignored_features: Vec::new(),
+            })
+        }
+        #[cfg(not(feature = "llvm"))]
+        Backend::Llvm => Err(anyhow!(
+            "[ERR_BACKEND_UNAVAILABLE] The llvm backend is not in this build"
+        )),
     }
 }
 
