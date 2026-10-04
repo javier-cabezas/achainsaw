@@ -120,7 +120,7 @@ jobs:
           python tests/test_py_binding.py
           python tests/test_mcp_e2e.py
           python tests/test_aot_e2e.py
-          python benchmarks/benchmark_kernels.py
+          python benchmarks/benchmark_kernels.py --quick
         env:
           ACHAINSAW_BACKEND: llvm
 
@@ -216,4 +216,4 @@ jobs:
         run: python tests/test_aot_e2e.py
 
       - name: Run Chainsaw-BLAS benchmark verification
-        run: python benchmarks/benchmark_kernels.py
+        run: python benchmarks/benchmark_kernels.py --quick

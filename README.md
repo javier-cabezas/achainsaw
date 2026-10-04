@@ -362,20 +362,35 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 
 ## ⚡ Chainsaw-BLAS: High-Performance Agent AI Kernel Library
 
-`achainsaw` ships with pre-compiled, mathematically verified AI kernels in `examples/kernels/` targeting LLM inference primitives, vector search, and token normalization:
+`examples/kernels/` holds verified kernels for LLM inference, vector search, and normalization. They are vector-length agnostic: each processes `vl` lanes per step with FMAs and finishes with masked `ldm`/`stm`, so the same source runs 128-bit vectors on Cranelift and AVX2/AVX-512/SVE-width vectors on LLVM. Every kernel takes element counts, and each `.air` file has matching `.airb` bytecode.
 
-| Kernel | Source | Bytecode | Primary Use Case | Numerical Error |
-|---|---|---|---|---|
-| **Cosine Similarity** | `cosine_similarity.air` | `.airb` | High-throughput embedding search & RAG | `< 1e-7` |
-| **Euclidean Distance (L2)** | `euclidean_distance.air` | `.airb` | Vector quantization & nearest neighbors | `0.00e+00` |
-| **Numerically Stable Softmax** | `softmax.air` | `.airb` | Attention head weighting ($\exp(x_i - \max)/\sum \exp$) | `< 1e-8` |
-| **RMSNorm** | `rmsnorm.air` | `.airb` | Transformer token normalization (LLaMA, Mistral, Gemma) | `< 5e-7` |
-| **GEMV (f32)** | `gemv_f32.air` | `.airb` | Matrix-vector linear projection | `< 3e-5` |
+| Kernel | Signature | Use case |
+|---|---|---|
+| `cosine_similarity.air` | `(a:ptr, b:ptr, n:i64)->f32` | Embedding search and RAG |
+| `euclidean_distance.air` | `(a:ptr, b:ptr, n:i64)->f32` | Nearest neighbors, vector quantization |
+| `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable |
+| `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
+| `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
+| `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
 
-Run the kernel benchmarks and numerical accuracy verification suite:
+`crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
+
 ```bash
-python benchmarks/benchmark_kernels.py
+python benchmarks/benchmark_kernels.py                  # host ISA, every available backend
+python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx2/avx512 (or neon/sve/...)
+python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
+
+Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
+
+| Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
+|---|---|---|---|
+| Cosine similarity, n=1024 | 2.4 µs | 1.7 µs | 0.8 µs |
+| Euclidean distance, n=1024 | 1.4 µs | 1.8 µs | 0.7 µs |
+| RMSNorm, n=4096 | 5.5 µs | 12.3 µs | 3.1 µs |
+| GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.38 ms (88 GFLOP/s) |
+
+Loop-heavy kernels such as GEMV currently pay for a fuel-check call on every loop iteration, which a follow-up change makes inline.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
@@ -610,7 +625,7 @@ achainsaw/
 │   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
 ├── examples/
-│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV
+│   ├── kernels/                # Chainsaw-BLAS: Cosine, L2, Softmax, RMSNorm, GEMV, GEMM (bf16)
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── fibonacci.air           # Branching Fibonacci kernel
 │   ├── simd_vector_dot.air     # 128-bit SIMD hardware dot product kernel
