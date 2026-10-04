@@ -163,16 +163,31 @@ thread_local! {
     static ACTIVE_ARENA: Cell<*const RefCell<Arena>> = const { Cell::new(std::ptr::null()) };
     /// Lowest stack address sandboxed code may reach; 0 disables the check.
     static STACK_LIMIT: Cell<usize> = const { Cell::new(0) };
+    /// Fuel counter of the engine whose code is running on this thread (see
+    /// `FuelActivation`), or null.
+    static ACTIVE_FUEL: Cell<*const Cell<i64>> = const { Cell::new(std::ptr::null()) };
 }
 
+/// Engine fuel counter value meaning "no budget": never reaches zero in practice.
+const UNLIMITED_FUEL: i64 = i64::MAX;
+
 /// Records `status` unless an earlier failure is already recorded, so the first cause
-/// (e.g. an allocation failure) is reported rather than its consequences.
+/// (e.g. an allocation failure) is reported rather than its consequences. Also empties the
+/// running engine's fuel counter, so its code stops at the next branch: JIT code only
+/// consults the runtime when the inline counter runs out.
 fn raise(status: ExecutionStatus) {
     CURRENT_STATUS.with(|s| {
         if s.get() == ExecutionStatus::Ok {
             s.set(status);
         }
     });
+    with_active_fuel(|counter| counter.set(0));
+}
+
+fn with_active_fuel<R>(f: impl FnOnce(&Cell<i64>) -> R) -> Option<R> {
+    let counter = ACTIVE_FUEL.with(|a| a.get());
+    // SAFETY: set only by `call_typed` for the duration of a call on its own engine.
+    (!counter.is_null()).then(|| f(unsafe { &*counter }))
 }
 
 fn halted() -> bool {
@@ -303,9 +318,20 @@ extern "C" fn rt_sandbox_check_mm(
     }
 }
 
-/// Charges `units` of fuel at once for bulk operations (`mm`). Same contract as
-/// `rt_check_fuel`: returns 1 and records `OutOfFuel` when the budget runs out.
+/// Charges `units` of fuel at once for bulk operations (`mm`): returns 1 and records
+/// `OutOfFuel` when the budget runs out, 0 otherwise.
 pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
+    if let Some(r) = with_active_fuel(|counter| {
+        let remaining = counter.get().saturating_sub(units.max(0));
+        if remaining <= 0 {
+            raise(ExecutionStatus::OutOfFuel);
+            return 1;
+        }
+        counter.set(remaining);
+        0
+    }) {
+        return r;
+    }
     FUEL_REMAINING.with(|f| {
         let fuel = f.get();
         if fuel < 0 {
@@ -322,29 +348,15 @@ pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
     })
 }
 
-/// Charged on every branch. Also returns 1 once any failure has been recorded, so code
-/// that keeps running after a callee unwound (e.g. on a memory violation) stops at its
-/// next branch.
-pub extern "C" fn rt_check_fuel() -> i32 {
-    if halted() {
-        return 1;
+/// Slow path of the inline fuel check that JIT code runs on every branch (decrement the
+/// engine's counter, continue while it is positive). Reached when the counter hits zero:
+/// either the budget is spent, or `raise` emptied it after a failure. Returns 1 (unwind)
+/// in both cases, recording `OutOfFuel` for the former.
+pub extern "C" fn rt_fuel_exhausted() -> i32 {
+    if !halted() {
+        raise(ExecutionStatus::OutOfFuel);
     }
-    FUEL_REMAINING.with(|f| {
-        let fuel = f.get();
-        if fuel < 0 {
-            return 0;
-        }
-        if fuel <= 0 {
-            raise(ExecutionStatus::OutOfFuel);
-            return 1;
-        }
-        f.set(fuel - 1);
-        if fuel - 1 <= 0 {
-            raise(ExecutionStatus::OutOfFuel);
-            return 1;
-        }
-        0
-    })
+    1
 }
 
 unsafe extern "C" fn rt_malloc(size: usize) -> *mut u8 {
@@ -567,6 +579,39 @@ impl SymbolRegistry {
     }
 }
 
+/// Loads the thread's fuel budget (`set_execution_fuel`) into an engine's inline counter for
+/// one call and makes it the active counter; on drop, writes the remaining budget back and
+/// restores the previous counter (calls may nest through host callbacks).
+struct FuelActivation<'a> {
+    counter: &'a Cell<i64>,
+    limited: bool,
+    prev: *const Cell<i64>,
+}
+
+impl<'a> FuelActivation<'a> {
+    fn new(counter: &'a Cell<i64>) -> Self {
+        let budget = FUEL_REMAINING.with(|f| f.get());
+        let limited = budget >= 0;
+        counter.set(if limited { budget } else { UNLIMITED_FUEL });
+        let prev = ACTIVE_FUEL.with(|a| a.replace(counter));
+        Self {
+            counter,
+            limited,
+            prev,
+        }
+    }
+}
+
+impl Drop for FuelActivation<'_> {
+    fn drop(&mut self) {
+        if self.limited {
+            let left = self.counter.get().max(0);
+            FUEL_REMAINING.with(|f| f.set(left));
+        }
+        ACTIVE_FUEL.with(|a| a.set(self.prev));
+    }
+}
+
 /// Points the runtime hooks at a sandboxed engine's arena and stack limit for one call,
 /// restoring the previous state when dropped (calls may nest through host callbacks).
 struct SandboxActivation {
@@ -601,7 +646,7 @@ struct CraneliftJit {
     module: JITModule,
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
-    rt_check_fuel_id: FuncId,
+    rt_fuel_exhausted_id: FuncId,
     rt_consume_fuel_id: FuncId,
     rt_sandbox_fault_id: FuncId,
     rt_stack_check_id: FuncId,
@@ -632,7 +677,7 @@ impl CraneliftJit {
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
         jit_builder.symbol("rt_free", rt_free as *const u8);
-        jit_builder.symbol("rt_check_fuel", rt_check_fuel as *const u8);
+        jit_builder.symbol("rt_fuel_exhausted", rt_fuel_exhausted as *const u8);
         jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
         jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
         jit_builder.symbol("rt_stack_check", rt_stack_check as *const u8);
@@ -654,8 +699,8 @@ impl CraneliftJit {
 
         let mut fuel_sig = module.make_signature();
         fuel_sig.returns.push(AbiParam::new(types::I32));
-        let rt_check_fuel_id =
-            module.declare_function("rt_check_fuel", Linkage::Import, &fuel_sig)?;
+        let rt_fuel_exhausted_id =
+            module.declare_function("rt_fuel_exhausted", Linkage::Import, &fuel_sig)?;
 
         let mut consume_sig = module.make_signature();
         consume_sig.params.push(AbiParam::new(types::I64));
@@ -688,7 +733,7 @@ impl CraneliftJit {
             module,
             rt_malloc_id,
             rt_free_id,
-            rt_check_fuel_id,
+            rt_fuel_exhausted_id,
             rt_consume_fuel_id,
             rt_sandbox_fault_id,
             rt_stack_check_id,
@@ -701,6 +746,7 @@ impl CraneliftJit {
         &mut self,
         ir_mod: &Module,
         fuel_enabled: bool,
+        fuel_counter: i64,
         sandbox: Option<(i64, i64)>,
     ) -> Result<Vec<(String, usize, Option<usize>)>> {
         let mut func_ids = HashMap::new();
@@ -750,8 +796,8 @@ impl CraneliftJit {
         });
         let config = LowerConfig {
             // Sandboxed code always checks at branches so it stops after a violation.
-            fuel_check_func_id: (fuel_enabled || sandbox.is_some())
-                .then_some(self.rt_check_fuel_id),
+            fuel_check: (fuel_enabled || sandbox.is_some())
+                .then_some((fuel_counter, self.rt_fuel_exhausted_id)),
             fuel_consume_func_id: fuel_enabled.then_some(self.rt_consume_fuel_id),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
@@ -835,6 +881,9 @@ pub struct JitEngine {
     sandbox: Option<Box<RefCell<Arena>>>,
     pub registry: Arc<RwLock<SymbolRegistry>>,
     pub fuel_enabled: bool,
+    /// Fuel counter JIT code decrements inline at every branch; boxed so its address stays
+    /// fixed. `call_typed` loads it from the thread's budget for each call.
+    fuel: Box<Cell<i64>>,
     pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
     function_ptrs: HashMap<String, usize>,
     trampoline_ptrs: HashMap<String, usize>,
@@ -915,6 +964,7 @@ impl JitEngine {
             sandbox: None,
             registry,
             fuel_enabled: true,
+            fuel: Box::new(Cell::new(UNLIMITED_FUEL)),
             signatures: HashMap::new(),
             function_ptrs: HashMap::new(),
             trampoline_ptrs: HashMap::new(),
@@ -939,6 +989,9 @@ impl JitEngine {
 
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
         set_execution_fuel(fuel);
+        // Also applies to code called directly through `get_fn_ptr`.
+        self.fuel
+            .set(fuel.map_or(UNLIMITED_FUEL, |f| f.min(i64::MAX as u64) as i64));
     }
 
     pub fn set_fuel_enabled(&mut self, enabled: bool) {
@@ -994,8 +1047,11 @@ impl JitEngine {
             let arena = arena.borrow();
             (arena.base as i64, arena.len() as i64)
         });
+        let fuel_counter = self.fuel.as_ptr() as i64;
         let compiled = match &mut self.codegen {
-            Codegen::Cranelift(clif) => clif.compile(ir_mod, self.fuel_enabled, sandbox)?,
+            Codegen::Cranelift(clif) => {
+                clif.compile(ir_mod, self.fuel_enabled, fuel_counter, sandbox)?
+            }
             #[cfg(feature = "llvm")]
             Codegen::Llvm {
                 target,
@@ -1008,7 +1064,7 @@ impl JitEngine {
                 let hooks = achainsaw_llvm::RuntimeHooks {
                     malloc: rt_malloc as *const () as usize,
                     free: rt_free as *const () as usize,
-                    check_fuel: rt_check_fuel as *const () as usize,
+                    fuel_exhausted: rt_fuel_exhausted as *const () as usize,
                     consume_fuel: rt_consume_fuel as *const () as usize,
                     sandbox_fault: rt_sandbox_fault as *const () as usize,
                     stack_check: rt_stack_check as *const () as usize,
@@ -1016,6 +1072,7 @@ impl JitEngine {
                 };
                 let opts = achainsaw_llvm::LowerOptions {
                     fuel: self.fuel_enabled,
+                    fuel_counter: fuel_counter as u64,
                     sandbox: sandbox.map(|(base, len)| achainsaw_llvm::SandboxBounds {
                         base: base as u64,
                         len: len as u64,
@@ -1114,6 +1171,7 @@ impl JitEngine {
         let mut raw_ret: u64 = 0;
         reset_execution_status();
 
+        let _fuel = FuelActivation::new(&self.fuel);
         let _sandbox = self.sandbox.as_deref().map(SandboxActivation::new);
         let tramp_fn: extern "C" fn(*const u64, *mut u64) = std::mem::transmute(tramp_ptr);
         tramp_fn(raw_args.as_ptr(), &mut raw_ret);

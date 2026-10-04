@@ -130,7 +130,7 @@ impl AotCompiler {
 
         // 3. Lower and define each function
         let config = LowerConfig {
-            fuel_check_func_id: None,
+            fuel_check: None,
             fuel_consume_func_id: None,
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,

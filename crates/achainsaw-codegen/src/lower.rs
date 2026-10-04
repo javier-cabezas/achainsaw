@@ -731,8 +731,42 @@ fn emit_matmul(
     builder.switch_to_block(done);
 }
 
+/// Inline fuel check before a branch: decrements the engine's counter in place and, only
+/// when it reaches zero, asks `rt_fuel_exhausted` whether to unwind (budget spent, or a
+/// failure was recorded). Leaves the builder in the block where execution continues.
+fn emit_fuel_check<M: ClifModule>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    (counter, exhausted): (i64, FuncId),
+    trap_block: ClifBlock,
+) {
+    let addr = c64(builder, counter);
+    let fuel = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), addr, 0);
+    let left = builder.ins().iadd_imm_s(fuel, -1);
+    builder.ins().store(MemFlagsData::trusted(), left, addr, 0);
+    let out = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThanOrEqual, left, 0);
+    let slow = builder.create_block();
+    let cont = builder.create_block();
+    builder.set_cold_block(slow);
+    builder.ins().brif(out, slow, &[], cont, &[]);
+
+    builder.switch_to_block(slow);
+    let callee = module.declare_func_in_func(exhausted, builder.func);
+    let call_inst = builder.ins().call(callee, &[]);
+    let stop = builder.inst_results(call_inst)[0];
+    builder.ins().brif(stop, trap_block, &[], cont, &[]);
+
+    builder.switch_to_block(cont);
+}
+
 pub struct LowerConfig {
-    pub fuel_check_func_id: Option<FuncId>,
+    /// Inline fuel check at every branch: the address of the engine's i64 fuel counter
+    /// (decremented in place) and `rt_fuel_exhausted() -> i32`, called when it reaches zero.
+    pub fuel_check: Option<(i64, FuncId)>,
     /// `rt_consume_fuel(units: i64) -> i32`, charged up front by bulk ops (`mm`).
     pub fuel_consume_func_id: Option<FuncId>,
     pub rt_malloc_id: FuncId,
@@ -792,8 +826,8 @@ pub fn lower_function<M: ClifModule>(
     }
 
     // Returns zeroes once a runtime check fails; `call_typed` then reports the status.
-    let fuel_trap_block = (config.fuel_check_func_id.is_some() || config.sandbox.is_some())
-        .then(|| builder.create_block());
+    let fuel_trap_block =
+        (config.fuel_check.is_some() || config.sandbox.is_some()).then(|| builder.create_block());
 
     let guard = config.sandbox.map(|sb| {
         let fault = builder.create_block();
@@ -1443,18 +1477,10 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some(fuel_func_id), Some(trap_block)) =
-                    (config.fuel_check_func_id, fuel_trap_block)
-                {
-                    let callee = module.declare_func_in_func(fuel_func_id, builder.func);
-                    let call_inst = builder.ins().call(callee, &[]);
-                    let is_exhausted = builder.inst_results(call_inst)[0];
-                    builder
-                        .ins()
-                        .brif(is_exhausted, trap_block, &[], target_block, &arg_vals);
-                } else {
-                    builder.ins().jump(target_block, &arg_vals);
+                if let (Some(check), Some(trap_block)) = (config.fuel_check, fuel_trap_block) {
+                    emit_fuel_check(&mut builder, module, check, trap_block);
                 }
+                builder.ins().jump(target_block, &arg_vals);
             }
             Terminator::Br {
                 cond,
@@ -1476,26 +1502,12 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some(fuel_func_id), Some(trap_block)) =
-                    (config.fuel_check_func_id, fuel_trap_block)
-                {
-                    let callee = module.declare_func_in_func(fuel_func_id, builder.func);
-                    let call_inst = builder.ins().call(callee, &[]);
-                    let is_exhausted = builder.inst_results(call_inst)[0];
-                    let normal_br_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(is_exhausted, trap_block, &[], normal_br_block, &[]);
-
-                    builder.switch_to_block(normal_br_block);
-                    builder
-                        .ins()
-                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
-                } else {
-                    builder
-                        .ins()
-                        .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+                if let (Some(check), Some(trap_block)) = (config.fuel_check, fuel_trap_block) {
+                    emit_fuel_check(&mut builder, module, check, trap_block);
                 }
+                builder
+                    .ins()
+                    .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
             }
             Terminator::Ret { val, .. } => {
                 if let Some(v) = val {

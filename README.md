@@ -385,12 +385,14 @@ Single calls on one Zen 4 core (AVX-512), compared with NumPy (whose GEMV/GEMM u
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
-| Cosine similarity, n=1024 | 2.4 µs | 1.7 µs | 0.8 µs |
-| Euclidean distance, n=1024 | 1.4 µs | 1.8 µs | 0.7 µs |
-| RMSNorm, n=4096 | 5.5 µs | 12.3 µs | 3.1 µs |
-| GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.38 ms (88 GFLOP/s) |
+| Cosine similarity, n=1024 | 2.4 µs | 1.1 µs | 0.5 µs |
+| Euclidean distance, n=1024 | 1.4 µs | 1.0 µs | 0.5 µs |
+| Softmax, n=1000 | 3.2 µs | 4.3 µs | 3.1 µs |
+| RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
+| GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
+| GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.39 ms (87 GFLOP/s) |
 
-Loop-heavy kernels such as GEMV currently pay for a fuel-check call on every loop iteration, which a follow-up change makes inline.
+Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
