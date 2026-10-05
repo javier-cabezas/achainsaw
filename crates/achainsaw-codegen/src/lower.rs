@@ -599,40 +599,27 @@ fn bitcast_flags() -> MemFlagsData {
     flags
 }
 
-/// `mm pc, pa, pb, m, n, k:dtype`: `C[m x n] += A[m x k] * B[k x n]` as an inline loop
-/// nest accumulating in f32 (i32 for i8) over `k` in order. Non-positive dimensions are a
-/// no-op. With `bounds`, `rt_sandbox_check_mm` validates all three matrices first. With
-/// `fuel`, charges one unit per 1024 multiply-adds before starting. Either one failing
-/// branches to its block and leaves C untouched.
+/// `mm pc, pa, pb, m, n, k:dtype`: `C[m x n] += A[m x k] * B[k x n]` as inline loops
+/// accumulating in f32 (i32 for i8), each element over `k` in order. Tiles of 4 rows by 2
+/// vectors of 4 columns keep 8 independent accumulators, so the loop is not bound by the
+/// latency of one add chain; narrower tiles and scalar loops cover the edges, and no load
+/// reaches past a matrix. `fused` uses `fma` (one rounding per step), else `fmul` + `fadd`.
+/// Non-positive dimensions are a no-op. With `bounds`, `rt_sandbox_check_mm` validates all
+/// three matrices first. With `fuel`, charges one unit per 1024 multiply-adds before
+/// starting. Either one failing branches to its block and leaves C untouched.
 fn emit_matmul(
     builder: &mut FunctionBuilder,
     regs: &[ClifValue],
     dtype: Type,
+    fused: bool,
     bounds: Option<(cranelift_codegen::ir::FuncRef, ClifBlock)>,
     fuel: Option<(cranelift_codegen::ir::FuncRef, ClifBlock)>,
 ) {
     let (pc, pa, pb, m, n, k) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
-    let is_int = dtype == Type::I8;
-    let acc_ty = if is_int { types::I32 } else { types::F32 };
     let esize = dtype.byte_size() as i64;
-    let elem_ty = mm_elem_type(dtype);
-
     let start = builder.create_block();
-    let i_hdr = builder.create_block();
-    let j_hdr = builder.create_block();
-    let k_init = builder.create_block();
-    let k_hdr = builder.create_block();
-    let k_body = builder.create_block();
-    let k_done = builder.create_block();
-    let i_next = builder.create_block();
+    let run = builder.create_block();
     let done = builder.create_block();
-    builder.append_block_param(i_hdr, types::I64); // i
-    builder.append_block_param(j_hdr, types::I64); // i
-    builder.append_block_param(j_hdr, types::I64); // j
-    for _ in 0..3 {
-        builder.append_block_param(k_hdr, types::I64); // i, j, kk
-    }
-    builder.append_block_param(k_hdr, acc_ty); // acc
 
     let m_pos = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, m, 0);
     let n_pos = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, n, 0);
@@ -642,7 +629,6 @@ fn emit_matmul(
     builder.ins().brif(any, start, &[], done, &[]);
 
     builder.switch_to_block(start);
-    let zero = c64(builder, 0);
     if let Some((check, trap)) = bounds {
         let es = c64(builder, esize);
         let call = builder.ins().call(check, &[pc, pa, pb, m, n, k, es]);
@@ -664,71 +650,391 @@ fn emit_matmul(
         let units = builder.ins().iadd_imm_s(units, 1);
         let call = builder.ins().call(consume, &[units]);
         let exhausted = builder.inst_results(call)[0];
-        builder
-            .ins()
-            .brif(exhausted, trap, &[], i_hdr, &[BlockArg::Value(zero)]);
+        builder.ins().brif(exhausted, trap, &[], run, &[]);
     } else {
-        builder.ins().jump(i_hdr, &[BlockArg::Value(zero)]);
+        builder.ins().jump(run, &[]);
     }
 
-    builder.switch_to_block(i_hdr);
-    let i = builder.block_params(i_hdr)[0];
-    let more_i = builder.ins().icmp(IntCC::SignedLessThan, i, m);
-    builder.ins().brif(
+    builder.switch_to_block(run);
+    let mm = Mm {
+        pc,
+        pa,
+        pb,
+        n,
+        k,
+        dtype,
+        esize,
+        fused,
+        a_stride: builder.ins().imul_imm_s(k, esize),
+        b_stride: builder.ins().imul_imm_s(n, esize),
+        c_stride: builder.ins().imul_imm_s(n, 4),
+    };
+    let zero = c64(builder, 0);
+    // Blocks of 4 rows, then single rows.
+    let i4 = emit_mm_rows(builder, &mm, zero, m, 4);
+    emit_mm_rows(builder, &mm, i4, m, 1);
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+}
+
+/// True when the target has fused multiply-add instructions, so `fma` is one instruction
+/// rather than a library call (AArch64 always; x86_64 with FMA3).
+fn native_fma(isa: &dyn cranelift_codegen::isa::TargetIsa) -> bool {
+    match isa.triple().architecture {
+        target_lexicon::Architecture::Aarch64(_) => true,
+        target_lexicon::Architecture::X86_64 => isa
+            .isa_flags()
+            .iter()
+            .any(|f| f.name == "has_fma" && f.as_bool() == Some(true)),
+        _ => false,
+    }
+}
+
+/// Operands and strides of one `mm`.
+struct Mm {
+    pc: ClifValue,
+    pa: ClifValue,
+    pb: ClifValue,
+    n: ClifValue,
+    k: ClifValue,
+    dtype: Type,
+    esize: i64,
+    fused: bool,
+    /// Row strides of A, B and C in bytes.
+    a_stride: ClifValue,
+    b_stride: ClifValue,
+    c_stride: ClifValue,
+}
+
+impl Mm {
+    fn acc_scalar(&self) -> types::Type {
+        if self.dtype == Type::I8 {
+            types::I32
+        } else {
+            types::F32
+        }
+    }
+
+    fn acc_vec(&self) -> types::Type {
+        if self.dtype == Type::I8 {
+            types::I32X4
+        } else {
+            types::F32X4
+        }
+    }
+
+    /// `acc + a * b` in the accumulator type.
+    fn madd(
+        &self,
+        b: &mut FunctionBuilder,
+        a: ClifValue,
+        x: ClifValue,
+        acc: ClifValue,
+    ) -> ClifValue {
+        if self.dtype == Type::I8 {
+            let prod = b.ins().imul(a, x);
+            b.ins().iadd(acc, prod)
+        } else if self.fused {
+            b.ins().fma(a, x, acc)
+        } else {
+            let prod = b.ins().fmul(a, x);
+            b.ins().fadd(acc, prod)
+        }
+    }
+
+    /// Four consecutive B elements at `ptr + offset`, widened to the accumulator lanes.
+    fn load_b4(&self, b: &mut FunctionBuilder, ptr: ClifValue, offset: i32) -> ClifValue {
+        let flags = user_mem_flags();
+        match self.dtype {
+            Type::F32 => b.ins().load(types::F32X4, flags, ptr, offset),
+            Type::BF16 => {
+                let bits = b.ins().uload16x4(flags, ptr, offset);
+                let bits = b.ins().ishl_imm_u(bits, 16);
+                b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
+            }
+            Type::F16 => {
+                let bits = b.ins().uload16x4(flags, ptr, offset);
+                f16x4_to_f32x4(b, bits)
+            }
+            Type::I8 => {
+                let word = b.ins().load(types::I32, flags, ptr, offset);
+                let v = b.ins().scalar_to_vector(types::I32X4, word);
+                let v = b.ins().bitcast(types::I8X16, bitcast_flags(), v);
+                let v = b.ins().swiden_low(v);
+                b.ins().swiden_low(v)
+            }
+            other => unreachable!("mm element type {other}"),
+        }
+    }
+}
+
+/// Rows `[i0, i0 + rows * t)` of C for the largest `t` with `i0 + rows * t <= m`, `rows`
+/// at a time. Returns the first row not done.
+fn emit_mm_rows(
+    b: &mut FunctionBuilder,
+    mm: &Mm,
+    i0: ClifValue,
+    m: ClifValue,
+    rows: i64,
+) -> ClifValue {
+    let hdr = b.create_block();
+    let body = b.create_block();
+    let exit = b.create_block();
+    b.append_block_param(hdr, types::I64);
+    b.append_block_param(exit, types::I64);
+    b.ins().jump(hdr, &[BlockArg::Value(i0)]);
+
+    b.switch_to_block(hdr);
+    let i = b.block_params(hdr)[0];
+    let last = b.ins().iadd_imm_s(i, rows);
+    let fits = b.ins().icmp(IntCC::SignedLessThanOrEqual, last, m);
+    b.ins().brif(fits, body, &[], exit, &[BlockArg::Value(i)]);
+
+    b.switch_to_block(body);
+    let zero = c64(b, 0);
+    let j8 = emit_mm_cols(b, mm, i, rows, zero, 2);
+    let j4 = emit_mm_cols(b, mm, i, rows, j8, 1);
+    emit_mm_scalar(b, mm, i, last, j4);
+    b.ins().jump(hdr, &[BlockArg::Value(last)]);
+
+    b.switch_to_block(exit);
+    b.block_params(exit)[0]
+}
+
+/// Tiles of `rows` x `vecs` vectors of C at row `i`, from column `j0` while a whole tile
+/// fits. Returns the first column not done.
+fn emit_mm_cols(
+    b: &mut FunctionBuilder,
+    mm: &Mm,
+    i: ClifValue,
+    rows: i64,
+    j0: ClifValue,
+    vecs: i64,
+) -> ClifValue {
+    let width = 4 * vecs;
+    let hdr = b.create_block();
+    let body = b.create_block();
+    let exit = b.create_block();
+    b.append_block_param(hdr, types::I64);
+    b.append_block_param(exit, types::I64);
+    b.ins().jump(hdr, &[BlockArg::Value(j0)]);
+
+    b.switch_to_block(hdr);
+    let j = b.block_params(hdr)[0];
+    let end = b.ins().iadd_imm_s(j, width);
+    let fits = b.ins().icmp(IntCC::SignedLessThanOrEqual, end, mm.n);
+    b.ins().brif(fits, body, &[], exit, &[BlockArg::Value(j)]);
+
+    b.switch_to_block(body);
+    emit_mm_tile(b, mm, i, j, rows, vecs);
+    b.ins().jump(hdr, &[BlockArg::Value(end)]);
+
+    b.switch_to_block(exit);
+    b.block_params(exit)[0]
+}
+
+/// `C[i..i+rows][j..j+4*vecs] += A[i..i+rows][..] * B[..][j..j+4*vecs]`, with the tile's
+/// accumulators and the A and B pointers carried through the `k` loop.
+fn emit_mm_tile(
+    b: &mut FunctionBuilder,
+    mm: &Mm,
+    i: ClifValue,
+    j: ClifValue,
+    rows: i64,
+    vecs: i64,
+) {
+    let flags = user_mem_flags();
+    let acc_vec = mm.acc_vec();
+    let c_row = b.ins().imul(i, mm.c_stride);
+    let c_col = b.ins().imul_imm_s(j, 4);
+    let c0 = b.ins().iadd(mm.pc, c_row);
+    let c0 = b.ins().iadd(c0, c_col);
+    let mut c_ptrs = Vec::new();
+    let mut accs = Vec::new();
+    for r in 0..rows {
+        let c_r = if r == 0 {
+            c0
+        } else {
+            let off = b.ins().imul_imm_s(mm.c_stride, r);
+            b.ins().iadd(c0, off)
+        };
+        for v in 0..vecs {
+            accs.push(b.ins().load(acc_vec, flags, c_r, (16 * v) as i32));
+        }
+        c_ptrs.push(c_r);
+    }
+    let a_row = b.ins().imul(i, mm.a_stride);
+    let a0 = b.ins().iadd(mm.pa, a_row);
+    let b_col = b.ins().imul_imm_s(j, mm.esize);
+    let b0 = b.ins().iadd(mm.pb, b_col);
+
+    // Loop state: kk, A pointer of the first row, B pointer, accumulators.
+    let hdr = b.create_block();
+    let body = b.create_block();
+    let exit = b.create_block();
+    for _ in 0..3 {
+        b.append_block_param(hdr, types::I64);
+    }
+    for _ in &accs {
+        b.append_block_param(hdr, acc_vec);
+    }
+    let zero = c64(b, 0);
+    let mut init = vec![zero, a0, b0];
+    init.extend(&accs);
+    jump_with(b, hdr, &init);
+
+    b.switch_to_block(hdr);
+    let p = b.block_params(hdr).to_vec();
+    let (kk, a_ptr, b_ptr, accs) = (p[0], p[1], p[2], &p[3..]);
+    let more = b.ins().icmp(IntCC::SignedLessThan, kk, mm.k);
+    b.ins().brif(more, body, &[], exit, &[]);
+
+    b.switch_to_block(body);
+    let bv: Vec<ClifValue> = (0..vecs)
+        .map(|v| mm.load_b4(b, b_ptr, (4 * mm.esize * v) as i32))
+        .collect();
+    let mut next = Vec::with_capacity(accs.len());
+    for r in 0..rows {
+        let a_r = if r == 0 {
+            a_ptr
+        } else {
+            let off = b.ins().imul_imm_s(mm.a_stride, r);
+            b.ins().iadd(a_ptr, off)
+        };
+        let raw = b.ins().load(mm_elem_type(mm.dtype), flags, a_r, 0);
+        let a = mm_widen(b, mm.dtype, raw);
+        let a = b.ins().splat(acc_vec, a);
+        for (v, x) in bv.iter().enumerate() {
+            next.push(mm.madd(b, a, *x, accs[r as usize * vecs as usize + v]));
+        }
+    }
+    let kk2 = b.ins().iadd_imm_s(kk, 1);
+    let a2 = b.ins().iadd_imm_s(a_ptr, mm.esize);
+    let b2 = b.ins().iadd(b_ptr, mm.b_stride);
+    let mut state = vec![kk2, a2, b2];
+    state.extend(next);
+    jump_with(b, hdr, &state);
+
+    b.switch_to_block(exit);
+    for (r, c_r) in c_ptrs.iter().enumerate() {
+        for v in 0..vecs {
+            let acc = accs[r * vecs as usize + v as usize];
+            b.ins().store(flags, acc, *c_r, (16 * v) as i32);
+        }
+    }
+}
+
+/// Rows `[i0, i1)`, columns `[j0, n)` of C one element at a time.
+fn emit_mm_scalar(b: &mut FunctionBuilder, mm: &Mm, i0: ClifValue, i1: ClifValue, j0: ClifValue) {
+    let flags = user_mem_flags();
+    let acc_ty = mm.acc_scalar();
+    let i_hdr = b.create_block();
+    let j_hdr = b.create_block();
+    let k_init = b.create_block();
+    let k_hdr = b.create_block();
+    let k_body = b.create_block();
+    let k_done = b.create_block();
+    let i_next = b.create_block();
+    let exit = b.create_block();
+    b.append_block_param(i_hdr, types::I64); // i
+    b.append_block_param(j_hdr, types::I64); // i
+    b.append_block_param(j_hdr, types::I64); // j
+    for _ in 0..3 {
+        b.append_block_param(k_hdr, types::I64); // i, j, kk
+    }
+    b.append_block_param(k_hdr, acc_ty); // acc
+    b.ins().jump(i_hdr, &[BlockArg::Value(i0)]);
+
+    b.switch_to_block(i_hdr);
+    let i = b.block_params(i_hdr)[0];
+    let more_i = b.ins().icmp(IntCC::SignedLessThan, i, i1);
+    b.ins().brif(
         more_i,
         j_hdr,
-        &[BlockArg::Value(i), BlockArg::Value(zero)],
-        done,
+        &[BlockArg::Value(i), BlockArg::Value(j0)],
+        exit,
         &[],
     );
 
-    builder.switch_to_block(j_hdr);
-    let (ji, j) = (
-        builder.block_params(j_hdr)[0],
-        builder.block_params(j_hdr)[1],
-    );
-    let more_j = builder.ins().icmp(IntCC::SignedLessThan, j, n);
-    builder.ins().brif(more_j, k_init, &[], i_next, &[]);
+    b.switch_to_block(j_hdr);
+    let (ji, j) = (b.block_params(j_hdr)[0], b.block_params(j_hdr)[1]);
+    let more_j = b.ins().icmp(IntCC::SignedLessThan, j, mm.n);
+    b.ins().brif(more_j, k_init, &[], i_next, &[]);
 
-    builder.switch_to_block(i_next);
-    let i2 = builder.ins().iadd_imm_s(ji, 1);
-    builder.ins().jump(i_hdr, &[BlockArg::Value(i2)]);
+    b.switch_to_block(i_next);
+    let i2 = b.ins().iadd_imm_s(ji, 1);
+    b.ins().jump(i_hdr, &[BlockArg::Value(i2)]);
 
-    builder.switch_to_block(k_init);
-    let c_ptr = elem_ptr(builder, pc, ji, n, j, 4);
-    let acc0 = builder.ins().load(acc_ty, user_mem_flags(), c_ptr, 0);
-    jump_with(builder, k_hdr, &[ji, j, zero, acc0]);
+    b.switch_to_block(k_init);
+    let c_ptr = elem_ptr(b, mm.pc, ji, mm.n, j, 4);
+    let acc0 = b.ins().load(acc_ty, flags, c_ptr, 0);
+    let zero = c64(b, 0);
+    jump_with(b, k_hdr, &[ji, j, zero, acc0]);
 
-    builder.switch_to_block(k_hdr);
-    let p = builder.block_params(k_hdr).to_vec();
+    b.switch_to_block(k_hdr);
+    let p = b.block_params(k_hdr).to_vec();
     let (ki, kj, kk, acc) = (p[0], p[1], p[2], p[3]);
-    let more_k = builder.ins().icmp(IntCC::SignedLessThan, kk, k);
-    builder.ins().brif(more_k, k_body, &[], k_done, &[]);
+    let more_k = b.ins().icmp(IntCC::SignedLessThan, kk, mm.k);
+    b.ins().brif(more_k, k_body, &[], k_done, &[]);
 
-    builder.switch_to_block(k_body);
-    let a_ptr = elem_ptr(builder, pa, ki, k, kk, esize);
-    let b_ptr = elem_ptr(builder, pb, kk, n, kj, esize);
-    let a_raw = builder.ins().load(elem_ty, user_mem_flags(), a_ptr, 0);
-    let b_raw = builder.ins().load(elem_ty, user_mem_flags(), b_ptr, 0);
-    let a = mm_widen(builder, dtype, a_raw);
-    let b = mm_widen(builder, dtype, b_raw);
-    let acc2 = if is_int {
-        let prod = builder.ins().imul(a, b);
-        builder.ins().iadd(acc, prod)
-    } else {
-        let prod = builder.ins().fmul(a, b);
-        builder.ins().fadd(acc, prod)
+    b.switch_to_block(k_body);
+    let a_ptr = elem_ptr(b, mm.pa, ki, mm.k, kk, mm.esize);
+    let b_ptr = elem_ptr(b, mm.pb, kk, mm.n, kj, mm.esize);
+    let a_raw = b.ins().load(mm_elem_type(mm.dtype), flags, a_ptr, 0);
+    let b_raw = b.ins().load(mm_elem_type(mm.dtype), flags, b_ptr, 0);
+    let a = mm_widen(b, mm.dtype, a_raw);
+    let x = mm_widen(b, mm.dtype, b_raw);
+    let acc2 = mm.madd(b, a, x, acc);
+    let kk2 = b.ins().iadd_imm_s(kk, 1);
+    jump_with(b, k_hdr, &[ki, kj, kk2, acc2]);
+
+    b.switch_to_block(k_done);
+    let c_out = elem_ptr(b, mm.pc, ki, mm.n, kj, 4);
+    b.ins().store(flags, acc, c_out, 0);
+    let j2 = b.ins().iadd_imm_s(kj, 1);
+    jump_with(b, j_hdr, &[ki, j2]);
+
+    b.switch_to_block(exit);
+}
+
+/// Four binary16 values (zero-extended into I32X4 lanes) -> F32X4, lane by lane as
+/// `f16_to_f32`. Exact; NaN payloads are preserved.
+fn f16x4_to_f32x4(b: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
+    let k = |b: &mut FunctionBuilder, v: u32| {
+        let s = c32(b, v);
+        b.ins().splat(types::I32X4, s)
     };
-    let kk2 = builder.ins().iadd_imm_s(kk, 1);
-    jump_with(builder, k_hdr, &[ki, kj, kk2, acc2]);
-
-    builder.switch_to_block(k_done);
-    let c_out = elem_ptr(builder, pc, ki, n, kj, 4);
-    builder.ins().store(user_mem_flags(), acc, c_out, 0);
-    let j2 = builder.ins().iadd_imm_s(kj, 1);
-    jump_with(builder, j_hdr, &[ki, j2]);
-
-    builder.switch_to_block(done);
+    let k8000 = k(b, 0x8000);
+    let sign = b.ins().band(x, k8000);
+    let sign = b.ins().ishl_imm_u(sign, 16);
+    let exp = b.ins().ushr_imm_u(x, 10);
+    let k1f = k(b, 0x1f);
+    let exp = b.ins().band(exp, k1f);
+    let k3ff = k(b, 0x3ff);
+    let mant = b.ins().band(x, k3ff);
+    let mant13 = b.ins().ishl_imm_u(mant, 13);
+    // Normal: rebias the exponent from 15 to 127.
+    let k112 = k(b, 112);
+    let exp32 = b.ins().iadd(exp, k112);
+    let exp32 = b.ins().ishl_imm_u(exp32, 23);
+    let normal = b.ins().bor(exp32, mant13);
+    // Inf/NaN.
+    let kinf = k(b, 0x7f80_0000);
+    let infnan = b.ins().bor(mant13, kinf);
+    // Zero/subnormal: mant * 2^-24, exact in f32 (mant < 2^10 converts exactly as signed).
+    let mant_f = b.ins().fcvt_from_sint(types::F32X4, mant);
+    let scale = b.ins().f32const(f32::from_bits(0x3380_0000)); // 2^-24
+    let scale = b.ins().splat(types::F32X4, scale);
+    let sub_f = b.ins().fmul(mant_f, scale);
+    let sub = b.ins().bitcast(types::I32X4, bitcast_flags(), sub_f);
+    let zero = k(b, 0);
+    let k31 = k(b, 31);
+    let is_sub = b.ins().icmp(IntCC::Equal, exp, zero);
+    let is_max = b.ins().icmp(IntCC::Equal, exp, k31);
+    let mag = b.ins().bitselect(is_max, infnan, normal);
+    let mag = b.ins().bitselect(is_sub, sub, mag);
+    let bits = b.ins().bor(mag, sign);
+    b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
 }
 
 /// Inline fuel check before a branch: decrements the fuel counter at `counter` in place
@@ -1540,7 +1846,8 @@ pub fn lower_function<M: ClifModule>(
                         )),
                         _ => None,
                     };
-                    emit_matmul(&mut builder, &regs, *dtype, bounds, fuel);
+                    let fused = native_fma(module.isa());
+                    emit_matmul(&mut builder, &regs, *dtype, fused, bounds, fuel);
                 }
                 Instruction::Par {
                     count, func, args, ..

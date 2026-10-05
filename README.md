@@ -140,9 +140,9 @@ On the LLVM backend, `mm` uses the best kernel the target has:
 | AArch64 with SME (e.g. Apple M4) | ZA-tile outer products (`fmopa`, `bfmopa`, `smopa`) in streaming mode |
 | Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), 4 rows of C per B strip |
 
-On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32 (about 50x Cranelift's scalar loop), 90 for bf16, 70 GOP/s for i8, and 29 for f16. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
+On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32, 90 for bf16, 70 GOP/s for i8, and 29 for f16. Cranelift's 128-bit kernel reaches about 50, 32, 33 and 9. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
 
-**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and lowering `mm` to a scalar loop nest. The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
+**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and running `mm` as 128-bit tiles (4 rows by 8 columns of C, with FMA where the CPU has it). The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
 
 | Target (LLVM backend) | `vx` | Masked `ldm`/`stm` |
 |---|---|---|
@@ -431,8 +431,8 @@ Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy
 | RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
 | GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
 | GEMV f32 with `par`, 512x1024, all cores | 6 µs | 61 µs | 13.5 µs (Ryzen 7 8845HS) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.4–1.6 ms (f32) | 20–21 ms | 1.1–1.2 ms (Ryzen 7 8845HS; 5.1 ms on one core) |
-| GEMM bf16, 256³ | 65 µs (f32) | 13 ms | 0.39 ms (87 GFLOP/s) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.1–1.6 ms (f32) | 2.5 ms (13 ms on one core) | 1.1–1.2 ms (Ryzen 7 8845HS; 5.1 ms on one core) |
+| GEMM bf16, 256³ | 65 µs (f32) | 1.3 ms | 0.39 ms (87 GFLOP/s) |
 
 Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.
 

@@ -534,6 +534,90 @@ fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
     }
 }
 
+/// Every f16 and bf16 bit pattern goes through `mm`'s widening of B (vector lanes on
+/// Cranelift) exactly: C = 0 + 1.0 * B, at every ISA level.
+#[test]
+fn mm_widens_every_half_value_exactly() {
+    for (level, features) in host_levels() {
+        let engine = jit(MM, &features);
+        for dtype in [Type::F16, Type::BF16] {
+            let f: MmFn =
+                unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
+            let one: u16 = if dtype == Type::F16 { 0x3c00 } else { 0x3f80 };
+            let b: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_le_bytes()).collect();
+            let mut c = vec![0u8; 4 << 16];
+            f(
+                c.as_mut_ptr(),
+                one.to_le_bytes().as_ptr(),
+                b.as_ptr(),
+                1,
+                1 << 16,
+                1,
+            );
+            for h in 0..=u16::MAX {
+                let want = if dtype == Type::F16 {
+                    f16::from_bits(h).to_f32()
+                } else {
+                    bf16::from_bits(h).to_f32()
+                };
+                let j = h as usize * 4;
+                let got = f32::from_le_bytes(c[j..j + 4].try_into().unwrap());
+                assert!(
+                    got == want || (got.is_nan() && want.is_nan()),
+                    "{dtype} {h:#06x} at {level}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+}
+
+/// `mm` reads and writes only its three matrices: each operand in turn ends exactly at a
+/// guard page, for shapes that end in every tile and tail case.
+#[cfg(unix)]
+#[test]
+fn mm_stays_inside_its_matrices() {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let map = || unsafe {
+        let base = libc::mmap(
+            std::ptr::null_mut(),
+            2 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base as *mut u8;
+        assert_eq!(
+            libc::mprotect(base.add(page).cast(), page, libc::PROT_NONE),
+            0
+        );
+        base
+    };
+    let (a_map, b_map, c_map) = (map(), map(), map());
+    for (_, features) in host_levels() {
+        let engine = jit(MM, &features);
+        for dtype in [Type::BF16, Type::F16, Type::F32, Type::I8] {
+            let f: MmFn =
+                unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
+            let es = dtype.byte_size();
+            for (m, n, k) in [(1, 1, 1), (5, 13, 3), (4, 8, 2), (3, 12, 1), (9, 7, 4)] {
+                let end = |map: *mut u8, bytes: usize| unsafe { map.add(page - bytes) };
+                let a = end(a_map, m * k * es);
+                let b = end(b_map, k * n * es);
+                let c = end(c_map, m * n * 4);
+                // Zeroed pages: every value is +0, so C stays finite whatever the order.
+                f(c, a, b, m as i64, n as i64, k as i64);
+            }
+        }
+    }
+    unsafe {
+        for map in [a_map, b_map, c_map] {
+            libc::munmap(map.cast(), 2 * page);
+        }
+    }
+}
+
 #[test]
 fn mm_accepts_literal_dimensions() {
     let engine = jit(MM, &CpuFeatures::host());
