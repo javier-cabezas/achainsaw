@@ -188,12 +188,12 @@ def make_cases():
 
     def verify_gemm(k):
         C[:] = 0.0
-        k(C, Ab, Bb, n, n, n)
+        k.run("gemm_bf16", C, Ab, Bb, n, n, n)
         return float(np.max(np.abs(C - gemm_ref)) / np.max(np.abs(gemm_ref)))
 
     cases.append(dict(
         name="gemm_bf16", label=f"GEMM bf16->f32 ({n}x{n}x{n})",
-        run=lambda k: k(C, Ab, Bb, n, n, n),
+        run=lambda k: k.run("gemm_bf16", C, Ab, Bb, n, n, n),
         verify=verify_gemm, tol=1e-4,
         # Same types as the kernel: bf16 inputs (raw bits; NumPy has no bf16 matmul, so
         # they are widened to f32 in the call), f32 accumulation.

@@ -56,8 +56,12 @@ fn swiglu(gate:ptr, up:ptr, out:ptr, n:i64)
     u = ldm pu:vx, rest:f32
     # e = exp(-g)
     x0 = vsub v_zero, g:f32
-    x1 = vmax x0, v_lo:f32
-    x = vmin x1, v_hi:f32
+    # Clamp with compare + select: vmax/vmin also order NaNs and signed zeros, which costs
+    # several instructions on Cranelift and is not needed here (a NaN still propagates).
+    below = vlt x0, v_lo:f32
+    x1 = vsel below, v_lo, x0
+    above = vgt x1, v_hi:f32
+    x = vsel above, v_hi, x1
     t = vmul x, v_log2e:f32
     tm = vadd t, v_magic:f32
     nf = vsub tm, v_magic:f32

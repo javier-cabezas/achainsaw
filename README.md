@@ -174,7 +174,7 @@ The rules:
 - **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
 
 How it runs:
-- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A helper that found nothing to do parks at once, so it does not slow down a busy thread sharing its core.
+- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A `par` with fewer indices than threads uses only that many threads: the other helpers stay parked, so they neither slow down busy threads sharing their core nor need waking for later loops of the same size.
 - **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
 - **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
 - **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
@@ -406,11 +406,11 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 |---|---|---|
 | `cosine_similarity.air` | `(a:ptr, b:ptr, n:i64)->f32` | Embedding search and RAG |
 | `euclidean_distance.air` | `(a:ptr, b:ptr, n:i64)->f32` | Nearest neighbors, vector quantization |
-| `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable |
+| `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable; `exp` vectorized in AIR (no libm call) |
 | `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
-| `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection |
+| `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection, 4 rows at a time (independent FMA chains, x loaded once per 4 rows) |
 | `gemv_par.air` | `gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | The same on all cores, blocks of 16 rows per `par` index; `bench(m, k, reps)->f32` runs it from the CLI or MCP |
-| `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
+| `gemm_bf16.air` | `gemm_bf16(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 on all cores: `par` over 16-row blocks, each an `mm` (AMX, SME or FMA) |
 | `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). Runs on all cores: one `par` gathers the selected entries, a second runs FlashAttention-2 (blocks of 64 entries, both products on `mm`) for groups of 8 heads |
 | `add_rmsnorm.air` | `(x:ptr, res:ptr, w:ptr, out:ptr, n:i64, eps:f32)->f32` | Residual add fused with RMSNorm between sublayers (vLLM's `fused_add_rms_norm`): updates the residual stream and normalizes it in two passes |
 | `rope.air` | `(x:ptr, heads:i64, dim:i64, cos:ptr, sin:ptr)` | Rotary position embedding in place, LLaMA/NeoX rotate-half layout, from a row of the cos/sin cache |
@@ -427,25 +427,36 @@ python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx
 python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
 
-Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits and widened in each call, Q8_0 weights stay int8; NumPy's GEMV/GEMM use multithreaded BLAS), from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS:
+Compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits and widened in each call, Q8_0 weights stay int8; NumPy's GEMV/GEMM use multithreaded OpenBLAS), from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS (8 cores, 16 threads). Kernels marked "all cores" use `par`; the others run on one core:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/kernels-vs-numpy-dark.svg">
+  <img alt="Speedup of each kernel over NumPy on a log scale, Cranelift and LLVM side by side; the numbers are in the table below" src="docs/kernels-vs-numpy-light.svg">
+</picture>
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
-| Cosine similarity, n=1024 | 2.3 µs | 1.1 µs | 0.5 µs |
-| Euclidean distance, n=1024 | 1.4 µs | 1.1 µs | 0.5 µs |
-| Softmax, n=1000 | 2.9 µs | 4.4 µs | 3.2 µs |
-| RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
-| GEMV f32, 512x1024 | 6 µs | 376 µs | 64 µs |
-| GEMV f32 with `par`, 512x1024, all cores | 6 µs | 62 µs | 18 µs |
-| GEMM bf16 -> f32, 256³ | 186 µs | 1.2 ms | 0.40 ms (84 GFLOP/s) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.4 ms | 2.2 ms (13 ms on one core) | 1.05 ms (5.1 ms on one core) |
-| SwiGLU, n=14336 | 11 µs | 21 µs | 4.8 µs |
-| Greedy argmax, vocab 128256 | 6.7 µs | 29 µs | 4.7 µs |
-| RoPE, 32 heads x 128 | 7.4 µs | 2.0 µs | 0.8 µs |
-| Residual add + RMSNorm, n=4096 | 6.3 µs | 6.1 µs | 3.2 µs |
-| Q8_0 GEMV 4096x4096, all cores | 6.5 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 0.52 ms | 0.17 ms (repeated calls keep part of the 18 MB in L3) |
+| Q8_0 GEMV 4096x4096, all cores | 5.74 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 444 µs (12.9x) | 162 µs (35.4x) |
+| RoPE, 32 heads x 128 | 7.8 µs | 1.9 µs (4.0x) | 0.80 µs (9.8x) |
+| Cosine similarity, n=1024 | 2.3 µs | 0.69 µs (3.4x) | 0.53 µs (4.4x) |
+| RMSNorm, n=4096 | 5.8 µs | 3.9 µs (1.5x) | 1.5 µs (3.9x) |
+| Softmax, n=1000 | 3.0 µs | 2.1 µs (1.4x) | 1.0 µs (3.0x) |
+| Euclidean distance, n=1024 | 1.4 µs | 0.67 µs (2.1x) | 0.53 µs (2.7x) |
+| SwiGLU, n=14336 | 11.0 µs | 15.9 µs (0.69x) | 4.8 µs (2.3x) |
+| GEMM bf16 -> f32, 256³, all cores | 169 µs | 263 µs (0.64x) | 76 µs (2.2x) |
+| Residual add + RMSNorm, n=4096 | 6.3 µs | 4.2 µs (1.5x) | 3.1 µs (2.0x) |
+| Greedy argmax, vocabulary 128256 | 7.0 µs | 16.3 µs (0.43x) | 4.9 µs (1.4x) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.34 ms | 2.14 ms (0.63x) | 1.12 ms (1.2x) |
+| GEMV f32 512x1024, all cores | 7.4 µs | 18.0 µs (0.41x) | 11.0 µs (0.67x) |
+| GEMV f32 512x1024, 1 core | 6.4 µs (all cores) | 39.1 µs (0.16x) | 22.1 µs (0.29x) |
 
-Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.
+`python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
+
+Where the remaining gaps come from:
+- **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
+- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads. With weights streaming from memory, as in LLM decode, the Q8_0 GEMV is 35x faster than NumPy.
+
+Fuel checks are inline (a decrement and a compare per branch, on a counter kept in a register), so loops pay almost nothing for runaway protection. The rare slow path calls the runtime through a stub that preserves every register, so it does not make Cranelift spill loop values: before that, the fuel checks made Cranelift's GEMV 2.6x slower.
 
 #### Single-call decode (deep fusion)
 
@@ -466,11 +477,11 @@ On a random model with Llama 3.2 1B's shapes (d 2048, 16 layers, 32 query heads 
 
 | | ms/token | tokens/s | weights read |
 |---|---|---|---|
-| AIR on LLVM, one call per token | 27.2 | 37 | 51 GB/s |
-| AIR on Cranelift, one call per token | 32.3 | 31 | 43 GB/s |
-| NumPy, same data types (int8 weights and activations, f32 elsewhere) | 735 | 1.4 | 1.9 GB/s |
+| AIR on LLVM, one call per token | 26.5 | 38 | 52 GB/s |
+| AIR on Cranelift, one call per token | 31.3 | 32 | 44 GB/s |
+| NumPy, same data types (int8 weights and activations, f32 elsewhere) | 627 | 1.6 | 2.2 GB/s |
 
-Both implementations share the weights and the arithmetic (exact int8 block dots, f32 for the embedding, norms, RoPE, KV cache and attention), and all 32 greedy tokens match. Decode is bound by memory bandwidth: the kernel streams each int8 weight once, at 51 GB/s, with no intermediate tensors, while NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. (Dequantizing the weights to f32 ahead of time, at 4x the memory, brings NumPy to about 114 ms/token.)
+Both implementations share the weights and the arithmetic (exact int8 block dots, f32 for the embedding, norms, RoPE, KV cache and attention), and all 32 greedy tokens match. Decode is bound by memory bandwidth: the kernel streams each int8 weight once, at 52 GB/s, with no intermediate tensors, while NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. (Dequantizing the weights to f32 ahead of time, at 4x the memory, brings NumPy to about 114 ms/token.)
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
