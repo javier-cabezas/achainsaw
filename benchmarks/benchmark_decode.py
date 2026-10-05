@@ -27,6 +27,7 @@ the reported decode speed covers the generated tokens only.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -83,6 +84,7 @@ def main():
     parser.add_argument("--threads", type=int,
                         help="threads for the kernel's par loops (default: all logical cores)")
     parser.add_argument("--no-numpy", action="store_true", help="skip the NumPy baseline")
+    parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -113,8 +115,12 @@ def main():
     src = open(KERNEL, encoding="utf-8").read()
     backends = achainsaw.available_backends() if args.backends == "all" else args.backends.split(",")
 
-    def report(label, prompt_s, times):
+    results = []
+
+    def report(label, prompt_s, times, backend=None):
         ms = np.median(times[1:] or times) * 1e3
+        results.append(dict(backend=backend or label, ms_per_token=ms,
+                            prompt_ms_per_token=prompt_s * 1e3 / len(prompt_ids)))
         pre = f"prompt {prompt_s * 1e3 / len(prompt_ids):6.1f} ms/token, " if tok else ""
         print(f"  {label:<22} {pre}decode {ms:7.2f} ms/token  {1e3 / ms:6.1f} tokens/s  "
               f"{wb / (ms / 1e3) / 1e9:5.1f} GB/s of weights")
@@ -131,7 +137,7 @@ def main():
 
         out, prompt_s, times = generate(step, prompt_ids, args.tokens, stop)
         runs[be] = out
-        report(f"AIR {be}, {kernel.threads} thr", prompt_s, times)
+        report(f"AIR {be}, {kernel.threads} thr", prompt_s, times, be)
         if tok:
             print("    " + repr(tok.decode(out)))
 
@@ -139,11 +145,16 @@ def main():
         cache = model.numpy_cache()
         out, prompt_s, times = generate(lambda t, p: model.numpy_step(cache, t, p), prompt_ids,
                                         args.tokens, stop)
-        report("NumPy, same types", prompt_s, times)
+        report("NumPy, same types", prompt_s, times, "numpy")
         for be, toks in runs.items():
             same = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
                         min(len(toks), len(out)))
             print(f"  {be}: first {same} of {len(toks)} tokens match NumPy")
+
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(dict(model=args.gguf or f"random {args.weights} x{args.layers} layers",
+                           weight_bytes=wb, results=results), f, indent=2)
 
 
 if __name__ == "__main__":

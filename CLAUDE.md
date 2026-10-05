@@ -17,6 +17,7 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 - MCP e2e: `cargo build -p achainsaw && python tests/test_mcp_e2e.py`
 - Python binding tests need the extension built first (`maturin develop` or copy `target/*/libachainsaw.so` to `achainsaw.so`), then `python tests/test_py_binding.py` and `python tests/test_gguf_decode.py` (a synthetic GGUF through the loader and `llama_decode.air`).
 - Lint (CI): `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+- Performance (CI's `perf` job on PRs): `python benchmarks/perf_compare.py BASE_DIR HEAD_DIR` runs each checkout's kernel and decode benchmarks (extension at each root) alternately and fails if a result is >25% slower on either backend. An intended slowdown needs the `perf-regression-ok` label, then a re-run of the job.
 - LLVM backend (LLVM 22): `export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22`, then add `--features achainsaw/llvm,achainsaw-codegen/llvm,achainsaw-llvm/llvm` to build/test/clippy. Run the suite on LLVM with `ACHAINSAW_BACKEND=llvm cargo test --workspace --features ...`; CI's `test-llvm` job runs it on both backends.
 
 ## Git workflow

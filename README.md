@@ -460,6 +460,8 @@ Compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits 
 
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
 
+Every pull request also runs a performance check in CI: [`benchmarks/perf_compare.py`](benchmarks/perf_compare.py) builds the PR's base and head on the same runner, runs each side's kernel benchmarks and a 4-layer decode alternately for 5 rounds, and fails if the best time of any kernel on either backend got more than 25% slower. Comparing best times from fresh processes keeps runner noise out; the job summary lists every ratio.
+
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
 - **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads. With weights streaming from memory, as in LLM decode, the Q8_0 GEMV is 35x faster than NumPy.
