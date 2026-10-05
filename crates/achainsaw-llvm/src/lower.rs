@@ -99,6 +99,9 @@ pub struct LowerOptions {
     pub vector_width: Option<u32>,
     /// Matrix engines for `mm`; without one, `mm` uses vector FMAs at `vx` width.
     pub matrix: MatrixUnits,
+    /// Float min/max compare and select instead of propagating NaN and ordering signed
+    /// zeros (`achainsaw_codegen::CodegenOptions::fast_math`).
+    pub fast_math: bool,
 }
 
 fn lane_bits(lane: Type) -> u32 {
@@ -195,7 +198,6 @@ pub fn lower_module<'ctx>(
         opts,
         // `par` workers count fuel in their own counters.
         dynamic_fuel: air.uses_par(),
-        fast: std::cell::Cell::new(false),
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
@@ -253,8 +255,6 @@ struct ModuleLowerer<'a, 'ctx> {
     /// Functions find their fuel counter on entry (`RT_FUEL_COUNTER`) instead of using
     /// `LowerOptions::fuel_counter` directly.
     dynamic_fuel: bool,
-    /// Whether the function being lowered is `fast` (see `Function::fast`).
-    fast: std::cell::Cell<bool>,
 }
 
 /// One AIR register: its LLVM value and AIR type.
@@ -869,7 +869,6 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     // ---------------------------------------------------------------------------------
 
     fn lower_function(&self, func: &Function, air: &Module) -> Result<()> {
-        self.fast.set(func.fast);
         let f = self.module.get_function(&func.name).unwrap();
         let b = &self.builder;
         let entry = self.ctx.append_basic_block(f, "entry");
@@ -1986,7 +1985,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     }
 
     /// Float min/max, scalar or vector: AIR's default semantics (`llvm.minimum`/`maximum`:
-    /// NaN if either operand is NaN, -0.0 below +0.0), or in `fast` functions compare and
+    /// NaN if either operand is NaN, -0.0 below +0.0), or with `fast_math` compare and
     /// select (`a > b ? a : b` for max), as in the Cranelift backend.
     fn float_minmax(
         &self,
@@ -1994,7 +1993,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         a: BasicValueEnum<'ctx>,
         c: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        if !self.fast.get() {
+        if !self.opts.fast_math {
             let name = if is_max {
                 "llvm.maximum"
             } else {

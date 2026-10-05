@@ -6,6 +6,7 @@ pub mod lower;
 
 pub use aot::{
     compile_assembly, compile_object, link_shared_library, AotCompiler, AotObject, AotTarget,
+    CodegenOptions,
 };
 pub use backend::{uses_wide_vectors, Backend};
 pub use jit::{

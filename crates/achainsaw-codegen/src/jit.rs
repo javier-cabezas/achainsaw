@@ -1354,6 +1354,7 @@ impl CraneliftJit {
         fuel_enabled: bool,
         fuel_counter: i64,
         sandbox: Option<(i64, i64)>,
+        fast_math: bool,
     ) -> Result<Vec<(String, usize, Option<usize>)>> {
         let mut func_ids = HashMap::new();
         let mut func_returns = HashMap::new();
@@ -1432,6 +1433,7 @@ impl CraneliftJit {
                 // `par` workers count fuel in their own counters.
                 fuel_counter_id: ir_mod.uses_par().then_some(self.rt_fuel_counter_id),
             }),
+            fast_math,
         };
 
         for func in &ir_mod.functions {
@@ -1507,6 +1509,8 @@ pub struct JitEngine {
     fuel: Box<Cell<i64>>,
     /// Most threads `par` may use (0: the whole pool).
     threads: usize,
+    /// See `CodegenOptions::fast_math`.
+    fast_math: bool,
     pub signatures: HashMap<String, (Vec<Type>, Option<Type>)>,
     function_ptrs: HashMap<String, usize>,
     trampoline_ptrs: HashMap<String, usize>,
@@ -1589,6 +1593,7 @@ impl JitEngine {
             fuel_enabled: true,
             fuel: Box::new(Cell::new(UNLIMITED_FUEL)),
             threads: 0,
+            fast_math: false,
             signatures: HashMap::new(),
             function_ptrs: HashMap::new(),
             trampoline_ptrs: HashMap::new(),
@@ -1630,6 +1635,16 @@ impl JitEngine {
             0 => par_pool_threads(),
             n => n.min(par_pool_threads()),
         }
+    }
+
+    /// Generates float min/max as compare and select (see `CodegenOptions::fast_math`) in
+    /// modules compiled from now on.
+    pub fn set_fast_math(&mut self, on: bool) {
+        self.fast_math = on;
+    }
+
+    pub fn fast_math(&self) -> bool {
+        self.fast_math
     }
 
     pub fn set_fuel_enabled(&mut self, enabled: bool) {
@@ -1687,9 +1702,13 @@ impl JitEngine {
         });
         let fuel_counter = self.fuel.as_ptr() as i64;
         let compiled = match &mut self.codegen {
-            Codegen::Cranelift(clif) => {
-                clif.compile(ir_mod, self.fuel_enabled, fuel_counter, sandbox)?
-            }
+            Codegen::Cranelift(clif) => clif.compile(
+                ir_mod,
+                self.fuel_enabled,
+                fuel_counter,
+                sandbox,
+                self.fast_math,
+            )?,
             #[cfg(feature = "llvm")]
             Codegen::Llvm {
                 target,
@@ -1720,6 +1739,7 @@ impl JitEngine {
                     vx: *vx,
                     vector_width: *vector_width,
                     matrix: *matrix,
+                    fast_math: self.fast_math,
                     ..Default::default()
                 };
                 // Functions from earlier modules first, then registered symbols.

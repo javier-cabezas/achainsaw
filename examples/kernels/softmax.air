@@ -3,9 +3,8 @@
 # Returns the sum of exponentials. Everything runs at full vector width, exp included
 # (`vexp`, about 1 ulp; no libm call). A masked load would pad the max with zeros, so the
 # max uses full vectors plus a scalar tail; the sum of the final partial vector is taken from
-# the stored outputs, whose masked reload zeroes the padding. `fast`: the max compares and
-# selects (NaN inputs still give NaN outputs, through exp).
-fn softmax(x:ptr, out:ptr, n:i64)->f32 fast
+# the stored outputs, whose masked reload zeroes the padding.
+fn softmax(x:ptr, out:ptr, n:i64)->f32
   b0:
     first = ld x:f32
     w = vl f32

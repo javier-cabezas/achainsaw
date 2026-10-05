@@ -1,10 +1,11 @@
-//! Scalar float `min`/`max` in default and `fast` functions, on the backend selected by
-//! `ACHAINSAW_BACKEND`: results follow AIR's semantics for every special value, and the
-//! optimizer folds constant operands to exactly what the JIT computes at run time.
+//! Scalar float `min`/`max` compiled with and without `fast_math`, on the backend selected
+//! by `ACHAINSAW_BACKEND`: results follow AIR's semantics for every special value, and the
+//! optimizer folds constant operands to exactly what the JIT computes at run time in either
+//! mode (it runs before code generation, so its folds must not depend on the mode).
 
 use achainsaw_codegen::{JitEngine, RtValue};
 use achainsaw_ir::opt::optimize_module;
-use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
+use achainsaw_ir::parse_and_validate;
 
 const SPECIALS: [f64; 9] = [
     f64::NAN,
@@ -18,8 +19,8 @@ const SPECIALS: [f64; 9] = [
     3.25e-3,
 ];
 
-/// AIR's float min/max: by default NaN if either is NaN and -0.0 below +0.0; in `fast`
-/// functions `a < b ? a : b` / `a > b ? a : b`.
+/// AIR's float min/max: by default NaN if either is NaN and -0.0 below +0.0; with
+/// `fast_math` `a < b ? a : b` / `a > b ? a : b`.
 fn reference(is_max: bool, fast: bool, a: f64, b: f64) -> f64 {
     if fast {
         let pick_a = if is_max { a > b } else { a < b };
@@ -65,25 +66,29 @@ fn source() -> String {
     let mut src = String::new();
     for ty in ["f32", "f64"] {
         for op in ["min", "max"] {
-            for (suffix, attr) in [("", ""), ("_fast", " fast")] {
-                src += &format!(
-                    "fn {op}_{ty}{suffix}(a:{ty}, b:{ty})->{ty}{attr}\n  b0:\n    r = {op} a, b\n    ret r\n\n"
-                );
-            }
+            src += &format!(
+                "fn {op}_{ty}(a:{ty}, b:{ty})->{ty}\n  b0:\n    r = {op} a, b\n    ret r\n\n"
+            );
         }
     }
     src
 }
 
+fn engine(fast_math: bool, src: &str) -> JitEngine {
+    let module = parse_and_validate(src).unwrap();
+    let mut engine = JitEngine::new().unwrap();
+    engine.set_fast_math(fast_math);
+    engine.compile_module(&module).unwrap();
+    engine
+}
+
 #[test]
 fn scalar_min_max_follow_air_semantics() {
-    let module = parse_and_validate(&source()).unwrap();
-    let mut engine = JitEngine::new().unwrap();
-    engine.compile_module(&module).unwrap();
-    for ty in ["f32", "f64"] {
-        for (op, is_max) in [("min", false), ("max", true)] {
-            for (suffix, fast) in [("", false), ("_fast", true)] {
-                let name = format!("{op}_{ty}{suffix}");
+    for fast in [false, true] {
+        let engine = engine(fast, &source());
+        for ty in ["f32", "f64"] {
+            for (op, is_max) in [("min", false), ("max", true)] {
+                let name = format!("{op}_{ty}");
                 for &a in &SPECIALS {
                     for &b in &SPECIALS {
                         let got = run(&engine, &name, ty, a, b);
@@ -95,7 +100,7 @@ fn scalar_min_max_follow_air_semantics() {
                         };
                         assert!(
                             same(got, want),
-                            "{name}({a:?}, {b:?}) = {got:?}, want {want:?}"
+                            "{name}({a:?}, {b:?}) fast_math={fast} = {got:?}, want {want:?}"
                         );
                     }
                 }
@@ -104,76 +109,64 @@ fn scalar_min_max_follow_air_semantics() {
     }
 }
 
-/// Constant folding gives what the JIT computes: `min(NaN, 1.0)` used to fold to 1.0
-/// (Rust's `f64::min`) while the program returns NaN.
+/// Constant folding gives what the JIT computes in both modes: `min(NaN, 1.0)` used to fold
+/// to 1.0 (Rust's `f64::min`) while the program returns NaN.
 #[test]
 fn folded_min_max_match_runtime() {
-    let runtime = {
-        let module = parse_and_validate(&source()).unwrap();
-        let mut engine = JitEngine::new().unwrap();
-        engine.compile_module(&module).unwrap();
-        engine
+    let lit = |v: f64| {
+        if v.is_nan() {
+            "nan".to_string()
+        } else if v.is_infinite() {
+            if v > 0.0 { "inf" } else { "-inf" }.to_string()
+        } else {
+            format!("{v:?}")
+        }
     };
-    for ty in ["f32", "f64"] {
-        for op in ["min", "max"] {
-            for (suffix, attr) in [("", ""), ("_fast", " fast")] {
-                for &a in &SPECIALS {
-                    for &b in &SPECIALS {
-                        let lit = |v: f64| {
-                            if v.is_nan() {
-                                "nan".to_string()
-                            } else if v.is_infinite() {
-                                if v > 0.0 { "inf" } else { "-inf" }.to_string()
-                            } else {
-                                format!("{v:?}")
-                            }
-                        };
-                        // Constants via `cst` (negative infinity as 0 - inf).
-                        let mk = |reg: &str, v: f64| {
-                            if v == f64::NEG_INFINITY {
-                                format!("    {reg}0 = cst inf:{ty}\n    {reg}z = cst 0.0:{ty}\n    {reg} = sub {reg}z, {reg}0\n")
-                            } else {
-                                format!("    {reg} = cst {}:{ty}\n", lit(v))
-                            }
-                        };
-                        let src = format!(
-                            "fn k()->{ty}{attr}\n  b0:\n{}{}    r = {op} a, b\n    ret r\n",
+    for fast in [false, true] {
+        let runtime = engine(fast, &source());
+        for ty in ["f32", "f64"] {
+            // Constants via `cst` (negative infinity as 0 - inf).
+            let mk = |reg: &str, v: f64| {
+                if v == f64::NEG_INFINITY {
+                    format!("    {reg}0 = cst inf:{ty}\n    {reg}z = cst 0.0:{ty}\n    {reg} = sub {reg}z, {reg}0\n")
+                } else {
+                    format!("    {reg} = cst {}:{ty}\n", lit(v))
+                }
+            };
+            for op in ["min", "max"] {
+                // One function per operand pair, folded together in one module.
+                let mut src = String::new();
+                for (i, &a) in SPECIALS.iter().enumerate() {
+                    for (j, &b) in SPECIALS.iter().enumerate() {
+                        src += &format!(
+                            "fn k_{i}_{j}()->{ty}\n  b0:\n{}{}    r = {op} a, b\n    ret r\n\n",
                             mk("a", a),
                             mk("b", b)
                         );
-                        let mut module = parse_and_validate(&src).unwrap();
-                        optimize_module(&mut module);
-                        let mut folded = JitEngine::new().unwrap();
-                        folded.compile_module(&module).unwrap();
-                        let got = match unsafe { folded.call_typed("k", &[]) }.unwrap() {
+                    }
+                }
+                let mut module = parse_and_validate(&src).unwrap();
+                optimize_module(&mut module);
+                let mut folded = JitEngine::new().unwrap();
+                folded.set_fast_math(fast);
+                folded.compile_module(&module).unwrap();
+                for (i, &a) in SPECIALS.iter().enumerate() {
+                    for (j, &b) in SPECIALS.iter().enumerate() {
+                        let got = match unsafe { folded.call_typed(&format!("k_{i}_{j}"), &[]) }
+                            .unwrap()
+                        {
                             Some(RtValue::F32(v)) => v as f64,
                             Some(RtValue::F64(v)) => v,
                             other => panic!("{other:?}"),
                         };
-                        let want = run(&runtime, &format!("{op}_{ty}{suffix}"), ty, a, b);
+                        let want = run(&runtime, &format!("{op}_{ty}"), ty, a, b);
                         assert!(
                             same(got, want),
-                            "{op}_{ty}{suffix} folded({a:?}, {b:?}) = {got:?}, runtime {want:?}"
+                            "{op}_{ty} fast_math={fast} folded({a:?}, {b:?}) = {got:?}, runtime {want:?}"
                         );
                     }
                 }
             }
         }
     }
-}
-
-#[test]
-fn fast_attribute_round_trips() {
-    let src = "fn k(a:f32, b:f32)->f32 fast\n  b0:\n    r = max a, b\n    ret r\n\nfn plain(fast:i32)->i32\n  b0:\n    r = add fast, 1:i32\n    ret r\n";
-    let module = parse_and_validate(src).unwrap();
-    assert!(module.functions[0].fast);
-    assert!(!module.functions[1].fast);
-    let text = to_air_text(&module);
-    assert!(text.contains("fn k(a:f32, b:f32)->f32 fast\n"), "{text}");
-    let decoded = decode_module(&encode_module(&module).unwrap()).unwrap();
-    assert!(decoded.functions[0].fast && !decoded.functions[1].fast);
-    assert_eq!(to_air_text(&decoded), text);
-    // Without a return type the attribute follows the parameters.
-    let module = parse_and_validate("fn v(p:ptr) fast\n  b0:\n    ret\n").unwrap();
-    assert!(module.functions[0].fast);
 }

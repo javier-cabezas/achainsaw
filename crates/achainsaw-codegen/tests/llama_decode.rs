@@ -342,9 +342,14 @@ fn llama_decode_matches_reference() {
     let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8);
     let (table, cfg) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
-    for (level, features) in host_levels() {
+    let modes = host_levels()
+        .into_iter()
+        .flat_map(|(level, features)| [false, true].map(|fast| (level, features, fast)));
+    for (level, features, fast) in modes {
         let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.set_fast_math(fast);
         engine.compile_module(&module).unwrap();
+        let level = format!("{level}{}", if fast { " fast_math" } else { "" });
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         let mut cache = vec![0f32; model.layers.len() * 2 * plane];

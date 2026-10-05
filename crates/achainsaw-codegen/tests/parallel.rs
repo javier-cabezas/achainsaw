@@ -529,7 +529,8 @@ fn par_in_aot_shared_library() {
         backends.push(Backend::Llvm);
     }
     for backend in backends {
-        let obj = compile_object(&module, &AotTarget::default(), backend).unwrap();
+        let obj =
+            compile_object(&module, &AotTarget::default(), backend, &Default::default()).unwrap();
         let obj_path = dir.join(format!("squares_{backend}.o"));
         let lib_path = dir.join(format!("libsquares_{backend}.so"));
         std::fs::write(&obj_path, &obj.bytes).unwrap();

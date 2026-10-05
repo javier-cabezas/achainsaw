@@ -198,6 +198,20 @@ class TestChainsawPy(unittest.TestCase):
         k = achainsaw.compile_binary(binary)
         self.assertEqual(k.run("fib", 10), 55)
 
+    def test_fast_math(self):
+        # max(NaN, 1): NaN by default, the second operand with fast_math.
+        code = "fn k(a:f32, b:f32)->f32\n  b0:\n    r = max a, b\n    ret r\n"
+        default = achainsaw.compile(code)
+        self.assertFalse(default.fast_math)
+        self.assertTrue(np.isnan(default.run("k", float("nan"), 1.0)))
+        fast = achainsaw.compile(code, fast_math=True)
+        self.assertTrue(fast.fast_math)
+        self.assertEqual(fast.run("k", float("nan"), 1.0), 1.0)
+        fast_bin = achainsaw.compile_binary(achainsaw.assemble(code), fast_math=True)
+        self.assertEqual(fast_bin.run("k", float("nan"), 1.0), 1.0)
+        # Ordinary values are the same either way.
+        self.assertEqual(default.run("k", 2.0, -3.0), fast.run("k", 2.0, -3.0))
+
     def test_compile_binary_invalid(self):
         with self.assertRaises(achainsaw.CompilationError) as ctx:
             achainsaw.compile_binary(b"INVALID_PAYLOAD")

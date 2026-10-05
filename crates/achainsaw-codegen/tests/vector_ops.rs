@@ -54,9 +54,9 @@ enum Kernel {
     Narrow(Type, Type),
     /// Shift amount: the i32 at `pc`.
     Shift(VShiftOp, Type, Type),
-    /// `vmin`/`vmax` in a `fast` function (compare and select).
+    /// `vmin`/`vmax` compiled with `fast_math` (compare and select).
     FastBin(VBinOp, Type, Type),
-    /// `vminr`/`vmaxr` in a `fast` function.
+    /// `vminr`/`vmaxr` compiled with `fast_math`.
     FastReduce(VectorReduceOp, Type, Type),
 }
 
@@ -96,15 +96,15 @@ impl Kernel {
             Kernel::FastBin(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
             Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
         };
-        let fast = if matches!(self, Kernel::FastBin(..) | Kernel::FastReduce(..)) {
-            " fast"
-        } else {
-            ""
-        };
         format!(
-            "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr){fast}\n  b0:\n{body}    st po, r\n    ret\n",
+            "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
             self.name()
         )
+    }
+
+    /// Whether the kernel must be compiled with `CodegenOptions::fast_math`.
+    fn fast_math(&self) -> bool {
+        matches!(self, Kernel::FastBin(..) | Kernel::FastReduce(..))
     }
 
     fn lane(&self) -> Type {
@@ -221,7 +221,26 @@ fn all_kernels() -> Vec<Kernel> {
     ks
 }
 
-/// Float min/max in `fast` functions: `a > b ? a : b` / `a < b ? a : b` (so a NaN operand or
+/// The kernels as modules compiled without and with `fast_math`, skipping empty groups.
+fn modules_by_mode(kernels: &[Kernel]) -> Vec<(bool, Vec<Kernel>, achainsaw_ir::Module)> {
+    [false, true]
+        .into_iter()
+        .filter_map(|fast| {
+            let group: Vec<Kernel> = kernels
+                .iter()
+                .copied()
+                .filter(|k| k.fast_math() == fast)
+                .collect();
+            if group.is_empty() {
+                return None;
+            }
+            let module = parse_and_validate(&module_source(&group)).expect("kernels validate");
+            Some((fast, group, module))
+        })
+        .collect()
+}
+
+/// Float min/max with `fast_math`: `a > b ? a : b` / `a < b ? a : b` (so a NaN operand or
 /// two zeros give `b`).
 fn fast_minmax(is_max: bool, a: f64, b: f64) -> f64 {
     let pick_a = if is_max { a > b } else { a < b };
@@ -763,35 +782,39 @@ fn vx_ops_match_reference_at_host_vector_length() {
 }
 
 fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeatures)>) {
-    let module = parse_and_validate(&module_source(kernels)).expect("kernels validate");
+    let modules = modules_by_mode(kernels);
     for (level, features) in levels {
-        let mut engine = JitEngine::with_features(&features).expect("JIT init");
-        engine
-            .compile_module(&module)
-            .unwrap_or_else(|e| panic!("compile at {level}: {e}"));
-        let vx_bytes = engine.vx_bits() as usize / 8;
-        let ctx = |trial| {
-            format!(
-                "ISA {level}, {} vx={vx_bytes}B, trial {trial}",
-                engine.backend()
-            )
-        };
+        for (fast, group, module) in &modules {
+            let mut engine = JitEngine::with_features(&features).expect("JIT init");
+            engine.set_fast_math(*fast);
+            engine
+                .compile_module(module)
+                .unwrap_or_else(|e| panic!("compile at {level}: {e}"));
+            let vx_bytes = engine.vx_bits() as usize / 8;
+            let ctx = |trial| {
+                format!(
+                    "ISA {level}, {} vx={vx_bytes}B, fast_math={fast}, trial {trial}",
+                    engine.backend()
+                )
+            };
 
-        for k in kernels {
-            let f: KernelFn = unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
-            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
-            for trial in 0..TRIALS {
-                let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.input_lane(), &mut rng, trial);
-                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
-                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
-                if trial == 1 {
-                    b = a; // exercise equal operands (min/max of equal values, x - x)
+            for k in group {
+                let f: KernelFn =
+                    unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
+                let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
+                for trial in 0..TRIALS {
+                    let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                    fill(&mut a, k.input_lane(), &mut rng, trial);
+                    fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                    fill(&mut c, k.input_lane(), &mut rng, trial + 2);
+                    if trial == 1 {
+                        b = a; // exercise equal operands (min/max of equal values, x - x)
+                    }
+                    let mut out = [0u8; BUF];
+                    f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                    let expected = reference(*k, &a, &b, &c, vx_bytes);
+                    check_output(*k, &expected, &out, vx_bytes, &ctx(trial));
                 }
-                let mut out = [0u8; BUF];
-                f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
-                let expected = reference(*k, &a, &b, &c, vx_bytes);
-                check_output(*k, &expected, &out, vx_bytes, &ctx(trial));
             }
         }
     }
@@ -799,8 +822,7 @@ fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeature
 
 #[test]
 fn vector_ops_compile_for_every_target() {
-    let kernels = all_kernels();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    let modules = modules_by_mode(&all_kernels());
     let targets = [
         ("x86_64-unknown-linux-gnu", "x86-64"),
         ("x86_64-unknown-linux-gnu", "x86-64-v2"),
@@ -809,16 +831,19 @@ fn vector_ops_compile_for_every_target() {
         ("aarch64-unknown-linux-gnu", "generic"),
     ];
     for (triple, cpu) in targets {
-        let mut compiler = AotCompiler::with_target(&AotTarget {
-            triple: Some(triple.into()),
-            cpu: Some(cpu.into()),
-            features: None,
-        })
-        .unwrap();
-        compiler
-            .compile_module(&module)
-            .unwrap_or_else(|e| panic!("{triple} {cpu}: {e}"));
-        assert!(!compiler.finish().unwrap().is_empty());
+        for (fast, _, module) in &modules {
+            let mut compiler = AotCompiler::with_target(&AotTarget {
+                triple: Some(triple.into()),
+                cpu: Some(cpu.into()),
+                features: None,
+            })
+            .unwrap();
+            compiler.set_fast_math(*fast);
+            compiler
+                .compile_module(module)
+                .unwrap_or_else(|e| panic!("{triple} {cpu} fast_math={fast}: {e}"));
+            assert!(!compiler.finish().unwrap().is_empty());
+        }
     }
 }
 
@@ -951,18 +976,20 @@ pub const LLVM_TARGETS: &[(&str, &str, &str)] = &[
 #[cfg(feature = "llvm")]
 #[test]
 fn vector_ops_compile_for_every_llvm_target() {
-    use achainsaw_codegen::{compile_object, Backend};
-    let kernels = all_kernels();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    use achainsaw_codegen::{compile_object, Backend, CodegenOptions};
+    let modules = modules_by_mode(&all_kernels());
     for (triple, cpu, features) in LLVM_TARGETS {
         let target = AotTarget {
             triple: Some((*triple).into()),
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        let obj = compile_object(&module, &target, Backend::Llvm)
-            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
-        assert!(!obj.bytes.is_empty());
+        for (fast, _, module) in &modules {
+            let options = CodegenOptions { fast_math: *fast };
+            let obj = compile_object(module, &target, Backend::Llvm, &options)
+                .unwrap_or_else(|e| panic!("{triple} {cpu} {features} fast_math={fast}: {e}"));
+            assert!(!obj.bytes.is_empty());
+        }
     }
 }
 
@@ -976,40 +1003,43 @@ fn fixed_width_vector_ops_agree_across_backends() {
         .into_iter()
         .filter(|k| k.width() != Type::Vx)
         .collect();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    let modules = modules_by_mode(&kernels);
     for (level, features) in host_levels() {
-        let engines: Vec<JitEngine> = [Backend::Cranelift, Backend::Llvm]
-            .into_iter()
-            .map(|b| {
-                let mut e = JitEngine::with_backend(b, &features).unwrap();
-                e.compile_module(&module).unwrap();
-                e
-            })
-            .collect();
-        for k in &kernels {
-            let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
-            for trial in 0..TRIALS {
-                let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.input_lane(), &mut rng, trial);
-                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
-                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
-                let outs: Vec<[u8; BUF]> = engines
-                    .iter()
-                    .map(|e| {
-                        let f: KernelFn =
-                            unsafe { std::mem::transmute(e.get_fn_ptr(&k.name()).unwrap()) };
-                        let mut out = [0u8; BUF];
-                        f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
-                        out
-                    })
-                    .collect();
-                check_output(
-                    *k,
-                    &outs[0],
-                    &outs[1],
-                    16,
-                    &format!("cranelift vs llvm, ISA {level}, trial {trial}"),
-                );
+        for (fast, group, module) in &modules {
+            let engines: Vec<JitEngine> = [Backend::Cranelift, Backend::Llvm]
+                .into_iter()
+                .map(|b| {
+                    let mut e = JitEngine::with_backend(b, &features).unwrap();
+                    e.set_fast_math(*fast);
+                    e.compile_module(module).unwrap();
+                    e
+                })
+                .collect();
+            for k in group {
+                let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
+                for trial in 0..TRIALS {
+                    let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                    fill(&mut a, k.input_lane(), &mut rng, trial);
+                    fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                    fill(&mut c, k.input_lane(), &mut rng, trial + 2);
+                    let outs: Vec<[u8; BUF]> = engines
+                        .iter()
+                        .map(|e| {
+                            let f: KernelFn =
+                                unsafe { std::mem::transmute(e.get_fn_ptr(&k.name()).unwrap()) };
+                            let mut out = [0u8; BUF];
+                            f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                            out
+                        })
+                        .collect();
+                    check_output(
+                        *k,
+                        &outs[0],
+                        &outs[1],
+                        16,
+                        &format!("cranelift vs llvm, ISA {level}, trial {trial}"),
+                    );
+                }
             }
         }
     }
@@ -1119,7 +1149,7 @@ fn vx_signatures_compile_for_every_llvm_target() {
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        compile_object(&module, &target, Backend::Llvm)
+        compile_object(&module, &target, Backend::Llvm, &Default::default())
             .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
     }
 }

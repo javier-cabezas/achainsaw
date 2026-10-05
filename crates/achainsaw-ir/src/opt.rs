@@ -179,7 +179,6 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
 
 /// Runs constant folding, constant propagation, and algebraic simplification.
 fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (usize, usize) {
-    let fast = func.fast;
     let reg_types = infer_reg_types(func, sigs);
     let mut constants: HashMap<String, (Constant, Type)> = HashMap::new();
     let mut substitutions: HashMap<String, String> = HashMap::new();
@@ -234,7 +233,7 @@ fn run_constant_and_algebraic_pass(func: &mut Function, sigs: &Signatures) -> (u
                             (constants.get(&lhs), constants.get(&rhs))
                         {
                             if let Some((folded_const, folded_ty)) =
-                                fold_binary_op(op, c1, lhs_ty, c2, rhs_ty, fast)
+                                fold_binary_op(op, c1, lhs_ty, c2, rhs_ty)
                             {
                                 debug_assert_eq!(folded_ty, res_ty);
                                 *inst = Instruction::AssignConst {
@@ -510,34 +509,14 @@ fn simplify_algebraic(
 /// code generators implement (two's-complement wrapping at the declared width,
 /// shift amounts masked to the width, f32 arithmetic performed in f32).
 /// Returns `None` when folding could hide a runtime error (division by zero, overflow).
-/// Float `min` as AIR defines it (and runs it): NaN if either operand is NaN, -0.0 below
-/// +0.0; in `fast` functions `a < b ? a : b`.
-fn air_fmin(a: f64, b: f64, fast: bool) -> f64 {
-    if fast {
-        return if a < b { a } else { b };
+/// Float min/max folded only when the result is the same under both lowerings a backend may
+/// pick (`CodegenOptions::fast_math` makes min/max compare and select): neither operand NaN,
+/// and not two zeros. Otherwise the instruction is left for the backend.
+fn fold_fminmax(is_max: bool, a: f64, b: f64) -> Option<f64> {
+    if a.is_nan() || b.is_nan() || (a == 0.0 && b == 0.0) {
+        return None;
     }
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a == b {
-        return if a.is_sign_negative() { a } else { b };
-    }
-    a.min(b)
-}
-
-/// Float `max` as AIR defines it: NaN if either operand is NaN, +0.0 above -0.0; in `fast`
-/// functions `a > b ? a : b`.
-fn air_fmax(a: f64, b: f64, fast: bool) -> f64 {
-    if fast {
-        return if a > b { a } else { b };
-    }
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a == b {
-        return if a.is_sign_positive() { a } else { b };
-    }
-    a.max(b)
+    Some(if is_max { a.max(b) } else { a.min(b) })
 }
 
 fn fold_binary_op(
@@ -546,7 +525,6 @@ fn fold_binary_op(
     ty1: Type,
     c2: &Constant,
     ty2: Type,
-    fast: bool,
 ) -> Option<(Constant, Type)> {
     let bool_const = |b: bool| Some((Constant::Int(b as i64), Type::I32));
 
@@ -666,8 +644,8 @@ fn fold_binary_op(
                     BinaryOp::Gt => return bool_const(a > b),
                     BinaryOp::Le => return bool_const(a <= b),
                     BinaryOp::Ge => return bool_const(a >= b),
-                    BinaryOp::Min => air_fmin(a as f64, b as f64, fast) as f32,
-                    BinaryOp::Max => air_fmax(a as f64, b as f64, fast) as f32,
+                    BinaryOp::Min => fold_fminmax(false, a as f64, b as f64)? as f32,
+                    BinaryOp::Max => fold_fminmax(true, a as f64, b as f64)? as f32,
                     _ => return None,
                 };
                 Some((Constant::Float(res as f64), Type::F32))
@@ -684,8 +662,8 @@ fn fold_binary_op(
                     BinaryOp::Gt => return bool_const(a > b),
                     BinaryOp::Le => return bool_const(a <= b),
                     BinaryOp::Ge => return bool_const(a >= b),
-                    BinaryOp::Min => air_fmin(a, b, fast),
-                    BinaryOp::Max => air_fmax(a, b, fast),
+                    BinaryOp::Min => fold_fminmax(false, a, b)?,
+                    BinaryOp::Max => fold_fminmax(true, a, b)?,
                     _ => return None,
                 };
                 Some((Constant::Float(res), Type::F64))

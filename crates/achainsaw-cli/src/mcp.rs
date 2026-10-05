@@ -23,7 +23,7 @@ Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, s
 
 AIR syntax:
 - Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits: 128 on cranelift, up to 512 or SVE-scalable on llvm; always get the lane count via `vl`, never assume it). Vectors are untyped bits; each vector op names its lane type.
-- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`. Append `fast` (`fn f(x:f32)->f32 fast`) to make float min/max (min max vmin vmax vminr vmaxr) compare-and-select, `max(a,b) = a > b ? a : b`, so NaN or two zeros give b: faster, still identical on both backends.
+- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`. Float min/max (min max vmin vmax vminr vmaxr) propagate NaN and order -0.0 below +0.0; air_run's `fast_math` compiles them as compare-and-select instead, `max(a,b) = a > b ? a : b` (a NaN operand or two zeros give b): faster, still identical on both backends.
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
 - One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
 - Each block ends with exactly one terminator: `jmp b(args)` | `br cond, b_then(args), b_else(args)` | `ret v` | `ret`.
@@ -135,14 +135,21 @@ pub const DEFAULT_SANDBOX_MEMORY_MB: usize = 64;
 /// Largest `max_memory_mb` that `air_run` accepts.
 pub const MAX_SANDBOX_MEMORY_MB: usize = 4096;
 
+/// How `air_run` compiles and runs a module; `None` fields take the defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecOptions<'a> {
+    pub fuel: Option<u64>,
+    pub max_memory_mb: Option<usize>,
+    pub threads: Option<usize>,
+    pub backend: Option<&'a str>,
+    pub fast_math: bool,
+}
+
 pub fn execute_ir(
     module: &Module,
     func_name: &str,
     args: &[f64],
-    fuel: Option<u64>,
-    max_memory_mb: Option<usize>,
-    threads: Option<usize>,
-    backend: Option<&str>,
+    options: &ExecOptions,
 ) -> Result<Value> {
     // Runs on its own thread so the sandbox's recursion budget fits whatever the host
     // thread's stack is (Windows main threads only get 1 MiB); `par` workers get the same.
@@ -151,15 +158,7 @@ pub fn execute_ir(
             .name("air_run".into())
             .stack_size(EXECUTION_STACK_BYTES)
             .spawn_scoped(scope, || {
-                execute_ir_on_this_thread(
-                    module,
-                    func_name,
-                    args,
-                    fuel,
-                    max_memory_mb,
-                    threads,
-                    backend,
-                )
+                execute_ir_on_this_thread(module, func_name, args, options)
             })?
             .join()
             .map_err(|_| anyhow!("air_run execution thread panicked"))?
@@ -170,10 +169,7 @@ fn execute_ir_on_this_thread(
     module: &Module,
     func_name: &str,
     args: &[f64],
-    fuel: Option<u64>,
-    max_memory_mb: Option<usize>,
-    threads: Option<usize>,
-    backend: Option<&str>,
+    options: &ExecOptions,
 ) -> Result<Value> {
     const ALLOWED_EXTERNALS: &[&str] = &[
         "sinf", "cosf", "tanf", "sqrtf", "expf", "logf", "powf", "fabsf", "floorf", "ceilf",
@@ -204,7 +200,7 @@ fn execute_ir_on_this_thread(
         ));
     }
 
-    let memory_mb = max_memory_mb.unwrap_or(DEFAULT_SANDBOX_MEMORY_MB);
+    let memory_mb = options.max_memory_mb.unwrap_or(DEFAULT_SANDBOX_MEMORY_MB);
     if memory_mb > MAX_SANDBOX_MEMORY_MB {
         return Err(anyhow!(
             "max_memory_mb must be at most {MAX_SANDBOX_MEMORY_MB}, got {memory_mb}"
@@ -213,14 +209,15 @@ fn execute_ir_on_this_thread(
     let arena_bytes = memory_mb * 1024 * 1024;
 
     let t1 = Instant::now();
-    let mut engine = JitEngine::for_module(backend, module)?;
+    let mut engine = JitEngine::for_module(options.backend, module)?;
     // Enforce default fuel budget of 1_000_000 instructions to prevent runaway LLM code
-    let effective_fuel = fuel.or(Some(1_000_000));
+    let effective_fuel = options.fuel.or(Some(1_000_000));
     engine.set_fuel(effective_fuel);
     // Bounds-check all memory accesses and cap recursion so untrusted code cannot
     // touch or crash the server process.
     engine.enable_sandbox(arena_bytes)?;
-    engine.set_threads(threads);
+    engine.set_threads(options.threads);
+    engine.set_fast_math(options.fast_math);
     engine.compile_module(module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -263,6 +260,7 @@ fn execute_ir_on_this_thread(
         "result": res_val,
         "backend": engine.backend().as_str(),
         "threads": engine.threads(),
+        "fast_math": engine.fast_math(),
         "compile_time_us": compile_time_us,
         "exec_time_us": exec_time_us,
     }))
@@ -381,8 +379,21 @@ pub fn handle_air_run(arguments: &Value) -> Value {
             None => return error_response("'threads' must be a positive integer"),
         },
     };
-    let backend = arguments.get("backend").and_then(|v| v.as_str());
-    match execute_ir(&module, func, &args, fuel, max_memory_mb, threads, backend) {
+    let fast_math = match arguments.get("fast_math") {
+        None | Some(Value::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => return error_response("'fast_math' must be a boolean"),
+        },
+    };
+    let options = ExecOptions {
+        fuel,
+        max_memory_mb,
+        threads,
+        backend: arguments.get("backend").and_then(|v| v.as_str()),
+        fast_math,
+    };
+    match execute_ir(&module, func, &args, &options) {
         Ok(val) => json_tool_result(val),
         Err(e) => json_tool_error(json!({
             "status": "error",
@@ -576,6 +587,10 @@ pub fn get_tools_list() -> Value {
                             "type": "integer",
                             "minimum": 1,
                             "description": "Most threads `par` loops may use (default: all cores, see air_target's par_threads); 1 runs them serially, to measure the speedup"
+                        },
+                        "fast_math": {
+                            "type": "boolean",
+                            "description": "Compile float min/max (min max vmin vmax vminr vmaxr) as compare and select, max(a,b) = a > b ? a : b, so a NaN operand or two zeros give b (default false: NaN-propagating, -0.0 < +0.0). Faster, notably on cranelift; identical on both backends"
                         }
                     },
                     "required": ["code"]
@@ -978,6 +993,39 @@ mod tests {
         assert!(text.contains("ERR_OUT_OF_MEMORY"), "{text}");
         let text = run_error_text(json!({ "code": code, "max_memory_mb": 1u64 << 40 }));
         assert!(text.contains("max_memory_mb"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_run_fast_math() {
+        // max(NaN, 1): NaN by default, 1 (the second operand) with fast_math.
+        let code = "fn main()->f32\n  b0:\n    z = cst 0.0:f32\n    n = div z, z\n    r = max n, 1.0:f32\n    ret r\n";
+        for (fast, want_nan) in [
+            (json!(null), true),
+            (json!(false), true),
+            (json!(true), false),
+        ] {
+            let res = handle_air_run(&json!({ "code": code, "fast_math": fast }));
+            assert_eq!(res["isError"], false, "{res}");
+            let text = res["content"][0]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                payload["fast_math"],
+                fast.as_bool().unwrap_or(false),
+                "{payload}"
+            );
+            if want_nan {
+                // JSON has no NaN: serde_json writes it as null.
+                assert!(payload["result"].is_null(), "{payload}");
+            } else {
+                assert_eq!(payload["result"], 1.0, "{payload}");
+            }
+        }
+        let bad = handle_air_run(&json!({ "code": code, "fast_math": "yes" }));
+        assert_eq!(bad["isError"], true);
+        assert!(bad["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fast_math"));
     }
 
     #[test]

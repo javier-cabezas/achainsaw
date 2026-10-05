@@ -590,7 +590,7 @@ fn vexp_f32x4(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
 
 /// Combines two lane values for a horizontal reduction.
 /// Float min/max, scalar or vector: AIR's default semantics (`fmin`/`fmax`: NaN if either
-/// operand is NaN, -0.0 below +0.0), or in `fast` functions compare and select
+/// operand is NaN, -0.0 below +0.0), or with `fast_math` compare and select
 /// (`a > b ? a : b` for max, `a < b ? a : b` for min).
 fn float_minmax(
     builder: &mut FunctionBuilder,
@@ -1299,6 +1299,9 @@ pub struct LowerConfig {
     pub sandbox: Option<SandboxConfig>,
     /// Runtime support for `par` (JIT only); without it, `par` runs serially.
     pub par: Option<ParConfig>,
+    /// Float min/max compare and select instead of propagating NaN and ordering signed
+    /// zeros (see `CodegenOptions::fast_math`).
+    pub fast_math: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1535,11 +1538,23 @@ pub fn lower_function<M: ClifModule>(
                                 (ext, Type::I32)
                             }
                             BinaryOp::Min => (
-                                float_minmax(&mut builder, false, func.fast, lhs_val, rhs_val),
+                                float_minmax(
+                                    &mut builder,
+                                    false,
+                                    config.fast_math,
+                                    lhs_val,
+                                    rhs_val,
+                                ),
                                 lhs_ty,
                             ),
                             BinaryOp::Max => (
-                                float_minmax(&mut builder, true, func.fast, lhs_val, rhs_val),
+                                float_minmax(
+                                    &mut builder,
+                                    true,
+                                    config.fast_math,
+                                    lhs_val,
+                                    rhs_val,
+                                ),
                                 lhs_ty,
                             ),
                             _ => return Err(anyhow!("Unsupported float op {:?}", op)),
@@ -1912,9 +1927,15 @@ pub fn lower_function<M: ClifModule>(
                         let lanes: Vec<ClifValue> = (0..lanes_per_part)
                             .map(|i| builder.ins().extractlane(v, i as u8))
                             .collect();
-                        part_results.push(reduce_tree(&mut builder, *op, *ty, func.fast, &lanes));
+                        part_results.push(reduce_tree(
+                            &mut builder,
+                            *op,
+                            *ty,
+                            config.fast_math,
+                            &lanes,
+                        ));
                     }
-                    let res = reduce_tree(&mut builder, *op, *ty, func.fast, &part_results);
+                    let res = reduce_tree(&mut builder, *op, *ty, config.fast_math, &part_results);
                     values.insert(dst.clone(), (vec![res], *ty));
                 }
                 Instruction::VBinary {
@@ -1929,7 +1950,14 @@ pub fn lower_function<M: ClifModule>(
                     let (r_parts, _) = parts(&values, rhs);
                     let mut out = Vec::with_capacity(l_parts.len());
                     for (l, r) in l_parts.into_iter().zip(r_parts) {
-                        out.push(vbinary_part(&mut builder, *op, *lane, func.fast, l, r));
+                        out.push(vbinary_part(
+                            &mut builder,
+                            *op,
+                            *lane,
+                            config.fast_math,
+                            l,
+                            r,
+                        ));
                     }
                     values.insert(dst.clone(), (out, vec_ty));
                 }

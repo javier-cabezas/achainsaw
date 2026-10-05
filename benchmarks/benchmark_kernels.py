@@ -6,7 +6,8 @@ Every kernel is checked against NumPy, then timed on each available code generat
 backend (Cranelift, and LLVM when the build has it) and, with --isa all, at every ISA
 level this machine reaches (for example sse, avx, avx2 and avx512 on an AVX-512 host).
 The kernels are vector-length agnostic, so the same source runs 128-bit vectors on
-Cranelift and up to 512-bit (or SVE-scalable) vectors on LLVM.
+Cranelift and up to 512-bit (or SVE-scalable) vectors on LLVM. Kernels compile with
+fast_math=True (float min/max as compare and select; the tests cover both modes).
 
     python benchmarks/benchmark_kernels.py                  # host ISA, all backends
     python benchmarks/benchmark_kernels.py --isa all        # sweep ISA levels too
@@ -395,7 +396,7 @@ def main():
         print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  {case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
         for backend, level in configs:
             achainsaw.set_isa_cap(level)
-            kernel = achainsaw.compile(src, backend=backend)
+            kernel = achainsaw.compile(src, backend=backend, fast_math=True)
             time.sleep(0.02)
             err = case["verify"](kernel)
             ok = err <= case["tol"]

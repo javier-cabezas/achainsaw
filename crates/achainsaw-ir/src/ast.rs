@@ -759,12 +759,6 @@ pub struct Function {
     pub name: String,
     pub params: Vec<(String, Type)>,
     pub ret_type: Option<Type>,
-    /// `fn f(...) fast`: float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`)
-    /// compare and select, `max(a, b) = a > b ? a : b` and `min(a, b) = a < b ? a : b`, so
-    /// a NaN operand or two zeros give `b`, instead of propagating NaN and ordering -0.0
-    /// below +0.0. Still identical on every backend; cheaper where vectors are 128 bits.
-    #[serde(default)]
-    pub fast: bool,
     pub blocks: Vec<Block>,
     pub span: Span,
 }

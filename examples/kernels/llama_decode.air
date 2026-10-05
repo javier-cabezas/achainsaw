@@ -277,7 +277,7 @@ fn qkv_head(t:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i
 
 # Attention of q head hq over positions 0..pos of its KV head, written back Q8-quantized
 # (into xq/dx at the head's offset) for the O projection.
-fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64) fast
+fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64)
   b0:
     w = vl f32
     group = udiv nh, nkv
@@ -546,7 +546,7 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
 # xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
 # At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
 # sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
-fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64) fast
+fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   b0:
     w = vl f32
     nb = udiv k, 32:i64

@@ -73,9 +73,6 @@ pub fn to_air_text(module: &Module) -> String {
             out.push_str("->");
             out.push_str(ret_ty.as_str());
         }
-        if func.fast {
-            out.push_str(" fast");
-        }
         out.push('\n');
 
         for block in &func.blocks {
@@ -574,9 +571,6 @@ impl BinaryEncoder {
             } else {
                 self.buf.push(0);
             }
-
-            // Attribute flags: bit 0 = `fast`.
-            self.buf.push(func.fast as u8);
 
             // Blocks
             self.buf
@@ -1106,11 +1100,6 @@ impl<'a> BinaryDecoder<'a> {
                 None
             };
 
-            let flags = self.read_u8()?;
-            if flags > 1 {
-                return Err(self.err("Invalid function attribute flags in AIRB"));
-            }
-
             let block_count = self.read_u32()?;
             let mut blocks = Vec::with_capacity(self.safe_capacity(block_count));
 
@@ -1147,7 +1136,6 @@ impl<'a> BinaryDecoder<'a> {
                 name,
                 params,
                 ret_type,
-                fast: flags & 1 != 0,
                 blocks,
                 span: Span::default(),
             });

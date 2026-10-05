@@ -1,7 +1,7 @@
 use achainsaw_codegen::cpu::{self, IsaLevel};
 use achainsaw_codegen::{
     compile_assembly, compile_object, link_shared_library, AotObject, AotTarget, Backend,
-    JitEngine, RtValue,
+    CodegenOptions, JitEngine, RtValue,
 };
 use achainsaw_ir::diag::Diagnostic;
 use achainsaw_ir::types::Type;
@@ -30,6 +30,10 @@ struct Cli {
     /// v256/v512/vx/mm when built in, else cranelift).
     #[arg(long, global = true, value_name = "BACKEND")]
     backend: Option<String>,
+    /// For run, bench and build: float min/max (min, max, vmin, vmax, vminr, vmaxr) compare
+    /// and select (`a > b ? a : b`) instead of propagating NaN and ordering -0.0 below +0.0.
+    #[arg(long, global = true)]
+    fast_math: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -184,6 +188,9 @@ fn main() {
     }
 
     let backend = cli.backend.as_deref();
+    let options = CodegenOptions {
+        fast_math: cli.fast_math,
+    };
 
     match cli.command {
         Commands::Cpu { json } => match cpu::target_report() {
@@ -245,7 +252,18 @@ fn main() {
             fuel,
             max_memory_mb,
             threads,
-        } => match run_exec(&path, &func, &args, fuel, max_memory_mb, threads, backend) {
+        } => match run_exec(
+            &path,
+            &func,
+            &args,
+            &ExecLimits {
+                fuel,
+                max_memory_mb,
+                threads,
+            },
+            backend,
+            &options,
+        ) {
             Ok(output) => {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -267,7 +285,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Commands::Bench { path, iters } => match run_bench(&path, iters, backend) {
+        Commands::Bench { path, iters } => match run_bench(&path, iters, backend, &options) {
             Ok(bench_res) => println!("{}", serde_json::to_string_pretty(&bench_res).unwrap()),
             Err(e) => {
                 eprintln!("Benchmark error: {e}");
@@ -368,6 +386,7 @@ fn main() {
                 },
                 shared,
                 backend,
+                &options,
             )
         } else {
             run_build(
@@ -380,6 +399,7 @@ fn main() {
                 },
                 shared,
                 backend,
+                &options,
             )
         } {
             Ok(stats) => {
@@ -451,14 +471,20 @@ fn run_check(path: &Path) -> Result<serde_json::Value, Diagnostic> {
     }))
 }
 
+/// `run`'s resource limits (`None`: the engine's defaults).
+struct ExecLimits {
+    fuel: Option<u64>,
+    max_memory_mb: Option<usize>,
+    threads: Option<usize>,
+}
+
 fn run_exec(
     path: &Path,
     func_name: &str,
     args: &[String],
-    fuel: Option<u64>,
-    max_memory_mb: Option<usize>,
-    threads: Option<usize>,
+    limits: &ExecLimits,
     backend: Option<&str>,
+    options: &CodegenOptions,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(path)
@@ -530,13 +556,14 @@ fn run_exec(
     let t1 = Instant::now();
     let backend = Backend::resolve_for(backend, &module)?;
     let mut engine = JitEngine::with_backend(backend, &cpu::CpuFeatures::effective()?)?;
-    if let Some(f) = fuel {
+    if let Some(f) = limits.fuel {
         engine.set_fuel(Some(f));
     }
-    if let Some(mb) = max_memory_mb {
+    if let Some(mb) = limits.max_memory_mb {
         engine.set_memory_quota(mb * 1024 * 1024);
     }
-    engine.set_threads(threads);
+    engine.set_threads(limits.threads);
+    engine.set_fast_math(options.fast_math);
     engine.compile_module(&module)?;
     let compile_time_us = t1.elapsed().as_micros();
 
@@ -568,7 +595,12 @@ fn run_exec(
     }))
 }
 
-fn run_bench(path: &Path, iters: u32, backend: Option<&str>) -> Result<serde_json::Value> {
+fn run_bench(
+    path: &Path,
+    iters: u32,
+    backend: Option<&str>,
+    options: &CodegenOptions,
+) -> Result<serde_json::Value> {
     let module = load_module(path)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
     let backend = Backend::resolve_for(backend, &module)?;
@@ -577,6 +609,7 @@ fn run_bench(path: &Path, iters: u32, backend: Option<&str>) -> Result<serde_jso
     let t0 = Instant::now();
     for _ in 0..iters {
         let mut engine = JitEngine::with_backend(backend, &features)?;
+        engine.set_fast_math(options.fast_math);
         engine.compile_module(&module)?;
     }
     let total_duration = t0.elapsed();
@@ -670,6 +703,7 @@ fn run_build_asm(
     target: &AotTarget,
     shared: bool,
     backend: Option<&str>,
+    options: &CodegenOptions,
 ) -> Result<serde_json::Value> {
     if shared {
         return Err(anyhow!(
@@ -679,7 +713,7 @@ fn run_build_asm(
     let module = load_module(input)
         .map_err(|d| anyhow!("Validation failed: [{}] {}", d.error_code, d.message))?;
     let backend = Backend::resolve_for(backend, &module)?;
-    let (asm, triple) = compile_assembly(&module, target, backend)?;
+    let (asm, triple) = compile_assembly(&module, target, backend, options)?;
     let out = output.unwrap_or_else(|| input.with_extension("s"));
     fs::write(&out, &asm)?;
     Ok(json!({
@@ -702,6 +736,7 @@ fn run_build(
     target: &AotTarget,
     shared: bool,
     backend: Option<&str>,
+    options: &CodegenOptions,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let module = load_module(input)
@@ -714,7 +749,7 @@ fn run_build(
         bytes,
         triple,
         ignored_features,
-    } = compile_object(&module, target, backend)?;
+    } = compile_object(&module, target, backend, options)?;
     let compile_time_us = t1.elapsed().as_micros();
 
     let sh_ext = if cfg!(target_os = "windows") {
