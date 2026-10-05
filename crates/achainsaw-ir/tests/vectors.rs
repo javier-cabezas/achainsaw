@@ -37,6 +37,17 @@ fn k(pa:ptr, po:ptr)->f64
     v = vminr a:i16
     n = vl f32
     lane = extlane r, 7:f32
+    fi = vitof a:f32
+    if = vftoi fi:i32
+    wl = vwidenlo a:i16
+    wh = vwidenhi a:i64
+    ex = vexp fi:f32
+    nr = vnarrow wl, wh:i8
+    amt = cst 3:i32
+    sl = vshl nr, amt:i32
+    sr = vshr sl, 5:i16
+    su = vushr sr, 9:i64:i8
+    st po, su
     ret t
 "#;
 
@@ -120,6 +131,60 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("n = vl f32"));
     assert!(text.contains("r = vsel e, a, b"));
     assert!(text.contains("f = vfma z, b, c:f32"));
+    assert!(text.contains("fi = vitof a:f32"), "{text}");
+    assert!(text.contains("nr = vnarrow wl, wh:i8"));
+    assert!(text.contains("sl = vshl nr, amt:i32"));
+}
+
+#[test]
+fn conversion_shift_and_exp_rules() {
+    let one = |body: &str| {
+        format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
+    };
+    // Conversions name the result lane type and support only some.
+    assert_eq!(
+        err_code(&one("    r = vitof a:f64\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vftoi a:i64\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vwidenlo a:i8\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vexp a:f64\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vnarrow a, b:i32\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vshl a, 1:f32\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(err_code(&one("    r = vexp a\n")), "ERR_EXPECTED_LANE_TYPE");
+    // Operands: a vector to convert, a scalar shift amount, same-width narrow operands.
+    assert_eq!(
+        err_code("fn k(p:ptr, x:f32)\n  b0:\n    r = vexp x:f32\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&one("    r = vshl a, b:i32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v128\n    r = vnarrow a, b:i8\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert!(parse_and_validate(&one("    n = cst 4:i64\n    r = vushr a, n:i8\n")).is_ok());
+    assert!(parse_and_validate(&one("    r = vshl a, 31:i32\n")).is_ok());
+    // The new mnemonics are still ordinary register names.
+    let src = "fn k(vexp:i32, vshl:i32)->i32\n  b0:\n    vnarrow = add vexp, vshl\n    vitof = mul vnarrow, vexp\n    ret vitof\n";
+    assert!(parse_and_validate(src).is_ok());
 }
 
 #[test]
@@ -206,12 +271,15 @@ fn extract_lane_bounds_use_guaranteed_width() {
 
 #[test]
 fn signature_rules() {
+    // AIR functions may take and return vx; C functions may not.
+    assert!(parse_and_validate("fn k(v:vx)\n  b0:\n    ret\n").is_ok());
+    assert!(parse_and_validate("fn k(p:ptr)->vx\n  b0:\n    v = ld p:vx\n    ret v\n").is_ok());
     assert_eq!(
-        err_code("fn k(v:vx)\n  b0:\n    ret\n"),
+        err_code("extfn ext(v:vx)\nfn k()\n  b0:\n    ret\n"),
         "ERR_SCALABLE_IN_SIGNATURE"
     );
     assert_eq!(
-        err_code("fn k(p:ptr)->vx\n  b0:\n    v = ld p:vx\n    ret v\n"),
+        err_code("extfn ext()->vx\nfn k()\n  b0:\n    ret\n"),
         "ERR_SCALABLE_IN_SIGNATURE"
     );
     assert_eq!(
@@ -426,5 +494,31 @@ fn masked_loads_and_mm_survive_dead_code_elimination() {
     assert!(
         text.contains("unused = ldm") && text.contains("mm p, p, p"),
         "{text}"
+    );
+}
+
+/// `vexp`'s constants are exactly the f32 values of the Cephes expf constants (results are
+/// bit-identical across backends only while these bits stay fixed).
+#[test]
+fn vexp_constants_are_pinned() {
+    use achainsaw_ir::ast::vexp;
+    let bits: Vec<u32> = [vexp::LOG2E, vexp::NEG_LN2_HI, vexp::LN2_LO]
+        .iter()
+        .chain(&vexp::POLY)
+        .map(|c| c.to_bits())
+        .collect();
+    assert_eq!(
+        bits,
+        [
+            0x3fb8_aa3b,
+            0xbf31_8000,
+            0x395e_8083,
+            0x3950_6967,
+            0x3ab7_43ce,
+            0x3c08_8908,
+            0x3d2a_a9c1,
+            0x3e2a_aaaa,
+            0x3f00_0000
+        ]
     );
 }

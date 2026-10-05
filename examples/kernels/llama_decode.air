@@ -15,7 +15,7 @@
 # Matrix-vector products are Q8_0 (see q8_gemv.air): int8 weights in blocks of 32 along k
 # with an f32 scale per block row, packed in chunks of 64 output rows (k-major within a
 # chunk); activations are quantized per 32-block on the fly and the int8 dots run on `mm`.
-# exp is vectorized in AIR (see swiglu.air), with no libm call.
+# exp is `vexp`, with no libm call.
 #
 # Shapes: d, ffn and vocab multiples of 64; head_dim a multiple of 64; heads a multiple of
 # kv_heads (grouped-query attention); pos < max_ctx.
@@ -479,10 +479,6 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     dots = alloc 256:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    magic = cst 12582912.0:f32
-    v_magic = splat magic:vx
-    magic_bits = cst 1262485504:i32
-    v_magic_bits = splat magic_bits:vx
     jmp zero_y(0:i64)
   zero_y(z:i64):
     z_more = lt z, 64:i64
@@ -532,8 +528,7 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     ps = add sb, j_off
     py = add dst, j_off
     p = ldm pp:vx, j_rest:i32
-    pb = vadd p, v_magic_bits:i32
-    pf = vsub pb, v_magic:f32
+    pf = vitof p:f32
     s = ldm ps:vx, j_rest:f32
     ds = vmul s, vd:f32
     acc = ldm py:vx, j_rest:f32
@@ -549,55 +544,72 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     ret
 
 # xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
+# At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
+# sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
 fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   b0:
+    w = vl f32
     nb = udiv k, 32:i64
     zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    abs_bits = cst 2147483647:i32
+    v_abs = splat abs_bits:vx
+    sign_bits = cst -2147483648:i32
+    v_sign = splat sign_bits:vx
+    half = cst 0.5:f32
+    v_half = splat half:vx
     jmp blocks(0:i64)
   blocks(b:i64):
     b_more = lt b, nb
     br b_more, block_start, done
   block_start:
     base = mul b, 32:i64
-    jmp amax(0:i64, zf)
-  amax(t:i64, a:f32):
+    base4 = mul base, 4:i64
+    bx = add x, base4
+    jmp amax(0:i64, v_zero)
+  amax(t:i64, a:vx):
     t_more = lt t, 32:i64
     br t_more, amax_body, scale
   amax_body:
-    i = add base, t
-    off = mul i, 4:i64
-    px = add x, off
-    v = ld px:f32
-    av = abs v
-    a2 = max a, av
-    t2 = add t, 1:i64
+    rest = sub 32:i64, t
+    to = mul t, 4:i64
+    pv = add bx, to
+    v = ldm pv:vx, rest:f32
+    av = vand v, v_abs:i32
+    a2 = vmax a, av:f32
+    t2 = add t, w
     jmp amax(t2, a2)
   scale:
-    d = div a, 127.0:f32
+    am = vmaxr a:f32
+    d = div am, 127.0:f32
     pos = gt d, zf
     inv = div 1.0:f32, d
     id = select pos, inv, zf
     b_off = mul b, 4:i64
     pd = add dx, b_off
     st pd, d
+    v_id = splat id:vx
     jmp quant(0:i64)
   quant(s:i64):
     s_more = lt s, 32:i64
     br s_more, quant_body, block_next
   quant_body:
-    j = add base, s
-    j_off = mul j, 4:i64
-    pj = add x, j_off
-    xj = ld pj:f32
-    sv = mul xj, id
-    nonneg = ge sv, zf
-    half = select nonneg, 0.5:f32, -0.5:f32
-    rv = add sv, half
-    q32 = ftoi rv:i32
-    q = trunc q32:i8
-    pq = add xq, j
-    st pq, q
-    s2 = add s, 1:i64
+    rest_q = sub 32:i64, s
+    so = mul s, 4:i64
+    pq_in = add bx, so
+    xv = ldm pq_in:vx, rest_q:f32
+    sv = vmul xv, v_id:f32
+    sgn = vand sv, v_sign:i32
+    hv = vor sgn, v_half:i32
+    rv = vadd sv, hv:f32
+    qi = vftoi rv:i32
+    q16 = vnarrow qi, qi:i16
+    q8 = vnarrow q16, q16:i8
+    q_off = add base, s
+    po = add xq, q_off
+    cnt = min rest_q, w
+    stm po, q8, cnt:i8
+    s2 = add s, w
     jmp quant(s2)
   block_next:
     b2 = add b, 1:i64
@@ -646,38 +658,8 @@ fn exp_shift(p:ptr, n:i64, shift:f32)->f32
   b0:
     w = vl f32
     v_shift = splat shift:vx
-    one = cst 1.0:f32
-    v_one = splat one:vx
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    lo = cst -87.0:f32
-    v_lo = splat lo:vx
-    hi = cst 88.0:f32
-    v_hi = splat hi:vx
-    log2e = cst 1.44269504088896341:f32
-    v_log2e = splat log2e:vx
-    magic = cst 12582912.0:f32
-    v_magic = splat magic:vx
-    ln2_hi = cst -0.693359375:f32
-    v_ln2_hi = splat ln2_hi:vx
-    ln2_lo = cst 0.000212194440:f32
-    v_ln2_lo = splat ln2_lo:vx
-    p0 = cst 0.00019875691500:f32
-    v_p0 = splat p0:vx
-    p1 = cst 0.0013981999507:f32
-    v_p1 = splat p1:vx
-    p2 = cst 0.0083334519073:f32
-    v_p2 = splat p2:vx
-    p3 = cst 0.041665795894:f32
-    v_p3 = splat p3:vx
-    p4 = cst 0.16666665459:f32
-    v_p4 = splat p4:vx
-    p5 = cst 0.50000001201:f32
-    v_p5 = splat p5:vx
-    bias = cst -1262485377:i32
-    v_bias = splat bias:vx
-    pow23 = cst 8388608:i32
-    v_pow23 = splat pow23:vx
     jmp loop(0:i64)
   loop(i:i64):
     more = lt i, n
@@ -688,28 +670,7 @@ fn exp_shift(p:ptr, n:i64, shift:f32)->f32
     pi = add p, off
     v = ldm pi:vx, rest:f32
     x0 = vsub v, v_shift:f32
-    # Clamp with compare + select (cheaper than vmax/vmin, whose NaN/signed-zero rules are
-    # not needed here).
-    below = vlt x0, v_lo:f32
-    x1 = vsel below, v_lo, x0
-    above = vgt x1, v_hi:f32
-    x = vsel above, v_hi, x1
-    t = vmul x, v_log2e:f32
-    tm = vadd t, v_magic:f32
-    nf = vsub tm, v_magic:f32
-    r0 = vfma nf, v_ln2_hi, x:f32
-    r = vfma nf, v_ln2_lo, r0:f32
-    q0 = vfma v_p0, r, v_p1:f32
-    q1 = vfma q0, r, v_p2:f32
-    q2 = vfma q1, r, v_p3:f32
-    q3 = vfma q2, r, v_p4:f32
-    q4 = vfma q3, r, v_p5:f32
-    r2 = vmul r, r:f32
-    rp = vadd r, v_one:f32
-    pe = vfma q4, r2, rp:f32
-    eb = vadd tm, v_bias:i32
-    scl = vmul eb, v_pow23:i32
-    e = vmul pe, scl:f32
+    e = vexp x0:f32
     stm pi, e, rest:f32
     i2 = add i, w
     jmp loop(i2)
@@ -737,34 +698,6 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
     v_one = splat one:vx
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    lo = cst -87.0:f32
-    v_lo = splat lo:vx
-    hi = cst 88.0:f32
-    v_hi = splat hi:vx
-    log2e = cst 1.44269504088896341:f32
-    v_log2e = splat log2e:vx
-    magic = cst 12582912.0:f32
-    v_magic = splat magic:vx
-    ln2_hi = cst -0.693359375:f32
-    v_ln2_hi = splat ln2_hi:vx
-    ln2_lo = cst 0.000212194440:f32
-    v_ln2_lo = splat ln2_lo:vx
-    p0 = cst 0.00019875691500:f32
-    v_p0 = splat p0:vx
-    p1 = cst 0.0013981999507:f32
-    v_p1 = splat p1:vx
-    p2 = cst 0.0083334519073:f32
-    v_p2 = splat p2:vx
-    p3 = cst 0.041665795894:f32
-    v_p3 = splat p3:vx
-    p4 = cst 0.16666665459:f32
-    v_p4 = splat p4:vx
-    p5 = cst 0.50000001201:f32
-    v_p5 = splat p5:vx
-    bias = cst -1262485377:i32
-    v_bias = splat bias:vx
-    pow23 = cst 8388608:i32
-    v_pow23 = splat pow23:vx
     jmp loop(0:i64)
   loop(i:i64):
     more = lt i, n
@@ -777,27 +710,8 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
     po = add out, off
     g = ldm pg:vx, rest:f32
     u = ldm pu:vx, rest:f32
-    x0 = vsub v_zero, g:f32
-    below = vlt x0, v_lo:f32
-    x1 = vsel below, v_lo, x0
-    above = vgt x1, v_hi:f32
-    x = vsel above, v_hi, x1
-    t = vmul x, v_log2e:f32
-    tm = vadd t, v_magic:f32
-    nf = vsub tm, v_magic:f32
-    r0 = vfma nf, v_ln2_hi, x:f32
-    r = vfma nf, v_ln2_lo, r0:f32
-    q0 = vfma v_p0, r, v_p1:f32
-    q1 = vfma q0, r, v_p2:f32
-    q2 = vfma q1, r, v_p3:f32
-    q3 = vfma q2, r, v_p4:f32
-    q4 = vfma q3, r, v_p5:f32
-    r2 = vmul r, r:f32
-    rp = vadd r, v_one:f32
-    p = vfma q4, r2, rp:f32
-    eb = vadd tm, v_bias:i32
-    scale = vmul eb, v_pow23:i32
-    e = vmul p, scale:f32
+    ng = vsub v_zero, g:f32
+    e = vexp ng:f32
     den = vadd e, v_one:f32
     gu = vmul g, u:f32
     y = vdiv gu, den:f32

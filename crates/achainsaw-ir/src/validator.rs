@@ -130,6 +130,22 @@ pub const MM_DTYPES: &[Type] = &[Type::BF16, Type::F16, Type::I8, Type::F32];
 /// Lane types supported by `vfma`.
 pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
 
+/// Result lane types each one-operand vector op supports.
+pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
+    match op {
+        VUnaryOp::Itof => &[Type::F32],
+        VUnaryOp::Ftoi => &[Type::I32],
+        VUnaryOp::WidenLo | VUnaryOp::WidenHi => &[Type::I16, Type::I32, Type::I64],
+        VUnaryOp::Exp => &[Type::F32],
+    }
+}
+
+/// Result lane types of `vnarrow` (from i16 and i32 lanes).
+pub const VNARROW_LANE_TYPES: &[Type] = &[Type::I8, Type::I16];
+
+/// Lane types of `vshl`, `vshr` and `vushr`.
+pub const VSHIFT_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::I32, Type::I64];
+
 fn lane_list(types: &[Type]) -> String {
     types
         .iter()
@@ -155,10 +171,12 @@ fn check_signature_type(
         )
         .with_context(serde_json::json!({ "function": func })));
     }
-    if ty == Type::Vx {
+    // AIR functions may take and return `vx` (only AIR code can call functions with vector
+    // signatures); a C function cannot, since `vx`'s width depends on the backend and CPU.
+    if is_extern && ty == Type::Vx {
         return Err(Diagnostic::error(
             "ERR_SCALABLE_IN_SIGNATURE",
-            format!("Function '{func}' uses 'vx' in its signature; scalable vectors cannot be passed or returned, pass a pointer instead"),
+            format!("External function '{func}' uses 'vx' in its signature; its width depends on the backend and CPU, so C functions cannot take or return it, pass a pointer instead"),
             span,
         )
         .with_context(serde_json::json!({ "function": func })));
@@ -999,6 +1017,52 @@ impl Validator {
                     )?;
                 }
                 Self::check_lane("mm", *dtype, MM_DTYPES, *span)?;
+            }
+            Instruction::VUnary {
+                op,
+                dst,
+                src,
+                lane,
+                span,
+            } => {
+                Self::check_lane(op.as_str(), *lane, vunary_lane_types(*op), *span)?;
+                let vec_ty = self.check_vector(ctx, src, scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VNarrow {
+                dst,
+                lo,
+                hi,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vnarrow", *lane, VNARROW_LANE_TYPES, *span)?;
+                let vec_ty = self.check_same_vectors(ctx, "vnarrow", &[lo, hi], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VShift {
+                op,
+                dst,
+                src,
+                amount,
+                lane,
+                span,
+            } => {
+                Self::check_lane(op.as_str(), *lane, VSHIFT_LANE_TYPES, *span)?;
+                let vec_ty = self.check_vector(ctx, src, scope, *span)?;
+                let amount_ty = self.check_reg(ctx, amount, scope, *span)?;
+                if !amount_ty.is_int() {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!(
+                            "'{}' shift amount '{amount}' must be a scalar integer, found '{amount_ty}'",
+                            op.as_str()
+                        ),
+                        *span,
+                    )
+                    .with_context(serde_json::json!({ "target": amount, "found": amount_ty.as_str() })));
+                }
+                Self::define(scope, defs, dst, vec_ty, *span)?;
             }
             Instruction::VLen { dst, lane, span } => {
                 Self::check_lane("vl", *lane, ALL_LANES, *span)?;

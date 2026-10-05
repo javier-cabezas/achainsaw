@@ -85,7 +85,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Type | Width | Notes |
 |---|---|---|
 | `v128`, `v256`, `v512` | 128/256/512 bits | Fixed width; usable in AIR function signatures |
-| `vx` | Target maximum (at least 128 bits) | Scalable; `n = vl f32` gives its lane count. Not allowed in signatures |
+| `vx` | Target maximum (at least 128 bits) | Scalable; `n = vl f32` gives its lane count. Usable in AIR function signatures, not in `extfn` ones |
 
 | Op | Syntax | Lane types |
 |---|---|---|
@@ -98,6 +98,10 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
 | Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
 | Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
+| Convert | `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN to 0); like scalar casts, the suffix is the result lane type | f32, i32 |
+| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half | widen: i16, i32, i64; narrow: i8, i16 |
+| Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, taken modulo the lane width | i8 to i64 |
+| Exponential | `e = vexp v:f32`: e^x within 2 ulp on [-87, 88], inputs clamped to that range, NaN propagated; a fixed algorithm, so results are bit-identical on every backend | f32 |
 | Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
 | Lane count | `n = vl f32` | Any |
 

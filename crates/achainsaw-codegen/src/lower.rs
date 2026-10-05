@@ -1,6 +1,6 @@
 use achainsaw_ir::ast::{
-    BinaryOp, CastOp, Constant, Function, Instruction, Terminator, UnaryOp, VBinOp, VCmpOp,
-    VectorReduceOp,
+    vexp, BinaryOp, CastOp, Constant, Function, Instruction, Terminator, UnaryOp, VBinOp, VCmpOp,
+    VShiftOp, VUnaryOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
@@ -486,6 +486,106 @@ fn flat_args(values: &Values, names: &[String]) -> Vec<ClifValue> {
         .iter()
         .flat_map(|n| values[n].0.iter().copied())
         .collect()
+}
+
+/// `VUnary` on the 128-bit parts of a vector. Conversions and `vexp` work part by part;
+/// widening reads the low or high half of the parts, each source part giving two results.
+fn vunary_parts(
+    builder: &mut FunctionBuilder,
+    op: VUnaryOp,
+    lane: Type,
+    src: &[ClifValue],
+) -> Parts {
+    match op {
+        VUnaryOp::Itof | VUnaryOp::Ftoi | VUnaryOp::Exp => src
+            .iter()
+            .map(|&p| {
+                let r = match op {
+                    VUnaryOp::Itof => {
+                        let x = as_lanes(builder, p, Type::I32);
+                        builder.ins().fcvt_from_sint(types::F32X4, x)
+                    }
+                    VUnaryOp::Ftoi => {
+                        let x = as_lanes(builder, p, Type::F32);
+                        builder.ins().fcvt_to_sint_sat(types::I32X4, x)
+                    }
+                    _ => {
+                        let x = as_lanes(builder, p, Type::F32);
+                        vexp_f32x4(builder, x)
+                    }
+                };
+                to_part(builder, r)
+            })
+            .collect(),
+        VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+            let narrow = op.source_lane(lane);
+            let lo = op == VUnaryOp::WidenLo;
+            if src.len() == 1 {
+                let x = as_lanes(builder, src[0], narrow);
+                let r = if lo {
+                    builder.ins().swiden_low(x)
+                } else {
+                    builder.ins().swiden_high(x)
+                };
+                return vec![to_part(builder, r)];
+            }
+            let half = src.len() / 2;
+            let range = if lo { 0..half } else { half..src.len() };
+            let mut out = Vec::with_capacity(src.len());
+            for &p in &src[range] {
+                let x = as_lanes(builder, p, narrow);
+                let l = builder.ins().swiden_low(x);
+                let h = builder.ins().swiden_high(x);
+                out.push(to_part(builder, l));
+                out.push(to_part(builder, h));
+            }
+            out
+        }
+    }
+}
+
+/// `vexp` on four f32 lanes: e^clamp(x, -87, 88) by the fixed sequence AIR defines (also in
+/// the LLVM backend, so results are bit-identical): n = round(x log2 e) by adding and
+/// subtracting 1.5 * 2^23, r = x - n ln2 with ln2 in two parts, the Cephes expf polynomial
+/// p(r) by FMAs, and 2^n built from the bits of the rounded sum.
+fn vexp_f32x4(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
+    let fsplat = |b: &mut FunctionBuilder, v: f32| {
+        let c = b.ins().f32const(v);
+        b.ins().splat(types::F32X4, c)
+    };
+    let lo = fsplat(builder, vexp::CLAMP_LO);
+    let hi = fsplat(builder, vexp::CLAMP_HI);
+    let below = builder.ins().fcmp(FloatCC::LessThan, x, lo);
+    let below = to_part(builder, below);
+    let x = builder.ins().bitselect(below, lo, x);
+    let above = builder.ins().fcmp(FloatCC::GreaterThan, x, hi);
+    let above = to_part(builder, above);
+    let x = builder.ins().bitselect(above, hi, x);
+    let log2e = fsplat(builder, vexp::LOG2E);
+    let magic = fsplat(builder, vexp::MAGIC);
+    let t = builder.ins().fmul(x, log2e);
+    let tm = builder.ins().fadd(t, magic);
+    let n = builder.ins().fsub(tm, magic);
+    let ln2_hi = fsplat(builder, vexp::NEG_LN2_HI);
+    let ln2_lo = fsplat(builder, vexp::LN2_LO);
+    let r = builder.ins().fma(n, ln2_hi, x);
+    let r = builder.ins().fma(n, ln2_lo, r);
+    let mut q = fsplat(builder, vexp::POLY[0]);
+    for &c in &vexp::POLY[1..] {
+        let c = fsplat(builder, c);
+        q = builder.ins().fma(q, r, c);
+    }
+    let r2 = builder.ins().fmul(r, r);
+    let one = fsplat(builder, 1.0);
+    let rp = builder.ins().fadd(r, one);
+    let p = builder.ins().fma(q, r2, rp);
+    let bits = builder.ins().bitcast(types::I32X4, bitcast_flags(), tm);
+    let bias = builder.ins().iconst(types::I32, vexp::EXP_BIAS as i64);
+    let bias = builder.ins().splat(types::I32X4, bias);
+    let e = builder.ins().iadd(bits, bias);
+    let e = builder.ins().ishl_imm_u(e, 23);
+    let scale = builder.ins().bitcast(types::F32X4, bitcast_flags(), e);
+    builder.ins().fmul(p, scale)
 }
 
 /// Combines two lane values for a horizontal reduction.
@@ -1954,6 +2054,61 @@ pub fn lower_function<M: ClifModule>(
                         builder.ins().brif(failed, trap, &[], cont, &[]);
                         builder.switch_to_block(cont);
                     }
+                }
+                Instruction::VUnary {
+                    op, dst, src, lane, ..
+                } => {
+                    let (src_parts, vec_ty) = parts(&values, src);
+                    let out = vunary_parts(&mut builder, *op, *lane, &src_parts);
+                    values.insert(dst.clone(), (out, vec_ty));
+                }
+                Instruction::VNarrow {
+                    dst, lo, hi, lane, ..
+                } => {
+                    let (lo_parts, vec_ty) = parts(&values, lo);
+                    let (hi_parts, _) = parts(&values, hi);
+                    let wide = if *lane == Type::I8 {
+                        Type::I16
+                    } else {
+                        Type::I32
+                    };
+                    // lo's lanes, then hi's, two narrowed parts packed into each result part.
+                    let all: Vec<ClifValue> = lo_parts.into_iter().chain(hi_parts).collect();
+                    let out = all
+                        .chunks(2)
+                        .map(|pair| {
+                            let x = as_lanes(&mut builder, pair[0], wide);
+                            let y = as_lanes(&mut builder, pair[1], wide);
+                            let r = builder.ins().snarrow(x, y);
+                            to_part(&mut builder, r)
+                        })
+                        .collect();
+                    values.insert(dst.clone(), (out, vec_ty));
+                }
+                Instruction::VShift {
+                    op,
+                    dst,
+                    src,
+                    amount,
+                    lane,
+                    ..
+                } => {
+                    let (src_parts, vec_ty) = parts(&values, src);
+                    let (n, _) = scalar(&values, amount);
+                    // Vector shifts take the amount modulo the lane width, as AIR defines.
+                    let out = src_parts
+                        .into_iter()
+                        .map(|p| {
+                            let x = as_lanes(&mut builder, p, *lane);
+                            let r = match op {
+                                VShiftOp::Shl => builder.ins().ishl(x, n),
+                                VShiftOp::Shr => builder.ins().sshr(x, n),
+                                VShiftOp::Ushr => builder.ins().ushr(x, n),
+                            };
+                            to_part(&mut builder, r)
+                        })
+                        .collect();
+                    values.insert(dst.clone(), (out, vec_ty));
                 }
                 Instruction::VLen { dst, lane, .. } => {
                     let lanes = VECTOR_PART_BITS / lane.bit_width().unwrap_or(32);

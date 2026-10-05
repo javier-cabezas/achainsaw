@@ -11,10 +11,7 @@
 #   scales + c * (k/32) * 256:  their scales ([k/32 x 64] f32)
 # so each chunk is contiguous and one `par` task computes it: per block, one i8 `mm`
 # [1 x 32] . [32 x 64] gives the 64 int32 dots (AMX, SME, vector or Cranelift tiles), which
-# are converted to f32 and accumulated into y.
-#
-# Vectors are untyped bits: an int32 lane p with |p| < 2^22 converts to f32 as
-# bits(p + 0x4B400000) - 1.5 * 2^23 (a block's dot is at most 32 * 127 * 127 < 2^19).
+# are converted to f32 (vitof) and accumulated into y.
 fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
     nb = udiv k, 32:i64
@@ -29,55 +26,72 @@ fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
     ret
 
 # xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
+# At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
+# sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
 fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   b0:
+    w = vl f32
     nb = udiv k, 32:i64
     zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    abs_bits = cst 2147483647:i32
+    v_abs = splat abs_bits:vx
+    sign_bits = cst -2147483648:i32
+    v_sign = splat sign_bits:vx
+    half = cst 0.5:f32
+    v_half = splat half:vx
     jmp blocks(0:i64)
   blocks(b:i64):
     b_more = lt b, nb
     br b_more, block_start, done
   block_start:
     base = mul b, 32:i64
-    jmp amax(0:i64, zf)
-  amax(t:i64, a:f32):
+    base4 = mul base, 4:i64
+    bx = add x, base4
+    jmp amax(0:i64, v_zero)
+  amax(t:i64, a:vx):
     t_more = lt t, 32:i64
     br t_more, amax_body, scale
   amax_body:
-    i = add base, t
-    off = mul i, 4:i64
-    px = add x, off
-    v = ld px:f32
-    av = abs v
-    a2 = max a, av
-    t2 = add t, 1:i64
+    rest = sub 32:i64, t
+    to = mul t, 4:i64
+    pv = add bx, to
+    v = ldm pv:vx, rest:f32
+    av = vand v, v_abs:i32
+    a2 = vmax a, av:f32
+    t2 = add t, w
     jmp amax(t2, a2)
   scale:
-    d = div a, 127.0:f32
+    am = vmaxr a:f32
+    d = div am, 127.0:f32
     pos = gt d, zf
     inv = div 1.0:f32, d
     id = select pos, inv, zf
     b_off = mul b, 4:i64
     pd = add dx, b_off
     st pd, d
+    v_id = splat id:vx
     jmp quant(0:i64)
   quant(s:i64):
     s_more = lt s, 32:i64
     br s_more, quant_body, block_next
   quant_body:
-    j = add base, s
-    j_off = mul j, 4:i64
-    pj = add x, j_off
-    xj = ld pj:f32
-    sv = mul xj, id
-    nonneg = ge sv, zf
-    half = select nonneg, 0.5:f32, -0.5:f32
-    rv = add sv, half
-    q32 = ftoi rv:i32
-    q = trunc q32:i8
-    pq = add xq, j
-    st pq, q
-    s2 = add s, 1:i64
+    rest_q = sub 32:i64, s
+    so = mul s, 4:i64
+    pq_in = add bx, so
+    xv = ldm pq_in:vx, rest_q:f32
+    sv = vmul xv, v_id:f32
+    sgn = vand sv, v_sign:i32
+    hv = vor sgn, v_half:i32
+    rv = vadd sv, hv:f32
+    qi = vftoi rv:i32
+    q16 = vnarrow qi, qi:i16
+    q8 = vnarrow q16, q16:i8
+    q_off = add base, s
+    po = add xq, q_off
+    cnt = min rest_q, w
+    stm po, q8, cnt:i8
+    s2 = add s, w
     jmp quant(s2)
   block_next:
     b2 = add b, 1:i64
@@ -101,10 +115,6 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     dots = alloc 256:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    magic = cst 12582912.0:f32
-    v_magic = splat magic:vx
-    magic_bits = cst 1262485504:i32
-    v_magic_bits = splat magic_bits:vx
     jmp zero_y(0:i64)
   zero_y(z:i64):
     z_more = lt z, 64:i64
@@ -154,8 +164,7 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     ps = add sb, j_off
     py = add yc, j_off
     p = ldm pp:vx, j_rest:i32
-    pb = vadd p, v_magic_bits:i32
-    pf = vsub pb, v_magic:f32
+    pf = vitof p:f32
     s = ldm ps:vx, j_rest:f32
     ds = vmul s, vd:f32
     acc = ldm py:vx, j_rest:f32
