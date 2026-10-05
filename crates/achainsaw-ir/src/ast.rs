@@ -268,6 +268,105 @@ impl CastOp {
     }
 }
 
+/// Lane-wise vector op with one operand. Like scalar casts, the suffix names the result lane
+/// type: `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN
+/// to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends the low / high half of the
+/// narrower lanes), `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VUnaryOp {
+    Itof,
+    Ftoi,
+    WidenLo,
+    WidenHi,
+    Exp,
+}
+
+impl VUnaryOp {
+    pub const ALL: [VUnaryOp; 5] = [
+        VUnaryOp::Itof,
+        VUnaryOp::Ftoi,
+        VUnaryOp::WidenLo,
+        VUnaryOp::WidenHi,
+        VUnaryOp::Exp,
+    ];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VUnaryOp::Itof => "vitof",
+            VUnaryOp::Ftoi => "vftoi",
+            VUnaryOp::WidenLo => "vwidenlo",
+            VUnaryOp::WidenHi => "vwidenhi",
+            VUnaryOp::Exp => "vexp",
+        }
+    }
+
+    /// Lane type of the operand for result lane type `lane`.
+    pub fn source_lane(&self, lane: Type) -> Type {
+        match (self, lane) {
+            (VUnaryOp::Itof, _) => Type::I32,
+            (VUnaryOp::Ftoi, _) => Type::F32,
+            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I16) => Type::I8,
+            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I32) => Type::I16,
+            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, _) => Type::I32,
+            (VUnaryOp::Exp, _) => Type::F32,
+        }
+    }
+}
+
+/// Constants of `vexp`, shared by every backend so its results are bit-identical:
+/// e^x = 2^n * p(r) with n = round(x log2 e) (by adding and subtracting `MAGIC`),
+/// r = x + n * NEG_LN2_HI + n * LN2_LO, and p the Cephes expf polynomial,
+/// p(r) = 1 + r + r^2 * (((((POLY[0] r + POLY[1]) r + POLY[2]) r + POLY[3]) r + POLY[4]) r + POLY[5]).
+/// Inputs are clamped to [CLAMP_LO, CLAMP_HI] first.
+pub mod vexp {
+    pub const CLAMP_LO: f32 = -87.0;
+    pub const CLAMP_HI: f32 = 88.0;
+    pub const LOG2E: f32 = std::f32::consts::LOG2_E;
+    pub const MAGIC: f32 = 12_582_912.0;
+    // The Cephes expf constants, written as the shortest decimals of their f32 values.
+    pub const NEG_LN2_HI: f32 = -0.693_359_4;
+    pub const LN2_LO: f32 = 0.000_212_194_44;
+    pub const POLY: [f32; 6] = [
+        0.000_198_756_91,
+        0.001_398_199_9,
+        0.008_333_452,
+        0.041_665_796,
+        0.166_666_66,
+        0.5,
+    ];
+    /// Added to the bits of `x log2 e + MAGIC` to get the biased exponent n + 127.
+    pub const EXP_BIAS: i32 = 127 - 0x4B40_0000;
+}
+
+/// Lane-wise shift by a scalar amount, taken modulo the lane width as for scalar shifts:
+/// `r = vshl v, n:i32` (`vshr` arithmetic, `vushr` logical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VShiftOp {
+    Shl,
+    Shr,
+    Ushr,
+}
+
+impl VShiftOp {
+    pub const ALL: [VShiftOp; 3] = [VShiftOp::Shl, VShiftOp::Shr, VShiftOp::Ushr];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VShiftOp::Shl => "vshl",
+            VShiftOp::Shr => "vshr",
+            VShiftOp::Ushr => "vushr",
+        }
+    }
+}
+
 /// Horizontal reduction of all lanes to a scalar of the lane type: `s = vsum v:f32`.
 ///
 /// Lanes are combined as a recursive-halves tree: `reduce(v) = op(reduce(lo), reduce(hi))`,
@@ -426,6 +525,33 @@ pub enum Instruction {
         else_val: String,
         span: Span,
     },
+    /// One-operand lane-wise op (`vitof`, `vftoi`, `vwidenlo`, `vwidenhi`, `vexp`); `lane` is
+    /// the result lane type.
+    VUnary {
+        op: VUnaryOp,
+        dst: String,
+        src: String,
+        lane: Type,
+        span: Span,
+    },
+    /// `r = vnarrow lo, hi:i8`: both operands' lanes narrowed to `lane` with signed
+    /// saturation, `lo`'s in the low half of the result and `hi`'s in the high half.
+    VNarrow {
+        dst: String,
+        lo: String,
+        hi: String,
+        lane: Type,
+        span: Span,
+    },
+    /// Lane-wise shift of `src` by the scalar `amount` (see `VShiftOp`).
+    VShift {
+        op: VShiftOp,
+        dst: String,
+        src: String,
+        amount: String,
+        lane: Type,
+        span: Span,
+    },
     /// Lane count of `vx` for `lane` (`n = vl f32`), as an i64.
     VLen {
         dst: String,
@@ -484,6 +610,9 @@ impl Instruction {
             | Instruction::VCmp { dst, .. }
             | Instruction::VSelect { dst, .. }
             | Instruction::VLen { dst, .. }
+            | Instruction::VUnary { dst, .. }
+            | Instruction::VNarrow { dst, .. }
+            | Instruction::VShift { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => Some(dst),
             Instruction::Call { dst, .. } => dst.as_deref(),
             Instruction::Store { .. }
@@ -508,7 +637,10 @@ impl Instruction {
             Instruction::Splat { src, .. }
             | Instruction::Unary { src, .. }
             | Instruction::Cast { src, .. }
+            | Instruction::VUnary { src, .. }
             | Instruction::VectorReduce { src, .. } => vec![src],
+            Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
+            Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } => vec![vec],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
@@ -556,7 +688,10 @@ impl Instruction {
             Instruction::Splat { src, .. }
             | Instruction::Unary { src, .. }
             | Instruction::Cast { src, .. }
+            | Instruction::VUnary { src, .. }
             | Instruction::VectorReduce { src, .. } => vec![src],
+            Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
+            Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } => vec![vec],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {

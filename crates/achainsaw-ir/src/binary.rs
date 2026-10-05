@@ -299,6 +299,26 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("par {count}, {func}({})", args.join(", ")));
                     }
+                    Instruction::VUnary {
+                        op, dst, src, lane, ..
+                    } => {
+                        out.push_str(&format!("{dst} = {} {src}:{lane}", op.as_str()));
+                    }
+                    Instruction::VNarrow {
+                        dst, lo, hi, lane, ..
+                    } => {
+                        out.push_str(&format!("{dst} = vnarrow {lo}, {hi}:{lane}"));
+                    }
+                    Instruction::VShift {
+                        op,
+                        dst,
+                        src,
+                        amount,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = {} {src}, {amount}:{lane}", op.as_str()));
+                    }
                 }
                 out.push('\n');
             }
@@ -807,6 +827,36 @@ impl BinaryEncoder {
                 self.buf.push(0x27);
                 self.buf.push(encode_type(*dtype));
                 self.push_regs(&[pc, pa, pb, m, n, k]);
+            }
+            Instruction::VUnary {
+                op, dst, src, lane, ..
+            } => {
+                self.buf.push(0x29);
+                self.buf
+                    .push(VUnaryOp::ALL.iter().position(|o| o == op).unwrap() as u8);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, src]);
+            }
+            Instruction::VNarrow {
+                dst, lo, hi, lane, ..
+            } => {
+                self.buf.push(0x2A);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, lo, hi]);
+            }
+            Instruction::VShift {
+                op,
+                dst,
+                src,
+                amount,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x2B);
+                self.buf
+                    .push(VShiftOp::ALL.iter().position(|o| o == op).unwrap() as u8);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, src, amount]);
             }
             Instruction::Par {
                 count, func, args, ..
@@ -1336,6 +1386,43 @@ impl<'a> BinaryDecoder<'a> {
                     n: self.read_string()?,
                     k: self.read_string()?,
                     dtype,
+                    span,
+                })
+            }
+            0x29 => {
+                let op = *VUnaryOp::ALL
+                    .get(self.read_u8()? as usize)
+                    .ok_or_else(|| self.err("Invalid vector unary op in AIRB"))?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VUnary {
+                    op,
+                    dst: self.read_string()?,
+                    src: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x2A => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VNarrow {
+                    dst: self.read_string()?,
+                    lo: self.read_string()?,
+                    hi: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x2B => {
+                let op = *VShiftOp::ALL
+                    .get(self.read_u8()? as usize)
+                    .ok_or_else(|| self.err("Invalid vector shift op in AIRB"))?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VShift {
+                    op,
+                    dst: self.read_string()?,
+                    src: self.read_string()?,
+                    amount: self.read_string()?,
+                    lane,
                     span,
                 })
             }

@@ -11,10 +11,12 @@
 
 use achainsaw_codegen::cpu::{CpuFeatures, IsaLevel};
 use achainsaw_codegen::{AotCompiler, AotTarget, JitEngine};
-use achainsaw_ir::ast::{VBinOp, VCmpOp, VectorReduceOp};
+use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VectorReduceOp};
 use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
-use achainsaw_ir::validator::{vbin_lane_types, VFMA_LANE_TYPES};
+use achainsaw_ir::validator::{
+    vbin_lane_types, vunary_lane_types, VFMA_LANE_TYPES, VNARROW_LANE_TYPES, VSHIFT_LANE_TYPES,
+};
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
 const LANES: [Type; 6] = [
@@ -47,6 +49,11 @@ enum Kernel {
     Sel(Type),
     Reduce(VectorReduceOp, Type, Type),
     Splat(Type, Type),
+    /// Result lane type, width.
+    Unary(VUnaryOp, Type, Type),
+    Narrow(Type, Type),
+    /// Shift amount: the i32 at `pc`.
+    Shift(VShiftOp, Type, Type),
 }
 
 impl Kernel {
@@ -58,6 +65,9 @@ impl Kernel {
             Kernel::Sel(w) => format!("k_vsel_{w}"),
             Kernel::Reduce(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Splat(l, w) => format!("k_splat_{l}_{w}"),
+            Kernel::Unary(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
+            Kernel::Narrow(l, w) => format!("k_vnarrow_{l}_{w}"),
+            Kernel::Shift(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
         }
     }
 
@@ -71,6 +81,12 @@ impl Kernel {
             Kernel::Sel(w) => format!("{}    r = vsel c, a, b\n", loads(*w)),
             Kernel::Reduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
             Kernel::Splat(l, w) => format!("    s = ld pa:{l}\n    r = splat s:{w}\n"),
+            Kernel::Unary(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
+            Kernel::Narrow(l, w) => format!("{}    r = vnarrow a, b:{l}\n", loads(*w)),
+            Kernel::Shift(op, l, w) => format!(
+                "    a = ld pa:{w}\n    n = ld pc:i32\n    r = {} a, n:{l}\n",
+                op.as_str()
+            ),
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
@@ -84,8 +100,20 @@ impl Kernel {
             | Kernel::Cmp(_, l, _)
             | Kernel::Fma(l, _)
             | Kernel::Reduce(_, l, _)
-            | Kernel::Splat(l, _) => *l,
+            | Kernel::Splat(l, _)
+            | Kernel::Unary(_, l, _)
+            | Kernel::Narrow(l, _)
+            | Kernel::Shift(_, l, _) => *l,
             Kernel::Sel(_) => Type::I8,
+        }
+    }
+
+    /// Lane type of the operands (the result lane type `lane()` for most ops).
+    fn input_lane(&self) -> Type {
+        match self {
+            Kernel::Unary(op, l, _) => op.source_lane(*l),
+            Kernel::Narrow(l, _) => wide_of(*l),
+            _ => self.lane(),
         }
     }
 
@@ -96,7 +124,10 @@ impl Kernel {
             | Kernel::Fma(_, w)
             | Kernel::Sel(w)
             | Kernel::Reduce(_, _, w)
-            | Kernel::Splat(_, w) => *w,
+            | Kernel::Splat(_, w)
+            | Kernel::Unary(_, _, w)
+            | Kernel::Narrow(_, w)
+            | Kernel::Shift(_, _, w) => *w,
         }
     }
 
@@ -112,8 +143,10 @@ impl Kernel {
     fn float_output(&self) -> bool {
         match self {
             Kernel::Bin(op, l, _) => l.is_float() && !op.is_bitwise(),
-            Kernel::Fma(..) | Kernel::Reduce(..) | Kernel::Splat(..) => self.lane().is_float(),
-            Kernel::Cmp(..) | Kernel::Sel(..) => false,
+            Kernel::Fma(..) | Kernel::Reduce(..) | Kernel::Splat(..) | Kernel::Unary(..) => {
+                self.lane().is_float()
+            }
+            Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Narrow(..) | Kernel::Shift(..) => false,
         }
     }
 }
@@ -143,8 +176,56 @@ fn all_kernels() -> Vec<Kernel> {
         for l in LANES {
             ks.push(Kernel::Splat(l, w));
         }
+        for op in VUnaryOp::ALL {
+            for &l in vunary_lane_types(op) {
+                ks.push(Kernel::Unary(op, l, w));
+            }
+        }
+        for &l in VNARROW_LANE_TYPES {
+            ks.push(Kernel::Narrow(l, w));
+        }
+        for op in VShiftOp::ALL {
+            for &l in VSHIFT_LANE_TYPES {
+                ks.push(Kernel::Shift(op, l, w));
+            }
+        }
     }
     ks
+}
+
+/// Lane type twice as wide as an integer lane (`vnarrow`'s operands).
+fn wide_of(lane: Type) -> Type {
+    match lane {
+        Type::I8 => Type::I16,
+        _ => Type::I32,
+    }
+}
+
+/// `vexp` as AIR defines it, step by step (see `achainsaw_ir::ast::vexp`).
+fn vexp_ref(x: f32) -> f32 {
+    let x = if x < vexp::CLAMP_LO {
+        vexp::CLAMP_LO
+    } else {
+        x
+    };
+    let x = if x > vexp::CLAMP_HI {
+        vexp::CLAMP_HI
+    } else {
+        x
+    };
+    let tm = x * vexp::LOG2E + vexp::MAGIC;
+    let n = tm - vexp::MAGIC;
+    let r = n.mul_add(vexp::NEG_LN2_HI, x);
+    let r = n.mul_add(vexp::LN2_LO, r);
+    let mut q = vexp::POLY[0];
+    for &c in &vexp::POLY[1..] {
+        q = q.mul_add(r, c);
+    }
+    let p = q.mul_add(r * r, r + 1.0);
+    let e = (tm.to_bits() as i32)
+        .wrapping_add(vexp::EXP_BIAS)
+        .wrapping_shl(23);
+    p * f32::from_bits(e as u32)
 }
 
 fn module_source(kernels: &[Kernel]) -> String {
@@ -352,6 +433,60 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             let s = l.byte_size();
             for i in 0..n {
                 out[i * s..i * s + s].copy_from_slice(&a[..s]);
+            }
+        }
+        Kernel::Unary(op, l, _) => match op {
+            VUnaryOp::Itof => {
+                for i in 0..n {
+                    let r = get_int(a, Type::I32, i) as f32;
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            // Saturating, NaN to 0, exactly as Rust's `as`.
+            VUnaryOp::Ftoi => {
+                (0..n).for_each(|i| put_int(&mut out, l, i, get_f32(a, i) as i32 as i64))
+            }
+            VUnaryOp::Exp => {
+                for i in 0..n {
+                    let r = vexp_ref(get_f32(a, i));
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+                let narrow = op.source_lane(l);
+                let base = if op == VUnaryOp::WidenLo { 0 } else { n };
+                for i in 0..n {
+                    put_int(&mut out, l, i, get_int(a, narrow, base + i));
+                }
+            }
+        },
+        Kernel::Narrow(l, _) => {
+            let wide = wide_of(l);
+            let half = w / wide.byte_size();
+            let bits = l.bit_width().unwrap();
+            let (min, max) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
+            for i in 0..half {
+                put_int(&mut out, l, i, get_int(a, wide, i).clamp(min, max));
+                put_int(&mut out, l, half + i, get_int(b, wide, i).clamp(min, max));
+            }
+        }
+        Kernel::Shift(op, l, _) => {
+            let bits = l.bit_width().unwrap() as u64;
+            let amount =
+                (i32::from_le_bytes(c[..4].try_into().unwrap()) as u64 & (bits - 1)) as u32;
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            for i in 0..n {
+                let x = get_int(a, l, i);
+                let r = match op {
+                    VShiftOp::Shl => x.wrapping_shl(amount),
+                    VShiftOp::Shr => x >> amount,
+                    VShiftOp::Ushr => ((x as u64 & mask) >> amount) as i64,
+                };
+                put_int(&mut out, l, i, l.wrap_int(r));
             }
         }
     }
@@ -575,9 +710,9 @@ fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeature
             let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
             for trial in 0..TRIALS {
                 let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.lane(), &mut rng, trial);
-                fill(&mut b, k.lane(), &mut rng, trial + 1);
-                fill(&mut c, k.lane(), &mut rng, trial + 2);
+                fill(&mut a, k.input_lane(), &mut rng, trial);
+                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
                 if trial == 1 {
                     b = a; // exercise equal operands (min/max of equal values, x - x)
                 }
@@ -783,9 +918,9 @@ fn fixed_width_vector_ops_agree_across_backends() {
             let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
             for trial in 0..TRIALS {
                 let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.lane(), &mut rng, trial);
-                fill(&mut b, k.lane(), &mut rng, trial + 1);
-                fill(&mut c, k.lane(), &mut rng, trial + 2);
+                fill(&mut a, k.input_lane(), &mut rng, trial);
+                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
                 let outs: Vec<[u8; BUF]> = engines
                     .iter()
                     .map(|e| {
@@ -805,5 +940,114 @@ fn fixed_width_vector_ops_agree_across_backends() {
                 );
             }
         }
+    }
+}
+
+/// `vexp`'s fixed algorithm is accurate: within 2 ulp of e^x over its whole range (the
+/// reference model above is what both backends match bit for bit), with NaN propagated and
+/// inputs past the clamp mapped to the endpoints.
+#[test]
+fn vexp_is_accurate() {
+    let ulps = |got: f32, want: f64| {
+        let w = want as f32;
+        (got.to_bits() as i64 - w.to_bits() as i64).unsigned_abs()
+    };
+    let (lo, hi) = (vexp::CLAMP_LO as f64, vexp::CLAMP_HI as f64);
+    let steps = 2_000_000;
+    let mut worst = (0u64, 0f32);
+    for i in 0..=steps {
+        let x = (lo + (hi - lo) * i as f64 / steps as f64) as f32;
+        let e = ulps(vexp_ref(x), (x as f64).exp());
+        if e > worst.0 {
+            worst = (e, x);
+        }
+    }
+    assert!(
+        worst.0 <= 2,
+        "vexp is {} ulp off at x = {}",
+        worst.0,
+        worst.1
+    );
+    assert!(vexp_ref(f32::NAN).is_nan());
+    assert_eq!(vexp_ref(f32::INFINITY), vexp_ref(vexp::CLAMP_HI));
+    assert_eq!(vexp_ref(f32::NEG_INFINITY), vexp_ref(vexp::CLAMP_LO));
+    assert_eq!(vexp_ref(0.0), 1.0);
+}
+
+/// A `vx` helper (SwiGLU's gate on full vectors) called from a loop: vx values cross calls
+/// as arguments and results, on both backends, and compile for every target including SVE.
+const VX_HELPER: &str = r#"
+fn silu_mul(g:vx, u:vx)->vx
+  b0:
+    z = cst 0.0:f32
+    zero = splat z:vx
+    ng = vsub zero, g:f32
+    e = vexp ng:f32
+    one = cst 1.0:f32
+    v_one = splat one:vx
+    den = vadd e, v_one:f32
+    gu = vmul g, u:f32
+    r = vdiv gu, den:f32
+    ret r
+
+fn swiglu(gate:ptr, up:ptr, out:ptr, n:i64)
+  b0:
+    w = vl f32
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    off = mul i, 4:i64
+    pg = add gate, off
+    pu = add up, off
+    po = add out, off
+    g = ldm pg:vx, rest:f32
+    u = ldm pu:vx, rest:f32
+    y = call silu_mul(g, u)
+    stm po, y, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  done:
+    ret
+"#;
+
+#[test]
+fn vx_values_cross_calls() {
+    let module = parse_and_validate(VX_HELPER).expect("valid");
+    for (level, features) in host_levels() {
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.compile_module(&module).unwrap();
+        let f: extern "C" fn(*const f32, *const f32, *mut f32, i64) =
+            unsafe { std::mem::transmute(engine.get_fn_ptr("swiglu").unwrap()) };
+        for n in [1usize, 3, 4, 17, 100] {
+            let g: Vec<f32> = (0..n).map(|i| i as f32 * 0.37 - 9.0).collect();
+            let u: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.01).collect();
+            let mut out = vec![f32::NAN; n + 1];
+            f(g.as_ptr(), u.as_ptr(), out.as_mut_ptr(), n as i64);
+            for i in 0..n {
+                let want = g[i] * u[i] / (vexp_ref(-g[i]) + 1.0);
+                assert_eq!(out[i], want, "n={n} [{i}] at {level}");
+            }
+            assert!(out[n].is_nan(), "wrote past n at {level}");
+        }
+        assert!(unsafe { engine.call_typed("silu_mul", &[]) }.is_err());
+    }
+}
+
+#[cfg(feature = "llvm")]
+#[test]
+fn vx_signatures_compile_for_every_llvm_target() {
+    use achainsaw_codegen::{compile_object, Backend};
+    let module = parse_and_validate(VX_HELPER).expect("valid");
+    for (triple, cpu, features) in LLVM_TARGETS {
+        let target = AotTarget {
+            triple: Some((*triple).into()),
+            cpu: Some((*cpu).into()),
+            features: (!features.is_empty()).then(|| (*features).into()),
+        };
+        compile_object(&module, &target, Backend::Llvm)
+            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
     }
 }

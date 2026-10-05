@@ -543,6 +543,48 @@ impl<'a> Parser<'a> {
                 span,
             });
         }
+        if let Some(op) = VUnaryOp::from_str_opt(name) {
+            let src = self.parse_operand(instructions, None)?;
+            let lane = self.parse_lane_suffix(&format!("{name} v:f32"))?;
+            self.expect_eol()?;
+            return Ok(Instruction::VUnary {
+                op,
+                dst,
+                src,
+                lane,
+                span,
+            });
+        }
+        if let Some(op) = VShiftOp::from_str_opt(name) {
+            let src = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            // A literal amount defaults to i64; `:lane` after it is the lane type.
+            let amount = self.parse_count_operand(instructions)?;
+            let lane = self.parse_lane_suffix(&format!("{name} v, n:i32"))?;
+            self.expect_eol()?;
+            return Ok(Instruction::VShift {
+                op,
+                dst,
+                src,
+                amount,
+                lane,
+                span,
+            });
+        }
+        if name == "vnarrow" {
+            let lo = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let hi = self.parse_operand(instructions, None)?;
+            let lane = self.parse_lane_suffix("vnarrow a, b:i8")?;
+            self.expect_eol()?;
+            return Ok(Instruction::VNarrow {
+                dst,
+                lo,
+                hi,
+                lane,
+                span,
+            });
+        }
         if name == "vsel" {
             let mask = self.parse_operand(instructions, None)?;
             self.expect(TokenKind::Comma)?;

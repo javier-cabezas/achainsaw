@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use achainsaw_ir::ast::{
-    BinaryOp, CastOp, Constant, Function, Instruction, Module, Terminator, UnaryOp, VBinOp, VCmpOp,
-    VectorReduceOp,
+    vexp, BinaryOp, CastOp, Constant, Function, Instruction, Module, Terminator, UnaryOp, VBinOp,
+    VCmpOp, VShiftOp, VUnaryOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
@@ -22,8 +22,8 @@ use inkwell::llvm_sys::LLVMTailCallKind;
 use inkwell::module::{Linkage, Module as LModule};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, VectorType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PhiValue,
-    PointerValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue,
+    PhiValue, PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
@@ -1258,6 +1258,47 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let r = vec2!(mt, me, |x, y| b.build_or(x, y, "")?);
                 st.values.insert(dst.clone(), (r, vty));
             }
+            Instruction::VUnary {
+                op, dst, src, lane, ..
+            } => {
+                let (v, vty) = self.val(st, src);
+                let r = self.vunary(*op, *lane, vty, v)?;
+                st.values.insert(dst.clone(), (r, vty));
+            }
+            Instruction::VNarrow {
+                dst, lo, hi, lane, ..
+            } => {
+                let (lv, vty) = self.val(st, lo);
+                let r = self.vnarrow(*lane, vty, lv, self.val(st, hi).0)?;
+                st.values.insert(dst.clone(), (r, vty));
+            }
+            Instruction::VShift {
+                op,
+                dst,
+                src,
+                amount,
+                lane,
+                ..
+            } => {
+                let (sv, vty) = self.val(st, src);
+                let x = self.as_lanes(sv, vty, *lane)?;
+                // The amount is taken modulo the lane width; LLVM shifts past it are poison.
+                let amt = self.int(st, amount);
+                let masked = b.build_and(
+                    amt,
+                    amt.get_type().const_int(lane_bits(*lane) as u64 - 1, false),
+                    "",
+                )?;
+                let lane_int = self.scalar_type(*lane).into_int_type();
+                let cast = b.build_int_cast_sign_flag(masked, lane_int, false, "")?;
+                let n = self.splat(cast.into(), *lane, vty)?;
+                let r = match op {
+                    VShiftOp::Shl => anyi2!(x, n, |a, c| b.build_left_shift(a, c, "")?),
+                    VShiftOp::Shr => anyi2!(x, n, |a, c| b.build_right_shift(a, c, true, "")?),
+                    VShiftOp::Ushr => anyi2!(x, n, |a, c| b.build_right_shift(a, c, false, "")?),
+                };
+                st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
+            }
             Instruction::VLen { dst, lane, .. } => {
                 let n = self.lanes_value(Type::Vx, *lane)?;
                 st.values.insert(dst.clone(), (n.into(), Type::I64));
@@ -1857,6 +1898,154 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             other => unreachable!("{other:?}"),
         };
         self.to_canon(m, vty)
+    }
+
+    /// `VUnary` (conversions name the result lane type, as in `VUnaryOp::source_lane`).
+    fn vunary(
+        &self,
+        op: VUnaryOp,
+        lane: Type,
+        vty: Type,
+        v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let src_lane = op.source_lane(lane);
+        let x = self.as_lanes(v, vty, src_lane)?;
+        let r = match op {
+            VUnaryOp::Itof => {
+                b.build_cast(InstructionOpcode::SIToFP, x, self.lane_vec(vty, lane), "")?
+            }
+            VUnaryOp::Ftoi => {
+                let rt = self.lane_vec(vty, lane);
+                self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
+            }
+            VUnaryOp::Exp => self.vexp(x)?,
+            VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+                // The low or high half of the lanes (for SVE, the index scales with vscale).
+                let n = self.lanes_min(vty, src_lane);
+                let half_ty = self.vec_of(self.scalar_type(src_lane), n / 2, self.scalable(vty));
+                let at = if op == VUnaryOp::WidenLo { 0 } else { n / 2 };
+                let half = self.intr(
+                    "llvm.vector.extract",
+                    &[half_ty, x.get_type()],
+                    &[x, self.c64(at as i64).into()],
+                )?;
+                b.build_cast(InstructionOpcode::SExt, half, self.lane_vec(vty, lane), "")?
+            }
+        };
+        self.to_canon(r, vty)
+    }
+
+    /// `vnarrow lo, hi:lane`: signed saturation to `lane`, `lo`'s lanes then `hi`'s.
+    fn vnarrow(
+        &self,
+        lane: Type,
+        vty: Type,
+        lo: BasicValueEnum<'ctx>,
+        hi: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let wide = if lane == Type::I8 {
+            Type::I16
+        } else {
+            Type::I32
+        };
+        let (min, max) = if lane == Type::I8 {
+            (i8::MIN as i64, i8::MAX as i64)
+        } else {
+            (i16::MIN as i64, i16::MAX as i64)
+        };
+        let n = self.lanes_min(vty, wide);
+        let half_ty = self.vec_of(self.scalar_type(lane), n, self.scalable(vty));
+        let wide_int = self.scalar_type(wide).into_int_type();
+        let narrow = |v: BasicValueEnum<'ctx>| -> Result<BasicValueEnum<'ctx>> {
+            let x = self.as_lanes(v, vty, wide)?;
+            let shape = Self::shape_of(x);
+            let hi_c = self.splat_const(wide_int.const_int(max as u64, true).into(), shape)?;
+            let lo_c = self.splat_const(wide_int.const_int(min as u64, true).into(), shape)?;
+            let t = self.intr("llvm.smin", &[x.get_type()], &[x, hi_c])?;
+            let t = self.intr("llvm.smax", &[x.get_type()], &[t, lo_c])?;
+            Ok(b.build_cast(InstructionOpcode::Trunc, t, half_ty, "")?)
+        };
+        let (l, h) = (narrow(lo)?, narrow(hi)?);
+        let res_ty = self.lane_vec(vty, lane);
+        let r = self.intr(
+            "llvm.vector.insert",
+            &[res_ty, half_ty],
+            &[res_ty.const_zero(), l, self.c64(0).into()],
+        )?;
+        let r = self.intr(
+            "llvm.vector.insert",
+            &[res_ty, half_ty],
+            &[r, h, self.c64(n as i64).into()],
+        )?;
+        self.to_canon(r, vty)
+    }
+
+    /// Lane-wise select on an `i1` vector mask.
+    fn vselect(
+        &self,
+        mask: BasicValueEnum<'ctx>,
+        then_v: BasicValueEnum<'ctx>,
+        else_v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        Ok(match mask {
+            BasicValueEnum::VectorValue(m) => b.build_select(m, then_v, else_v, "")?,
+            BasicValueEnum::ScalableVectorValue(m) => b.build_select(m, then_v, else_v, "")?,
+            other => unreachable!("vector mask expected, found {other:?}"),
+        })
+    }
+
+    /// `vexp` on f32 lanes: the same operation sequence and constants as the Cranelift
+    /// backend (`achainsaw_ir::ast::vexp`), so results are bit-identical.
+    fn vexp(&self, x: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let shape = Self::shape_of(x);
+        let f = |v: f32| self.splat_const(self.ctx.f32_type().const_float(v as f64).into(), shape);
+        let fma = |a: BasicValueEnum<'ctx>, m: BasicValueEnum<'ctx>, c: BasicValueEnum<'ctx>| {
+            self.intr("llvm.fma", &[a.get_type()], &[a, m, c])
+        };
+        let (lo, hi) = (f(vexp::CLAMP_LO)?, f(vexp::CLAMP_HI)?);
+        let below = vec2!(x, lo, |a, c| b.build_float_compare(
+            FloatPredicate::OLT,
+            a,
+            c,
+            ""
+        )?);
+        let x = self.vselect(below, lo, x)?;
+        let above = vec2!(x, hi, |a, c| b.build_float_compare(
+            FloatPredicate::OGT,
+            a,
+            c,
+            ""
+        )?);
+        let x = self.vselect(above, hi, x)?;
+        let (log2e, magic) = (f(vexp::LOG2E)?, f(vexp::MAGIC)?);
+        let t = anyf2!(x, log2e, |a, c| b.build_float_mul(a, c, "")?);
+        let tm = anyf2!(t, magic, |a, c| b.build_float_add(a, c, "")?);
+        let n = anyf2!(tm, magic, |a, c| b.build_float_sub(a, c, "")?);
+        let r = fma(n, f(vexp::NEG_LN2_HI)?, x)?;
+        let r = fma(n, f(vexp::LN2_LO)?, r)?;
+        let mut q = f(vexp::POLY[0])?;
+        for &c in &vexp::POLY[1..] {
+            q = fma(q, r, f(c)?)?;
+        }
+        let r2 = anyf2!(r, r, |a, c| b.build_float_mul(a, c, "")?);
+        let one = f(1.0)?;
+        let rp = anyf2!(r, one, |a, c| b.build_float_add(a, c, "")?);
+        let p = fma(q, r2, rp)?;
+        let int_ty = self.shaped(self.i32().into(), shape);
+        let bits = self.bitcast(tm, int_ty)?;
+        let bias = self.splat_const(
+            self.i32().const_int(vexp::EXP_BIAS as u64, true).into(),
+            shape,
+        )?;
+        let e = anyi2!(bits, bias, |a, c| b.build_int_add(a, c, "")?);
+        let sh = self.splat_const(self.i32().const_int(23, false).into(), shape)?;
+        let e = anyi2!(e, sh, |a, c| b.build_left_shift(a, c, "")?);
+        let scale = self.bitcast(e, x.get_type())?;
+        Ok(anyf2!(p, scale, |a, c| b.build_float_mul(a, c, "")?))
     }
 
     /// `min(max(count, 0), lanes)`.

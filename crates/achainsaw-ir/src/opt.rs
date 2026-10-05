@@ -134,6 +134,9 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                         dst, then_val: lhs, ..
                     } => (dst, types.get(lhs).copied()),
                     Instruction::VLen { dst, .. } => (dst, Some(Type::I64)),
+                    Instruction::VUnary { dst, src, .. }
+                    | Instruction::VShift { dst, src, .. }
+                    | Instruction::VNarrow { dst, lo: src, .. } => (dst, types.get(src).copied()),
                     Instruction::MaskedLoad { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
                     Instruction::Call {
@@ -1057,7 +1060,10 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VFma { dst, .. }
                 | Instruction::VCmp { dst, .. }
                 | Instruction::VSelect { dst, .. }
-                | Instruction::VLen { dst, .. } => used.contains(dst),
+                | Instruction::VLen { dst, .. }
+                | Instruction::VUnary { dst, .. }
+                | Instruction::VNarrow { dst, .. }
+                | Instruction::VShift { dst, .. } => used.contains(dst),
 
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }
