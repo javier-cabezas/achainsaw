@@ -334,3 +334,281 @@ fn flash_attention_matches_reference() {
         }
     }
 }
+
+#[test]
+fn swiglu_matches_reference() {
+    type Swiglu = extern "C" fn(*const f32, *const f32, *mut f32, i64);
+    let specials = [
+        -100.0f32, -88.5, -87.0, -20.0, -1e-3, 0.0, 1e-3, 20.0, 87.0, 88.5, 100.0,
+    ];
+    for (level, engine) in engines("swiglu") {
+        let k: Swiglu = unsafe { std::mem::transmute(engine.get_fn_ptr("swiglu").unwrap()) };
+        let mut rng = Rng(31);
+        for n in LENGTHS.iter().copied().chain([specials.len()]) {
+            let gate: Vec<f32> = if n == specials.len() {
+                specials.to_vec()
+            } else {
+                rng.vec(n).iter().map(|v| v * 6.0).collect()
+            };
+            let up = rng.vec(n);
+            let mut out = vec![f32::NAN; n];
+            k(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), n as i64);
+            for i in 0..n {
+                let (g, u) = (gate[i] as f64, up[i] as f64);
+                let want = g / (1.0 + (-g).exp()) * u;
+                let got = out[i] as f64;
+                let tol = 2e-6 * want.abs() + 1e-30;
+                assert!(
+                    (got - want).abs() <= tol,
+                    "swiglu n={n} [{i}] g={g} u={u} at {level}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn argmax_matches_reference() {
+    type Argmax = extern "C" fn(*const f32, i64) -> i64;
+    for (level, engine) in engines("argmax") {
+        let k: Argmax = unsafe { std::mem::transmute(engine.get_fn_ptr("argmax").unwrap()) };
+        let mut rng = Rng(41);
+        // Llama 3's vocabulary is 128256 tokens.
+        for n in LENGTHS.iter().copied().chain([128256]) {
+            let base = rng.vec(n);
+            let negative: Vec<f32> = base.iter().map(|v| v - 10.0).collect();
+            let mut tie = base.clone();
+            let top = base.iter().cloned().fold(f32::MIN, f32::max) + 1.0;
+            tie[n / 3] = top;
+            tie[n - 1] = top;
+            // 64 apart: a multiple of every lane count, so both land in one lane.
+            let mut same_lane = base.clone();
+            if n > 200 {
+                same_lane[n / 4] = top;
+                same_lane[n / 4 + 64] = top;
+            }
+            // Equal maxima across lanes and accumulator sets at every vector width, with the
+            // first one in each of the four sets in turn.
+            let spreads: Vec<Vec<f32>> = [0, 4, 8, 12]
+                .iter()
+                .map(|&start| {
+                    let mut v = base.clone();
+                    if n > 200 {
+                        for d in [0, 4, 8, 12, 16, 32] {
+                            v[n / 5 + start + d] = top;
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let mut in_tail = base.clone();
+            in_tail[n - 1] = top;
+            let mut at_zero = base.clone();
+            at_zero[0] = top;
+            for (name, x) in [
+                ("random", &base),
+                ("negative", &negative),
+                ("tie", &tie),
+                ("tie in one lane", &same_lane),
+                ("ties across sets +0", &spreads[0]),
+                ("ties across sets +4", &spreads[1]),
+                ("ties across sets +8", &spreads[2]),
+                ("ties across sets +12", &spreads[3]),
+                ("tail", &in_tail),
+                ("first", &at_zero),
+            ] {
+                let want = x
+                    .iter()
+                    .enumerate()
+                    .fold(
+                        (0, f32::MIN),
+                        |(bi, bv), (i, &v)| {
+                            if v > bv {
+                                (i, v)
+                            } else {
+                                (bi, bv)
+                            }
+                        },
+                    )
+                    .0;
+                let got = k(x.as_ptr(), n as i64);
+                assert_eq!(got, want as i64, "argmax {name} n={n} at {level}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_matches_reference() {
+    type Rope = extern "C" fn(*mut f32, i64, i64, *const f32, *const f32);
+    for (level, engine) in engines("rope") {
+        let k: Rope = unsafe { std::mem::transmute(engine.get_fn_ptr("rope").unwrap()) };
+        let mut rng = Rng(51);
+        for (heads, dim, pos) in [
+            (1, 2, 0),
+            (3, 6, 5),
+            (2, 34, 17),
+            (32, 64, 1000),
+            (8, 128, 77),
+        ] {
+            let half = dim / 2;
+            let freq = |j: usize| 500000f64.powf(-2.0 * j as f64 / dim as f64);
+            let cos: Vec<f32> = (0..half)
+                .map(|j| (pos as f64 * freq(j)).cos() as f32)
+                .collect();
+            let sin: Vec<f32> = (0..half)
+                .map(|j| (pos as f64 * freq(j)).sin() as f32)
+                .collect();
+            let x0 = rng.vec(heads * dim);
+            let mut x = x0.clone();
+            k(
+                x.as_mut_ptr(),
+                heads as i64,
+                dim as i64,
+                cos.as_ptr(),
+                sin.as_ptr(),
+            );
+            for h in 0..heads {
+                for j in 0..half {
+                    let (x1, x2) = (x0[h * dim + j] as f64, x0[h * dim + half + j] as f64);
+                    let (c, s) = (cos[j] as f64, sin[j] as f64);
+                    let tol = 1e-6 * (x1.abs() + x2.abs()) + 1e-30;
+                    for (got, want, which) in [
+                        (x[h * dim + j], x1 * c - x2 * s, "x1"),
+                        (x[h * dim + half + j], x2 * c + x1 * s, "x2"),
+                    ] {
+                        assert!(
+                            (got as f64 - want).abs() <= tol,
+                            "rope {heads}x{dim} head {h} {which}[{j}] at {level}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn add_rmsnorm_matches_reference() {
+    type AddNorm = extern "C" fn(*const f32, *mut f32, *const f32, *mut f32, i64, f32) -> f32;
+    for (level, engine) in engines("add_rmsnorm") {
+        let k: AddNorm = unsafe { std::mem::transmute(engine.get_fn_ptr("add_rmsnorm").unwrap()) };
+        let mut rng = Rng(61);
+        for n in LENGTHS {
+            let x = rng.vec(n);
+            let res0 = rng.vec(n);
+            let w = rng.vec(n);
+            let mut res = res0.clone();
+            let mut out = vec![f32::NAN; n];
+            let eps = 1e-5f32;
+            k(
+                x.as_ptr(),
+                res.as_mut_ptr(),
+                w.as_ptr(),
+                out.as_mut_ptr(),
+                n as i64,
+                eps,
+            );
+            let summed: Vec<f32> = res0.iter().zip(&x).map(|(r, v)| r + v).collect();
+            assert_eq!(res, summed, "add_rmsnorm residual n={n} at {level}");
+            let ms = summed.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64;
+            let inv = 1.0 / (ms + eps as f64).sqrt();
+            for i in 0..n {
+                let want = summed[i] as f64 * inv * w[i] as f64;
+                let got = out[i] as f64;
+                close(
+                    got,
+                    want,
+                    (summed[i] as f64 * inv * w[i] as f64).abs(),
+                    &format!("add_rmsnorm n={n} [{i}] at {level}"),
+                );
+            }
+        }
+    }
+}
+
+/// Q8_0 weights in `q8_gemv`'s chunked layout (64 output rows per chunk, k-major within
+/// a chunk), plus the dequantized matrix.
+fn q8_pack(rng: &mut Rng, m: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+    let nb = k / 32;
+    let q: Vec<i8> = (0..m * k).map(|_| (rng.next() * 63.5) as i8).collect();
+    let s: Vec<f32> = (0..nb * m)
+        .map(|_| 0.001 + rng.next().abs() * 0.01)
+        .collect();
+    let (mut wq, mut sc) = (vec![0i8; m * k], vec![0f32; nb * m]);
+    for c in 0..m / 64 {
+        for kk in 0..k {
+            for r in 0..64 {
+                wq[c * k * 64 + kk * 64 + r] = q[(c * 64 + r) * k + kk];
+            }
+        }
+        for b in 0..nb {
+            for r in 0..64 {
+                // s is stored [b][i]; the kernel reads chunk c's [b][r].
+                sc[c * nb * 64 + b * 64 + r] = s[b * m + c * 64 + r];
+            }
+        }
+    }
+    (wq, sc, q, s)
+}
+
+/// x quantized per 32-block exactly as `quantize_q8` does (f32 arithmetic).
+fn q8_quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let mut xq = vec![0i8; x.len()];
+    let mut dx = vec![0f32; x.len() / 32];
+    for b in 0..x.len() / 32 {
+        let blk = &x[b * 32..b * 32 + 32];
+        let d = blk.iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        dx[b] = d;
+        for t in 0..32 {
+            let v = blk[t] * id;
+            let r = v + if v >= 0.0 { 0.5 } else { -0.5 };
+            xq[b * 32 + t] = r as i32 as i8;
+        }
+    }
+    (xq, dx)
+}
+
+#[test]
+fn q8_gemv_matches_reference() {
+    type Q8 = extern "C" fn(*const i8, *const f32, *const f32, *mut f32, i64, i64);
+    for (level, engine) in engines("q8_gemv") {
+        let kern: Q8 = unsafe { std::mem::transmute(engine.get_fn_ptr("q8_gemv").unwrap()) };
+        let mut rng = Rng(71);
+        for (m, k) in [(64, 32), (128, 96), (64, 1024), (320, 512)] {
+            let (wq, sc, q, s) = q8_pack(&mut rng, m, k);
+            let mut x: Vec<f32> = rng.vec(k);
+            // An all-zero block quantizes with scale 0.
+            x[..32].iter_mut().for_each(|v| *v = 0.0);
+            let mut y = vec![f32::NAN; m];
+            kern(
+                wq.as_ptr(),
+                sc.as_ptr(),
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                m as i64,
+                k as i64,
+            );
+            let (xq, dx) = q8_quantize(&x);
+            for i in 0..m {
+                let terms: Vec<f64> = (0..k / 32)
+                    .map(|b| {
+                        let dot: i64 = (0..32)
+                            .map(|t| q[i * k + b * 32 + t] as i64 * xq[b * 32 + t] as i64)
+                            .sum();
+                        s[b * m + i] as f64 * dx[b] as f64 * dot as f64
+                    })
+                    .collect();
+                let want: f64 = terms.iter().sum();
+                let scale: f64 = terms.iter().map(|t| t.abs()).sum();
+                let tol = (k / 32 + 4) as f64 * f32::EPSILON as f64 * scale + 1e-30;
+                assert!(
+                    (y[i] as f64 - want).abs() <= tol,
+                    "q8_gemv {m}x{k} y[{i}] at {level}: got {}, want {want}, tol {tol}",
+                    y[i]
+                );
+            }
+        }
+    }
+}

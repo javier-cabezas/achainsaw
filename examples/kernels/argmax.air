@@ -1,0 +1,131 @@
+# Greedy decoding: index of the largest of n >= 1 f32 logits (the first one on ties, as in
+# numpy.argmax and torch.argmax). One pass at full vector width with four independent sets of
+# per-lane best values and indices, so consecutive vectors do not wait on each other (strictly
+# greater wins within a lane, so the earliest index stays). The sets merge preferring the
+# larger value, then the smaller index; the lanes holding the maximum then give the smallest
+# index. Single vectors and a scalar loop cover the rest. Logits must not be NaN.
+fn argmax(x:ptr, n:i64)->i64
+  b0:
+    w = vl f32
+    first = ld x:f32
+    has_vec = ge n, w
+    br has_vec, iota_init, tail(1:i64, first, 0:i64)
+
+  # lane_idx = [0, 1, ..., w - 1] as i32 lanes.
+  iota_init:
+    iota_bytes = mul w, 4:i64
+    iota = alloc iota_bytes
+    jmp iota_fill(0:i64)
+  iota_fill(t:i64):
+    t_more = lt t, w
+    br t_more, iota_body, vec_init
+  iota_body:
+    t32 = trunc t:i32
+    t_off = mul t, 4:i64
+    pt = add iota, t_off
+    st pt, t32
+    t2 = add t, 1:i64
+    jmp iota_fill(t2)
+  vec_init:
+    lane_idx = ld iota:vx
+    free iota
+    w32 = trunc w:i32
+    v_step = splat w32:vx
+    w4 = mul w, 4:i64
+    best0 = ld x:vx
+    next_idx = vadd lane_idx, v_step:i32
+    jmp quad(w, best0, lane_idx, best0, lane_idx, best0, lane_idx, best0, lane_idx, next_idx)
+  # Four vectors per step, one into each set.
+  quad(i:i64, ba:vx, ia:vx, bb:vx, ib:vx, bc:vx, ic:vx, bd:vx, id:vx, cur:vx):
+    end4 = add i, w4
+    full4 = le end4, n
+    br full4, quad_body, merge
+  quad_body:
+    off = mul i, 4:i64
+    pa = add x, off
+    va = ld pa:vx
+    ca = vadd cur, v_step:i32
+    pb = add pa, iota_bytes
+    vb = ld pb:vx
+    cb = vadd ca, v_step:i32
+    pc = add pb, iota_bytes
+    vc = ld pc:vx
+    cc = vadd cb, v_step:i32
+    pd = add pc, iota_bytes
+    vd = ld pd:vx
+    gta = vgt va, ba:f32
+    ba2 = vsel gta, va, ba
+    ia2 = vsel gta, cur, ia
+    gtb = vgt vb, bb:f32
+    bb2 = vsel gtb, vb, bb
+    ib2 = vsel gtb, ca, ib
+    gtc = vgt vc, bc:f32
+    bc2 = vsel gtc, vc, bc
+    ic2 = vsel gtc, cb, ic
+    gtd = vgt vd, bd:f32
+    bd2 = vsel gtd, vd, bd
+    id2 = vsel gtd, cc, id
+    cur2 = vadd cc, v_step:i32
+    jmp quad(end4, ba2, ia2, bb2, ib2, bc2, ic2, bd2, id2, cur2)
+  # Set b wins over set a where it is larger, or equal with a smaller index.
+  merge:
+    gab = vgt bb, ba:f32
+    eab = veq bb, ba:f32
+    lab = vlt ib, ia:i32
+    tab = vand eab, lab:i32
+    mab = vor gab, tab:i32
+    bab = vsel mab, bb, ba
+    iab = vsel mab, ib, ia
+    gcd = vgt bd, bc:f32
+    ecd = veq bd, bc:f32
+    lcd = vlt id, ic:i32
+    tcd = vand ecd, lcd:i32
+    mcd = vor gcd, tcd:i32
+    bcd = vsel mcd, bd, bc
+    icd = vsel mcd, id, ic
+    gf = vgt bcd, bab:f32
+    ef = veq bcd, bab:f32
+    lf = vlt icd, iab:i32
+    tf = vand ef, lf:i32
+    mf = vor gf, tf:i32
+    best_m = vsel mf, bcd, bab
+    idx_m = vsel mf, icd, iab
+    jmp vec(i, best_m, idx_m, cur)
+  vec(vi:i64, best:vx, best_idx:vx, cur_idx:vx):
+    end = add vi, w
+    full = le end, n
+    br full, vec_body, reduce
+  vec_body:
+    voff = mul vi, 4:i64
+    px = add x, voff
+    v = ld px:vx
+    is_gt = vgt v, best:f32
+    best2 = vsel is_gt, v, best
+    best_idx2 = vsel is_gt, cur_idx, best_idx
+    cur_idx2 = vadd cur_idx, v_step:i32
+    jmp vec(end, best2, best_idx2, cur_idx2)
+  reduce:
+    mx = vmaxr best:f32
+    v_mx = splat mx:vx
+    is_max = veq best, v_mx:f32
+    big = cst 2147483647:i32
+    v_big = splat big:vx
+    cand = vsel is_max, best_idx, v_big
+    bi32 = vminr cand:i32
+    bi = sext bi32:i64
+    jmp tail(vi, mx, bi)
+
+  tail(k:i64, m:f32, mi:i64):
+    k_more = lt k, n
+    br k_more, tail_body, done(mi)
+  tail_body:
+    k_off = mul k, 4:i64
+    pk = add x, k_off
+    xk = ld pk:f32
+    better = gt xk, m
+    m2 = select better, xk, m
+    mi2 = select better, k, mi
+    k2 = add k, 1:i64
+    jmp tail(k2, m2, mi2)
+  done(result:i64):
+    ret result

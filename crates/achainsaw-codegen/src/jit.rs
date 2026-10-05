@@ -540,9 +540,11 @@ pub fn in_par_worker() -> bool {
 
 /// How long a helper that just ran iterations spins before parking, so back-to-back `par`
 /// loops do not pay a thread wake-up each (tens to hundreds of microseconds on some hosts).
-/// A helper that found nothing to do parks at once: while the loop it missed still runs,
-/// spinning would only slow down a busy thread sharing its core (SMT).
-const PAR_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
+/// Kept short because spinning helpers take cores from other runtimes' threads: alternating
+/// with NumPy's OpenBLAS pool cost 8.4 ms per pair of calls with a 2 ms spin and 4.4 ms
+/// with 200 us (2.7 ms run apart). A helper that found nothing to do parks at once: while the
+/// loop it missed still runs, spinning would only slow down a busy thread sharing its core.
+const PAR_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// Helper threads that run `par` iterations next to the calling thread.
 struct ParPool {

@@ -51,6 +51,28 @@ def bf16_values(bits):
     return (bits.astype(np.uint32) << 16).view(np.float32)
 
 
+def q8_quantize(x):
+    """Q8_0 activations exactly as the kernels' quantize_q8: per 32-block scale
+    max|x| / 127 and values rounded half away from zero, in f32. Returns the integer values
+    (as f32) and the scales."""
+    blocks = x.reshape(-1, 32).astype(np.float32)
+    d = np.abs(blocks).max(axis=1) / np.float32(127.0)
+    with np.errstate(divide="ignore"):
+        inv = np.where(d > 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
+    v = blocks * inv[:, None]
+    return np.trunc(v + np.where(v >= 0, np.float32(0.5), np.float32(-0.5))).reshape(-1), d
+
+
+def np_q8_gemv(q_blocks, scales, x):
+    """NumPy Q8_0 GEMV with the kernel's data types: int8 weights q_blocks [k/32 x m x 32],
+    f32 scales [k/32 x m], int8-quantized activations, exact integer block dots (computed as a
+    batched f32 matmul, exact because every block dot is below 2^24), f32 accumulation."""
+    xq, dx = q8_quantize(x)
+    nb = q_blocks.shape[0]
+    dots = np.matmul(q_blocks.astype(np.float32), xq.reshape(nb, 32, 1))[:, :, 0]
+    return ((dots * dx[:, None]) * scales).sum(axis=0)
+
+
 def time_call(func, budget_s, min_iters=5):
     """Average seconds per call, running for about `budget_s` after a short warm-up."""
     for _ in range(3):
@@ -173,8 +195,9 @@ def make_cases():
         name="gemm_bf16", label=f"GEMM bf16->f32 ({n}x{n}x{n})",
         run=lambda k: k(C, Ab, Bb, n, n, n),
         verify=verify_gemm, tol=1e-4,
-        # NumPy has no bf16 matmul; compare with its f32 matmul on the same values.
-        numpy=lambda: Af @ Bf, flops=2 * n * n * n,
+        # Same types as the kernel: bf16 inputs (raw bits; NumPy has no bf16 matmul, so
+        # they are widened to f32 in the call), f32 accumulation.
+        numpy=lambda: bf16_values(Ab) @ bf16_values(Bb), flops=2 * n * n * n,
     ))
     # One decode step of DeepSeek V4 Pro's sparse attention: 128 query heads share one
     # 512-dim KV head (K = V) and attend to 1152 selected cache entries (sliding window 128
@@ -193,24 +216,132 @@ def make_cases():
     pr = np.exp(scores - mx)
     den = pr.sum(axis=1, keepdims=True) + np.exp(fsink[:, None].astype(np.float64) - mx)
     flash_ref = (pr @ sel) / den
-    qn, kvn = bf16_values(fq), bf16_values(fkv)
 
     def verify_flash(k):
         k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
         return float(np.max(np.abs(fout - flash_ref)) / np.max(np.abs(flash_ref)))
 
     def np_flash():
-        s = (qn @ kvn[fidx].T) * fscale
+        # Same types as the kernel: bf16 q and kv (widened to f32 here), f32 scores and
+        # softmax, probabilities rounded to bf16 for the product with V. The -1 entries are
+        # all valid here, so no masking is needed.
+        q32, sel32 = bf16_values(fq), bf16_values(fkv[fidx])
+        s = (q32 @ sel32.T) * fscale
         m = s.max(axis=1, keepdims=True)
         e = np.exp(s - m)
-        return (e @ kvn[fidx]) / (e.sum(axis=1, keepdims=True) + np.exp(fsink[:, None] - m))
+        p = bf16_values(bf16_bits(e))
+        return (p @ sel32) / (e.sum(axis=1, keepdims=True) + np.exp(fsink[:, None] - m))
 
     cases.append(dict(
         name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
         run=lambda k: k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
         verify=verify_flash, tol=1e-2,
-        # NumPy has no bf16 matmul; compare with f32 on the same values (multithreaded BLAS).
         numpy=np_flash, flops=2 * 2 * fh * fnk * fd,
+    ))
+
+    # Decode-step glue at Llama 3 8B sizes (d = 4096, MLP 14336, 32 heads of 128,
+    # vocabulary 128256).
+    sw_n = 14336
+    gate = (rng.standard_normal(sw_n) * 3.0).astype(np.float32)
+    up = rng.standard_normal(sw_n).astype(np.float32)
+    sw_out = np.zeros(sw_n, dtype=np.float32)
+    gd = gate.astype(np.float64)
+    sw_ref = gd / (1.0 + np.exp(-gd)) * up
+
+    def verify_swiglu(k):
+        k(gate, up, sw_out, sw_n)
+        return float(np.max(np.abs(sw_out - sw_ref) / (np.abs(sw_ref) + 1e-30)))
+
+    cases.append(dict(
+        name="swiglu", label=f"SwiGLU, vectorized exp (n={sw_n})",
+        run=lambda k: k(gate, up, sw_out, sw_n),
+        verify=verify_swiglu, tol=2e-6,
+        numpy=lambda: gate / (1.0 + np.exp(-gate)) * up, flops=8 * sw_n,
+    ))
+
+    vocab = 128256
+    logits = rng.standard_normal(vocab).astype(np.float32)
+    am_ref = int(np.argmax(logits))
+    cases.append(dict(
+        name="argmax", label=f"Greedy argmax (vocab={vocab})",
+        run=lambda k: k(logits, vocab),
+        verify=lambda k: float(k(logits, vocab) != am_ref), tol=0.0,
+        numpy=lambda: np.argmax(logits), flops=vocab,
+    ))
+
+    rh, rd, rpos = 32, 128, 1000
+    rhalf = rd // 2
+    ang = rpos * 500000.0 ** (-2.0 * np.arange(rhalf) / rd)
+    rcos, rsin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    rq0 = rng.standard_normal((rh, rd)).astype(np.float32)
+    rq = rq0.copy()
+    x1, x2 = rq0[:, :rhalf].astype(np.float64), rq0[:, rhalf:].astype(np.float64)
+    rope_ref = np.concatenate([x1 * rcos - x2 * rsin, x2 * rcos + x1 * rsin], axis=1)
+
+    def verify_rope(k):
+        rq[:] = rq0
+        k(rq, rh, rd, rcos, rsin)
+        return float(np.max(np.abs(rq - rope_ref)))
+
+    def np_rope():
+        a, b = rq0[:, :rhalf], rq0[:, rhalf:]
+        return np.concatenate([a * rcos - b * rsin, b * rcos + a * rsin], axis=1)
+
+    cases.append(dict(
+        name="rope", label=f"RoPE, in place ({rh} heads x {rd})",
+        run=lambda k: k(rq, rh, rd, rcos, rsin),
+        verify=verify_rope, tol=1e-5, numpy=np_rope, flops=6 * rh * rhalf,
+    ))
+
+    an = 4096
+    ax = rng.standard_normal(an).astype(np.float32)
+    ares0 = rng.standard_normal(an).astype(np.float32)
+    ares = ares0.copy()
+    aw = rng.uniform(0.8, 1.2, an).astype(np.float32)
+    aout = np.zeros(an, dtype=np.float32)
+    asum = ares0.astype(np.float64) + ax
+    an_ref = asum / np.sqrt(np.mean(asum * asum) + 1e-5) * aw
+
+    def verify_add_rmsnorm(k):
+        ares[:] = ares0
+        k(ax, ares, aw, aout, an, 1e-5)
+        return float(np.max(np.abs(aout - an_ref)))
+
+    def np_add_rmsnorm():
+        r = ares0 + ax
+        return r / np.sqrt(np.mean(r * r) + 1e-5) * aw
+
+    cases.append(dict(
+        name="add_rmsnorm", label=f"Residual add + RMSNorm (n={an})",
+        run=lambda k: k(ax, ares, aw, aout, an, 1e-5),
+        verify=verify_add_rmsnorm, tol=1e-5, numpy=np_add_rmsnorm, flops=5 * an,
+    ))
+
+    qm, qk = 4096, 4096
+    qnb = qk // 32
+    qq = rng.integers(-127, 128, size=(qm, qk), dtype=np.int8)
+    qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float32)
+    # Packed layout: 64-row chunks, k-major within a chunk.
+    q_packed = np.ascontiguousarray(qq.reshape(qm // 64, 64, qk).transpose(0, 2, 1))
+    s_packed = np.ascontiguousarray(qs.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
+    qx = rng.standard_normal(qk).astype(np.float32)
+    qy = np.zeros(qm, dtype=np.float32)
+    # NumPy keeps the same int8 weights, block-major ([k/32 x m x 32]).
+    q_blocks = np.ascontiguousarray(qq.reshape(qm, qnb, 32).transpose(1, 0, 2))
+    xq_ints, dxs = q8_quantize(qx)
+    dots = np.einsum("rbt,bt->rb", qq.reshape(qm, qnb, 32).astype(np.int64),
+                     xq_ints.reshape(qnb, 32).astype(np.int64))
+    q8_ref = (dots * qs.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
+
+    def verify_q8(k):
+        k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk)
+        return float(np.max(np.abs(qy - q8_ref)) / np.max(np.abs(q8_ref)))
+
+    cases.append(dict(
+        name="q8_gemv", label=f"Q8_0 GEMV, all cores ({qm}x{qk})",
+        run=lambda k: k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk),
+        verify=verify_q8, tol=1e-5, numpy=lambda: np_q8_gemv(q_blocks, qs, qx),
+        flops=2 * qm * qk,
     ))
     return cases
 
@@ -255,6 +386,9 @@ def main():
     configs = [(b, l) for b in backends for l in levels]
     for case in cases:
         src = source(case["name"])
+        # Both runtimes busy-wait for a moment after parallel work; let the other's threads
+        # settle before timing each one.
+        time.sleep(0.02)
         np_s = time_call(case["numpy"], budget)
         row = dict(kernel=case["name"], label=case["label"], numpy_us=np_s * 1e6, runs=[])
         print(f"\n{case['label']}")
@@ -262,6 +396,7 @@ def main():
         for backend, level in configs:
             achainsaw.set_isa_cap(level)
             kernel = achainsaw.compile(src, backend=backend)
+            time.sleep(0.02)
             err = case["verify"](kernel)
             ok = err <= case["tol"]
             if not ok:

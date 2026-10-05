@@ -1,0 +1,50 @@
+# Rotary position embedding (RoPE), in place, for one token: x holds `heads` vectors of
+# `dim` f32 values (q or k), rotated in the LLaMA/NeoX "rotate-half" layout used by
+# Hugging Face and vLLM. cos and sin hold the token position's dim/2 values,
+# cos[j] = cos(pos * theta^(-2j/dim)) (a row of the usual cos/sin cache):
+#   x1 = x[j], x2 = x[j + dim/2]:   x[j] = x1 cos - x2 sin,   x[j + dim/2] = x2 cos + x1 sin
+fn rope(x:ptr, heads:i64, dim:i64, cos:ptr, sin:ptr)
+  b0:
+    w = vl f32
+    half = udiv dim, 2:i64
+    half_bytes = mul half, 4:i64
+    row_bytes = mul dim, 4:i64
+    zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    jmp heads_loop(0:i64)
+  heads_loop(h:i64):
+    h_more = lt h, heads
+    br h_more, head_start, done
+  head_start:
+    h_off = mul h, row_bytes
+    p1 = add x, h_off
+    p2 = add p1, half_bytes
+    jmp cols(0:i64)
+  cols(j:i64):
+    j_more = lt j, half
+    br j_more, cols_body, head_next
+  cols_body:
+    rest = sub half, j
+    off = mul j, 4:i64
+    q1 = add p1, off
+    q2 = add p2, off
+    qc = add cos, off
+    qs = add sin, off
+    x1 = ldm q1:vx, rest:f32
+    x2 = ldm q2:vx, rest:f32
+    c = ldm qc:vx, rest:f32
+    s = ldm qs:vx, rest:f32
+    x2s = vmul x2, s:f32
+    minus_x2s = vsub v_zero, x2s:f32
+    y1 = vfma x1, c, minus_x2s:f32
+    x2c = vmul x2, c:f32
+    y2 = vfma x1, s, x2c:f32
+    stm q1, y1, rest:f32
+    stm q2, y2, rest:f32
+    j2 = add j, w
+    jmp cols(j2)
+  head_next:
+    h2 = add h, 1:i64
+    jmp heads_loop(h2)
+  done:
+    ret
