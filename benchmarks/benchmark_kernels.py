@@ -395,6 +395,8 @@ def main():
                         help="'host' (default), 'all' reachable levels, or a comma list")
     parser.add_argument("--quick", action="store_true", help="short timing runs (CI)")
     parser.add_argument("--json", metavar="PATH", help="also write results as JSON")
+    parser.add_argument("--no-numpy", action="store_true",
+                        help="skip timing NumPy (results still verified against it)")
     args = parser.parse_args()
 
     available = achainsaw.available_backends()
@@ -418,10 +420,13 @@ def main():
         # Both runtimes busy-wait for a moment after parallel work; let the other's threads
         # settle before timing each one.
         time.sleep(0.02)
-        np_s = time_call(case["numpy"], budget)
-        row = dict(kernel=case["name"], label=case["label"], numpy_us=np_s * 1e6, runs=[])
+        np_s = None if args.no_numpy else time_call(case["numpy"], budget)
+        row = dict(kernel=case["name"], label=case["label"],
+                   numpy_us=np_s and np_s * 1e6, runs=[])
         print(f"\n{case['label']}")
-        print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  {case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
+        if np_s:
+            print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  "
+                  f"{case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
         for backend, level in configs:
             achainsaw.set_isa_cap(level)
             kernel = achainsaw.compile(src, backend=backend, fast_math=True)
@@ -432,8 +437,9 @@ def main():
                 failures.append(f"{case['name']} on {backend}/{level or 'host'}: error {err:.2e}")
             secs = time_call(lambda: case["run"](kernel), budget)
             tag = f"{backend}@{level or 'host'}"
+            vs = f"  {np_s / secs:6.2f}x NumPy" if np_s else ""
             print(f"    {tag:<22} {secs * 1e6:10.2f} us  {case['flops'] / secs / 1e9:8.2f} GFLOP/s"
-                  f"  {np_s / secs:6.2f}x NumPy  err {err:.1e} {'PASS' if ok else 'FAIL'}")
+                  f"{vs}  err {err:.1e} {'PASS' if ok else 'FAIL'}")
             row["runs"].append(dict(backend=backend, isa=level or "host", us=secs * 1e6,
                                     gflops=case["flops"] / secs / 1e9, error=err, ok=ok))
         results.append(row)
