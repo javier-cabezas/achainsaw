@@ -74,17 +74,23 @@ def np_q8_gemv(q_blocks, scales, x):
     return ((dots * dx[:, None]) * scales).sum(axis=0)
 
 
-def time_call(func, budget_s, min_iters=5):
-    """Average seconds per call, running for about `budget_s` after a short warm-up."""
+def time_call(func, budget_s, min_iters=5, chunks=5):
+    """Seconds per call after a short warm-up: the run of about `budget_s` is split into
+    `chunks` and the fastest chunk's average is returned, so a transient stall (another
+    process, a migrated thread) does not count against the kernel."""
     for _ in range(3):
         func()
-    iters, t0 = 0, time.perf_counter()
-    while True:
-        func()
-        iters += 1
-        elapsed = time.perf_counter() - t0
-        if iters >= min_iters and elapsed >= budget_s:
-            return elapsed / iters
+    best = float("inf")
+    for _ in range(chunks):
+        iters, t0 = 0, time.perf_counter()
+        while True:
+            func()
+            iters += 1
+            elapsed = time.perf_counter() - t0
+            if iters >= min_iters and elapsed >= budget_s / chunks:
+                break
+        best = min(best, elapsed / iters)
+    return best
 
 
 def make_cases():
@@ -295,11 +301,18 @@ def make_cases():
     ))
 
     an = 4096
-    ax = rng.standard_normal(an).astype(np.float32)
+    # The four buffers are slices of one block, 17 cache lines apart beyond their 16 KB. Left
+    # to the allocator, `out` landed exactly 64 KB + 48 bytes after `res`, and this Zen 4
+    # then ran the kernel 2x slower in most processes (1.5 vs 3.1 µs): the second pass
+    # stores out[i] while loading res a few lanes ahead, apparently taken by the CPU as a
+    # possible alias of the load. Fixed offsets keep the timing the same from run to run.
+    gap = an + 17 * 16
+    block = np.zeros(4 * gap, dtype=np.float32)
+    ax, ares, aw, aout = (block[i * gap:i * gap + an] for i in range(4))
+    ax[:] = rng.standard_normal(an)
     ares0 = rng.standard_normal(an).astype(np.float32)
-    ares = ares0.copy()
-    aw = rng.uniform(0.8, 1.2, an).astype(np.float32)
-    aout = np.zeros(an, dtype=np.float32)
+    ares[:] = ares0
+    aw[:] = rng.uniform(0.8, 1.2, an)
     asum = ares0.astype(np.float64) + ax
     an_ref = asum / np.sqrt(np.mean(asum * asum) + 1e-5) * aw
 

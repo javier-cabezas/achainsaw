@@ -263,13 +263,14 @@ jobs:
       - name: Install NumPy
         run: python -m pip install numpy
 
-      # One target directory for both, so dependencies build once.
+      # Separate target directories: in a shared one, Cargo can take the base's newer outputs
+      # as up to date for the head's (older) sources and skip rebuilding it.
       - name: Build base and head extensions (release, LLVM)
         run: |
           for side in "$BASE_DIR" "$GITHUB_WORKSPACE"; do
             cargo build --release --manifest-path "$side/Cargo.toml" -p achainsaw-py \
-              --features achainsaw-py/llvm --target-dir "$GITHUB_WORKSPACE/target"
-            cp "$GITHUB_WORKSPACE/target/release/libachainsaw.so" "$side/achainsaw.so"
+              --features achainsaw-py/llvm --target-dir "$side/target"
+            cp "$side/target/release/libachainsaw.so" "$side/achainsaw.so"
           done
 
       - name: Compare base and head

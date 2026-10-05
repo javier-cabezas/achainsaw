@@ -16,7 +16,9 @@ stable statistic. A result is a regression when the head's best is slower than t
 by more than --threshold (relative) and --min-us (absolute).
 
 Exit status: 1 on a regression (0 with --allow-regressions), 2 if the head's benchmarks fail.
-Benchmarks only one side has are listed but not compared.
+If the base's fail (say, a base too old for these scripts), nothing is compared and the
+status is 0, with a note in the summary. Benchmarks only one side has are listed but not
+compared.
 """
 
 import argparse
@@ -28,20 +30,30 @@ import tempfile
 import time
 
 
-def supports(script, flag):
-    out = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True)
+def side_env(root):
+    paths = [root, os.path.join(root, "benchmarks"), os.environ.get("PYTHONPATH", "")]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in paths if p))
+
+
+def supports(script, flag, env):
+    """Whether `script --help` (run as the benchmarks run) lists `flag`; a script that
+    cannot even print its help is an error, not a missing option."""
+    out = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True,
+                         env=env)
+    if out.returncode != 0:
+        raise RuntimeError(f"{script} --help failed:\n{out.stderr[-3000:]}")
     return flag in out.stdout
 
 
-def run_side(root, workdir, tag):
-    """One round of benchmarks for the checkout at `root`: {(benchmark, backend): us}."""
-    paths = [root, os.path.join(root, "benchmarks"), os.environ.get("PYTHONPATH", "")]
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in paths if p))
+def run_side(root, workdir, tag, skipped):
+    """One round of benchmarks for the checkout at `root`: {(benchmark, backend): us}.
+    Benchmarks this side's scripts cannot run are added to `skipped`."""
+    env = side_env(root)
     times = {}
     kernels = os.path.join(root, "benchmarks", "benchmark_kernels.py")
     out = os.path.join(workdir, f"{tag}-kernels.json")
     cmd = [sys.executable, kernels, "--json", out]
-    if supports(kernels, "--no-numpy"):
+    if supports(kernels, "--no-numpy", env):
         cmd.append("--no-numpy")
     res = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=root)
     if res.returncode != 0:
@@ -52,7 +64,9 @@ def run_side(root, workdir, tag):
                 times[(r["kernel"], run["backend"])] = run["us"]
 
     decode = os.path.join(root, "benchmarks", "benchmark_decode.py")
-    if os.path.exists(decode) and supports(decode, "--json"):
+    if not (os.path.exists(decode) and supports(decode, "--json", env)):
+        skipped.add(f"{tag}: llama_decode (benchmark_decode.py has no --json)")
+    else:
         out = os.path.join(workdir, f"{tag}-decode.json")
         cmd = [sys.executable, decode, "--layers", "4", "--tokens", "16", "--weights", "q4",
                "--no-numpy", "--json", out]
@@ -86,16 +100,24 @@ def main():
 
     sides = {"base": os.path.abspath(args.base), "head": os.path.abspath(args.head)}
     best = {"base": {}, "head": {}}
+    skipped = set()
     with tempfile.TemporaryDirectory() as workdir:
         for rnd in range(args.rounds):
             order = ["base", "head"] if rnd % 2 == 0 else ["head", "base"]
             for side in order:
                 t0 = time.perf_counter()
                 try:
-                    times = run_side(sides[side], workdir, side)
+                    times = run_side(sides[side], workdir, side, skipped)
                 except RuntimeError as e:
                     print(f"[{side}] {e}", file=sys.stderr)
-                    sys.exit(2 if side == "head" else 0)
+                    if side == "head":
+                        sys.exit(2)
+                    note = f"The base's benchmarks failed, so nothing was compared:\n```\n{e}\n```\n"
+                    print(note)
+                    if args.summary:
+                        with open(args.summary, "a", encoding="utf-8") as f:
+                            f.write(note)
+                    sys.exit(0)
                 for key, us in times.items():
                     best[side][key] = min(us, best[side].get(key, float("inf")))
                 print(f"round {rnd + 1}/{args.rounds} {side}: {len(times)} results "
@@ -130,6 +152,7 @@ def main():
     if regressions and args.allow_regressions:
         verdict += " Allowed by the `perf-regression-ok` label."
     lines += ["", verdict]
+    lines += [f"Skipped: {s}." for s in sorted(skipped)]
     report = "\n".join(lines) + "\n"
     print(report)
     if args.summary:
