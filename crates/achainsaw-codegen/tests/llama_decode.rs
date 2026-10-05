@@ -27,41 +27,105 @@ impl Rng {
     }
 }
 
-/// A Q8 matrix: logical `q` [rows x k] and scales `s` [k/32 x rows], plus the kernel's
-/// packed layout (64-row chunks, k-major within a chunk).
-struct Q8 {
-    rows: usize,
-    k: usize,
-    q: Vec<i8>,
-    s: Vec<f32>,
-    packed_q: Vec<i8>,
-    packed_s: Vec<f32>,
+/// Weight formats of `mat_chunk_into`, by their number in the model table.
+#[derive(Clone, Copy, PartialEq)]
+enum Fmt {
+    Q8 = 0,
+    Q4 = 1,
+    Q6 = 2,
 }
 
-impl Q8 {
-    fn random(rng: &mut Rng, rows: usize, k: usize) -> Self {
+impl Fmt {
+    /// Values per scale.
+    fn group(self) -> usize {
+        if self == Fmt::Q6 {
+            16
+        } else {
+            32
+        }
+    }
+}
+
+/// A Q8_0, Q4_0 or Q6_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0, -32..=31 for
+/// Q6_K) and f16 scales `s` [k/group x rows], plus the kernel's packed layout: 64-row chunks
+/// with, per 32-block, k-major int8 [32 x 64] for Q8_0; 1024 bytes for Q4_0 whose byte
+/// t * 64 + r holds row r's element t (low nibble) and t + 16 (high nibble), offset by 8;
+/// for Q6_K those nibbles of the low 4 bits of the values offset by 32, then 512 bytes whose
+/// byte t * 64 + r holds the high 2 bits of elements t, t + 8, t + 16, t + 24.
+struct Mat {
+    rows: usize,
+    k: usize,
+    fmt: Fmt,
+    q: Vec<i8>,
+    s: Vec<f32>,
+    packed_q: Vec<u8>,
+    packed_s: Vec<u16>,
+}
+
+impl Mat {
+    fn random(rng: &mut Rng, rows: usize, k: usize, fmt: Fmt) -> Self {
         let nb = k / 32;
-        let q: Vec<i8> = (0..rows * k).map(|_| (rng.next() * 127.0) as i8).collect();
-        // Entries of roughly unit variance times 1/sqrt(k), as in a trained layer.
-        let s: Vec<f32> = (0..nb * rows)
-            .map(|_| (0.75 + 0.25 * rng.next()) / (73.0 * (k as f32).sqrt()))
+        let g = fmt.group();
+        let (qmax, smax) = match fmt {
+            Fmt::Q8 => (127.0, 73.0),
+            Fmt::Q4 => (8.0, 4.6),
+            Fmt::Q6 => (32.0, 18.5),
+        };
+        let q: Vec<i8> = (0..rows * k)
+            .map(|_| {
+                ((rng.next() * qmax).floor() as i32).clamp(-qmax as i32, qmax as i32 - 1) as i8
+            })
             .collect();
-        let (mut packed_q, mut packed_s) = (vec![0i8; rows * k], vec![0f32; nb * rows]);
+        // Entries of roughly unit variance times 1/sqrt(k), as in a trained layer; f16 scales
+        // (Q4_0's are often negative).
+        let s: Vec<f32> = (0..k / g * rows)
+            .map(|_| {
+                let v = (0.75 + 0.25 * rng.next()) / (smax * (k as f32).sqrt());
+                let v = if fmt != Fmt::Q8 && rng.next() < 0.0 {
+                    -v
+                } else {
+                    v
+                };
+                half::f16::from_f32(v).to_f32()
+            })
+            .collect();
+        let block_bytes = match fmt {
+            Fmt::Q8 => 2048,
+            Fmt::Q4 => 1024,
+            Fmt::Q6 => 1536,
+        };
+        let mut packed_q = vec![0u8; rows / 64 * nb * block_bytes];
+        let mut packed_s = vec![0u16; k / g * rows];
         for c in 0..rows / 64 {
             for kk in 0..k {
+                let (b, t) = (kk / 32, kk % 32);
+                let blk = (c * nb + b) * block_bytes;
                 for r in 0..64 {
-                    packed_q[c * k * 64 + kk * 64 + r] = q[(c * 64 + r) * k + kk];
+                    let v = q[(c * 64 + r) * k + kk];
+                    match fmt {
+                        Fmt::Q8 => packed_q[blk + t * 64 + r] = v as u8,
+                        Fmt::Q4 => {
+                            packed_q[blk + (t % 16) * 64 + r] |= ((v + 8) as u8) << (4 * (t / 16))
+                        }
+                        Fmt::Q6 => {
+                            let u = (v + 32) as u8;
+                            packed_q[blk + (t % 16) * 64 + r] |= (u & 15) << (4 * (t / 16));
+                            packed_q[blk + 1024 + (t % 8) * 64 + r] |= (u >> 4) << (2 * (t / 8));
+                        }
+                    }
                 }
             }
-            for b in 0..nb {
+            for gi in 0..k / g {
                 for r in 0..64 {
-                    packed_s[c * nb * 64 + b * 64 + r] = s[b * rows + c * 64 + r];
+                    packed_s[(c * (k / g) + gi) * 64 + r] =
+                        half::f16::from_f32(s[gi * rows + c * 64 + r]).to_bits();
                 }
             }
         }
         Self {
             rows,
             k,
+            fmt,
             q,
             s,
             packed_q,
@@ -69,15 +133,25 @@ impl Q8 {
         }
     }
 
+    /// The matrix's 3 words in the kernel's model table.
+    fn words(&self) -> [usize; 3] {
+        [
+            self.packed_q.as_ptr() as usize,
+            self.packed_s.as_ptr() as usize,
+            self.fmt as usize,
+        ]
+    }
+
     fn matvec(&self, (xq, dx): &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
+        let g = self.fmt.group();
         (0..self.rows)
             .map(|i| {
-                (0..self.k / 32)
-                    .map(|b| {
-                        let dot: i64 = (0..32)
-                            .map(|t| self.q[i * self.k + b * 32 + t] as i64 * xq[b * 32 + t] as i64)
+                (0..self.k / g)
+                    .map(|gi| {
+                        let dot: i64 = (0..g)
+                            .map(|t| self.q[i * self.k + gi * g + t] as i64 * xq[gi * g + t] as i64)
                             .sum();
-                        self.s[b * self.rows + i] as f64 * dx[b] as f64 * dot as f64
+                        self.s[gi * self.rows + i] as f64 * dx[gi * g / 32] as f64 * dot as f64
                     })
                     .sum()
             })
@@ -104,11 +178,11 @@ fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
 
 struct Layer {
     attn_norm: Vec<f32>,
-    qkv: Q8,
-    o: Q8,
+    qkv: Mat,
+    o: Mat,
     ffn_norm: Vec<f32>,
-    gate_up: Q8,
-    down: Q8,
+    gate_up: Mat,
+    down: Mat,
 }
 
 struct Model {
@@ -122,7 +196,7 @@ struct Model {
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
-    lm: Q8,
+    lm: Mat,
     cos: Vec<f32>,
     sin: Vec<f32>,
     layers: Vec<Layer>,
@@ -139,6 +213,7 @@ impl Model {
         f: usize,
         vocab: usize,
         max_ctx: usize,
+        mixed: bool,
     ) -> Self {
         let mut rng = Rng(2026);
         let mut norm = |n| (0..n).map(|_| 1.0 + 0.2 * rng.next()).collect::<Vec<f32>>();
@@ -155,16 +230,27 @@ impl Model {
                 sin.push(a.sin() as f32);
             }
         }
+        // `mixed`: Q4_0, Q8_0 and Q6_K rotate across the matrices of a layer and across
+        // layers, and the LM head is Q6_K.
         let layers = attn_norms
             .into_iter()
             .zip(ffn_norms)
-            .map(|(attn_norm, ffn_norm)| Layer {
-                attn_norm,
-                qkv: Q8::random(&mut rng, (nh + 2 * nkv) * hd, d),
-                o: Q8::random(&mut rng, d, nh * hd),
-                ffn_norm,
-                gate_up: Q8::random(&mut rng, 2 * f, d),
-                down: Q8::random(&mut rng, d, f),
+            .enumerate()
+            .map(|(l, (attn_norm, ffn_norm))| {
+                let fmt = |i: usize| match (mixed, (i + l) % 3) {
+                    (false, _) => Fmt::Q8,
+                    (true, 0) => Fmt::Q4,
+                    (true, 1) => Fmt::Q8,
+                    _ => Fmt::Q6,
+                };
+                Layer {
+                    attn_norm,
+                    qkv: Mat::random(&mut rng, (nh + 2 * nkv) * hd, d, fmt(0)),
+                    o: Mat::random(&mut rng, d, nh * hd, fmt(1)),
+                    ffn_norm,
+                    gate_up: Mat::random(&mut rng, 2 * f, d, fmt(2)),
+                    down: Mat::random(&mut rng, d, f, fmt(3)),
+                }
             })
             .collect();
         Self {
@@ -178,7 +264,7 @@ impl Model {
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
-            lm: Q8::random(&mut rng, vocab, d),
+            lm: Mat::random(&mut rng, vocab, d, if mixed { Fmt::Q6 } else { Fmt::Q8 }),
             cos,
             sin,
             layers,
@@ -276,28 +362,16 @@ impl Model {
     /// The kernel's `model` pointer table and `cfg`.
     fn tables(&self) -> (Vec<usize>, Vec<i64>) {
         let p = |v: &[f32]| v.as_ptr() as usize;
-        let pq = |v: &[i8]| v.as_ptr() as usize;
-        let mut t = vec![
-            p(&self.embd),
-            p(&self.norm_out),
-            pq(&self.lm.packed_q),
-            p(&self.lm.packed_s),
-            p(&self.cos),
-            p(&self.sin),
-        ];
+        let mut t = vec![p(&self.embd), p(&self.norm_out)];
+        t.extend(self.lm.words());
+        t.extend([p(&self.cos), p(&self.sin)]);
         for l in &self.layers {
-            t.extend([
-                p(&l.attn_norm),
-                pq(&l.qkv.packed_q),
-                p(&l.qkv.packed_s),
-                pq(&l.o.packed_q),
-                p(&l.o.packed_s),
-                p(&l.ffn_norm),
-                pq(&l.gate_up.packed_q),
-                p(&l.gate_up.packed_s),
-                pq(&l.down.packed_q),
-                p(&l.down.packed_s),
-            ]);
+            t.push(p(&l.attn_norm));
+            t.extend(l.qkv.words());
+            t.extend(l.o.words());
+            t.push(p(&l.ffn_norm));
+            t.extend(l.gate_up.words());
+            t.extend(l.down.words());
         }
         let cfg = [
             self.d,
@@ -332,6 +406,16 @@ fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
 
 #[test]
 fn llama_decode_matches_reference() {
+    check_decode(false);
+}
+
+/// Q4_0, Q8_0 and Q6_K matrices mixed within and across layers, and a Q6_K LM head.
+#[test]
+fn llama_decode_mixed_formats_match_reference() {
+    check_decode(true);
+}
+
+fn check_decode(mixed: bool) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -339,7 +423,7 @@ fn llama_decode_matches_reference() {
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     // d=128, 2 layers, 4 q heads over 2 KV heads of 64, MLP 256, vocab 512, context 8.
-    let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8);
+    let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
     let (table, cfg) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
     let modes = host_levels()
@@ -349,7 +433,11 @@ fn llama_decode_matches_reference() {
         let mut engine = JitEngine::with_features(&features).unwrap();
         engine.set_fast_math(fast);
         engine.compile_module(&module).unwrap();
-        let level = format!("{level}{}", if fast { " fast_math" } else { "" });
+        let level = format!(
+            "{level}{}{}",
+            if fast { " fast_math" } else { "" },
+            if mixed { " mixed Q4/Q8/Q6" } else { "" }
+        );
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         let mut cache = vec![0f32; model.layers.len() * 2 * plane];

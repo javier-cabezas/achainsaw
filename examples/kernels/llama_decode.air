@@ -12,24 +12,25 @@
 # then the final RMSNorm and the LM head with a fused argmax: each task keeps only the best
 # of its 64 logits, so the logits are never written.
 #
-# Matrix-vector products are Q8_0 (see q8_gemv.air): int8 weights in blocks of 32 along k
-# with an f32 scale per block row, packed in chunks of 64 output rows (k-major within a
-# chunk); activations are quantized per 32-block on the fly and the int8 dots run on `mm`.
-# exp is `vexp`, with no libm call.
+# Each weight matrix is Q8_0, Q4_0 (see q8_gemv.air and q4_gemv.air) or Q6_K, chosen per
+# matrix: 8-, 4- or 6-bit weights with f16 scales per 32 (Q6_K: 16) values of a row, packed
+# in chunks of 64 output rows (see mat_chunk_into); activations are quantized to int8 per
+# 32-block on the fly and the int8 dots run on `mm` (Q4_0 and Q6_K are unpacked first). exp is `vexp`, with no
+# libm call.
 #
 # Shapes: d, ffn and vocab multiples of 64; head_dim a multiple of 64; heads a multiple of
 # kv_heads (grouped-query attention); pos < max_ctx.
 #
 # cfg (i64[8]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx
-# model (ptr table):
+# model (table of 8-byte words): a matrix takes 3 words, its packed weights, its scales and
+# its format (0: Q8_0, 1: Q4_0, 2: Q6_K), and functions receive a pointer to those words.
 #   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]
-#   [2] LM head q8 [vocab x d]            [3] its scales
-#   [4] RoPE cos f32 [max_ctx x head_dim/2]   [5] RoPE sin (same shape)
-#   then 10 per layer, at 6 + 10 * l:
-#   attention norm f32 [d]; QKV q8 [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
-#   then k heads, then v heads) and its scales; O q8 [d x heads * head_dim] and scales;
-#   MLP norm f32 [d]; gate/up q8 [2 ffn x d], chunks interleaved (gate rows 64c.., then up
-#   rows 64c..) and scales; down q8 [d x ffn] and scales
+#   [2..4] LM head [vocab x d]
+#   [5] RoPE cos f32 [max_ctx x head_dim/2]   [6] RoPE sin (same shape)
+#   then 14 per layer, at 7 + 14 * l:
+#   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
+#   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
+#   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn]
 # cache: per layer, K then V, each f32 [max_ctx x kv_heads x head_dim]
 # h: f32 [d], the residual stream; holds the final hidden state on return.
 fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64
@@ -52,14 +53,11 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     embd = ld model:ptr
     m1 = add model, 8:i64
     norm_out = ld m1:ptr
-    m2 = add model, 16:i64
-    lm_w = ld m2:ptr
-    m3 = add model, 24:i64
-    lm_s = ld m3:ptr
-    m4 = add model, 32:i64
-    cos_t = ld m4:ptr
+    lm = add model, 16:i64
     m5 = add model, 40:i64
-    sin_t = ld m5:ptr
+    cos_t = ld m5:ptr
+    m6 = add model, 48:i64
+    sin_t = ld m6:ptr
     w = vl f32
     d4 = mul d, 4:i64
     # h = embedding row of the token.
@@ -113,39 +111,27 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    slot0 = mul l, 10:i64
-    slot = add slot0, 6:i64
+    slot0 = mul l, 14:i64
+    slot = add slot0, 7:i64
     lp_off = mul slot, 8:i64
     lp = add model, lp_off
     attn_norm = ld lp:ptr
-    lp1 = add lp, 8:i64
-    wqkv = ld lp1:ptr
-    lp2 = add lp, 16:i64
-    sqkv = ld lp2:ptr
-    lp3 = add lp, 24:i64
-    wo = ld lp3:ptr
-    lp4 = add lp, 32:i64
-    so = ld lp4:ptr
-    lp5 = add lp, 40:i64
-    ffn_norm = ld lp5:ptr
-    lp6 = add lp, 48:i64
-    wgu = ld lp6:ptr
+    m_qkv = add lp, 8:i64
+    m_o = add lp, 32:i64
     lp7 = add lp, 56:i64
-    sgu = ld lp7:ptr
-    lp8 = add lp, 64:i64
-    wdn = ld lp8:ptr
-    lp9 = add lp, 72:i64
-    sdn = ld lp9:ptr
+    ffn_norm = ld lp7:ptr
+    m_gu = add lp, 64:i64
+    m_dn = add lp, 88:i64
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
     call norm_quant(h, attn_norm, xn, xq, dx, d, eps)
-    par heads_all, qkv_head(wqkv, sqkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, cos_r, sin_r)
+    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, cos_r, sin_r)
     par nh, attn_head(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos)
-    par dchunks, proj_add(wo, so, xq, dx, h, qd)
+    par dchunks, proj_add(m_o, xq, dx, h, qd)
     call norm_quant(h, ffn_norm, xn, xq, dx, d, eps)
-    par fchunks, gate_up(wgu, sgu, xq, dx, aq, adx, d)
-    par dchunks, proj_add(wdn, sdn, aq, adx, h, f)
+    par fchunks, gate_up(m_gu, xq, dx, aq, adx, d)
+    par dchunks, proj_add(m_dn, aq, adx, h, f)
     l2 = add l, 1:i64
     jmp layers(l2)
 
@@ -156,7 +142,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     best = alloc vb4
     vb8 = mul vchunks, 8:i64
     best_idx = alloc vb8
-    par vchunks, lm_chunk(lm_w, lm_s, xq, dx, best, best_idx, d)
+    par vchunks, lm_chunk(lm, xq, dx, best, best_idx, d)
     b_first = ld best:f32
     i_first = ld best_idx:i64
     jmp pick(1:i64, b_first, i_first)
@@ -235,7 +221,7 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
 
 # Q, K or V head t: 64-row chunks of the QKV projection written straight to their
 # destination (the q buffer, or this position's KV-cache slot), then RoPE for q and k.
-fn qkv_head(t:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, cos_r:ptr, sin_r:ptr)
+fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, cos_r:ptr, sin_r:ptr)
   b0:
     hd4 = mul hd, 4:i64
     is_q = lt t, nh
@@ -264,7 +250,7 @@ fn qkv_head(t:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i
     c = add c0, i
     o = mul i, 256:i64
     out = add dst, o
-    call q8_chunk_into(c, wq, sc, xq, dx, out, d)
+    call mat_chunk_into(c, mat, xq, dx, out, d)
     i2 = add i, 1:i64
     jmp chunks(i2)
   epilogue:
@@ -386,11 +372,11 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     ret
 
 # h[64c .. 64c + 64] += (W x)[64c .. 64c + 64]: a projection fused with the residual add.
-fn proj_add(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
+fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
   b0:
     w = vl f32
     tmp = alloc 256:i64
-    call q8_chunk_into(c, wq, sc, xq, dx, tmp, k)
+    call mat_chunk_into(c, mat, xq, dx, tmp, k)
     h_off = mul c, 256:i64
     hc = add h, h_off
     jmp add_loop(0:i64)
@@ -414,15 +400,15 @@ fn proj_add(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
 
 # MLP rows 64c..64c+63: gate and up chunks, SwiGLU, then Q8 quantization for the down
 # projection (two 32-blocks per task).
-fn gate_up(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
+fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
   b0:
     g = alloc 256:i64
     u = alloc 256:i64
     a = alloc 256:i64
     cg = mul c, 2:i64
     cu = add cg, 1:i64
-    call q8_chunk_into(cg, wq, sc, xq, dx, g, k)
-    call q8_chunk_into(cu, wq, sc, xq, dx, u, k)
+    call mat_chunk_into(cg, mat, xq, dx, g, k)
+    call mat_chunk_into(cu, mat, xq, dx, u, k)
     call silu_mul(g, u, a, 64:i64)
     q_off = mul c, 64:i64
     aq_c = add aq, q_off
@@ -435,10 +421,10 @@ fn gate_up(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
     ret
 
 # LM head rows 64c..64c+63, keeping only the best logit (first on ties) and its token.
-fn lm_chunk(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
+fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
   b0:
     tmp = alloc 256:i64
-    call q8_chunk_into(c, wq, sc, xq, dx, tmp, k)
+    call mat_chunk_into(c, mat, xq, dx, tmp, k)
     first = ld tmp:f32
     jmp scan(1:i64, first, 0:i64)
   scan(j:i64, bv:f32, bj:i64):
@@ -465,20 +451,62 @@ fn lm_chunk(c:i64, wq:ptr, sc:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64
     free tmp
     ret
 
-# The 64 outputs of Q8 chunk c (see q8_gemv.air) into dst.
-fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
+# dst[0 .. 64] = rows 64c .. 64c + 64 of the matrix `mat` (weights, scales, format) times
+# the quantized activations. Per 32-block of a chunk's 64 rows:
+#   Q8_0 (format 0): 2048 bytes, k-major int8 [32 x 64], fed to `mm` directly.
+#   Q4_0 (format 1): 1024 bytes [16 x 64]: byte t * 64 + j holds row j's value t (low
+#                    nibble) and t + 16 (high), each offset by 8.
+#   Q6_K (format 2): 1536 bytes: the low 4 bits as Q4_0's nibbles, then a 512-byte plane
+#                    [8 x 64] whose byte t * 64 + j holds the high 2 bits of row j's values
+#                    t, t + 8, t + 16, t + 24 (bit pairs 0..3); values offset by 32.
+# Q4_0 and Q6_K unpack into an int8 tile [32 x 64]. Scales are f16 [64] vectors per block:
+# one for Q8_0 and Q4_0, two for Q6_K (one per 16 values, so two `mm`s of k = 16).
+fn mat_chunk_into(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
   b0:
+    wq = ld mat:ptr
+    mat1 = add mat, 8:i64
+    scales = ld mat1:ptr
+    mat2 = add mat, 16:i64
+    fmt = ld mat2:i64
+    is_q4 = eq fmt, 1:i64
+    is_q6 = eq fmt, 2:i64
     w = vl f32
+    w8 = vl i8
     nb = udiv k, 32:i64
-    chunk_w = mul k, 64:i64
+    blk_q4 = cst 1024:i64
+    blk_q6 = cst 1536:i64
+    blk_q8 = cst 2048:i64
+    blk_a = select is_q4, blk_q4, blk_q8
+    blk_bytes = select is_q6, blk_q6, blk_a
+    one = cst 1:i64
+    two = cst 2:i64
+    nsub = select is_q6, two, one
+    chunk_w = mul nb, blk_bytes
     w_off = mul c, chunk_w
     wc = add wq, w_off
-    chunk_s = mul nb, 256:i64
+    sc_blk = mul nsub, 128:i64
+    chunk_s = mul nb, sc_blk
     s_off = mul c, chunk_s
     sc = add scales, s_off
     dots = alloc 256:i64
+    tile = alloc 2048:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
+    mag_mask = cst 32767:i32
+    v_mag_mask = splat mag_mask:vx
+    sign_bit = cst -2147483648:i32
+    v_sign_bit = splat sign_bit:vx
+    two_112 = cst 2004877312:i32
+    v_two_112 = splat two_112:vx
+    lo_mask = cst 15:i8
+    v_lo_mask = splat lo_mask:vx
+    eight = cst 8:i8
+    v_eight = splat eight:vx
+    three = cst 3:i8
+    v_three = splat three:vx
+    off32 = cst 32:i8
+    v_32 = splat off32:vx
+    four = cst 4:i32
     jmp zero_y(0:i64)
   zero_y(z:i64):
     z_more = lt z, 64:i64
@@ -494,10 +522,95 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     b_more = lt b, nb
     br b_more, block_start, done
   block_start:
+    blk_off = mul b, blk_bytes
+    wb = add wc, blk_off
+    br is_q4, unpack4(0:i64), not_q4
+  not_q4:
+    br is_q6, unpack6_lo(0:i64), sub(0:i64, wb)
+  unpack4(u:i64):
+    u_more = lt u, 1024:i64
+    br u_more, unpack4_body, sub(0:i64, tile)
+  unpack4_body:
+    pn = add wb, u
+    nv = ld pn:vx
+    lo = vand nv, v_lo_mask:i8
+    lo_q = vsub lo, v_eight:i8
+    hi = vushr nv, four:i8
+    hi_q = vsub hi, v_eight:i8
+    plo = add tile, u
+    st plo, lo_q
+    hi_off = add u, 1024:i64
+    phi = add tile, hi_off
+    st phi, hi_q
+    u2 = add u, w8
+    jmp unpack4(u2)
+  unpack6_lo(u6:i64):
+    u6_more = lt u6, 1024:i64
+    br u6_more, unpack6_lo_body, unpack6_hi(0:i64)
+  unpack6_lo_body:
+    pn6 = add wb, u6
+    nv6 = ld pn6:vx
+    lo6 = vand nv6, v_lo_mask:i8
+    hi6 = vushr nv6, four:i8
+    plo6 = add tile, u6
+    st plo6, lo6
+    hi6_off = add u6, 1024:i64
+    phi6 = add tile, hi6_off
+    st phi6, hi6
+    u6b = add u6, w8
+    jmp unpack6_lo(u6b)
+  unpack6_hi(uh:i64):
+    uh_more = lt uh, 512:i64
+    br uh_more, unpack6_hi_body, sub(0:i64, tile)
+  unpack6_hi_body:
+    hb_base = add wb, 1024:i64
+    phb = add hb_base, uh
+    hb = ld phb:vx
+    hbits0 = vand hb, v_three:i8
+    htop0 = vshl hbits0, four:i8
+    ht_off0 = add uh, 0:i64
+    pt0 = add tile, ht_off0
+    tl0 = ld pt0:vx
+    tq0 = vor tl0, htop0:i8
+    tv0 = vsub tq0, v_32:i8
+    st pt0, tv0
+    hs1 = vushr hb, 2:i8
+    hbits1 = vand hs1, v_three:i8
+    htop1 = vshl hbits1, four:i8
+    ht_off1 = add uh, 512:i64
+    pt1 = add tile, ht_off1
+    tl1 = ld pt1:vx
+    tq1 = vor tl1, htop1:i8
+    tv1 = vsub tq1, v_32:i8
+    st pt1, tv1
+    hs2 = vushr hb, 4:i8
+    hbits2 = vand hs2, v_three:i8
+    htop2 = vshl hbits2, four:i8
+    ht_off2 = add uh, 1024:i64
+    pt2 = add tile, ht_off2
+    tl2 = ld pt2:vx
+    tq2 = vor tl2, htop2:i8
+    tv2 = vsub tq2, v_32:i8
+    st pt2, tv2
+    hs3 = vushr hb, 6:i8
+    hbits3 = vand hs3, v_three:i8
+    htop3 = vshl hbits3, four:i8
+    ht_off3 = add uh, 1536:i64
+    pt3 = add tile, ht_off3
+    tl3 = ld pt3:vx
+    tq3 = vor tl3, htop3:i8
+    tv3 = vsub tq3, v_32:i8
+    st pt3, tv3
+    uh2 = add uh, w8
+    jmp unpack6_hi(uh2)
+  sub(si:i64, wt:ptr):
+    si_more = lt si, nsub
+    br si_more, sub_start, block_next
+  sub_start:
     jmp zero_dots(0:i64)
   zero_dots(zd:i64):
     zd_more = lt zd, 64:i64
-    br zd_more, zero_dots_body, block_mm
+    br zd_more, zero_dots_body, sub_mm
   zero_dots_body:
     zd_rest = sub 64:i64, zd
     zd_off = mul zd, 4:i64
@@ -505,44 +618,88 @@ fn q8_chunk_into(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     stm pzd, v_zero, zd_rest:i32
     zd2 = add zd, w
     jmp zero_dots(zd2)
-  block_mm:
+  sub_mm:
+    br is_q6, mm16, mm32
+  mm32:
     xb_off = mul b, 32:i64
     xb = add xq, xb_off
-    wb_off = mul b, 2048:i64
-    wb = add wc, wb_off
-    mm dots, xb, wb, 1:i64, 64:i64, 32:i64:i8
+    mm dots, xb, wt, 1:i64, 64:i64, 32:i64:i8
+    jmp sub_scale
+  mm16:
+    x16_b = mul b, 32:i64
+    x16_s = mul si, 16:i64
+    x16_off = add x16_b, x16_s
+    xb16 = add xq, x16_off
+    w16_off = mul si, 1024:i64
+    wt16 = add wt, w16_off
+    mm dots, xb16, wt16, 1:i64, 64:i64, 16:i64:i8
+    jmp sub_scale
+  sub_scale:
     d_off = mul b, 4:i64
     pd = add dx, d_off
     d = ld pd:f32
     vd = splat d:vx
-    sb_off = mul b, 256:i64
+    sb_b = mul b, nsub
+    sb_i = add sb_b, si
+    sb_off = mul sb_i, 128:i64
     sb = add sc, sb_off
     jmp accum(0:i64)
   accum(j:i64):
     j_more = lt j, 64:i64
-    br j_more, accum_body, block_next
+    br j_more, accum_body, sub_next
   accum_body:
+    # Two vectors of outputs per step, from one full vector of f16 scales (a partial load
+    # would cost a lane-by-lane copy on Cranelift). f16 to f32 is exact for finite values:
+    # the magnitude bits shifted into an f32 exponent and mantissa, times 2^112 (the bias
+    # difference; also right for subnormals), and the sign of the sign-extended value.
     j_rest = sub 64:i64, j
+    sj_off = mul j, 2:i64
+    ps = add sb, sj_off
+    s16 = ldm ps:vx, j_rest:i16
     j_off = mul j, 4:i64
     pp = add dots, j_off
-    ps = add sb, j_off
     py = add dst, j_off
     p = ldm pp:vx, j_rest:i32
     pf = vitof p:f32
-    s = ldm ps:vx, j_rest:f32
+    s32 = vwidenlo s16:i32
+    s_mag = vand s32, v_mag_mask:i32
+    s_exp = vshl s_mag, 13:i32
+    s_abs = vmul s_exp, v_two_112:f32
+    s_sgn = vand s32, v_sign_bit:i32
+    s = vor s_abs, s_sgn:i32
     ds = vmul s, vd:f32
     acc = ldm py:vx, j_rest:f32
     acc2 = vfma pf, ds, acc:f32
     stm py, acc2, j_rest:f32
-    j2 = add j, w
+    jh = add j, w
+    jh_rest = sub 64:i64, jh
+    jh_off = mul jh, 4:i64
+    pph = add dots, jh_off
+    pyh = add dst, jh_off
+    ph = ldm pph:vx, jh_rest:i32
+    pfh = vitof ph:f32
+    s32h = vwidenhi s16:i32
+    s_magh = vand s32h, v_mag_mask:i32
+    s_exph = vshl s_magh, 13:i32
+    s_absh = vmul s_exph, v_two_112:f32
+    s_sgnh = vand s32h, v_sign_bit:i32
+    sh = vor s_absh, s_sgnh:i32
+    dsh = vmul sh, vd:f32
+    acch = ldm pyh:vx, jh_rest:f32
+    acc2h = vfma pfh, dsh, acch:f32
+    stm pyh, acc2h, jh_rest:f32
+    j2 = add jh, w
     jmp accum(j2)
+  sub_next:
+    si2 = add si, 1:i64
+    jmp sub(si2, wt)
   block_next:
     b2 = add b, 1:i64
     jmp blocks(b2)
   done:
+    free tile
     free dots
     ret
-
 # xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
 # At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
 # sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
