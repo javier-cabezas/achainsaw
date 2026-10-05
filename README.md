@@ -174,7 +174,7 @@ The rules:
 - **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
 
 How it runs:
-- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 2 ms before parking, so back-to-back `par` loops do not pay thread wake-ups. A helper that found nothing to do parks at once, so it does not slow down a busy thread sharing its core.
+- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A helper that found nothing to do parks at once, so it does not slow down a busy thread sharing its core.
 - **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
 - **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
 - **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
@@ -412,6 +412,12 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `gemv_par.air` | `gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | The same on all cores, blocks of 16 rows per `par` index; `bench(m, k, reps)->f32` runs it from the CLI or MCP |
 | `gemm_bf16.air` | `(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 via `mm` (AMX, SME or FMA) |
 | `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). Runs on all cores: one `par` gathers the selected entries, a second runs FlashAttention-2 (blocks of 64 entries, both products on `mm`) for groups of 8 heads |
+| `add_rmsnorm.air` | `(x:ptr, res:ptr, w:ptr, out:ptr, n:i64, eps:f32)->f32` | Residual add fused with RMSNorm between sublayers (vLLM's `fused_add_rms_norm`): updates the residual stream and normalizes it in two passes |
+| `rope.air` | `(x:ptr, heads:i64, dim:i64, cos:ptr, sin:ptr)` | Rotary position embedding in place, LLaMA/NeoX rotate-half layout, from a row of the cos/sin cache |
+| `swiglu.air` | `(gate:ptr, up:ptr, out:ptr, n:i64)` | `silu(gate) * up` with `exp` vectorized in AIR (Cephes polynomial; 2^n built by reading the f32 lanes as i32), no libm call |
+| `argmax.air` | `(x:ptr, n:i64)->i64` | Greedy decoding: first index of the largest logit, one pass with four independent (value, index) accumulator sets |
+| `q8_gemv.air` | `q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q8_0 (llama.cpp) matrix-vector product on all cores: int8 weights in 32-blocks with f32 scales, packed in 64-row chunks; activations quantized on the fly; int8 dots on `mm`, converted to f32 by reading i32 lanes as f32 bits |
+| `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out: see [Single-call decode](#single-call-decode-deep-fusion) |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
 
@@ -421,20 +427,50 @@ python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx
 python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
 ```
 
-Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy (whose GEMV/GEMM use multithreaded BLAS):
+Single calls on one Zen 4 core (AVX-512) except where noted, compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits and widened in each call, Q8_0 weights stay int8; NumPy's GEMV/GEMM use multithreaded BLAS), from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS:
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
-| Cosine similarity, n=1024 | 2.4 µs | 1.1 µs | 0.5 µs |
-| Euclidean distance, n=1024 | 1.4 µs | 1.0 µs | 0.5 µs |
-| Softmax, n=1000 | 3.2 µs | 4.3 µs | 3.1 µs |
+| Cosine similarity, n=1024 | 2.3 µs | 1.1 µs | 0.5 µs |
+| Euclidean distance, n=1024 | 1.4 µs | 1.1 µs | 0.5 µs |
+| Softmax, n=1000 | 2.9 µs | 4.4 µs | 3.2 µs |
 | RMSNorm, n=4096 | 5.7 µs | 6.0 µs | 1.4 µs |
-| GEMV f32, 512x1024 | 6 µs | 355 µs | 62 µs (about 34 GB/s from one core) |
-| GEMV f32 with `par`, 512x1024, all cores | 6 µs | 61 µs | 13.5 µs (Ryzen 7 8845HS) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.1–1.6 ms (f32) | 2.5 ms (13 ms on one core) | 1.1–1.2 ms (Ryzen 7 8845HS; 5.1 ms on one core) |
-| GEMM bf16, 256³ | 65 µs (f32) | 1.3 ms | 0.39 ms (87 GFLOP/s) |
+| GEMV f32, 512x1024 | 6 µs | 376 µs | 64 µs |
+| GEMV f32 with `par`, 512x1024, all cores | 6 µs | 62 µs | 18 µs |
+| GEMM bf16 -> f32, 256³ | 186 µs | 1.2 ms | 0.40 ms (84 GFLOP/s) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.4 ms | 2.2 ms (13 ms on one core) | 1.05 ms (5.1 ms on one core) |
+| SwiGLU, n=14336 | 11 µs | 21 µs | 4.8 µs |
+| Greedy argmax, vocab 128256 | 6.7 µs | 29 µs | 4.7 µs |
+| RoPE, 32 heads x 128 | 7.4 µs | 2.0 µs | 0.8 µs |
+| Residual add + RMSNorm, n=4096 | 6.3 µs | 6.1 µs | 3.2 µs |
+| Q8_0 GEMV 4096x4096, all cores | 6.5 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 0.52 ms | 0.17 ms (repeated calls keep part of the 18 MB in L3) |
 
 Fuel checks are inline (a decrement and a compare per branch), so loops pay almost nothing for runaway protection.
+
+#### Single-call decode (deep fusion)
+
+[`examples/kernels/llama_decode.air`](examples/kernels/llama_decode.air) runs a whole decode step of a Llama-style model (RMSNorm, grouped-query attention with RoPE and a KV cache, SwiGLU MLP, Q8_0 weights) in one call: the token id goes in, the greedy next token comes out. Like GPU megakernels ([Hazy Research's Llama-1B megakernel](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles), [AutoMegaKernel](https://arxiv.org/pdf/2606.09682)), it removes the boundaries between the ~100 small kernels of a forward pass; on a CPU that means each elementwise op runs inside the pass that produces or consumes its data:
+
+| Pass | Fused into it |
+|---|---|
+| RMSNorm (serial) | Q8 quantization of its output |
+| QKV projection (`par`, one task per head) | RoPE, KV-cache append |
+| Attention (`par`, one task per q head) | vectorized softmax `exp`, Q8 quantization of its output |
+| O and down projections (`par`, 64 rows per task) | residual add |
+| Gate and up projections (`par`, 64 rows per task) | SwiGLU, Q8 quantization |
+| LM head (`par`, 64 rows per task) | argmax: each task keeps only its best logit, so the logits are never written |
+
+That is 2 serial norms and 5 `par` regions per layer. Weights use `q8_gemv`'s chunked layout, so every task owns its output rows and applies its epilogue without a cross-task reduction. `crates/achainsaw-codegen/tests/llama_decode.rs` checks it against an f64 reference model over several positions, at every ISA level on both backends.
+
+On a random model with Llama 3.2 1B's shapes (d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256; 1.39 GB of Q8_0 weights) on a Ryzen 7 8845HS, from [`benchmarks/benchmark_decode.py`](benchmarks/benchmark_decode.py):
+
+| | ms/token | tokens/s | weights read |
+|---|---|---|---|
+| AIR on LLVM, one call per token | 27.2 | 37 | 51 GB/s |
+| AIR on Cranelift, one call per token | 32.3 | 31 | 43 GB/s |
+| NumPy, same data types (int8 weights and activations, f32 elsewhere) | 735 | 1.4 | 1.9 GB/s |
+
+Both implementations share the weights and the arithmetic (exact int8 block dots, f32 for the embedding, norms, RoPE, KV cache and attention), and all 32 greedy tokens match. Decode is bound by memory bandwidth: the kernel streams each int8 weight once, at 51 GB/s, with no intermediate tensors, while NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. (Dequantizing the weights to f32 ahead of time, at 4x the memory, brings NumPy to about 114 ms/token.)
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
@@ -669,7 +705,7 @@ achainsaw/
 │   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
 ├── examples/                   # Each .air has matching .airb bytecode
-│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, bf16 GEMM, flash attention
+│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, GEMM, attention, RoPE, SwiGLU, Q8 GEMV, argmax, single-call decode
 │   ├── fibonacci.air           # Iterative Fibonacci (branches, block parameters)
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── dot_product.air         # Scalar dot product with pointer arithmetic

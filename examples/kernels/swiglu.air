@@ -1,0 +1,85 @@
+# SwiGLU gate of LLaMA/Mistral/Qwen MLPs (vLLM's silu_and_mul):
+#   out_i = silu(gate_i) * up_i,   silu(g) = g / (1 + exp(-g))
+#
+# exp runs at full vector width, with no libm call (Cephes expf, about 1 ulp):
+#   x = clamp(x, -87, 88);  n = round(x * log2(e));  r = x - n * ln2   (ln2 in two parts)
+#   exp(x) = 2^n * p(r),    p = 1 + r + r^2 * (degree-5 polynomial in r)
+# Vectors are untyped bits, so the f32 lanes are reused as i32 lanes for 2^n: adding
+# 1.5 * 2^23 to t = x * log2(e) rounds it to n and leaves 0x4B400000 + n in the bits;
+# (bits - 0x4B400000 + 127) * 2^23 is then the bit pattern of 2^n.
+fn swiglu(gate:ptr, up:ptr, out:ptr, n:i64)
+  b0:
+    w = vl f32
+    one = cst 1.0:f32
+    v_one = splat one:vx
+    zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    lo = cst -87.0:f32
+    v_lo = splat lo:vx
+    hi = cst 88.0:f32
+    v_hi = splat hi:vx
+    log2e = cst 1.44269504088896341:f32
+    v_log2e = splat log2e:vx
+    magic = cst 12582912.0:f32
+    v_magic = splat magic:vx
+    ln2_hi = cst -0.693359375:f32
+    v_ln2_hi = splat ln2_hi:vx
+    ln2_lo = cst 0.000212194440:f32
+    v_ln2_lo = splat ln2_lo:vx
+    p0 = cst 0.00019875691500:f32
+    v_p0 = splat p0:vx
+    p1 = cst 0.0013981999507:f32
+    v_p1 = splat p1:vx
+    p2 = cst 0.0083334519073:f32
+    v_p2 = splat p2:vx
+    p3 = cst 0.041665795894:f32
+    v_p3 = splat p3:vx
+    p4 = cst 0.16666665459:f32
+    v_p4 = splat p4:vx
+    p5 = cst 0.50000001201:f32
+    v_p5 = splat p5:vx
+    bias = cst -1262485377:i32
+    v_bias = splat bias:vx
+    pow23 = cst 8388608:i32
+    v_pow23 = splat pow23:vx
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    off = mul i, 4:i64
+    pg = add gate, off
+    pu = add up, off
+    po = add out, off
+    g = ldm pg:vx, rest:f32
+    u = ldm pu:vx, rest:f32
+    # e = exp(-g)
+    x0 = vsub v_zero, g:f32
+    x1 = vmax x0, v_lo:f32
+    x = vmin x1, v_hi:f32
+    t = vmul x, v_log2e:f32
+    tm = vadd t, v_magic:f32
+    nf = vsub tm, v_magic:f32
+    r0 = vfma nf, v_ln2_hi, x:f32
+    r = vfma nf, v_ln2_lo, r0:f32
+    q0 = vfma v_p0, r, v_p1:f32
+    q1 = vfma q0, r, v_p2:f32
+    q2 = vfma q1, r, v_p3:f32
+    q3 = vfma q2, r, v_p4:f32
+    q4 = vfma q3, r, v_p5:f32
+    r2 = vmul r, r:f32
+    rp = vadd r, v_one:f32
+    p = vfma q4, r2, rp:f32
+    eb = vadd tm, v_bias:i32
+    scale = vmul eb, v_pow23:i32
+    e = vmul p, scale:f32
+    # silu(g) * up = g * up / (1 + e)
+    den = vadd e, v_one:f32
+    gu = vmul g, u:f32
+    y = vdiv gu, den:f32
+    stm po, y, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  done:
+    ret
