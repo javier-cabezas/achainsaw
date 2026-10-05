@@ -96,7 +96,7 @@ fn gather_block(blk:i64, kv:ptr, idx:ptr, kvs:ptr, nk:i64, d:i64)
 
 # FlashAttention-2 for heads [g * group, g * group + group), over the gathered entries kvs.
 # Writes only those heads' rows of out.
-fn attend_heads(g:i64, q_all:ptr, kvs:ptr, idx:ptr, sink_all:ptr, out_all:ptr, nh:i64, d:i64, nk:i64, scale:f32, group:i64)
+fn attend_heads(g:i64, q_all:ptr, kvs:ptr, idx:ptr, sink_all:ptr, out_all:ptr, nh:i64, d:i64, nk:i64, scale:f32, group:i64) fast
   b0:
     r0 = mul g, group
     left_h = sub nh, r0

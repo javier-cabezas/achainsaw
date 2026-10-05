@@ -589,19 +589,52 @@ fn vexp_f32x4(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
 }
 
 /// Combines two lane values for a horizontal reduction.
+/// Float min/max, scalar or vector: AIR's default semantics (`fmin`/`fmax`: NaN if either
+/// operand is NaN, -0.0 below +0.0), or in `fast` functions compare and select
+/// (`a > b ? a : b` for max, `a < b ? a : b` for min).
+fn float_minmax(
+    builder: &mut FunctionBuilder,
+    is_max: bool,
+    fast: bool,
+    a: ClifValue,
+    b: ClifValue,
+) -> ClifValue {
+    if !fast {
+        return if is_max {
+            builder.ins().fmax(a, b)
+        } else {
+            builder.ins().fmin(a, b)
+        };
+    }
+    let cc = if is_max {
+        FloatCC::GreaterThan
+    } else {
+        FloatCC::LessThan
+    };
+    let c = builder.ins().fcmp(cc, a, b);
+    let ty = builder.func.dfg.value_type(a);
+    if ty.is_vector() {
+        let m = builder.ins().bitcast(ty, bitcast_flags(), c);
+        builder.ins().bitselect(m, a, b)
+    } else {
+        builder.ins().select(c, a, b)
+    }
+}
+
 fn reduce_pair(
     builder: &mut FunctionBuilder,
     op: VectorReduceOp,
     lane: Type,
+    fast: bool,
     a: ClifValue,
     b: ClifValue,
 ) -> ClifValue {
     match (op, lane.is_float()) {
         (VectorReduceOp::Sum, true) => builder.ins().fadd(a, b),
         (VectorReduceOp::Sum, false) => builder.ins().iadd(a, b),
-        (VectorReduceOp::Max, true) => builder.ins().fmax(a, b),
+        (VectorReduceOp::Max, true) => float_minmax(builder, true, fast, a, b),
         (VectorReduceOp::Max, false) => builder.ins().smax(a, b),
-        (VectorReduceOp::Min, true) => builder.ins().fmin(a, b),
+        (VectorReduceOp::Min, true) => float_minmax(builder, false, fast, a, b),
         (VectorReduceOp::Min, false) => builder.ins().smin(a, b),
     }
 }
@@ -612,21 +645,23 @@ fn reduce_tree(
     builder: &mut FunctionBuilder,
     op: VectorReduceOp,
     lane: Type,
+    fast: bool,
     vals: &[ClifValue],
 ) -> ClifValue {
     if vals.len() == 1 {
         return vals[0];
     }
     let (lo, hi) = vals.split_at(vals.len() / 2);
-    let a = reduce_tree(builder, op, lane, lo);
-    let b = reduce_tree(builder, op, lane, hi);
-    reduce_pair(builder, op, lane, a, b)
+    let a = reduce_tree(builder, op, lane, fast, lo);
+    let b = reduce_tree(builder, op, lane, fast, hi);
+    reduce_pair(builder, op, lane, fast, a, b)
 }
 
 fn vbinary_part(
     builder: &mut FunctionBuilder,
     op: VBinOp,
     lane: Type,
+    fast: bool,
     l: ClifValue,
     r: ClifValue,
 ) -> ClifValue {
@@ -649,9 +684,9 @@ fn vbinary_part(
         (VBinOp::Sub, false) => builder.ins().isub(a, b),
         (VBinOp::Mul, true) => builder.ins().fmul(a, b),
         (VBinOp::Mul, false) => builder.ins().imul(a, b),
-        (VBinOp::Min, true) => builder.ins().fmin(a, b),
+        (VBinOp::Min, true) => float_minmax(builder, false, fast, a, b),
         (VBinOp::Min, false) => builder.ins().smin(a, b),
-        (VBinOp::Max, true) => builder.ins().fmax(a, b),
+        (VBinOp::Max, true) => float_minmax(builder, true, fast, a, b),
         (VBinOp::Max, false) => builder.ins().smax(a, b),
         // The validator only allows float lanes for vdiv.
         (VBinOp::Div, _) => builder.ins().fdiv(a, b),
@@ -1499,8 +1534,14 @@ pub fn lower_function<M: ClifModule>(
                                 let ext = builder.ins().uextend(types::I32, cmp);
                                 (ext, Type::I32)
                             }
-                            BinaryOp::Min => (builder.ins().fmin(lhs_val, rhs_val), lhs_ty),
-                            BinaryOp::Max => (builder.ins().fmax(lhs_val, rhs_val), lhs_ty),
+                            BinaryOp::Min => (
+                                float_minmax(&mut builder, false, func.fast, lhs_val, rhs_val),
+                                lhs_ty,
+                            ),
+                            BinaryOp::Max => (
+                                float_minmax(&mut builder, true, func.fast, lhs_val, rhs_val),
+                                lhs_ty,
+                            ),
                             _ => return Err(anyhow!("Unsupported float op {:?}", op)),
                         },
                         _ => {
@@ -1871,9 +1912,9 @@ pub fn lower_function<M: ClifModule>(
                         let lanes: Vec<ClifValue> = (0..lanes_per_part)
                             .map(|i| builder.ins().extractlane(v, i as u8))
                             .collect();
-                        part_results.push(reduce_tree(&mut builder, *op, *ty, &lanes));
+                        part_results.push(reduce_tree(&mut builder, *op, *ty, func.fast, &lanes));
                     }
-                    let res = reduce_tree(&mut builder, *op, *ty, &part_results);
+                    let res = reduce_tree(&mut builder, *op, *ty, func.fast, &part_results);
                     values.insert(dst.clone(), (vec![res], *ty));
                 }
                 Instruction::VBinary {
@@ -1888,7 +1929,7 @@ pub fn lower_function<M: ClifModule>(
                     let (r_parts, _) = parts(&values, rhs);
                     let mut out = Vec::with_capacity(l_parts.len());
                     for (l, r) in l_parts.into_iter().zip(r_parts) {
-                        out.push(vbinary_part(&mut builder, *op, *lane, l, r));
+                        out.push(vbinary_part(&mut builder, *op, *lane, func.fast, l, r));
                     }
                     values.insert(dst.clone(), (out, vec_ty));
                 }

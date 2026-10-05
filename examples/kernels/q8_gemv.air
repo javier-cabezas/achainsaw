@@ -28,7 +28,7 @@ fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
 # xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
 # At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
 # sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
-fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
+fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64) fast
   b0:
     w = vl f32
     nb = udiv k, 32:i64

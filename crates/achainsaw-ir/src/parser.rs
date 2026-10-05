@@ -301,6 +301,11 @@ impl<'a> Parser<'a> {
     fn parse_function(&mut self) -> Result<Function, Diagnostic> {
         let fn_span = self.expect(TokenKind::Fn)?;
         let (name, params, ret_type) = self.parse_signature()?;
+        // Optional `fast` attribute (see `Function::fast`).
+        let fast = matches!(self.peek_kind(), TokenKind::Ident(word) if word == "fast");
+        if fast {
+            self.advance();
+        }
         self.skip_newlines();
 
         let mut blocks = Vec::new();
@@ -325,6 +330,7 @@ impl<'a> Parser<'a> {
             name,
             params,
             ret_type,
+            fast,
             blocks,
             span: Span {
                 start: fn_span.start,

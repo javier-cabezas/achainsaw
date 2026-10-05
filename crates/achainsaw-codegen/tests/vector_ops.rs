@@ -54,6 +54,10 @@ enum Kernel {
     Narrow(Type, Type),
     /// Shift amount: the i32 at `pc`.
     Shift(VShiftOp, Type, Type),
+    /// `vmin`/`vmax` in a `fast` function (compare and select).
+    FastBin(VBinOp, Type, Type),
+    /// `vminr`/`vmaxr` in a `fast` function.
+    FastReduce(VectorReduceOp, Type, Type),
 }
 
 impl Kernel {
@@ -68,6 +72,8 @@ impl Kernel {
             Kernel::Unary(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Narrow(l, w) => format!("k_vnarrow_{l}_{w}"),
             Kernel::Shift(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
+            Kernel::FastBin(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
+            Kernel::FastReduce(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
         }
     }
 
@@ -87,9 +93,16 @@ impl Kernel {
                 "    a = ld pa:{w}\n    n = ld pc:i32\n    r = {} a, n:{l}\n",
                 op.as_str()
             ),
+            Kernel::FastBin(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
+            Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
+        };
+        let fast = if matches!(self, Kernel::FastBin(..) | Kernel::FastReduce(..)) {
+            " fast"
+        } else {
+            ""
         };
         format!(
-            "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
+            "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr){fast}\n  b0:\n{body}    st po, r\n    ret\n",
             self.name()
         )
     }
@@ -103,7 +116,9 @@ impl Kernel {
             | Kernel::Splat(l, _)
             | Kernel::Unary(_, l, _)
             | Kernel::Narrow(l, _)
-            | Kernel::Shift(_, l, _) => *l,
+            | Kernel::Shift(_, l, _)
+            | Kernel::FastBin(_, l, _)
+            | Kernel::FastReduce(_, l, _) => *l,
             Kernel::Sel(_) => Type::I8,
         }
     }
@@ -127,14 +142,16 @@ impl Kernel {
             | Kernel::Splat(_, w)
             | Kernel::Unary(_, _, w)
             | Kernel::Narrow(_, w)
-            | Kernel::Shift(_, _, w) => *w,
+            | Kernel::Shift(_, _, w)
+            | Kernel::FastBin(_, _, w)
+            | Kernel::FastReduce(_, _, w) => *w,
         }
     }
 
     /// Bytes of output to compare.
     fn out_bytes(&self, vx_bytes: usize) -> usize {
         match self {
-            Kernel::Reduce(_, l, _) => l.byte_size(),
+            Kernel::Reduce(_, l, _) | Kernel::FastReduce(_, l, _) => l.byte_size(),
             _ => width_bytes(self.width(), vx_bytes),
         }
     }
@@ -143,9 +160,12 @@ impl Kernel {
     fn float_output(&self) -> bool {
         match self {
             Kernel::Bin(op, l, _) => l.is_float() && !op.is_bitwise(),
-            Kernel::Fma(..) | Kernel::Reduce(..) | Kernel::Splat(..) | Kernel::Unary(..) => {
-                self.lane().is_float()
-            }
+            Kernel::Fma(..)
+            | Kernel::Reduce(..)
+            | Kernel::Splat(..)
+            | Kernel::Unary(..)
+            | Kernel::FastBin(..)
+            | Kernel::FastReduce(..) => self.lane().is_float(),
             Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Narrow(..) | Kernel::Shift(..) => false,
         }
     }
@@ -189,8 +209,27 @@ fn all_kernels() -> Vec<Kernel> {
                 ks.push(Kernel::Shift(op, l, w));
             }
         }
+        for l in [Type::F32, Type::F64] {
+            for op in [VBinOp::Min, VBinOp::Max] {
+                ks.push(Kernel::FastBin(op, l, w));
+            }
+            for op in [VectorReduceOp::Min, VectorReduceOp::Max] {
+                ks.push(Kernel::FastReduce(op, l, w));
+            }
+        }
     }
     ks
+}
+
+/// Float min/max in `fast` functions: `a > b ? a : b` / `a < b ? a : b` (so a NaN operand or
+/// two zeros give `b`).
+fn fast_minmax(is_max: bool, a: f64, b: f64) -> f64 {
+    let pick_a = if is_max { a > b } else { a < b };
+    if pick_a {
+        a
+    } else {
+        b
+    }
 }
 
 /// Lane type twice as wide as an integer lane (`vnarrow`'s operands).
@@ -468,6 +507,39 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             for i in 0..half {
                 put_int(&mut out, l, i, get_int(a, wide, i).clamp(min, max));
                 put_int(&mut out, l, half + i, get_int(b, wide, i).clamp(min, max));
+            }
+        }
+        Kernel::FastBin(op, l, _) => {
+            let is_max = op == VBinOp::Max;
+            for i in 0..n {
+                if l == Type::F32 {
+                    let (x, y) = (get_f32(a, i), get_f32(b, i));
+                    let pick_x = if is_max { x > y } else { x < y };
+                    let r = if pick_x { x } else { y };
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                } else {
+                    let r = fast_minmax(is_max, get_f64(a, i), get_f64(b, i));
+                    out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+        }
+        Kernel::FastReduce(op, l, _) => {
+            let is_max = op == VectorReduceOp::Max;
+            if l == Type::F32 {
+                let vals: Vec<f32> = (0..n).map(|i| get_f32(a, i)).collect();
+                let r = tree(&vals, &|x: f32, y: f32| {
+                    let pick_x = if is_max { x > y } else { x < y };
+                    if pick_x {
+                        x
+                    } else {
+                        y
+                    }
+                });
+                out[..4].copy_from_slice(&r.to_le_bytes());
+            } else {
+                let vals: Vec<f64> = (0..n).map(|i| get_f64(a, i)).collect();
+                let r = tree(&vals, &|x, y| fast_minmax(is_max, x, y));
+                out[..8].copy_from_slice(&r.to_le_bytes());
             }
         }
         Kernel::Shift(op, l, _) => {

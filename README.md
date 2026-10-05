@@ -107,6 +107,8 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 
 Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths.
 
+**Fast min/max:** a function declared `fn softmax(x:ptr, out:ptr, n:i64)->f32 fast` computes its float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`) by compare and select, `max(a, b) = a > b ? a : b` and `min(a, b) = a < b ? a : b`, so a NaN operand or two zeros give `b`. That skips the NaN and signed-zero handling, which costs several instructions per op on 128-bit Cranelift vectors, and results stay identical on every backend (they are what x86's `maxps`/`minps` compute). Softmax runs 17% faster on Cranelift and 13% faster on LLVM with it.
+
 Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
 ```air
 fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
@@ -440,19 +442,19 @@ Compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits 
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
-| Q8_0 GEMV 4096x4096, all cores | 5.74 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 444 µs (12.9x) | 162 µs (35.4x) |
-| RoPE, 32 heads x 128 | 7.8 µs | 1.9 µs (4.0x) | 0.80 µs (9.8x) |
-| Cosine similarity, n=1024 | 2.3 µs | 0.69 µs (3.4x) | 0.53 µs (4.4x) |
-| RMSNorm, n=4096 | 5.8 µs | 3.9 µs (1.5x) | 1.5 µs (3.9x) |
-| Softmax, n=1000 | 3.0 µs | 2.1 µs (1.4x) | 1.0 µs (3.0x) |
-| Euclidean distance, n=1024 | 1.4 µs | 0.67 µs (2.1x) | 0.53 µs (2.7x) |
-| SwiGLU, n=14336 | 11.0 µs | 15.9 µs (0.69x) | 4.8 µs (2.3x) |
-| GEMM bf16 -> f32, 256³, all cores | 169 µs | 263 µs (0.64x) | 76 µs (2.2x) |
-| Residual add + RMSNorm, n=4096 | 6.3 µs | 4.2 µs (1.5x) | 3.1 µs (2.0x) |
-| Greedy argmax, vocabulary 128256 | 7.0 µs | 16.3 µs (0.43x) | 4.9 µs (1.4x) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.34 ms | 2.14 ms (0.63x) | 1.12 ms (1.2x) |
-| GEMV f32 512x1024, all cores | 7.4 µs | 18.0 µs (0.41x) | 11.0 µs (0.67x) |
-| GEMV f32 512x1024, 1 core | 6.4 µs (all cores) | 39.1 µs (0.16x) | 22.1 µs (0.29x) |
+| Q8_0 GEMV 4096x4096, all cores | 6.69 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 471 µs (14.2x) | 148 µs (45.1x) |
+| RoPE, 32 heads x 128 | 7.7 µs | 2.0 µs (3.8x) | 0.80 µs (9.6x) |
+| Residual add + RMSNorm, n=4096 | 6.3 µs | 4.2 µs (1.5x) | 1.5 µs (4.2x) |
+| Cosine similarity, n=1024 | 2.3 µs | 0.70 µs (3.3x) | 0.54 µs (4.3x) |
+| RMSNorm, n=4096 | 5.6 µs | 3.9 µs (1.4x) | 1.4 µs (3.9x) |
+| Softmax, n=1000 | 2.9 µs | 1.8 µs (1.6x) | 0.93 µs (3.2x) |
+| Euclidean distance, n=1024 | 1.4 µs | 0.67 µs (2.1x) | 0.54 µs (2.6x) |
+| GEMM bf16 -> f32, 256³, all cores | 172 µs | 251 µs (0.69x) | 76 µs (2.3x) |
+| SwiGLU, n=14336 | 11.2 µs | 14.7 µs (0.76x) | 5.0 µs (2.2x) |
+| Greedy argmax, vocabulary 128256 | 6.9 µs | 16.2 µs (0.43x) | 4.9 µs (1.4x) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.42 ms | 2.20 ms (0.65x) | 1.06 ms (1.3x) |
+| GEMV f32 512x1024, all cores | 6.2 µs | 17.7 µs (0.35x) | 9.6 µs (0.64x) |
+| GEMV f32 512x1024, 1 core | 6.0 µs (all cores) | 39.8 µs (0.15x) | 21.8 µs (0.27x) |
 
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
 
@@ -482,8 +484,8 @@ On a random model with Llama 3.2 1B's shapes (d 2048, 16 layers, 32 query heads 
 | | ms/token | tokens/s | weights read |
 |---|---|---|---|
 | AIR on LLVM, one call per token | 26.5 | 38 | 52 GB/s |
-| AIR on Cranelift, one call per token | 31.3 | 32 | 44 GB/s |
-| NumPy, same data types (int8 weights and activations, f32 elsewhere) | 627 | 1.6 | 2.2 GB/s |
+| AIR on Cranelift, one call per token | 31.0 | 32 | 45 GB/s |
+| NumPy, same data types (int8 weights and activations, f32 elsewhere) | 781 | 1.3 | 1.8 GB/s |
 
 Both implementations share the weights and the arithmetic (exact int8 block dots, f32 for the embedding, norms, RoPE, KV cache and attention), and all 32 greedy tokens match. Decode is bound by memory bandwidth: the kernel streams each int8 weight once, at 52 GB/s, with no intermediate tensors, while NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. (Dequantizing the weights to f32 ahead of time, at 4x the memory, brings NumPy to about 114 ms/token.)
 
