@@ -113,6 +113,12 @@ impl PyKernel {
         Ok(self.engine(py)?.backend().as_str())
     }
 
+    /// Whether float min/max were compiled as compare and select (see `compile`).
+    #[getter]
+    pub fn fast_math(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.engine(py)?.fast_math())
+    }
+
     /// Most threads `par` loops may use (`None`: all cores; 1 runs them serially).
     #[pyo3(signature = (threads=None))]
     pub fn set_threads(&self, py: Python<'_>, threads: Option<usize>) -> PyResult<()> {
@@ -392,7 +398,11 @@ pub fn disassemble(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
     Ok(to_air_text(&module))
 }
 
-fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResult<PyKernel> {
+fn build_kernel(
+    module: &achainsaw_ir::Module,
+    backend: Option<&str>,
+    fast_math: bool,
+) -> PyResult<PyKernel> {
     let runtime_err = |e: anyhow::Error| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
 
     let mut signatures = HashMap::new();
@@ -402,6 +412,7 @@ fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResul
     }
 
     let mut engine = JitEngine::for_module(backend, module).map_err(runtime_err)?;
+    engine.set_fast_math(fast_math);
     engine.compile_module(module).map_err(runtime_err)?;
 
     Ok(PyKernel {
@@ -411,27 +422,38 @@ fn build_kernel(module: &achainsaw_ir::Module, backend: Option<&str>) -> PyResul
     })
 }
 
-/// Compiles AIRB bytecode. `backend` is "cranelift", "llvm" or "auto" (the default: follows
-/// ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else Cranelift).
+/// Compiles AIRB bytecode; `backend` and `fast_math` as in `compile`.
 #[pyfunction]
-#[pyo3(signature = (bytes, backend=None))]
-pub fn compile_binary(py: Python<'_>, bytes: &[u8], backend: Option<&str>) -> PyResult<PyKernel> {
+#[pyo3(signature = (bytes, backend=None, fast_math=false))]
+pub fn compile_binary(
+    py: Python<'_>,
+    bytes: &[u8],
+    backend: Option<&str>,
+    fast_math: bool,
+) -> PyResult<PyKernel> {
     let module = decode_module(bytes).map_err(|d| diagnostic_to_py_err(py, d))?;
     let mut validator = achainsaw_ir::Validator::new();
     validator
         .validate_module(&module)
         .map_err(|d| diagnostic_to_py_err(py, d))?;
-    build_kernel(&module, backend)
+    build_kernel(&module, backend, fast_math)
 }
 
 /// Compiles AIR source text. `backend` is "cranelift", "llvm" or "auto" (the default:
 /// follows ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else
-/// Cranelift).
+/// Cranelift). `fast_math` compiles float min/max (min, max, vmin, vmax, vminr, vmaxr) as
+/// compare and select, `max(a, b) = a > b ? a : b`, so a NaN operand or two zeros give `b`;
+/// by default they propagate NaN and order -0.0 below +0.0.
 #[pyfunction]
-#[pyo3(signature = (source, backend=None))]
-pub fn compile(py: Python<'_>, source: &str, backend: Option<&str>) -> PyResult<PyKernel> {
+#[pyo3(signature = (source, backend=None, fast_math=false))]
+pub fn compile(
+    py: Python<'_>,
+    source: &str,
+    backend: Option<&str>,
+    fast_math: bool,
+) -> PyResult<PyKernel> {
     let module = parse_and_validate(source).map_err(|d| diagnostic_to_py_err(py, d))?;
-    build_kernel(&module, backend)
+    build_kernel(&module, backend, fast_math)
 }
 
 /// Backends compiled into this build, e.g. ["cranelift", "llvm"].

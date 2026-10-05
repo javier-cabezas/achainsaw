@@ -9,6 +9,7 @@ exact integer block dots, f32 for everything else (embedding, norms, RoPE, KV ca
 attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the int8 weights to
 f32 in each call and runs the block dots as a batched f32 BLAS matmul (exact here).
+The kernel compiles with fast_math=True (float min/max as compare and select).
 
     python benchmarks/benchmark_decode.py                 # all 16 layers, 32 tokens
     python benchmarks/benchmark_decode.py --layers 4 --tokens 16 --no-numpy
@@ -152,7 +153,7 @@ def main():
 
     runs = {}
     for be in backends:
-        kernel = achainsaw.compile(src, backend=be)
+        kernel = achainsaw.compile(src, backend=be, fast_math=True)
         cache, h = model.new_cache(), np.zeros(model.d, dtype=np.float32)
         token, tokens, times = 1, [], []
         for pos in range(args.tokens):

@@ -705,7 +705,7 @@ fn new_ops_compile_for_every_llvm_target() {
             cpu: Some(cpu.into()),
             features: (!features.is_empty()).then(|| features.into()),
         };
-        let obj = compile_object(&module, &target, Backend::Llvm)
+        let obj = compile_object(&module, &target, Backend::Llvm, &Default::default())
             .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
         assert!(!obj.bytes.is_empty());
     }
@@ -778,7 +778,7 @@ fn mm_kernels_match_target_matrix_engines() {
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        let (asm, _) = compile_assembly(&module, &target, Backend::Llvm)
+        let (asm, _) = compile_assembly(&module, &target, Backend::Llvm, &Default::default())
             .unwrap_or_else(|e| panic!("{cpu} {features}: {e}"));
         for w in *want {
             assert!(

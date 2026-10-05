@@ -20,6 +20,18 @@ pub struct AotCompiler {
     rt_malloc_id: FuncId,
     rt_free_id: FuncId,
     ignored_features: Vec<&'static str>,
+    fast_math: bool,
+}
+
+/// Code generation choices that change what instructions lower to (not the target).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodegenOptions {
+    /// Float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`) compare and select:
+    /// `max(a, b) = a > b ? a : b`, `min(a, b) = a < b ? a : b`, so a NaN operand or two
+    /// zeros give `b`. Without it they propagate NaN and order -0.0 below +0.0. Either way
+    /// results are identical on every backend; compare and select is cheaper, notably on
+    /// Cranelift's 128-bit vectors.
+    pub fast_math: bool,
 }
 
 /// Code generation target for AOT builds. All fields default to the (capped) host.
@@ -77,7 +89,13 @@ impl AotCompiler {
             rt_malloc_id,
             rt_free_id,
             ignored_features,
+            fast_math: false,
         })
+    }
+
+    /// See `CodegenOptions::fast_math`; applies to modules compiled from now on.
+    pub fn set_fast_math(&mut self, on: bool) {
+        self.fast_math = on;
     }
 
     /// Requested target features that Cranelift cannot use (e.g. `avx512bw`, `sve`).
@@ -136,6 +154,7 @@ impl AotCompiler {
             rt_free_id: self.rt_free_id,
             sandbox: None,
             par: None,
+            fast_math: self.fast_math,
         };
 
         for func in &ir_mod.functions {
@@ -184,15 +203,16 @@ pub fn compile_assembly(
     ir_mod: &Module,
     target: &AotTarget,
     backend: Backend,
+    options: &CodegenOptions,
 ) -> Result<(String, String)> {
     match backend {
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
-            let (spec, opts) = llvm_aot_options(target)?;
+            let (spec, opts) = llvm_aot_options(target, options)?;
             achainsaw_llvm::compile_assembly(ir_mod, &spec, &opts)
         }
         _ => {
-            let _ = (ir_mod, target);
+            let _ = (ir_mod, target, options);
             Err(anyhow!(
                 "[ERR_UNSUPPORTED_EMIT] Assembly output needs the llvm backend (--backend llvm)"
             ))
@@ -203,6 +223,7 @@ pub fn compile_assembly(
 #[cfg(feature = "llvm")]
 fn llvm_aot_options(
     target: &AotTarget,
+    options: &CodegenOptions,
 ) -> Result<(achainsaw_llvm::TargetSpec, achainsaw_llvm::LowerOptions)> {
     let (spec, features) = cpu::llvm_aot_target(target)?;
     let (vx, vector_width) = features.llvm_vector_shape(false);
@@ -210,16 +231,23 @@ fn llvm_aot_options(
         vx,
         vector_width,
         matrix: features.llvm_matrix_units(),
+        fast_math: options.fast_math,
         ..Default::default()
     };
     Ok((spec, opts))
 }
 
 /// Compiles `ir_mod` to a native object for `target` with `backend`.
-pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> Result<AotObject> {
+pub fn compile_object(
+    ir_mod: &Module,
+    target: &AotTarget,
+    backend: Backend,
+    options: &CodegenOptions,
+) -> Result<AotObject> {
     match backend {
         Backend::Cranelift => {
             let mut compiler = AotCompiler::with_target(target)?;
+            compiler.set_fast_math(options.fast_math);
             let triple = compiler.triple();
             let ignored_features = compiler.ignored_features().to_vec();
             compiler.compile_module(ir_mod)?;
@@ -231,7 +259,7 @@ pub fn compile_object(ir_mod: &Module, target: &AotTarget, backend: Backend) -> 
         }
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
-            let (spec, opts) = llvm_aot_options(target)?;
+            let (spec, opts) = llvm_aot_options(target, options)?;
             let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec, &opts)?;
             Ok(AotObject {
                 bytes,

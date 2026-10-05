@@ -28,42 +28,42 @@
 <text x="434.7" y="616" font-size="11" text-anchor="end" fill="#898781">← slower than NumPy</text>
 <text x="450.7" y="616" font-size="11" fill="#898781">faster than NumPy →</text>
 <text x="238" y="119.0" font-size="12" text-anchor="end" fill="#0b0b0b">Q8_0 GEMV 4096x4096, all cores</text>
-<path d="M442.7,104.0 H652.8 Q656.8,104.0 656.8,108.0 V110.0 Q656.8,114.0 652.8,114.0 H442.7 Z" fill="#2a78d6"><title>Q8_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 12.92x NumPy</title></path>
-<path d="M442.7,116.0 H737.2 Q741.2,116.0 741.2,120.0 V122.0 Q741.2,126.0 737.2,126.0 H442.7 Z" fill="#eb6834"><title>Q8_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 35.43x NumPy</title></path>
+<path d="M442.7,104.0 H660.6 Q664.6,104.0 664.6,108.0 V110.0 Q664.6,114.0 660.6,114.0 H442.7 Z" fill="#2a78d6"><title>Q8_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 14.20x NumPy</title></path>
+<path d="M442.7,116.0 H757.4 Q761.4,116.0 761.4,120.0 V122.0 Q761.4,126.0 757.4,126.0 H442.7 Z" fill="#eb6834"><title>Q8_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 45.12x NumPy</title></path>
 <text x="238" y="155.0" font-size="12" text-anchor="end" fill="#0b0b0b">RoPE, 32 heads x 128</text>
-<path d="M442.7,140.0 H554.9 Q558.9,140.0 558.9,144.0 V146.0 Q558.9,150.0 554.9,150.0 H442.7 Z" fill="#2a78d6"><title>RoPE, 32 heads x 128, Cranelift (128-bit vectors): 4.01x NumPy</title></path>
-<path d="M442.7,152.0 H629.2 Q633.2,152.0 633.2,156.0 V158.0 Q633.2,162.0 629.2,162.0 H442.7 Z" fill="#eb6834"><title>RoPE, 32 heads x 128, LLVM (AVX-512): 9.75x NumPy</title></path>
+<path d="M442.7,140.0 H550.5 Q554.5,140.0 554.5,144.0 V146.0 Q554.5,150.0 550.5,150.0 H442.7 Z" fill="#2a78d6"><title>RoPE, 32 heads x 128, Cranelift (128-bit vectors): 3.80x NumPy</title></path>
+<path d="M442.7,152.0 H627.6 Q631.6,152.0 631.6,156.0 V158.0 Q631.6,162.0 627.6,162.0 H442.7 Z" fill="#eb6834"><title>RoPE, 32 heads x 128, LLVM (AVX-512): 9.56x NumPy</title></path>
 <text x="238" y="191.0" font-size="12" text-anchor="end" fill="#0b0b0b">Cosine similarity, n=1024</text>
-<path d="M442.7,176.0 H540.4 Q544.4,176.0 544.4,180.0 V182.0 Q544.4,186.0 540.4,186.0 H442.7 Z" fill="#2a78d6"><title>Cosine similarity, n=1024, Cranelift (128-bit vectors): 3.37x NumPy</title></path>
-<path d="M442.7,188.0 H562.8 Q566.8,188.0 566.8,192.0 V194.0 Q566.8,198.0 562.8,198.0 H442.7 Z" fill="#eb6834"><title>Cosine similarity, n=1024, LLVM (AVX-512): 4.41x NumPy</title></path>
-<text x="238" y="227.0" font-size="12" text-anchor="end" fill="#0b0b0b">RMSNorm, n=4096</text>
-<path d="M442.7,212.0 H470.9 Q474.9,212.0 474.9,216.0 V218.0 Q474.9,222.0 470.9,222.0 H442.7 Z" fill="#2a78d6"><title>RMSNorm, n=4096, Cranelift (128-bit vectors): 1.47x NumPy</title></path>
-<path d="M442.7,224.0 H552.0 Q556.0,224.0 556.0,228.0 V230.0 Q556.0,234.0 552.0,234.0 H442.7 Z" fill="#eb6834"><title>RMSNorm, n=4096, LLVM (AVX-512): 3.87x NumPy</title></path>
-<text x="238" y="263.0" font-size="12" text-anchor="end" fill="#0b0b0b">Softmax, n=1000</text>
-<path d="M442.7,248.0 H466.9 Q470.9,248.0 470.9,252.0 V254.0 Q470.9,258.0 466.9,258.0 H442.7 Z" fill="#2a78d6"><title>Softmax, n=1000, Cranelift (128-bit vectors): 1.40x NumPy</title></path>
-<path d="M442.7,260.0 H529.4 Q533.4,260.0 533.4,264.0 V266.0 Q533.4,270.0 529.4,270.0 H442.7 Z" fill="#eb6834"><title>Softmax, n=1000, LLVM (AVX-512): 2.96x NumPy</title></path>
-<text x="238" y="299.0" font-size="12" text-anchor="end" fill="#0b0b0b">Euclidean distance, n=1024</text>
-<path d="M442.7,284.0 H501.2 Q505.2,284.0 505.2,288.0 V290.0 Q505.2,294.0 501.2,294.0 H442.7 Z" fill="#2a78d6"><title>Euclidean distance, n=1024, Cranelift (128-bit vectors): 2.11x NumPy</title></path>
-<path d="M442.7,296.0 H520.1 Q524.1,296.0 524.1,300.0 V302.0 Q524.1,306.0 520.1,306.0 H442.7 Z" fill="#eb6834"><title>Euclidean distance, n=1024, LLVM (AVX-512): 2.65x NumPy</title></path>
-<text x="238" y="335.0" font-size="12" text-anchor="end" fill="#0b0b0b">SwiGLU, n=14336</text>
-<path d="M442.7,320.0 H415.8 Q411.8,320.0 411.8,324.0 V326.0 Q411.8,330.0 415.8,330.0 H442.7 Z" fill="#2a78d6"><title>SwiGLU, n=14336, Cranelift (128-bit vectors): 0.69x NumPy</title></path>
-<path d="M442.7,332.0 H507.8 Q511.8,332.0 511.8,336.0 V338.0 Q511.8,342.0 507.8,342.0 H442.7 Z" fill="#eb6834"><title>SwiGLU, n=14336, LLVM (AVX-512): 2.29x NumPy</title></path>
+<path d="M442.7,176.0 H537.3 Q541.3,176.0 541.3,180.0 V182.0 Q541.3,186.0 537.3,186.0 H442.7 Z" fill="#2a78d6"><title>Cosine similarity, n=1024, Cranelift (128-bit vectors): 3.25x NumPy</title></path>
+<path d="M442.7,188.0 H560.1 Q564.1,188.0 564.1,192.0 V194.0 Q564.1,198.0 560.1,198.0 H442.7 Z" fill="#eb6834"><title>Cosine similarity, n=1024, LLVM (AVX-512): 4.27x NumPy</title></path>
+<text x="238" y="227.0" font-size="12" text-anchor="end" fill="#0b0b0b">Residual add + RMSNorm, n=4096</text>
+<path d="M442.7,212.0 H473.7 Q477.7,212.0 477.7,216.0 V218.0 Q477.7,222.0 473.7,222.0 H442.7 Z" fill="#2a78d6"><title>Residual add + RMSNorm, n=4096, Cranelift (128-bit vectors): 1.52x NumPy</title></path>
+<path d="M442.7,224.0 H557.7 Q561.7,224.0 561.7,228.0 V230.0 Q561.7,234.0 557.7,234.0 H442.7 Z" fill="#eb6834"><title>Residual add + RMSNorm, n=4096, LLVM (AVX-512): 4.15x NumPy</title></path>
+<text x="238" y="263.0" font-size="12" text-anchor="end" fill="#0b0b0b">RMSNorm, n=4096</text>
+<path d="M442.7,248.0 H469.1 Q473.1,248.0 473.1,252.0 V254.0 Q473.1,258.0 469.1,258.0 H442.7 Z" fill="#2a78d6"><title>RMSNorm, n=4096, Cranelift (128-bit vectors): 1.44x NumPy</title></path>
+<path d="M442.7,260.0 H552.7 Q556.7,260.0 556.7,264.0 V266.0 Q556.7,270.0 552.7,270.0 H442.7 Z" fill="#eb6834"><title>RMSNorm, n=4096, LLVM (AVX-512): 3.91x NumPy</title></path>
+<text x="238" y="299.0" font-size="12" text-anchor="end" fill="#0b0b0b">Softmax, n=1000</text>
+<path d="M442.7,284.0 H479.1 Q483.1,284.0 483.1,288.0 V290.0 Q483.1,294.0 479.1,294.0 H442.7 Z" fill="#2a78d6"><title>Softmax, n=1000, Cranelift (128-bit vectors): 1.62x NumPy</title></path>
+<path d="M442.7,296.0 H535.4 Q539.4,296.0 539.4,300.0 V302.0 Q539.4,306.0 535.4,306.0 H442.7 Z" fill="#eb6834"><title>Softmax, n=1000, LLVM (AVX-512): 3.18x NumPy</title></path>
+<text x="238" y="335.0" font-size="12" text-anchor="end" fill="#0b0b0b">Euclidean distance, n=1024</text>
+<path d="M442.7,320.0 H499.0 Q503.0,320.0 503.0,324.0 V326.0 Q503.0,330.0 499.0,330.0 H442.7 Z" fill="#2a78d6"><title>Euclidean distance, n=1024, Cranelift (128-bit vectors): 2.06x NumPy</title></path>
+<path d="M442.7,332.0 H518.1 Q522.1,332.0 522.1,336.0 V338.0 Q522.1,342.0 518.1,342.0 H442.7 Z" fill="#eb6834"><title>Euclidean distance, n=1024, LLVM (AVX-512): 2.58x NumPy</title></path>
 <text x="238" y="371.0" font-size="12" text-anchor="end" fill="#0b0b0b">GEMM bf16 256³, all cores</text>
-<path d="M442.7,356.0 H409.5 Q405.5,356.0 405.5,360.0 V362.0 Q405.5,366.0 409.5,366.0 H442.7 Z" fill="#2a78d6"><title>GEMM bf16 256³, all cores, Cranelift (128-bit vectors): 0.64x NumPy</title></path>
-<path d="M442.7,368.0 H505.0 Q509.0,368.0 509.0,372.0 V374.0 Q509.0,378.0 505.0,378.0 H442.7 Z" fill="#eb6834"><title>GEMM bf16 256³, all cores, LLVM (AVX-512): 2.21x NumPy</title></path>
-<text x="238" y="407.0" font-size="12" text-anchor="end" fill="#0b0b0b">Residual add + RMSNorm, n=4096</text>
-<path d="M442.7,392.0 H473.2 Q477.2,392.0 477.2,396.0 V398.0 Q477.2,402.0 473.2,402.0 H442.7 Z" fill="#2a78d6"><title>Residual add + RMSNorm, n=4096, Cranelift (128-bit vectors): 1.51x NumPy</title></path>
-<path d="M442.7,404.0 H497.2 Q501.2,404.0 501.2,408.0 V410.0 Q501.2,414.0 497.2,414.0 H442.7 Z" fill="#eb6834"><title>Residual add + RMSNorm, n=4096, LLVM (AVX-512): 2.01x NumPy</title></path>
+<path d="M442.7,356.0 H415.3 Q411.3,356.0 411.3,360.0 V362.0 Q411.3,366.0 415.3,366.0 H442.7 Z" fill="#2a78d6"><title>GEMM bf16 256³, all cores, Cranelift (128-bit vectors): 0.69x NumPy</title></path>
+<path d="M442.7,368.0 H507.6 Q511.6,368.0 511.6,372.0 V374.0 Q511.6,378.0 507.6,378.0 H442.7 Z" fill="#eb6834"><title>GEMM bf16 256³, all cores, LLVM (AVX-512): 2.28x NumPy</title></path>
+<text x="238" y="407.0" font-size="12" text-anchor="end" fill="#0b0b0b">SwiGLU, n=14336</text>
+<path d="M442.7,392.0 H424.1 Q420.1,392.0 420.1,396.0 V398.0 Q420.1,402.0 424.1,402.0 H442.7 Z" fill="#2a78d6"><title>SwiGLU, n=14336, Cranelift (128-bit vectors): 0.76x NumPy</title></path>
+<path d="M442.7,404.0 H505.8 Q509.8,404.0 509.8,408.0 V410.0 Q509.8,414.0 505.8,414.0 H442.7 Z" fill="#eb6834"><title>SwiGLU, n=14336, LLVM (AVX-512): 2.23x NumPy</title></path>
 <text x="238" y="443.0" font-size="12" text-anchor="end" fill="#0b0b0b">Greedy argmax, 128256 logits</text>
-<path d="M442.7,428.0 H375.7 Q371.7,428.0 371.7,432.0 V434.0 Q371.7,438.0 375.7,438.0 H442.7 Z" fill="#2a78d6"><title>Greedy argmax, 128256 logits, Cranelift (128-bit vectors): 0.43x NumPy</title></path>
-<path d="M442.7,440.0 H468.4 Q472.4,440.0 472.4,444.0 V446.0 Q472.4,450.0 468.4,450.0 H442.7 Z" fill="#eb6834"><title>Greedy argmax, 128256 logits, LLVM (AVX-512): 1.43x NumPy</title></path>
+<path d="M442.7,428.0 H375.1 Q371.1,428.0 371.1,432.0 V434.0 Q371.1,438.0 375.1,438.0 H442.7 Z" fill="#2a78d6"><title>Greedy argmax, 128256 logits, Cranelift (128-bit vectors): 0.43x NumPy</title></path>
+<path d="M442.7,440.0 H467.3 Q471.3,440.0 471.3,444.0 V446.0 Q471.3,450.0 467.3,450.0 H442.7 Z" fill="#eb6834"><title>Greedy argmax, 128256 logits, LLVM (AVX-512): 1.41x NumPy</title></path>
 <text x="238" y="479.0" font-size="12" text-anchor="end" fill="#0b0b0b">Flash attention decode, all cores</text>
-<path d="M442.7,464.0 H407.5 Q403.5,464.0 403.5,468.0 V470.0 Q403.5,474.0 407.5,474.0 H442.7 Z" fill="#2a78d6"><title>Flash attention decode, all cores, Cranelift (128-bit vectors): 0.63x NumPy</title></path>
-<path d="M442.7,476.0 H454.1 Q458.1,476.0 458.1,480.0 V482.0 Q458.1,486.0 454.1,486.0 H442.7 Z" fill="#eb6834"><title>Flash attention decode, all cores, LLVM (AVX-512): 1.20x NumPy</title></path>
+<path d="M442.7,464.0 H410.3 Q406.3,464.0 406.3,468.0 V470.0 Q406.3,474.0 410.3,474.0 H442.7 Z" fill="#2a78d6"><title>Flash attention decode, all cores, Cranelift (128-bit vectors): 0.65x NumPy</title></path>
+<path d="M442.7,476.0 H463.0 Q467.0,476.0 467.0,480.0 V482.0 Q467.0,486.0 463.0,486.0 H442.7 Z" fill="#eb6834"><title>Flash attention decode, all cores, LLVM (AVX-512): 1.34x NumPy</title></path>
 <text x="238" y="515.0" font-size="12" text-anchor="end" fill="#0b0b0b">GEMV f32 512x1024, all cores</text>
-<path d="M442.7,500.0 H371.9 Q367.9,500.0 367.9,504.0 V506.0 Q367.9,510.0 371.9,510.0 H442.7 Z" fill="#2a78d6"><title>GEMV f32 512x1024, all cores, Cranelift (128-bit vectors): 0.41x NumPy</title></path>
-<path d="M442.7,512.0 H413.2 Q409.2,512.0 409.2,516.0 V518.0 Q409.2,522.0 413.2,522.0 H442.7 Z" fill="#eb6834"><title>GEMV f32 512x1024, all cores, LLVM (AVX-512): 0.67x NumPy</title></path>
+<path d="M442.7,500.0 H358.3 Q354.3,500.0 354.3,504.0 V506.0 Q354.3,510.0 358.3,510.0 H442.7 Z" fill="#2a78d6"><title>GEMV f32 512x1024, all cores, Cranelift (128-bit vectors): 0.35x NumPy</title></path>
+<path d="M442.7,512.0 H409.6 Q405.6,512.0 405.6,516.0 V518.0 Q405.6,522.0 409.6,522.0 H442.7 Z" fill="#eb6834"><title>GEMV f32 512x1024, all cores, LLVM (AVX-512): 0.64x NumPy</title></path>
 <text x="238" y="551.0" font-size="12" text-anchor="end" fill="#0b0b0b">GEMV f32 512x1024, 1 core</text>
-<path d="M442.7,536.0 H295.7 Q291.7,536.0 291.7,540.0 V542.0 Q291.7,546.0 295.7,546.0 H442.7 Z" fill="#2a78d6"><title>GEMV f32 512x1024, 1 core, Cranelift (128-bit vectors): 0.16x NumPy</title></path>
-<path d="M442.7,548.0 H343.4 Q339.4,548.0 339.4,552.0 V554.0 Q339.4,558.0 343.4,558.0 H442.7 Z" fill="#eb6834"><title>GEMV f32 512x1024, 1 core, LLVM (AVX-512): 0.29x NumPy</title></path>
+<path d="M442.7,536.0 H288.2 Q284.2,536.0 284.2,540.0 V542.0 Q284.2,546.0 288.2,546.0 H442.7 Z" fill="#2a78d6"><title>GEMV f32 512x1024, 1 core, Cranelift (128-bit vectors): 0.15x NumPy</title></path>
+<path d="M442.7,548.0 H338.5 Q334.5,548.0 334.5,552.0 V554.0 Q334.5,558.0 338.5,558.0 H442.7 Z" fill="#eb6834"><title>GEMV f32 512x1024, 1 core, LLVM (AVX-512): 0.27x NumPy</title></path>
 </svg>

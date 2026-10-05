@@ -54,6 +54,10 @@ enum Kernel {
     Narrow(Type, Type),
     /// Shift amount: the i32 at `pc`.
     Shift(VShiftOp, Type, Type),
+    /// `vmin`/`vmax` compiled with `fast_math` (compare and select).
+    FastBin(VBinOp, Type, Type),
+    /// `vminr`/`vmaxr` compiled with `fast_math`.
+    FastReduce(VectorReduceOp, Type, Type),
 }
 
 impl Kernel {
@@ -68,6 +72,8 @@ impl Kernel {
             Kernel::Unary(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Narrow(l, w) => format!("k_vnarrow_{l}_{w}"),
             Kernel::Shift(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
+            Kernel::FastBin(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
+            Kernel::FastReduce(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
         }
     }
 
@@ -87,11 +93,18 @@ impl Kernel {
                 "    a = ld pa:{w}\n    n = ld pc:i32\n    r = {} a, n:{l}\n",
                 op.as_str()
             ),
+            Kernel::FastBin(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
+            Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
             self.name()
         )
+    }
+
+    /// Whether the kernel must be compiled with `CodegenOptions::fast_math`.
+    fn fast_math(&self) -> bool {
+        matches!(self, Kernel::FastBin(..) | Kernel::FastReduce(..))
     }
 
     fn lane(&self) -> Type {
@@ -103,7 +116,9 @@ impl Kernel {
             | Kernel::Splat(l, _)
             | Kernel::Unary(_, l, _)
             | Kernel::Narrow(l, _)
-            | Kernel::Shift(_, l, _) => *l,
+            | Kernel::Shift(_, l, _)
+            | Kernel::FastBin(_, l, _)
+            | Kernel::FastReduce(_, l, _) => *l,
             Kernel::Sel(_) => Type::I8,
         }
     }
@@ -127,14 +142,16 @@ impl Kernel {
             | Kernel::Splat(_, w)
             | Kernel::Unary(_, _, w)
             | Kernel::Narrow(_, w)
-            | Kernel::Shift(_, _, w) => *w,
+            | Kernel::Shift(_, _, w)
+            | Kernel::FastBin(_, _, w)
+            | Kernel::FastReduce(_, _, w) => *w,
         }
     }
 
     /// Bytes of output to compare.
     fn out_bytes(&self, vx_bytes: usize) -> usize {
         match self {
-            Kernel::Reduce(_, l, _) => l.byte_size(),
+            Kernel::Reduce(_, l, _) | Kernel::FastReduce(_, l, _) => l.byte_size(),
             _ => width_bytes(self.width(), vx_bytes),
         }
     }
@@ -143,9 +160,12 @@ impl Kernel {
     fn float_output(&self) -> bool {
         match self {
             Kernel::Bin(op, l, _) => l.is_float() && !op.is_bitwise(),
-            Kernel::Fma(..) | Kernel::Reduce(..) | Kernel::Splat(..) | Kernel::Unary(..) => {
-                self.lane().is_float()
-            }
+            Kernel::Fma(..)
+            | Kernel::Reduce(..)
+            | Kernel::Splat(..)
+            | Kernel::Unary(..)
+            | Kernel::FastBin(..)
+            | Kernel::FastReduce(..) => self.lane().is_float(),
             Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Narrow(..) | Kernel::Shift(..) => false,
         }
     }
@@ -189,8 +209,46 @@ fn all_kernels() -> Vec<Kernel> {
                 ks.push(Kernel::Shift(op, l, w));
             }
         }
+        for l in [Type::F32, Type::F64] {
+            for op in [VBinOp::Min, VBinOp::Max] {
+                ks.push(Kernel::FastBin(op, l, w));
+            }
+            for op in [VectorReduceOp::Min, VectorReduceOp::Max] {
+                ks.push(Kernel::FastReduce(op, l, w));
+            }
+        }
     }
     ks
+}
+
+/// The kernels as modules compiled without and with `fast_math`, skipping empty groups.
+fn modules_by_mode(kernels: &[Kernel]) -> Vec<(bool, Vec<Kernel>, achainsaw_ir::Module)> {
+    [false, true]
+        .into_iter()
+        .filter_map(|fast| {
+            let group: Vec<Kernel> = kernels
+                .iter()
+                .copied()
+                .filter(|k| k.fast_math() == fast)
+                .collect();
+            if group.is_empty() {
+                return None;
+            }
+            let module = parse_and_validate(&module_source(&group)).expect("kernels validate");
+            Some((fast, group, module))
+        })
+        .collect()
+}
+
+/// Float min/max with `fast_math`: `a > b ? a : b` / `a < b ? a : b` (so a NaN operand or
+/// two zeros give `b`).
+fn fast_minmax(is_max: bool, a: f64, b: f64) -> f64 {
+    let pick_a = if is_max { a > b } else { a < b };
+    if pick_a {
+        a
+    } else {
+        b
+    }
 }
 
 /// Lane type twice as wide as an integer lane (`vnarrow`'s operands).
@@ -470,6 +528,39 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 put_int(&mut out, l, half + i, get_int(b, wide, i).clamp(min, max));
             }
         }
+        Kernel::FastBin(op, l, _) => {
+            let is_max = op == VBinOp::Max;
+            for i in 0..n {
+                if l == Type::F32 {
+                    let (x, y) = (get_f32(a, i), get_f32(b, i));
+                    let pick_x = if is_max { x > y } else { x < y };
+                    let r = if pick_x { x } else { y };
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                } else {
+                    let r = fast_minmax(is_max, get_f64(a, i), get_f64(b, i));
+                    out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+        }
+        Kernel::FastReduce(op, l, _) => {
+            let is_max = op == VectorReduceOp::Max;
+            if l == Type::F32 {
+                let vals: Vec<f32> = (0..n).map(|i| get_f32(a, i)).collect();
+                let r = tree(&vals, &|x: f32, y: f32| {
+                    let pick_x = if is_max { x > y } else { x < y };
+                    if pick_x {
+                        x
+                    } else {
+                        y
+                    }
+                });
+                out[..4].copy_from_slice(&r.to_le_bytes());
+            } else {
+                let vals: Vec<f64> = (0..n).map(|i| get_f64(a, i)).collect();
+                let r = tree(&vals, &|x, y| fast_minmax(is_max, x, y));
+                out[..8].copy_from_slice(&r.to_le_bytes());
+            }
+        }
         Kernel::Shift(op, l, _) => {
             let bits = l.bit_width().unwrap() as u64;
             let amount =
@@ -691,35 +782,39 @@ fn vx_ops_match_reference_at_host_vector_length() {
 }
 
 fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeatures)>) {
-    let module = parse_and_validate(&module_source(kernels)).expect("kernels validate");
+    let modules = modules_by_mode(kernels);
     for (level, features) in levels {
-        let mut engine = JitEngine::with_features(&features).expect("JIT init");
-        engine
-            .compile_module(&module)
-            .unwrap_or_else(|e| panic!("compile at {level}: {e}"));
-        let vx_bytes = engine.vx_bits() as usize / 8;
-        let ctx = |trial| {
-            format!(
-                "ISA {level}, {} vx={vx_bytes}B, trial {trial}",
-                engine.backend()
-            )
-        };
+        for (fast, group, module) in &modules {
+            let mut engine = JitEngine::with_features(&features).expect("JIT init");
+            engine.set_fast_math(*fast);
+            engine
+                .compile_module(module)
+                .unwrap_or_else(|e| panic!("compile at {level}: {e}"));
+            let vx_bytes = engine.vx_bits() as usize / 8;
+            let ctx = |trial| {
+                format!(
+                    "ISA {level}, {} vx={vx_bytes}B, fast_math={fast}, trial {trial}",
+                    engine.backend()
+                )
+            };
 
-        for k in kernels {
-            let f: KernelFn = unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
-            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
-            for trial in 0..TRIALS {
-                let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.input_lane(), &mut rng, trial);
-                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
-                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
-                if trial == 1 {
-                    b = a; // exercise equal operands (min/max of equal values, x - x)
+            for k in group {
+                let f: KernelFn =
+                    unsafe { std::mem::transmute(engine.get_fn_ptr(&k.name()).unwrap()) };
+                let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ k.name().len() as u64);
+                for trial in 0..TRIALS {
+                    let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                    fill(&mut a, k.input_lane(), &mut rng, trial);
+                    fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                    fill(&mut c, k.input_lane(), &mut rng, trial + 2);
+                    if trial == 1 {
+                        b = a; // exercise equal operands (min/max of equal values, x - x)
+                    }
+                    let mut out = [0u8; BUF];
+                    f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                    let expected = reference(*k, &a, &b, &c, vx_bytes);
+                    check_output(*k, &expected, &out, vx_bytes, &ctx(trial));
                 }
-                let mut out = [0u8; BUF];
-                f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
-                let expected = reference(*k, &a, &b, &c, vx_bytes);
-                check_output(*k, &expected, &out, vx_bytes, &ctx(trial));
             }
         }
     }
@@ -727,8 +822,7 @@ fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeature
 
 #[test]
 fn vector_ops_compile_for_every_target() {
-    let kernels = all_kernels();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    let modules = modules_by_mode(&all_kernels());
     let targets = [
         ("x86_64-unknown-linux-gnu", "x86-64"),
         ("x86_64-unknown-linux-gnu", "x86-64-v2"),
@@ -737,16 +831,19 @@ fn vector_ops_compile_for_every_target() {
         ("aarch64-unknown-linux-gnu", "generic"),
     ];
     for (triple, cpu) in targets {
-        let mut compiler = AotCompiler::with_target(&AotTarget {
-            triple: Some(triple.into()),
-            cpu: Some(cpu.into()),
-            features: None,
-        })
-        .unwrap();
-        compiler
-            .compile_module(&module)
-            .unwrap_or_else(|e| panic!("{triple} {cpu}: {e}"));
-        assert!(!compiler.finish().unwrap().is_empty());
+        for (fast, _, module) in &modules {
+            let mut compiler = AotCompiler::with_target(&AotTarget {
+                triple: Some(triple.into()),
+                cpu: Some(cpu.into()),
+                features: None,
+            })
+            .unwrap();
+            compiler.set_fast_math(*fast);
+            compiler
+                .compile_module(module)
+                .unwrap_or_else(|e| panic!("{triple} {cpu} fast_math={fast}: {e}"));
+            assert!(!compiler.finish().unwrap().is_empty());
+        }
     }
 }
 
@@ -879,18 +976,20 @@ pub const LLVM_TARGETS: &[(&str, &str, &str)] = &[
 #[cfg(feature = "llvm")]
 #[test]
 fn vector_ops_compile_for_every_llvm_target() {
-    use achainsaw_codegen::{compile_object, Backend};
-    let kernels = all_kernels();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    use achainsaw_codegen::{compile_object, Backend, CodegenOptions};
+    let modules = modules_by_mode(&all_kernels());
     for (triple, cpu, features) in LLVM_TARGETS {
         let target = AotTarget {
             triple: Some((*triple).into()),
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        let obj = compile_object(&module, &target, Backend::Llvm)
-            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
-        assert!(!obj.bytes.is_empty());
+        for (fast, _, module) in &modules {
+            let options = CodegenOptions { fast_math: *fast };
+            let obj = compile_object(module, &target, Backend::Llvm, &options)
+                .unwrap_or_else(|e| panic!("{triple} {cpu} {features} fast_math={fast}: {e}"));
+            assert!(!obj.bytes.is_empty());
+        }
     }
 }
 
@@ -904,40 +1003,43 @@ fn fixed_width_vector_ops_agree_across_backends() {
         .into_iter()
         .filter(|k| k.width() != Type::Vx)
         .collect();
-    let module = parse_and_validate(&module_source(&kernels)).expect("kernels validate");
+    let modules = modules_by_mode(&kernels);
     for (level, features) in host_levels() {
-        let engines: Vec<JitEngine> = [Backend::Cranelift, Backend::Llvm]
-            .into_iter()
-            .map(|b| {
-                let mut e = JitEngine::with_backend(b, &features).unwrap();
-                e.compile_module(&module).unwrap();
-                e
-            })
-            .collect();
-        for k in &kernels {
-            let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
-            for trial in 0..TRIALS {
-                let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
-                fill(&mut a, k.input_lane(), &mut rng, trial);
-                fill(&mut b, k.input_lane(), &mut rng, trial + 1);
-                fill(&mut c, k.input_lane(), &mut rng, trial + 2);
-                let outs: Vec<[u8; BUF]> = engines
-                    .iter()
-                    .map(|e| {
-                        let f: KernelFn =
-                            unsafe { std::mem::transmute(e.get_fn_ptr(&k.name()).unwrap()) };
-                        let mut out = [0u8; BUF];
-                        f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
-                        out
-                    })
-                    .collect();
-                check_output(
-                    *k,
-                    &outs[0],
-                    &outs[1],
-                    16,
-                    &format!("cranelift vs llvm, ISA {level}, trial {trial}"),
-                );
+        for (fast, group, module) in &modules {
+            let engines: Vec<JitEngine> = [Backend::Cranelift, Backend::Llvm]
+                .into_iter()
+                .map(|b| {
+                    let mut e = JitEngine::with_backend(b, &features).unwrap();
+                    e.set_fast_math(*fast);
+                    e.compile_module(module).unwrap();
+                    e
+                })
+                .collect();
+            for k in group {
+                let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ k.name().len() as u64);
+                for trial in 0..TRIALS {
+                    let (mut a, mut b, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                    fill(&mut a, k.input_lane(), &mut rng, trial);
+                    fill(&mut b, k.input_lane(), &mut rng, trial + 1);
+                    fill(&mut c, k.input_lane(), &mut rng, trial + 2);
+                    let outs: Vec<[u8; BUF]> = engines
+                        .iter()
+                        .map(|e| {
+                            let f: KernelFn =
+                                unsafe { std::mem::transmute(e.get_fn_ptr(&k.name()).unwrap()) };
+                            let mut out = [0u8; BUF];
+                            f(a.as_ptr(), b.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                            out
+                        })
+                        .collect();
+                    check_output(
+                        *k,
+                        &outs[0],
+                        &outs[1],
+                        16,
+                        &format!("cranelift vs llvm, ISA {level}, trial {trial}"),
+                    );
+                }
             }
         }
     }
@@ -1047,7 +1149,7 @@ fn vx_signatures_compile_for_every_llvm_target() {
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        compile_object(&module, &target, Backend::Llvm)
+        compile_object(&module, &target, Backend::Llvm, &Default::default())
             .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
     }
 }

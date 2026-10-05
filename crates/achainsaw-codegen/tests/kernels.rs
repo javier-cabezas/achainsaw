@@ -21,17 +21,23 @@ fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
         .collect()
 }
 
-/// Compiles `examples/kernels/<name>.air` once per ISA level.
-fn engines(name: &str) -> Vec<(IsaLevel, JitEngine)> {
+/// Compiles `examples/kernels/<name>.air` once per ISA level, without and with `fast_math`
+/// (the kernels' results must not depend on it for finite inputs). Each engine comes with
+/// a label naming its level and mode.
+fn engines(name: &str) -> Vec<(String, JitEngine)> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/kernels/");
     let src = std::fs::read_to_string(format!("{path}{name}.air")).unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{name}: {d:?}"));
     host_levels()
         .into_iter()
-        .map(|(level, features)| {
-            let mut e = JitEngine::with_features(&features).unwrap();
-            e.compile_module(&module).unwrap();
-            (level, e)
+        .flat_map(|(level, features)| {
+            [false, true].map(|fast| {
+                let mut e = JitEngine::with_features(&features).unwrap();
+                e.set_fast_math(fast);
+                e.compile_module(&module).unwrap();
+                let mode = if fast { " fast_math" } else { "" };
+                (format!("{level}{mode}"), e)
+            })
         })
         .collect()
 }

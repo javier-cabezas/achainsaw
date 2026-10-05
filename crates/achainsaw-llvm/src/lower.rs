@@ -99,6 +99,9 @@ pub struct LowerOptions {
     pub vector_width: Option<u32>,
     /// Matrix engines for `mm`; without one, `mm` uses vector FMAs at `vx` width.
     pub matrix: MatrixUnits,
+    /// Float min/max compare and select instead of propagating NaN and ordering signed
+    /// zeros (`achainsaw_codegen::CodegenOptions::fast_math`).
+    pub fast_math: bool,
 }
 
 fn lane_bits(lane: Type) -> u32 {
@@ -1513,14 +1516,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let c = b.build_float_compare(p, x, y, "")?;
                 return Ok((self.zext_bool(c)?, Type::I32));
             }
-            let t = l.get_type();
             let v: BasicValueEnum = match op {
                 BinaryOp::Add => b.build_float_add(x, y, "")?.into(),
                 BinaryOp::Sub => b.build_float_sub(x, y, "")?.into(),
                 BinaryOp::Mul => b.build_float_mul(x, y, "")?.into(),
                 BinaryOp::Div => b.build_float_div(x, y, "")?.into(),
-                BinaryOp::Min => self.intr("llvm.minimum", &[t], &[l, r])?,
-                BinaryOp::Max => self.intr("llvm.maximum", &[t], &[l, r])?,
+                BinaryOp::Min => self.float_minmax(false, l, r)?,
+                BinaryOp::Max => self.float_minmax(true, l, r)?,
                 _ => return Err(anyhow!("Unsupported float op {op:?}")),
             };
             return Ok((v, lty));
@@ -1806,9 +1808,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             ) => b.build_int_add(x, y, "")?.into(),
             (VectorReduceOp::Sum, true, _, _) => vec2!(a, c, |x, y| b.build_float_add(x, y, "")?),
             (VectorReduceOp::Sum, false, _, _) => vec2!(a, c, |x, y| b.build_int_add(x, y, "")?),
-            (VectorReduceOp::Max, true, _, _) => self.intr("llvm.maximum", &[t], &[a, c])?,
+            (VectorReduceOp::Max, true, _, _) => self.float_minmax(true, a, c)?,
             (VectorReduceOp::Max, false, _, _) => self.intr("llvm.smax", &[t], &[a, c])?,
-            (VectorReduceOp::Min, true, _, _) => self.intr("llvm.minimum", &[t], &[a, c])?,
+            (VectorReduceOp::Min, true, _, _) => self.float_minmax(false, a, c)?,
             (VectorReduceOp::Min, false, _, _) => self.intr("llvm.smin", &[t], &[a, c])?,
         })
     }
@@ -1839,9 +1841,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             (VBinOp::Sub, false) => vec2!(x, y, |a, c| b.build_int_sub(a, c, "")?),
             (VBinOp::Mul, true) => vec2!(x, y, |a, c| b.build_float_mul(a, c, "")?),
             (VBinOp::Mul, false) => vec2!(x, y, |a, c| b.build_int_mul(a, c, "")?),
-            (VBinOp::Min, true) => self.intr("llvm.minimum", &[t], &[x, y])?,
+            (VBinOp::Min, true) => self.float_minmax(false, x, y)?,
             (VBinOp::Min, false) => self.intr("llvm.smin", &[t], &[x, y])?,
-            (VBinOp::Max, true) => self.intr("llvm.maximum", &[t], &[x, y])?,
+            (VBinOp::Max, true) => self.float_minmax(true, x, y)?,
             (VBinOp::Max, false) => self.intr("llvm.smax", &[t], &[x, y])?,
             // The validator only allows float lanes for vdiv.
             (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
@@ -1980,6 +1982,41 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             &[r, h, self.c64(n as i64).into()],
         )?;
         self.to_canon(r, vty)
+    }
+
+    /// Float min/max, scalar or vector: AIR's default semantics (`llvm.minimum`/`maximum`:
+    /// NaN if either operand is NaN, -0.0 below +0.0), or with `fast_math` compare and
+    /// select (`a > b ? a : b` for max), as in the Cranelift backend.
+    fn float_minmax(
+        &self,
+        is_max: bool,
+        a: BasicValueEnum<'ctx>,
+        c: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if !self.opts.fast_math {
+            let name = if is_max {
+                "llvm.maximum"
+            } else {
+                "llvm.minimum"
+            };
+            return self.intr(name, &[a.get_type()], &[a, c]);
+        }
+        let b = &self.builder;
+        let p = if is_max {
+            FloatPredicate::OGT
+        } else {
+            FloatPredicate::OLT
+        };
+        match (a, c) {
+            (BasicValueEnum::FloatValue(x), BasicValueEnum::FloatValue(y)) => {
+                let m = b.build_float_compare(p, x, y, "")?;
+                Ok(b.build_select(m, a, c, "")?)
+            }
+            _ => {
+                let m = vec2!(a, c, |x, y| b.build_float_compare(p, x, y, "")?);
+                self.vselect(m, a, c)
+            }
+        }
     }
 
     /// Lane-wise select on an `i1` vector mask.
