@@ -1,39 +1,111 @@
 # Matrix-vector product y = A x for a row-major m x k f32 matrix A.
-# Each row is a vector-length-agnostic dot product with a masked load for the final
-# partial vector.
+# Rows go 4 at a time: each vector of x is loaded once for 4 rows, and the 4 FMA chains are
+# independent, so the loop is not bound by FMA latency. Full vectors in the main loop, one
+# masked step for the partial tail, then any leftover rows one at a time.
 fn gemv(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
     z = cst 0.0:f32
     zero = splat z:vx
     w = vl f32
     row_bytes = mul k, 4:i64
-    jmp rows(0:i64)
-  rows(i:i64):
-    more_i = lt i, m
-    br more_i, row_init, done
-  row_init:
-    row_off = mul i, row_bytes
-    prow = add a, row_off
-    jmp cols(0:i64, zero)
-  cols(j:i64, acc:vx):
-    more_j = lt j, k
-    br more_j, cols_body, row_done
-  cols_body:
+    jmp quads(0:i64)
+
+  quads(i:i64):
+    i4 = add i, 4:i64
+    more_q = le i4, m
+    br more_q, quad_init, singles(i)
+  quad_init:
+    off0 = mul i, row_bytes
+    r0 = add a, off0
+    r1 = add r0, row_bytes
+    r2 = add r1, row_bytes
+    r3 = add r2, row_bytes
+    jmp quad_cols(0:i64, zero, zero, zero, zero)
+  quad_cols(j:i64, c0:vx, c1:vx, c2:vx, c3:vx):
+    jw = add j, w
+    full = le jw, k
+    br full, quad_body, quad_tail
+  quad_body:
+    o = mul j, 4:i64
+    px = add x, o
+    xv = ld px:vx
+    p0 = add r0, o
+    a0 = ld p0:vx
+    p1 = add r1, o
+    a1 = ld p1:vx
+    p2 = add r2, o
+    a2 = ld p2:vx
+    p3 = add r3, o
+    a3 = ld p3:vx
+    c0n = vfma a0, xv, c0:f32
+    c1n = vfma a1, xv, c1:f32
+    c2n = vfma a2, xv, c2:f32
+    c3n = vfma a3, xv, c3:f32
+    jmp quad_cols(jw, c0n, c1n, c2n, c3n)
+  quad_tail:
     rest = sub k, j
-    off = mul j, 4:i64
-    pa = add prow, off
-    px = add x, off
-    va = ldm pa:vx, rest:f32
-    vx0 = ldm px:vx, rest:f32
-    acc2 = vfma va, vx0, acc:f32
-    j2 = add j, w
-    jmp cols(j2, acc2)
-  row_done:
-    s = vsum acc:f32
-    yoff = mul i, 4:i64
-    py = add y, yoff
-    st py, s
-    i2 = add i, 1:i64
-    jmp rows(i2)
+    ot = mul j, 4:i64
+    pxt = add x, ot
+    xt = ldm pxt:vx, rest:f32
+    pt0 = add r0, ot
+    t0 = ldm pt0:vx, rest:f32
+    pt1 = add r1, ot
+    t1 = ldm pt1:vx, rest:f32
+    pt2 = add r2, ot
+    t2 = ldm pt2:vx, rest:f32
+    pt3 = add r3, ot
+    t3 = ldm pt3:vx, rest:f32
+    d0 = vfma t0, xt, c0:f32
+    d1 = vfma t1, xt, c1:f32
+    d2 = vfma t2, xt, c2:f32
+    d3 = vfma t3, xt, c3:f32
+    s0 = vsum d0:f32
+    s1 = vsum d1:f32
+    s2 = vsum d2:f32
+    s3 = vsum d3:f32
+    yo = mul i, 4:i64
+    py0 = add y, yo
+    st py0, s0
+    py1 = add py0, 4:i64
+    st py1, s1
+    py2 = add py0, 8:i64
+    st py2, s2
+    py3 = add py0, 12:i64
+    st py3, s3
+    jmp quads(i4)
+
+  singles(si:i64):
+    more_s = lt si, m
+    br more_s, single_init, done
+  single_init:
+    s_off = mul si, row_bytes
+    rs = add a, s_off
+    jmp single_cols(0:i64, zero)
+  single_cols(sj:i64, acc:vx):
+    sjw = add sj, w
+    s_full = le sjw, k
+    br s_full, single_body, single_tail
+  single_body:
+    so = mul sj, 4:i64
+    spx = add x, so
+    sx = ld spx:vx
+    spa = add rs, so
+    sa = ld spa:vx
+    acc2 = vfma sa, sx, acc:f32
+    jmp single_cols(sjw, acc2)
+  single_tail:
+    srest = sub k, sj
+    sot = mul sj, 4:i64
+    sxp = add x, sot
+    sxt = ldm sxp:vx, srest:f32
+    sap = add rs, sot
+    sat = ldm sap:vx, srest:f32
+    accf = vfma sat, sxt, acc:f32
+    sum = vsum accf:f32
+    syo = mul si, 4:i64
+    sy = add y, syo
+    st sy, sum
+    si2 = add si, 1:i64
+    jmp singles(si2)
   done:
     ret

@@ -1,7 +1,26 @@
 # Matrix multiply-accumulate C[m x n] += A[m x k] * B[k x n] with bf16 A and B and an f32 C
-# (row-major, contiguous). On the LLVM backend `mm` uses AMX tiles on Sapphire/Granite Rapids,
-# SME outer products on SME CPUs, and full-width vector FMAs elsewhere.
+# (row-major, contiguous), on all cores: `par` gives each task 16 rows of A and C (contiguous
+# slices) and the whole of B. On the LLVM backend each `mm` uses AMX tiles on
+# Sapphire/Granite Rapids, SME outer products on SME CPUs, and full-width vector FMAs
+# elsewhere.
 fn gemm_bf16(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
   b0:
-    mm c, a, b, m, n, k:bf16
+    m15 = add m, 15:i64
+    blocks = udiv m15, 16:i64
+    par blocks, gemm_rows(c, a, b, m, n, k)
+    ret
+
+# Rows [16 * blk, min(16 * blk + 16, m)) of C.
+fn gemm_rows(blk:i64, c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)
+  b0:
+    first = mul blk, 16:i64
+    left = sub m, first
+    rows = min left, 16:i64
+    c_row = mul n, 4:i64
+    c_off = mul first, c_row
+    cb = add c, c_off
+    a_row = mul k, 2:i64
+    a_off = mul first, a_row
+    ab = add a, a_off
+    mm cb, ab, b, rows, n, k:bf16
     ret

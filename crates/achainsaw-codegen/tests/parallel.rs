@@ -545,3 +545,72 @@ fn par_in_aot_shared_library() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Values live in registers across fuel refills (the `rt_fuel_exhausted` slow path, which on
+/// Cranelift saves every register) come back intact: vector, float and integer accumulators
+/// carried through a loop long enough to refill a worker's fuel many times.
+#[test]
+fn registers_survive_fuel_refills() {
+    let src = r#"
+fn work(i:i64, out:ptr)
+  b0:
+    one = cst 1:i32
+    v_one = splat one:vx
+    two = cst 2:i32
+    v_two = splat two:vx
+    jmp loop(0:i64, v_one, v_two, 0.5:f64, 3:i64)
+  loop(j:i64, a:vx, b:vx, f:f64, s:i64):
+    more = lt j, 300000:i64
+    br more, body, done
+  body:
+    a2 = vadd a, v_one:i32
+    b2 = vadd b, v_two:i32
+    f2 = add f, 1.0:f64
+    s2 = add s, i
+    j2 = add j, 1:i64
+    jmp loop(j2, a2, b2, f2, s2)
+  done:
+    ea = extlane a, 0:i32
+    eb = extlane b, 3:i32
+    fa = sext ea:i64
+    fb = sext eb:i64
+    fi = ftoi f:i64
+    t0 = add fa, fb
+    t1 = add t0, fi
+    t2 = add t1, s
+    off = mul i, 8:i64
+    q = add out, off
+    st q, t2
+    ret
+
+fn run(out:ptr, n:i64)
+  b0:
+    par n, work(out)
+    ret
+"#;
+    let n = 48usize;
+    // a = 1 + 300000, b = 2 + 2 * 300000, f = 0.5 + 300000 (truncated), s = 3 + 300000 i.
+    let want = |i: usize| (300001 + 600002 + 300000 + 3 + 300000 * i) as i64;
+    for (threads, fuel) in [
+        (None, Some(100_000_000u64)),
+        (Some(1), Some(100_000_000)),
+        (None, None),
+    ] {
+        let mut e = engine(src, None, threads);
+        e.set_fuel(fuel);
+        let mut out = vec![0i64; n];
+        call(
+            &e,
+            "run",
+            &[
+                RtValue::Ptr(out.as_mut_ptr() as usize),
+                RtValue::I64(n as i64),
+            ],
+        )
+        .unwrap();
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, want(i), "i={i} threads={threads:?} fuel={fuel:?}");
+        }
+        set_execution_fuel(None);
+    }
+}

@@ -11,7 +11,7 @@ use cranelift_codegen::ir::{
     AbiParam, Block as ClifBlock, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
     Value as ClifValue,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module as ClifModule};
 use std::collections::HashMap;
 
@@ -1037,23 +1037,56 @@ fn f16x4_to_f32x4(b: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
     b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
 }
 
-/// Inline fuel check before a branch: decrements the fuel counter at `counter` in place
-/// and, only when it reaches zero, asks `rt_fuel_exhausted` whether to unwind (budget spent,
-/// or a failure was recorded). Leaves the builder in the block where execution continues.
+/// Fuel counter of a function: kept in a variable (a register) between checks, and in memory
+/// at `addr` whenever code outside the function may read or change it (see `spill`/`reload`).
+#[derive(Clone, Copy)]
+struct FuelVar {
+    var: Variable,
+    addr: ClifValue,
+}
+
+impl FuelVar {
+    /// Loads the counter into a new variable at function entry.
+    fn load(builder: &mut FunctionBuilder, addr: ClifValue) -> Self {
+        let var = builder.declare_var(types::I64);
+        let fuel = Self { var, addr };
+        fuel.reload(builder);
+        fuel
+    }
+
+    /// Writes the counter back to memory, before a call or a return.
+    fn spill(self, builder: &mut FunctionBuilder) {
+        let v = builder.use_var(self.var);
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), v, self.addr, 0);
+    }
+
+    /// Reads the counter from memory, after a call that may have used or reset it.
+    fn reload(self, builder: &mut FunctionBuilder) {
+        let v = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), self.addr, 0);
+        builder.def_var(self.var, v);
+    }
+}
+
+/// Inline fuel check before a branch: decrements the counter (in a register) and, only when
+/// it reaches zero, writes it back and calls `rt_fuel_exhausted`, which records why it ran out
+/// (budget spent, or a failure) or refills it (a `par` worker); execution continues while the
+/// reloaded counter is positive and unwinds otherwise. Leaves the builder in the block where
+/// execution continues. The hook preserves every register (`PreserveAll`), so loop values are
+/// not spilled around this cold call.
 fn emit_fuel_check<M: ClifModule>(
     builder: &mut FunctionBuilder,
     module: &mut M,
-    counter: ClifValue,
+    fuel: FuelVar,
     exhausted: FuncId,
     trap_block: ClifBlock,
 ) {
-    let fuel = builder
-        .ins()
-        .load(types::I64, MemFlagsData::trusted(), counter, 0);
-    let left = builder.ins().iadd_imm_s(fuel, -1);
-    builder
-        .ins()
-        .store(MemFlagsData::trusted(), left, counter, 0);
+    let left = builder.use_var(fuel.var);
+    let left = builder.ins().iadd_imm_s(left, -1);
+    builder.def_var(fuel.var, left);
     let out = builder
         .ins()
         .icmp_imm_s(IntCC::SignedLessThanOrEqual, left, 0);
@@ -1063,9 +1096,14 @@ fn emit_fuel_check<M: ClifModule>(
     builder.ins().brif(out, slow, &[], cont, &[]);
 
     builder.switch_to_block(slow);
+    fuel.spill(builder);
     let callee = module.declare_func_in_func(exhausted, builder.func);
-    let call_inst = builder.ins().call(callee, &[]);
-    let stop = builder.inst_results(call_inst)[0];
+    builder.ins().call(callee, &[]);
+    fuel.reload(builder);
+    let refilled = builder.use_var(fuel.var);
+    let stop = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThanOrEqual, refilled, 0);
     builder.ins().brif(stop, trap_block, &[], cont, &[]);
 
     builder.switch_to_block(cont);
@@ -1244,6 +1282,14 @@ pub fn lower_function<M: ClifModule>(
         _ => None,
     };
 
+    let fuel = match config.fuel_check {
+        Some((counter, _)) if has_branches => {
+            let addr = fuel_counter.unwrap_or_else(|| c64(&mut builder, counter));
+            Some(FuelVar::load(&mut builder, addr))
+        }
+        _ => None,
+    };
+
     // Jump from synthetic entry to function's first block
     let first_block_label = &func.blocks[0].label;
     let first_block = *clif_blocks.get(first_block_label).unwrap();
@@ -1277,6 +1323,19 @@ pub fn lower_function<M: ClifModule>(
 
         // Translate instructions
         for inst in &block.instructions {
+            // Calls (AIR, runtime hooks, `mm` and `par` charging fuel) see the counter in
+            // memory and may change it.
+            let calls_out = matches!(
+                inst,
+                Instruction::Call { .. }
+                    | Instruction::Alloc { .. }
+                    | Instruction::Free { .. }
+                    | Instruction::MatMul { .. }
+                    | Instruction::Par { .. }
+            );
+            if let (true, Some(f)) = (calls_out, fuel) {
+                f.spill(&mut builder);
+            }
             match inst {
                 Instruction::AssignConst { dst, val, ty, .. } => {
                     let clif_ty = to_clif_type(*ty);
@@ -1860,6 +1919,9 @@ pub fn lower_function<M: ClifModule>(
                         let callee = module.declare_func_in_func(target, builder.func);
                         let arg_vals = flat_args(&values, args);
                         emit_serial_par(&mut builder, callee, n, &arg_vals);
+                        if let Some(f) = fuel {
+                            f.reload(&mut builder);
+                        }
                         continue;
                     };
                     // Arguments in trampoline layout; slot 0 is the index, set by the runtime.
@@ -1899,6 +1961,9 @@ pub fn lower_function<M: ClifModule>(
                     values.insert(dst.clone(), (vec![v], Type::I64));
                 }
             }
+            if let (true, Some(f)) = (calls_out, fuel) {
+                f.reload(&mut builder);
+            }
         }
 
         // Translate terminators
@@ -1910,11 +1975,10 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some((counter, exhausted)), Some(trap_block)) =
-                    (config.fuel_check, fuel_trap_block)
+                if let (Some((_, exhausted)), Some(f), Some(trap_block)) =
+                    (config.fuel_check, fuel, fuel_trap_block)
                 {
-                    let addr = fuel_counter.unwrap_or_else(|| c64(&mut builder, counter));
-                    emit_fuel_check(&mut builder, module, addr, exhausted, trap_block);
+                    emit_fuel_check(&mut builder, module, f, exhausted, trap_block);
                 }
                 builder.ins().jump(target_block, &arg_vals);
             }
@@ -1938,17 +2002,19 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some((counter, exhausted)), Some(trap_block)) =
-                    (config.fuel_check, fuel_trap_block)
+                if let (Some((_, exhausted)), Some(f), Some(trap_block)) =
+                    (config.fuel_check, fuel, fuel_trap_block)
                 {
-                    let addr = fuel_counter.unwrap_or_else(|| c64(&mut builder, counter));
-                    emit_fuel_check(&mut builder, module, addr, exhausted, trap_block);
+                    emit_fuel_check(&mut builder, module, f, exhausted, trap_block);
                 }
                 builder
                     .ins()
                     .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
             }
             Terminator::Ret { val, .. } => {
+                if let Some(f) = fuel {
+                    f.spill(&mut builder);
+                }
                 if let Some(v) = val {
                     let (ret_parts, _) = parts(&values, v);
                     builder.ins().return_(&ret_parts);

@@ -390,6 +390,146 @@ pub extern "C" fn rt_fuel_exhausted() -> i32 {
     1
 }
 
+/// `rt_fuel_exhausted` for Cranelift code, in the `PreserveAll` convention: saves every
+/// register a C call may clobber, so the register allocator keeps loop values in registers
+/// across the (cold) call instead of spilling them on the hot path. It returns nothing:
+/// the caller reloads the fuel counter, which is positive exactly when execution continues.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+extern "C" fn rt_fuel_exhausted_preserve_all() {
+    // Saves the System V and Windows caller-saved GPRs and xmm0-15 (the vector registers
+    // Cranelift allocates), keeps the stack 16-byte aligned, and leaves the 32 bytes of
+    // shadow space a Windows callee may use.
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "sub rsp, 296",
+        "movdqu [rsp + 32], xmm0",
+        "movdqu [rsp + 48], xmm1",
+        "movdqu [rsp + 64], xmm2",
+        "movdqu [rsp + 80], xmm3",
+        "movdqu [rsp + 96], xmm4",
+        "movdqu [rsp + 112], xmm5",
+        "movdqu [rsp + 128], xmm6",
+        "movdqu [rsp + 144], xmm7",
+        "movdqu [rsp + 160], xmm8",
+        "movdqu [rsp + 176], xmm9",
+        "movdqu [rsp + 192], xmm10",
+        "movdqu [rsp + 208], xmm11",
+        "movdqu [rsp + 224], xmm12",
+        "movdqu [rsp + 240], xmm13",
+        "movdqu [rsp + 256], xmm14",
+        "movdqu [rsp + 272], xmm15",
+        "call {hook}",
+        "movdqu xmm0, [rsp + 32]",
+        "movdqu xmm1, [rsp + 48]",
+        "movdqu xmm2, [rsp + 64]",
+        "movdqu xmm3, [rsp + 80]",
+        "movdqu xmm4, [rsp + 96]",
+        "movdqu xmm5, [rsp + 112]",
+        "movdqu xmm6, [rsp + 128]",
+        "movdqu xmm7, [rsp + 144]",
+        "movdqu xmm8, [rsp + 160]",
+        "movdqu xmm9, [rsp + 176]",
+        "movdqu xmm10, [rsp + 192]",
+        "movdqu xmm11, [rsp + 208]",
+        "movdqu xmm12, [rsp + 224]",
+        "movdqu xmm13, [rsp + 240]",
+        "movdqu xmm14, [rsp + 256]",
+        "movdqu xmm15, [rsp + 272]",
+        "add rsp, 296",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "pop rbp",
+        "ret",
+        hook = sym rt_fuel_exhausted,
+    );
+}
+
+/// AArch64 version of the `PreserveAll` stub: saves x0-x18 and the full q0-q31.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+extern "C" fn rt_fuel_exhausted_preserve_all() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
+        "sub sp, sp, #672",
+        "stp x0, x1, [sp, #0]",
+        "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]",
+        "stp x6, x7, [sp, #48]",
+        "stp x8, x9, [sp, #64]",
+        "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]",
+        "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]",
+        "str x18, [sp, #144]",
+        "stp q0, q1, [sp, #160]",
+        "stp q2, q3, [sp, #192]",
+        "stp q4, q5, [sp, #224]",
+        "stp q6, q7, [sp, #256]",
+        "stp q8, q9, [sp, #288]",
+        "stp q10, q11, [sp, #320]",
+        "stp q12, q13, [sp, #352]",
+        "stp q14, q15, [sp, #384]",
+        "stp q16, q17, [sp, #416]",
+        "stp q18, q19, [sp, #448]",
+        "stp q20, q21, [sp, #480]",
+        "stp q22, q23, [sp, #512]",
+        "stp q24, q25, [sp, #544]",
+        "stp q26, q27, [sp, #576]",
+        "stp q28, q29, [sp, #608]",
+        "stp q30, q31, [sp, #640]",
+        "bl {hook}",
+        "ldp q0, q1, [sp, #160]",
+        "ldp q2, q3, [sp, #192]",
+        "ldp q4, q5, [sp, #224]",
+        "ldp q6, q7, [sp, #256]",
+        "ldp q8, q9, [sp, #288]",
+        "ldp q10, q11, [sp, #320]",
+        "ldp q12, q13, [sp, #352]",
+        "ldp q14, q15, [sp, #384]",
+        "ldp q16, q17, [sp, #416]",
+        "ldp q18, q19, [sp, #448]",
+        "ldp q20, q21, [sp, #480]",
+        "ldp q22, q23, [sp, #512]",
+        "ldp q24, q25, [sp, #544]",
+        "ldp q26, q27, [sp, #576]",
+        "ldp q28, q29, [sp, #608]",
+        "ldp q30, q31, [sp, #640]",
+        "ldp x0, x1, [sp, #0]",
+        "ldp x2, x3, [sp, #16]",
+        "ldp x4, x5, [sp, #32]",
+        "ldp x6, x7, [sp, #48]",
+        "ldp x8, x9, [sp, #64]",
+        "ldp x10, x11, [sp, #80]",
+        "ldp x12, x13, [sp, #96]",
+        "ldp x14, x15, [sp, #112]",
+        "ldp x16, x17, [sp, #128]",
+        "ldr x18, [sp, #144]",
+        "add sp, sp, #672",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+        hook = sym rt_fuel_exhausted,
+    );
+}
+
 /// Fuel counter of the code running on this thread, or null when no engine call is active
 /// (code reached through `get_fn_ptr`, which then uses its engine's counter). Called on
 /// entry by functions of modules that use `par`, whose workers each count their own fuel.
@@ -542,8 +682,7 @@ pub fn in_par_worker() -> bool {
 /// loops do not pay a thread wake-up each (tens to hundreds of microseconds on some hosts).
 /// Kept short because spinning helpers take cores from other runtimes' threads: alternating
 /// with NumPy's OpenBLAS pool cost 8.4 ms per pair of calls with a 2 ms spin and 4.4 ms
-/// with 200 us (2.7 ms run apart). A helper that found nothing to do parks at once: while the
-/// loop it missed still runs, spinning would only slow down a busy thread sharing its core.
+/// with 200 us (2.7 ms run apart).
 const PAR_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// Helper threads that run `par` iterations next to the calling thread.
@@ -628,8 +767,17 @@ fn helper_loop(index: usize) {
             (slot.0, slot.1.clone())
         };
         seen = epoch;
-        let worked = job.is_some_and(|region| index < region.helpers && region.participate(false));
-        spin = if worked {
+        // Helpers a `par` does not use (it has fewer tasks than threads, or a lower thread
+        // cap) park at once, so they neither slow down busy threads sharing their core nor
+        // need waking for loops of the same size; the others wait for the next `par`.
+        let used = job.is_some_and(|region| {
+            let used = index < region.helpers;
+            if used {
+                region.participate(false);
+            }
+            used
+        });
+        spin = if used {
             PAR_SPIN
         } else {
             std::time::Duration::ZERO
@@ -682,7 +830,8 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
         args,
         count: n,
         next: AtomicI64::new(0),
-        helpers: threads - 1,
+        // At most one thread per index.
+        helpers: threads.min(n as usize) - 1,
         inflight: AtomicUsize::new(0),
         caller: std::thread::current(),
         fuel: AtomicI64::new(caller_fuel.map_or(UNLIMITED_FUEL, |c| c.get())),
@@ -1106,6 +1255,12 @@ impl CraneliftJit {
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("rt_malloc", rt_malloc as *const u8);
         jit_builder.symbol("rt_free", rt_free as *const u8);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        jit_builder.symbol(
+            "rt_fuel_exhausted",
+            rt_fuel_exhausted_preserve_all as *const u8,
+        );
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         jit_builder.symbol("rt_fuel_exhausted", rt_fuel_exhausted as *const u8);
         jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
         jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
@@ -1128,10 +1283,16 @@ impl CraneliftJit {
         free_sig.params.push(AbiParam::new(types::I64));
         let rt_free_id = module.declare_function("rt_free", Linkage::Import, &free_sig)?;
 
+        // No result: the caller reads the fuel counter back (see `emit_fuel_check`).
+        let mut exhausted_sig = module.make_signature();
+        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+            exhausted_sig.call_conv = cranelift_codegen::isa::CallConv::PreserveAll;
+        }
+        let rt_fuel_exhausted_id =
+            module.declare_function("rt_fuel_exhausted", Linkage::Import, &exhausted_sig)?;
+
         let mut fuel_sig = module.make_signature();
         fuel_sig.returns.push(AbiParam::new(types::I32));
-        let rt_fuel_exhausted_id =
-            module.declare_function("rt_fuel_exhausted", Linkage::Import, &fuel_sig)?;
 
         let mut consume_sig = module.make_signature();
         consume_sig.params.push(AbiParam::new(types::I64));

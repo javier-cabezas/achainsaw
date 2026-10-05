@@ -1,15 +1,44 @@
 # Numerically stable softmax over n f32 values:
 #   out_i = exp(x_i - max(x)) / sum_j exp(x_j - max(x))
-# Returns the sum of exponentials. The max and the normalization run at full vector width;
-# exp is a scalar libm call per element. A masked load would pad the max with zeros, so
-# the max uses full vectors plus a scalar tail instead.
-extfn expf(x:f32)->f32
-
+# Returns the sum of exponentials. Everything runs at full vector width, exp included
+# (Cephes expf in AIR, as in swiglu.air, about 1 ulp; no libm call). A masked load would pad
+# the max with zeros, so the max uses full vectors plus a scalar tail; the sum of the final
+# partial vector is taken from the stored outputs, whose masked reload zeroes the padding.
 fn softmax(x:ptr, out:ptr, n:i64)->f32
   b0:
     first = ld x:f32
     w = vl f32
     vmax0 = splat first:vx
+    zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    one = cst 1.0:f32
+    v_one = splat one:vx
+    lo = cst -87.0:f32
+    v_lo = splat lo:vx
+    log2e = cst 1.44269504088896341:f32
+    v_log2e = splat log2e:vx
+    magic = cst 12582912.0:f32
+    v_magic = splat magic:vx
+    ln2_hi = cst -0.693359375:f32
+    v_ln2_hi = splat ln2_hi:vx
+    ln2_lo = cst 0.000212194440:f32
+    v_ln2_lo = splat ln2_lo:vx
+    p0 = cst 0.00019875691500:f32
+    v_p0 = splat p0:vx
+    p1 = cst 0.0013981999507:f32
+    v_p1 = splat p1:vx
+    p2 = cst 0.0083334519073:f32
+    v_p2 = splat p2:vx
+    p3 = cst 0.041665795894:f32
+    v_p3 = splat p3:vx
+    p4 = cst 0.16666665459:f32
+    v_p4 = splat p4:vx
+    p5 = cst 0.50000001201:f32
+    v_p5 = splat p5:vx
+    bias = cst -1262485377:i32
+    v_bias = splat bias:vx
+    pow23 = cst 8388608:i32
+    v_pow23 = splat pow23:vx
     jmp max_vec(0:i64, vmax0)
   max_vec(i:i64, vm:vx):
     end = add i, w
@@ -26,7 +55,7 @@ fn softmax(x:ptr, out:ptr, n:i64)->f32
     jmp max_tail(t, m0)
   max_tail(k:i64, m:f32):
     more_k = lt k, n
-    br more_k, max_tail_body, exps(0:i64, 0.0:f32, m)
+    br more_k, max_tail_body, exps_init(m)
   max_tail_body:
     off_k = mul k, 4:i64
     pk = add x, off_k
@@ -34,21 +63,50 @@ fn softmax(x:ptr, out:ptr, n:i64)->f32
     m2 = max m, xk
     k2 = add k, 1:i64
     jmp max_tail(k2, m2)
-  exps(e:i64, total:f32, mx:f32):
+
+  # out = exp(x - max), summed as it goes. x - max <= 0, so only the lower clamp matters.
+  exps_init(mx:f32):
+    v_mx = splat mx:vx
+    jmp exps(0:i64, v_zero)
+  exps(e:i64, acc:vx):
     more_e = lt e, n
-    br more_e, exps_body, norm_init(total)
+    br more_e, exps_body, norm_init(acc)
   exps_body:
+    rest = sub n, e
     off_e = mul e, 4:i64
     pe = add x, off_e
-    xe = ld pe:f32
-    shifted = sub xe, mx
-    ev = call expf(shifted)
     po = add out, off_e
-    st po, ev
-    total2 = add total, ev
-    e2 = add e, 1:i64
-    jmp exps(e2, total2, mx)
-  norm_init(s:f32):
+    xv = ldm pe:vx, rest:f32
+    x0 = vsub xv, v_mx:f32
+    # Clamp with compare + select (cheaper than vmax, whose NaN/signed-zero rules are not
+    # needed here).
+    below = vlt x0, v_lo:f32
+    xc = vsel below, v_lo, x0
+    tl = vmul xc, v_log2e:f32
+    tm = vadd tl, v_magic:f32
+    nf = vsub tm, v_magic:f32
+    r0 = vfma nf, v_ln2_hi, xc:f32
+    r = vfma nf, v_ln2_lo, r0:f32
+    q0 = vfma v_p0, r, v_p1:f32
+    q1 = vfma q0, r, v_p2:f32
+    q2 = vfma q1, r, v_p3:f32
+    q3 = vfma q2, r, v_p4:f32
+    q4 = vfma q3, r, v_p5:f32
+    r2 = vmul r, r:f32
+    rp = vadd r, v_one:f32
+    pv = vfma q4, r2, rp:f32
+    eb = vadd tm, v_bias:i32
+    scale = vmul eb, v_pow23:i32
+    ev = vmul pv, scale:f32
+    stm po, ev, rest:f32
+    # Re-read what was stored: lanes past n come back as zeros and add nothing.
+    kept = ldm po:vx, rest:f32
+    acc2 = vadd acc, kept:f32
+    e2 = add e, w
+    jmp exps(e2, acc2)
+
+  norm_init(total:vx):
+    s = vsum total:f32
     inv = div 1.0:f32, s
     vinv = splat inv:vx
     jmp norm(0:i64)
@@ -56,12 +114,12 @@ fn softmax(x:ptr, out:ptr, n:i64)->f32
     more_j = lt j, n
     br more_j, norm_body, done
   norm_body:
-    rest = sub n, j
+    rest_j = sub n, j
     off_j = mul j, 4:i64
     pj = add out, off_j
-    ej = ldm pj:vx, rest:f32
+    ej = ldm pj:vx, rest_j:f32
     pj2 = vmul ej, vinv:f32
-    stm pj, pj2, rest:f32
+    stm pj, pj2, rest_j:f32
     j2 = add j, w
     jmp norm(j2)
   done:
