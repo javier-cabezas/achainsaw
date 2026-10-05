@@ -118,6 +118,7 @@ jobs:
         run: |
           cargo build --bin achainsaw --features achainsaw/llvm
           python tests/test_py_binding.py
+          python tests/test_gguf_decode.py
           python tests/test_mcp_e2e.py
           python tests/test_aot_e2e.py
           python benchmarks/benchmark_kernels.py --quick
@@ -205,6 +206,9 @@ jobs:
 
       - name: Run Python unit tests
         run: python tests/test_py_binding.py
+
+      - name: Run GGUF loading and decode tests
+        run: python tests/test_gguf_decode.py
 
       - name: Build CLI binary for MCP & AOT tests
         run: cargo build --bin achainsaw

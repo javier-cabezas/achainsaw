@@ -533,25 +533,51 @@ fn add_rmsnorm_matches_reference() {
     }
 }
 
-/// Q8_0 weights in `q8_gemv`'s chunked layout (64 output rows per chunk, k-major within
-/// a chunk), plus the dequantized matrix.
-fn q8_pack(rng: &mut Rng, m: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+/// Q8_0 or Q4_0 weights in `q8_gemv`'s / `q4_gemv`'s chunked layout (64 output rows per
+/// chunk; k-major int8 for Q8_0, per block 1024 nibble bytes [16 x 64] for Q4_0) with f16
+/// scales, plus the logical values q (q - 8 for Q4_0) and the scales as f32. Scales include
+/// negative values (Q4_0's usually are), zero and f16 subnormals.
+fn q_pack(rng: &mut Rng, m: usize, k: usize, q4: bool) -> (Vec<u8>, Vec<u16>, Vec<i8>, Vec<f32>) {
     let nb = k / 32;
-    let q: Vec<i8> = (0..m * k).map(|_| (rng.next() * 63.5) as i8).collect();
-    let s: Vec<f32> = (0..nb * m)
-        .map(|_| 0.001 + rng.next().abs() * 0.01)
+    let q: Vec<i8> = (0..m * k)
+        .map(|_| {
+            if q4 {
+                ((rng.next() * 8.0).floor() as i32).clamp(-8, 7) as i8
+            } else {
+                (rng.next() * 63.5) as i8
+            }
+        })
         .collect();
-    let (mut wq, mut sc) = (vec![0i8; m * k], vec![0f32; nb * m]);
+    let s16: Vec<half::f16> = (0..nb * m)
+        .map(|i| {
+            let v = match i % 17 {
+                0 => 0.0,
+                1 => 3.0e-6 * rng.next(), // f16 subnormal
+                _ => (0.001 + rng.next().abs() * 0.01) * rng.next().signum(),
+            };
+            half::f16::from_f32(v)
+        })
+        .collect();
+    let s: Vec<f32> = s16.iter().map(|v| v.to_f32()).collect();
+    let mut wq = vec![0u8; if q4 { m * k / 2 } else { m * k }];
+    let mut sc = vec![0u16; nb * m];
     for c in 0..m / 64 {
         for kk in 0..k {
             for r in 0..64 {
-                wq[c * k * 64 + kk * 64 + r] = q[(c * 64 + r) * k + kk];
+                let v = q[(c * 64 + r) * k + kk];
+                if q4 {
+                    let (b, t) = (kk / 32, kk % 32);
+                    wq[c * k * 32 + b * 1024 + (t % 16) * 64 + r] |=
+                        ((v + 8) as u8) << (4 * (t / 16));
+                } else {
+                    wq[c * k * 64 + kk * 64 + r] = v as u8;
+                }
             }
         }
         for b in 0..nb {
             for r in 0..64 {
                 // s is stored [b][i]; the kernel reads chunk c's [b][r].
-                sc[c * nb * 64 + b * 64 + r] = s[b * m + c * 64 + r];
+                sc[c * nb * 64 + b * 64 + r] = s16[b * m + c * 64 + r].to_bits();
             }
         }
     }
@@ -578,12 +604,21 @@ fn q8_quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
 
 #[test]
 fn q8_gemv_matches_reference() {
-    type Q8 = extern "C" fn(*const i8, *const f32, *const f32, *mut f32, i64, i64);
-    for (level, engine) in engines("q8_gemv") {
-        let kern: Q8 = unsafe { std::mem::transmute(engine.get_fn_ptr("q8_gemv").unwrap()) };
+    check_q_gemv("q8_gemv", false);
+}
+
+#[test]
+fn q4_gemv_matches_reference() {
+    check_q_gemv("q4_gemv", true);
+}
+
+fn check_q_gemv(name: &str, q4: bool) {
+    type Gemv = extern "C" fn(*const u8, *const u16, *const f32, *mut f32, i64, i64);
+    for (level, engine) in engines(name) {
+        let kern: Gemv = unsafe { std::mem::transmute(engine.get_fn_ptr(name).unwrap()) };
         let mut rng = Rng(71);
         for (m, k) in [(64, 32), (128, 96), (64, 1024), (320, 512)] {
-            let (wq, sc, q, s) = q8_pack(&mut rng, m, k);
+            let (wq, sc, q, s) = q_pack(&mut rng, m, k, q4);
             let mut x: Vec<f32> = rng.vec(k);
             // An all-zero block quantizes with scale 0.
             x[..32].iter_mut().for_each(|v| *v = 0.0);
@@ -611,7 +646,7 @@ fn q8_gemv_matches_reference() {
                 let tol = (k / 32 + 4) as f64 * f32::EPSILON as f64 * scale + 1e-30;
                 assert!(
                     (y[i] as f64 - want).abs() <= tol,
-                    "q8_gemv {m}x{k} y[{i}] at {level}: got {}, want {want}, tol {tol}",
+                    "{name} {m}x{k} y[{i}] at {level}: got {}, want {want}, tol {tol}",
                     y[i]
                 );
             }

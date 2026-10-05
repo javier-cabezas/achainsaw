@@ -28,6 +28,7 @@ SHORT = {
     "rope": "RoPE, 32 heads x 128",
     "add_rmsnorm": "Residual add + RMSNorm, n=4096",
     "q8_gemv": "Q8_0 GEMV 4096x4096, all cores",
+    "q4_gemv": "Q4_0 GEMV 4096x4096, all cores",
 }
 
 THEMES = {

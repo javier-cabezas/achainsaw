@@ -321,10 +321,12 @@ def make_cases():
     qm, qk = 4096, 4096
     qnb = qk // 32
     qq = rng.integers(-127, 128, size=(qm, qk), dtype=np.int8)
-    qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float32)
+    # f16 scales, as GGUF stores them (NumPy uses the same values in f32).
+    qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float16)
     # Packed layout: 64-row chunks, k-major within a chunk.
     q_packed = np.ascontiguousarray(qq.reshape(qm // 64, 64, qk).transpose(0, 2, 1))
     s_packed = np.ascontiguousarray(qs.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
+    qs = qs.astype(np.float32)
     qx = rng.standard_normal(qk).astype(np.float32)
     qy = np.zeros(qm, dtype=np.float32)
     # NumPy keeps the same int8 weights, block-major ([k/32 x m x 32]).
@@ -342,6 +344,32 @@ def make_cases():
         name="q8_gemv", label=f"Q8_0 GEMV, all cores ({qm}x{qk})",
         run=lambda k: k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk),
         verify=verify_q8, tol=1e-5, numpy=lambda: np_q8_gemv(q_blocks, qs, qx),
+        flops=2 * qm * qk,
+    ))
+
+    # Q4_0: 4-bit weights q in 0..15 (value q - 8), llama.cpp's nibble bytes per block (byte t:
+    # values t and t + 16), packed per chunk and block as 1024 bytes [16 x 64].
+    q4 = rng.integers(0, 16, size=(qm, qk), dtype=np.uint8)
+    q4s = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (4.6 * np.sqrt(qk))).astype(np.float16)
+    nib = q4.reshape(qm, qnb, 32)
+    nib = nib[:, :, :16] | (nib[:, :, 16:] << 4)                     # [m x k/32 x 16]
+    q4_packed = np.ascontiguousarray(nib.reshape(qm // 64, 64, qnb, 16).transpose(0, 2, 3, 1))
+    q4s_packed = np.ascontiguousarray(q4s.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
+    q4s = q4s.astype(np.float32)
+    q4_vals = q4.astype(np.int8) - np.int8(8)
+    q4_blocks = np.ascontiguousarray(q4_vals.reshape(qm, qnb, 32).transpose(1, 0, 2))
+    dots4 = np.einsum("rbt,bt->rb", q4_vals.reshape(qm, qnb, 32).astype(np.int64),
+                      xq_ints.reshape(qnb, 32).astype(np.int64))
+    q4_ref = (dots4 * q4s.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
+
+    def verify_q4(k):
+        k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk)
+        return float(np.max(np.abs(qy - q4_ref)) / np.max(np.abs(q4_ref)))
+
+    cases.append(dict(
+        name="q4_gemv", label=f"Q4_0 GEMV, all cores ({qm}x{qk})",
+        run=lambda k: k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk),
+        verify=verify_q4, tol=1e-5, numpy=lambda: np_q8_gemv(q4_blocks, q4s, qx),
         flops=2 * qm * qk,
     ))
     return cases

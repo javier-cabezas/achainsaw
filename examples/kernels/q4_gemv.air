@@ -1,18 +1,20 @@
-# Quantized matrix-vector product y = W x on all cores, Q8_0 style (llama.cpp): W is m x k
-# int8 in blocks of 32 along k, each block row with its own f16 scale,
-#   W[i][32b + t] = scales[b][i] * q[i][32b + t],
-# and x is quantized on the fly the same way: dx[b] = max|x in block b| / 127,
-# xq = round(x / dx). Each block contributes scales[b][i] * dx[b] * (q[i] . xq) with an exact
-# int32 dot product, so the weights are read once, as 1 byte (plus 1/16 for scales).
+# Quantized matrix-vector product y = W x on all cores, Q4_0 style (llama.cpp): W is m x k
+# with 4-bit weights in blocks of 32 along k, each block row with its own f16 scale,
+#   W[i][32b + t] = scales[b][i] * (q[i][32b + t] - 8),   q in 0..15,
+# and x quantized on the fly to int8 per 32-block as in q8_gemv. Each block contributes
+# scales[b][i] * dx[b] * ((q[i] - 8) . xq) with an exact int32 dot product, so the weights are
+# read once, as half a byte (plus 1/16 for scales): 53% of Q8_0's traffic.
 #
 # Packed layout, for m a multiple of 64 and k a multiple of 32: output rows come in chunks
 # of 64; chunk c holds
-#   wq     + c * k * 64:        q for its rows, k-major ([k x 64] i8, row kk = column kk)
+#   wq     + c * k * 32:        nibbles for its rows, 1024 bytes per block b: byte t * 64 + j
+#                               holds q[64c + j][32b + t] (low nibble) and q[64c + j][32b +
+#                               16 + t] (high nibble), t < 16
 #   scales + c * (k/32) * 128:  their scales ([k/32 x 64] f16)
-# so each chunk is contiguous and one `par` task computes it: per block, one i8 `mm`
-# [1 x 32] . [32 x 64] gives the 64 int32 dots (AMX, SME, vector or Cranelift tiles), which
-# are converted to f32 (vitof) and accumulated into y.
-fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
+# so a block unpacks with a mask, a shift and a subtraction per byte into the [32 x 64] i8
+# tile that q8_gemv stores directly (low nibbles fill rows 0..15, high nibbles rows 16..31),
+# and the same i8 `mm` gives the 64 int32 dots.
+fn q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
     nb = udiv k, 32:i64
     xq = alloc k
@@ -20,7 +22,7 @@ fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
     dx = alloc nb4
     call quantize_q8(x, xq, dx, k)
     chunks = udiv m, 64:i64
-    par chunks, q8_chunk(wq, scales, xq, dx, y, k)
+    par chunks, q4_chunk(wq, scales, xq, dx, y, k)
     free dx
     free xq
     ret
@@ -99,12 +101,12 @@ fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   done:
     ret
 
-# y[64c .. 64c + 64] for chunk c.
-fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
+# y[64c .. 64c + 64] for chunk c: per block, unpack the nibbles into `tile`, then as q8_chunk.
+fn q4_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
   b0:
     w = vl f32
     nb = udiv k, 32:i64
-    chunk_w = mul k, 64:i64
+    chunk_w = mul k, 32:i64
     w_off = mul c, chunk_w
     wc = add wq, w_off
     chunk_s = mul nb, 128:i64
@@ -113,6 +115,13 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     y_off = mul c, 256:i64
     yc = add y, y_off
     dots = alloc 256:i64
+    tile = alloc 2048:i64
+    w8 = vl i8
+    lo_mask = cst 15:i8
+    v_lo_mask = splat lo_mask:vx
+    eight = cst 8:i8
+    v_eight = splat eight:vx
+    four = cst 4:i32
     zf = cst 0.0:f32
     v_zero = splat zf:vx
     mag_mask = cst 32767:i32
@@ -139,7 +148,7 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     jmp zero_dots(0:i64)
   zero_dots(zd:i64):
     zd_more = lt zd, 64:i64
-    br zd_more, zero_dots_body, block_mm
+    br zd_more, zero_dots_body, unpack(0:i64)
   zero_dots_body:
     zd_rest = sub 64:i64, zd
     zd_off = mul zd, 4:i64
@@ -147,12 +156,29 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     stm pzd, v_zero, zd_rest:i32
     zd2 = add zd, w
     jmp zero_dots(zd2)
+  unpack(u:i64):
+    u_more = lt u, 1024:i64
+    br u_more, unpack_body, block_mm
+  unpack_body:
+    nib_off = mul b, 1024:i64
+    nib_base = add wc, nib_off
+    pn = add nib_base, u
+    nv = ld pn:vx
+    lo = vand nv, v_lo_mask:i8
+    lo_q = vsub lo, v_eight:i8
+    hi = vushr nv, four:i8
+    hi_q = vsub hi, v_eight:i8
+    plo = add tile, u
+    st plo, lo_q
+    hi_off = add u, 1024:i64
+    phi = add tile, hi_off
+    st phi, hi_q
+    u2 = add u, w8
+    jmp unpack(u2)
   block_mm:
     xb_off = mul b, 32:i64
     xb = add xq, xb_off
-    wb_off = mul b, 2048:i64
-    wb = add wc, wb_off
-    mm dots, xb, wb, 1:i64, 64:i64, 32:i64:i8
+    mm dots, xb, tile, 1:i64, 64:i64, 32:i64:i8
     d_off = mul b, 4:i64
     pd = add dx, d_off
     d = ld pd:f32
@@ -210,5 +236,6 @@ fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     b2 = add b, 1:i64
     jmp blocks(b2)
   done:
+    free tile
     free dots
     ret
