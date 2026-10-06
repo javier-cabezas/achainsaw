@@ -573,6 +573,17 @@ impl CpuFeatures {
         }
     }
 
+    /// Whether these features convert f16 <-> f32 vectors in hardware: x86 F16C, or any
+    /// AArch64 (FCVTL/FCVTN are baseline).
+    #[cfg(feature = "llvm")]
+    pub fn llvm_native_f16(&self) -> bool {
+        match self.arch {
+            Arch::X86_64 => self.has(F::F16c),
+            Arch::Aarch64 => true,
+            Arch::Other => false,
+        }
+    }
+
     /// Whether LLVM code for these features uses scalable (SVE) `vx` vectors.
     pub fn llvm_vx_scalable(&self) -> bool {
         self.arch == Arch::Aarch64 && self.has(F::Sve)
@@ -901,7 +912,13 @@ pub fn llvm_aot_target(
             match isa::lookup(x86) {
                 Ok(mut builder) => {
                     let _ = builder.enable(cpu);
-                    enabled_cranelift_features(&builder, arch)?.with_prerequisites()
+                    let mut set = enabled_cranelift_features(&builder, arch)?.with_prerequisites();
+                    // Cranelift's presets do not track F16C, which x86-64-v3 and every AVX2
+                    // CPU have (it decides LLVM's f16 vector conversions).
+                    if set.has(F::Avx2) {
+                        set.enable(F::F16c);
+                    }
+                    set
                 }
                 Err(_) => CpuFeatures::empty(arch),
             }

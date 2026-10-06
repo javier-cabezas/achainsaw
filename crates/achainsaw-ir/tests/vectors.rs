@@ -48,6 +48,15 @@ fn k(pa:ptr, po:ptr)->f64
     sr = vshr sl, 5:i16
     su = vushr sr, 9:i64:i8
     st po, su
+    hf = vfwidenlo a:f16
+    hb = vfwidenhi a:bf16
+    nh = vnarrow hf, hb:f16
+    nb = vnarrow hf, ex:bf16
+    hn = vl bf16
+    hm = ldm pa:vx, hn:f16
+    stm po, hm, hn:bf16
+    st po, nh
+    st po, nb
     ret t
 "#;
 
@@ -134,6 +143,9 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("fi = vitof a:f32"), "{text}");
     assert!(text.contains("nr = vnarrow wl, wh:i8"));
     assert!(text.contains("sl = vshl nr, amt:i32"));
+    assert!(text.contains("hb = vfwidenhi a:bf16"), "{text}");
+    assert!(text.contains("nh = vnarrow hf, hb:f16"));
+    assert!(text.contains("hm = ldm pa:vx, hn:f16"));
 }
 
 #[test]
@@ -402,8 +414,10 @@ fn masked_and_mm_type_rules() {
         err_code(&with("    v = ldm p:f32, n:f32\n    st p, v\n")),
         "ERR_TYPE_MISMATCH"
     );
+    // Masked ops count lanes, f16/bf16 included, but not vector-typed ones.
+    assert!(parse_and_validate(&with("    v = ldm p:vx, n:bf16\n    stm p, v, n:f16\n")).is_ok());
     assert_eq!(
-        err_code(&with("    v = ldm p:vx, n:bf16\n    st p, v\n")),
+        err_code(&with("    v = ldm p:vx, n:v128\n    st p, v\n")),
         "ERR_INVALID_LANE_TYPE"
     );
     assert_eq!(

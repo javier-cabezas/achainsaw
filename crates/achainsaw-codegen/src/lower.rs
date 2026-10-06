@@ -3,6 +3,7 @@ use achainsaw_ir::ast::{
     VShiftOp, VUnaryOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
+use achainsaw_ir::validator::vnarrow_source_lane;
 use anyhow::{anyhow, Result};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
@@ -63,7 +64,8 @@ pub fn push_abi_params(params: &mut Vec<AbiParam>, ty: Type) {
 fn lane_vec_type(lane: Type) -> types::Type {
     match lane {
         Type::I8 => types::I8X16,
-        Type::I16 => types::I16X8,
+        // f16/bf16 lanes are carried as their bits, as scalars are.
+        Type::I16 | Type::F16 | Type::BF16 => types::I16X8,
         Type::I32 => types::I32X4,
         Type::I64 | Type::Ptr => types::I64X2,
         Type::F64 => types::F64X2,
@@ -517,27 +519,42 @@ fn vunary_parts(
                 to_part(builder, r)
             })
             .collect(),
-        VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+        VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
             let narrow = op.source_lane(lane);
-            let lo = op == VUnaryOp::WidenLo;
+            let lo = op.is_low_half();
+            // One half of a part's lanes, widened: sign-extended integers, or f16/bf16 bits
+            // zero-extended to i32 and converted to f32.
+            let widen = |b: &mut FunctionBuilder, x: ClifValue, low: bool| -> ClifValue {
+                let r = match narrow {
+                    Type::F16 | Type::BF16 => {
+                        let bits = if low {
+                            b.ins().uwiden_low(x)
+                        } else {
+                            b.ins().uwiden_high(x)
+                        };
+                        if narrow == Type::F16 {
+                            f16x4_to_f32x4(b, bits)
+                        } else {
+                            let bits = b.ins().ishl_imm_u(bits, 16);
+                            b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
+                        }
+                    }
+                    _ if low => b.ins().swiden_low(x),
+                    _ => b.ins().swiden_high(x),
+                };
+                to_part(b, r)
+            };
             if src.len() == 1 {
                 let x = as_lanes(builder, src[0], narrow);
-                let r = if lo {
-                    builder.ins().swiden_low(x)
-                } else {
-                    builder.ins().swiden_high(x)
-                };
-                return vec![to_part(builder, r)];
+                return vec![widen(builder, x, lo)];
             }
             let half = src.len() / 2;
             let range = if lo { 0..half } else { half..src.len() };
             let mut out = Vec::with_capacity(src.len());
             for &p in &src[range] {
                 let x = as_lanes(builder, p, narrow);
-                let l = builder.ins().swiden_low(x);
-                let h = builder.ins().swiden_high(x);
-                out.push(to_part(builder, l));
-                out.push(to_part(builder, h));
+                out.push(widen(builder, x, true));
+                out.push(widen(builder, x, false));
             }
             out
         }
@@ -1170,6 +1187,73 @@ fn f16x4_to_f32x4(b: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
     let mag = b.ins().bitselect(is_sub, sub, mag);
     let bits = b.ins().bor(mag, sign);
     b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
+}
+
+/// Four f32 lanes -> binary16 bits in I32X4 lanes, lane by lane as `f32_to_f16` (rounding to
+/// nearest-even; NaNs become the quiet NaN 0x7e00).
+fn f32x4_to_f16x4(b: &mut FunctionBuilder, f: ClifValue) -> ClifValue {
+    let k = |b: &mut FunctionBuilder, v: u32| {
+        let s = c32(b, v);
+        b.ins().splat(types::I32X4, s)
+    };
+    let x = b.ins().bitcast(types::I32X4, bitcast_flags(), f);
+    let ksign = k(b, 0x8000_0000);
+    let sign = b.ins().band(x, ksign);
+    let a = b.ins().bxor(x, sign);
+    // |f| >= 65536.0 (2^16): Inf, or NaN when above the f32 Inf pattern.
+    let kbig = k(b, 0x4780_0000);
+    let is_big = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, a, kbig);
+    let kinf32 = k(b, 0x7f80_0000);
+    let is_nan = b.ins().icmp(IntCC::UnsignedGreaterThan, a, kinf32);
+    let qnan = k(b, 0x7e00);
+    let inf = k(b, 0x7c00);
+    let big = b.ins().bitselect(is_nan, qnan, inf);
+    // Result is subnormal or zero: let the FPU round by adding 0.5 (denorm magic).
+    let ksub = k(b, 0x3880_0000);
+    let is_sub = b.ins().icmp(IntCC::UnsignedLessThan, a, ksub);
+    let af = b.ins().bitcast(types::F32X4, bitcast_flags(), a);
+    let magic = b.ins().f32const(f32::from_bits(0x3f00_0000));
+    let magic = b.ins().splat(types::F32X4, magic);
+    let sum = b.ins().fadd(af, magic);
+    let sum_bits = b.ins().bitcast(types::I32X4, bitcast_flags(), sum);
+    let kmagic = k(b, 0x3f00_0000);
+    let sub = b.ins().isub(sum_bits, kmagic);
+    // Normal: rebias and round to nearest-even on the 13 dropped mantissa bits.
+    let odd = b.ins().ushr_imm_u(a, 13);
+    let k1 = k(b, 1);
+    let odd = b.ins().band(odd, k1);
+    let bias = k(b, (((15i32 - 127) << 23) + 0xfff) as u32);
+    let t = b.ins().iadd(a, bias);
+    let t = b.ins().iadd(t, odd);
+    let normal = b.ins().ushr_imm_u(t, 13);
+    let mag = b.ins().bitselect(is_sub, sub, normal);
+    let mag = b.ins().bitselect(is_big, big, mag);
+    let sign16 = b.ins().ushr_imm_u(sign, 16);
+    b.ins().bor(mag, sign16)
+}
+
+/// Four f32 lanes -> bfloat16 bits in I32X4 lanes, lane by lane as `f32_to_bf16` (rounding
+/// to nearest-even; NaNs are quieted).
+fn f32x4_to_bf16x4(b: &mut FunctionBuilder, f: ClifValue) -> ClifValue {
+    let k = |b: &mut FunctionBuilder, v: u32| {
+        let s = c32(b, v);
+        b.ins().splat(types::I32X4, s)
+    };
+    let x = b.ins().bitcast(types::I32X4, bitcast_flags(), f);
+    let hi = b.ins().ushr_imm_u(x, 16);
+    let k1 = k(b, 1);
+    let lsb = b.ins().band(hi, k1);
+    let k7fff = k(b, 0x7fff);
+    let r = b.ins().iadd(x, k7fff);
+    let r = b.ins().iadd(r, lsb);
+    let rounded = b.ins().ushr_imm_u(r, 16);
+    let k40 = k(b, 0x40);
+    let quiet = b.ins().bor(hi, k40);
+    let kabs = k(b, 0x7fff_ffff);
+    let abs = b.ins().band(x, kabs);
+    let kinf = k(b, 0x7f80_0000);
+    let is_nan = b.ins().icmp(IntCC::UnsignedGreaterThan, abs, kinf);
+    b.ins().bitselect(is_nan, quiet, rounded)
 }
 
 /// Fuel counter of a function: kept in a variable (a register) between checks, and in memory
@@ -2136,11 +2220,7 @@ pub fn lower_function<M: ClifModule>(
                 } => {
                     let (lo_parts, vec_ty) = parts(&values, lo);
                     let (hi_parts, _) = parts(&values, hi);
-                    let wide = if *lane == Type::I8 {
-                        Type::I16
-                    } else {
-                        Type::I32
-                    };
+                    let wide = vnarrow_source_lane(*lane);
                     // lo's lanes, then hi's, two narrowed parts packed into each result part.
                     let all: Vec<ClifValue> = lo_parts.into_iter().chain(hi_parts).collect();
                     let out = all
@@ -2148,7 +2228,21 @@ pub fn lower_function<M: ClifModule>(
                         .map(|pair| {
                             let x = as_lanes(&mut builder, pair[0], wide);
                             let y = as_lanes(&mut builder, pair[1], wide);
-                            let r = builder.ins().snarrow(x, y);
+                            let r = match *lane {
+                                // f32 lanes to f16/bf16 bits in i32 lanes (all below 2^16,
+                                // so the unsigned saturating narrow is exact).
+                                Type::F16 | Type::BF16 => {
+                                    let f = if *lane == Type::F16 {
+                                        f32x4_to_f16x4
+                                    } else {
+                                        f32x4_to_bf16x4
+                                    };
+                                    let xb = f(&mut builder, x);
+                                    let yb = f(&mut builder, y);
+                                    builder.ins().unarrow(xb, yb)
+                                }
+                                _ => builder.ins().snarrow(x, y),
+                            };
                             to_part(&mut builder, r)
                         })
                         .collect();
