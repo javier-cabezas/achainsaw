@@ -1448,8 +1448,10 @@ impl<'a> BinaryDecoder<'a> {
     }
 
     fn read_lane_type(&mut self) -> Result<Type, Diagnostic> {
+        // Arithmetic lanes, or f16/bf16 (`vfwiden*`, `vnarrow`, lane counts); the validator
+        // checks each op's lane types.
         decode_type(self.read_u8()?)
-            .filter(Type::is_lane)
+            .filter(|t| t.is_lane() || t.is_half())
             .ok_or_else(|| self.err("Invalid vector lane type in AIRB"))
     }
 

@@ -272,6 +272,9 @@ impl CastOp {
 /// type: `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN
 /// to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends the low / high half of the
 /// narrower lanes), `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
+/// The exception is `w = vfwidenlo v:f16` / `vfwidenhi` (also `:bf16`): the result is always
+/// f32, so the suffix names the 16-bit float lanes whose low / high half is widened (exactly;
+/// a NaN stays a NaN, its payload unspecified).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VUnaryOp {
     Itof,
@@ -279,15 +282,19 @@ pub enum VUnaryOp {
     WidenLo,
     WidenHi,
     Exp,
+    FWidenLo,
+    FWidenHi,
 }
 
 impl VUnaryOp {
-    pub const ALL: [VUnaryOp; 5] = [
+    pub const ALL: [VUnaryOp; 7] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
         VUnaryOp::WidenHi,
         VUnaryOp::Exp,
+        VUnaryOp::FWidenLo,
+        VUnaryOp::FWidenHi,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -301,12 +308,37 @@ impl VUnaryOp {
             VUnaryOp::WidenLo => "vwidenlo",
             VUnaryOp::WidenHi => "vwidenhi",
             VUnaryOp::Exp => "vexp",
+            VUnaryOp::FWidenLo => "vfwidenlo",
+            VUnaryOp::FWidenHi => "vfwidenhi",
         }
     }
 
-    /// Lane type of the operand for result lane type `lane`.
+    /// Whether the op converts the low or high half of its lanes to lanes twice as wide.
+    pub fn is_widen(&self) -> bool {
+        matches!(
+            self,
+            VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi
+        )
+    }
+
+    /// Whether the op works on the low half of its source lanes (`vwidenlo`, `vfwidenlo`).
+    pub fn is_low_half(&self) -> bool {
+        matches!(self, VUnaryOp::WidenLo | VUnaryOp::FWidenLo)
+    }
+
+    /// Lane type of the result for the op's suffix `lane` (the suffix itself, except for
+    /// `vfwiden*`, whose suffix names the source).
+    pub fn result_lane(&self, lane: Type) -> Type {
+        match self {
+            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => Type::F32,
+            _ => lane,
+        }
+    }
+
+    /// Lane type of the operand for the op's suffix `lane`.
     pub fn source_lane(&self, lane: Type) -> Type {
         match (self, lane) {
+            (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, _) => lane,
             (VUnaryOp::Itof, _) => Type::I32,
             (VUnaryOp::Ftoi, _) => Type::F32,
             (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I16) => Type::I8,

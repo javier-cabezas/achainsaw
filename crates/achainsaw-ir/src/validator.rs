@@ -124,6 +124,18 @@ const ALL_LANES: &[Type] = &[
     Type::F64,
 ];
 
+/// Lane types of `vl`, `ldm` and `stm`, which only count lanes: also the 16-bit floats.
+const COUNT_LANES: &[Type] = &[
+    Type::I8,
+    Type::I16,
+    Type::I32,
+    Type::I64,
+    Type::F32,
+    Type::F64,
+    Type::F16,
+    Type::BF16,
+];
+
 /// Element types supported by `mm`.
 pub const MM_DTYPES: &[Type] = &[Type::BF16, Type::F16, Type::I8, Type::F32];
 
@@ -137,11 +149,22 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
         VUnaryOp::Ftoi => &[Type::I32],
         VUnaryOp::WidenLo | VUnaryOp::WidenHi => &[Type::I16, Type::I32, Type::I64],
         VUnaryOp::Exp => &[Type::F32],
+        VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => &[Type::F16, Type::BF16],
     }
 }
 
-/// Result lane types of `vnarrow` (from i16 and i32 lanes).
-pub const VNARROW_LANE_TYPES: &[Type] = &[Type::I8, Type::I16];
+/// Result lane types of `vnarrow`: i8 and i16 from i16 and i32 lanes (saturating), f16 and
+/// bf16 from f32 lanes (rounding to nearest-even, as `ftrunc`).
+pub const VNARROW_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::F16, Type::BF16];
+
+/// Lane type `vnarrow` narrows from, for its result lane type.
+pub fn vnarrow_source_lane(lane: Type) -> Type {
+    match lane {
+        Type::I8 => Type::I16,
+        Type::I16 => Type::I32,
+        _ => Type::F32,
+    }
+}
 
 /// Lane types of `vshl`, `vshr` and `vushr`.
 pub const VSHIFT_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::I32, Type::I64];
@@ -971,7 +994,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::check_lane("ldm", *lane, ALL_LANES, *span)?;
+                Self::check_lane("ldm", *lane, COUNT_LANES, *span)?;
                 Self::define(scope, defs, dst, *ty, *span)?;
             }
             Instruction::MaskedStore {
@@ -984,7 +1007,7 @@ impl Validator {
                 self.check_typed(ctx, ptr, Type::Ptr, "stm pointer", scope, *span)?;
                 self.check_vector(ctx, val, scope, *span)?;
                 self.check_typed(ctx, count, Type::I64, "stm lane count", scope, *span)?;
-                Self::check_lane("stm", *lane, ALL_LANES, *span)?;
+                Self::check_lane("stm", *lane, COUNT_LANES, *span)?;
             }
             Instruction::MatMul {
                 pc,
@@ -1065,7 +1088,7 @@ impl Validator {
                 Self::define(scope, defs, dst, vec_ty, *span)?;
             }
             Instruction::VLen { dst, lane, span } => {
-                Self::check_lane("vl", *lane, ALL_LANES, *span)?;
+                Self::check_lane("vl", *lane, COUNT_LANES, *span)?;
                 Self::define(scope, defs, dst, Type::I64, *span)?;
             }
         }

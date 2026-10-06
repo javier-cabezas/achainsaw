@@ -15,7 +15,8 @@ use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VectorReduceOp
 use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::{
-    vbin_lane_types, vunary_lane_types, VFMA_LANE_TYPES, VNARROW_LANE_TYPES, VSHIFT_LANE_TYPES,
+    vbin_lane_types, vnarrow_source_lane, vunary_lane_types, VFMA_LANE_TYPES, VNARROW_LANE_TYPES,
+    VSHIFT_LANE_TYPES,
 };
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
@@ -123,6 +124,14 @@ impl Kernel {
         }
     }
 
+    /// Lane type of the results: `lane()`, except for `vfwiden*` (f32).
+    fn out_lane(&self) -> Type {
+        match self {
+            Kernel::Unary(op, l, _) => op.result_lane(*l),
+            _ => self.lane(),
+        }
+    }
+
     /// Lane type of the operands (the result lane type `lane()` for most ops).
     fn input_lane(&self) -> Type {
         match self {
@@ -165,8 +174,9 @@ impl Kernel {
             | Kernel::Splat(..)
             | Kernel::Unary(..)
             | Kernel::FastBin(..)
-            | Kernel::FastReduce(..) => self.lane().is_float(),
-            Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Narrow(..) | Kernel::Shift(..) => false,
+            | Kernel::FastReduce(..) => self.out_lane().is_float(),
+            Kernel::Narrow(l, _) => l.is_half(),
+            Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Shift(..) => false,
         }
     }
 }
@@ -253,9 +263,24 @@ fn fast_minmax(is_max: bool, a: f64, b: f64) -> f64 {
 
 /// Lane type twice as wide as an integer lane (`vnarrow`'s operands).
 fn wide_of(lane: Type) -> Type {
-    match lane {
-        Type::I8 => Type::I16,
-        _ => Type::I32,
+    vnarrow_source_lane(lane)
+}
+
+/// f16 or bf16 bits to f32, as the `half` crate converts them.
+fn half_to_f32(lane: Type, bits: u16) -> f32 {
+    if lane == Type::F16 {
+        half::f16::from_bits(bits).to_f32()
+    } else {
+        half::bf16::from_bits(bits).to_f32()
+    }
+}
+
+/// f32 to f16 or bf16 bits, rounding to nearest-even (the `half` crate).
+fn f32_to_half(lane: Type, x: f32) -> u16 {
+    if lane == Type::F16 {
+        half::f16::from_f32(x).to_bits()
+    } else {
+        half::bf16::from_f32(x).to_bits()
     }
 }
 
@@ -403,8 +428,7 @@ fn tree<T: Copy>(vals: &[T], f: &impl Fn(T, T) -> T) -> T {
 fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8> {
     let mut out = vec![0u8; BUF];
     let w = width_bytes(k.width(), vx_bytes);
-    let lane = k.lane();
-    let n = w / lane.byte_size();
+    let n = w / k.out_lane().byte_size();
     match k {
         Kernel::Bin(op, Type::F32, _) if !op.is_bitwise() => {
             for i in 0..n {
@@ -517,7 +541,21 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                     put_int(&mut out, l, i, get_int(a, narrow, base + i));
                 }
             }
+            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
+                let base = if op.is_low_half() { 0 } else { n };
+                for i in 0..n {
+                    let r = half_to_f32(l, get_int(a, l, base + i) as u16);
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
         },
+        Kernel::Narrow(l, _) if l.is_half() => {
+            let half = w / 4;
+            for i in 0..half {
+                put_int(&mut out, l, i, f32_to_half(l, get_f32(a, i)) as i64);
+                put_int(&mut out, l, half + i, f32_to_half(l, get_f32(b, i)) as i64);
+            }
+        }
         Kernel::Narrow(l, _) => {
             let wide = wide_of(l);
             let half = w / wide.byte_size();
@@ -702,6 +740,25 @@ fn fill(buf: &mut [u8], lane: Type, rng: &mut Rng, trial: u64) {
                 };
                 buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
+            Type::F16 | Type::BF16 => {
+                // Zeros, ones, largest finite, infinities, smallest subnormal, NaNs (quiet and
+                // signaling), then random bit patterns.
+                let specials: [u16; 10] = if lane == Type::F16 {
+                    [
+                        0, 0x8000, 0x3c00, 0xbc00, 0x7bff, 0x7c00, 0xfc00, 0x0001, 0x7e00, 0x7c01,
+                    ]
+                } else {
+                    [
+                        0, 0x8000, 0x3f80, 0xbf80, 0x7f7f, 0x7f80, 0xff80, 0x0001, 0x7fc0, 0x7f81,
+                    ]
+                };
+                let v = if special {
+                    specials[(i + idx) % specials.len()]
+                } else {
+                    (pick >> 16) as u16
+                };
+                buf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
             _ => {
                 let bits = lane.bit_width().unwrap();
                 let min = i64::MIN >> (64 - bits);
@@ -720,8 +777,21 @@ fn fill(buf: &mut [u8], lane: Type, rng: &mut Rng, trial: u64) {
 
 fn check_output(k: Kernel, expected: &[u8], actual: &[u8], vx_bytes: usize, ctx: &str) {
     let n = k.out_bytes(vx_bytes);
-    if k.float_output() {
-        let s = k.lane().byte_size();
+    if k.float_output() && k.out_lane().is_half() {
+        // NaN payloads aside: 16-bit floats compare bit for bit unless both are NaN.
+        let lane = k.out_lane();
+        for i in 0..n / 2 {
+            let e = u16::from_le_bytes([expected[i * 2], expected[i * 2 + 1]]);
+            let a = u16::from_le_bytes([actual[i * 2], actual[i * 2 + 1]]);
+            let ok = e == a || (half_to_f32(lane, e).is_nan() && half_to_f32(lane, a).is_nan());
+            assert!(
+                ok,
+                "{} lane {i}: expected {e:#06x}, got {a:#06x} ({ctx})",
+                k.name()
+            );
+        }
+    } else if k.float_output() {
+        let s = k.out_lane().byte_size();
         for i in 0..n / s {
             let (e, a) = if s == 4 {
                 (get_f32(expected, i) as f64, get_f32(actual, i) as f64)

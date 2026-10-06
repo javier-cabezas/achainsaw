@@ -130,6 +130,184 @@ fn same_bits_or_nan(expected: f32, actual: f32) -> bool {
     }
 }
 
+/// Vector `vfwidenlo`/`vfwidenhi` and `vnarrow` to f16/bf16 over whole buffers, `vl` lanes at
+/// a time (buffers are padded to a multiple of any vector length).
+const VECTOR_CONVERSIONS: &str = r#"
+fn vwiden_f16(src:ptr, dst:ptr, n:i64)
+  b0:
+    w16 = vl i16
+    half = udiv w16, 2:i64
+    jmp lp(0:i64)
+  lp(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    so = mul i, 2:i64
+    ps = add src, so
+    v = ld ps:vx
+    lo = vfwidenlo v:f16
+    hi = vfwidenhi v:f16
+    do = mul i, 4:i64
+    pd = add dst, do
+    st pd, lo
+    ih = add i, half
+    dho = mul ih, 4:i64
+    pdh = add dst, dho
+    st pdh, hi
+    i2 = add i, w16
+    jmp lp(i2)
+  done:
+    ret
+
+fn vwiden_bf16(src:ptr, dst:ptr, n:i64)
+  b0:
+    w16 = vl i16
+    half = udiv w16, 2:i64
+    jmp lp(0:i64)
+  lp(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    so = mul i, 2:i64
+    ps = add src, so
+    v = ld ps:vx
+    lo = vfwidenlo v:bf16
+    hi = vfwidenhi v:bf16
+    do = mul i, 4:i64
+    pd = add dst, do
+    st pd, lo
+    ih = add i, half
+    dho = mul ih, 4:i64
+    pdh = add dst, dho
+    st pdh, hi
+    i2 = add i, w16
+    jmp lp(i2)
+  done:
+    ret
+
+fn vnarrow_f16(src:ptr, dst:ptr, n:i64)
+  b0:
+    w = vl f32
+    w2 = mul w, 2:i64
+    jmp lp(0:i64)
+  lp(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    so = mul i, 4:i64
+    pa = add src, so
+    a = ld pa:vx
+    ib = add i, w
+    sbo = mul ib, 4:i64
+    pb = add src, sbo
+    b = ld pb:vx
+    r = vnarrow a, b:f16
+    do = mul i, 2:i64
+    pd = add dst, do
+    st pd, r
+    i2 = add i, w2
+    jmp lp(i2)
+  done:
+    ret
+
+fn vnarrow_bf16(src:ptr, dst:ptr, n:i64)
+  b0:
+    w = vl f32
+    w2 = mul w, 2:i64
+    jmp lp(0:i64)
+  lp(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    so = mul i, 4:i64
+    pa = add src, so
+    a = ld pa:vx
+    ib = add i, w
+    sbo = mul ib, 4:i64
+    pb = add src, sbo
+    b = ld pb:vx
+    r = vnarrow a, b:bf16
+    do = mul i, 2:i64
+    pd = add dst, do
+    st pd, r
+    i2 = add i, w2
+    jmp lp(i2)
+  done:
+    ret
+"#;
+
+#[test]
+fn vector_half_conversions_match_reference_exhaustively() {
+    type Conv = extern "C" fn(*const u8, *mut u8, i64);
+    let pad = |n: usize| n.div_ceil(1024) * 1024;
+    for (level, features) in host_levels() {
+        let engine = jit(VECTOR_CONVERSIONS, &features);
+        let f = |name: &str| -> Conv {
+            unsafe { std::mem::transmute(engine.get_fn_ptr(name).unwrap()) }
+        };
+        let all: Vec<u16> = (0..=u16::MAX).collect();
+        let src: Vec<u8> = all.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut out = vec![0u8; all.len() * 4];
+        f("vwiden_f16")(src.as_ptr(), out.as_mut_ptr(), all.len() as i64);
+        for (i, &b) in all.iter().enumerate() {
+            let got = f32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+            let want = f16::from_bits(b).to_f32();
+            assert!(
+                same_bits_or_nan(want, got),
+                "vfwiden f16 {b:#06x} -> {got:?}, want {want:?} at {level}"
+            );
+        }
+        f("vwiden_bf16")(src.as_ptr(), out.as_mut_ptr(), all.len() as i64);
+        for (i, &b) in all.iter().enumerate() {
+            let got = u32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+            let want = bf16::from_bits(b).to_f32();
+            assert!(
+                same_bits_or_nan(want, f32::from_bits(got)),
+                "vfwiden bf16 {b:#06x} -> {got:#010x} at {level}"
+            );
+        }
+
+        for (name, reference, to_f32) in [
+            (
+                "vnarrow_f16",
+                (|x: f32| f16::from_f32(x).to_bits()) as fn(f32) -> u16,
+                (|b| f16::from_bits(b).to_f32()) as fn(u16) -> f32,
+            ),
+            (
+                "vnarrow_bf16",
+                |x: f32| bf16::from_f32(x).to_bits(),
+                |b| bf16::from_bits(b).to_f32(),
+            ),
+        ] {
+            let inputs = rounding_inputs(to_f32);
+            let n = pad(inputs.len());
+            let mut src = vec![0u8; n * 4];
+            for (i, x) in inputs.iter().enumerate() {
+                src[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+            }
+            let mut out = vec![0u8; n * 2];
+            f(name)(src.as_ptr(), out.as_mut_ptr(), n as i64);
+            for (i, &x) in inputs.iter().enumerate() {
+                let got = u16::from_le_bytes([out[i * 2], out[i * 2 + 1]]);
+                if x.is_nan() {
+                    assert!(
+                        to_f32(got).is_nan(),
+                        "{name}: NaN {:#010x} -> {got:#06x} at {level}",
+                        x.to_bits()
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        reference(x),
+                        "{name}: {x:e} ({:#010x}) at {level}",
+                        x.to_bits()
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn half_conversions_match_reference_exhaustively() {
     for (level, features) in host_levels() {
@@ -212,13 +390,15 @@ fn half_bitcasts_preserve_bits() {
 // ---------------------------------------------------------------------------------------
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
-const LANES: [Type; 6] = [
+const LANES: [Type; 8] = [
     Type::I8,
     Type::I16,
     Type::I32,
     Type::I64,
     Type::F32,
     Type::F64,
+    Type::F16,
+    Type::BF16,
 ];
 
 fn masked_module() -> String {

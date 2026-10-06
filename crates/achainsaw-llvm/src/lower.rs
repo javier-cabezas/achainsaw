@@ -102,6 +102,10 @@ pub struct LowerOptions {
     /// Float min/max compare and select instead of propagating NaN and ordering signed
     /// zeros (`achainsaw_codegen::CodegenOptions::fast_math`).
     pub fast_math: bool,
+    /// The target converts f16 <-> f32 vectors in hardware (x86 F16C, AArch64), so
+    /// `vfwiden*`/`vnarrow` on f16 use `fpext`/`fptrunc` instead of integer sequences. Both
+    /// give the same results except NaN payloads.
+    pub native_f16: bool,
 }
 
 fn lane_bits(lane: Type) -> u32 {
@@ -731,34 +735,55 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.bitcast(bits, f32t)
     }
 
+    /// f32 (or f32 lanes) -> binary16 bits (i16, or i16 lanes), rounding to nearest-even;
+    /// NaNs become the quiet NaN 0x7e00. The same sequence as Cranelift's `f32_to_f16`.
     fn f32_to_f16(&self, f: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let f32t = self.ctx.f32_type();
-        let x = b.build_bit_cast(f, self.i32(), "")?.into_int_value();
-        let sign = b.build_and(x, self.c32(0x8000_0000), "")?;
-        let a = b.build_xor(x, sign, "")?;
-        let is_big = b.build_int_compare(IntPredicate::UGE, a, self.c32(0x4780_0000), "")?;
-        let is_nan = b.build_int_compare(IntPredicate::UGT, a, self.c32(0x7f80_0000), "")?;
-        let big = b
-            .build_select(is_nan, self.c32(0x7e00), self.c32(0x7c00), "")?
-            .into_int_value();
-        let is_sub = b.build_int_compare(IntPredicate::ULT, a, self.c32(0x3880_0000), "")?;
-        let af = b.build_bit_cast(a, f32t, "")?.into_float_value();
-        let magic = f32t.const_float(f32::from_bits(0x3f00_0000) as f64);
-        let sum = b.build_float_add(af, magic, "")?;
-        let sum_bits = b.build_bit_cast(sum, self.i32(), "")?.into_int_value();
-        let sub = b.build_int_sub(sum_bits, self.c32(0x3f00_0000), "")?;
-        let odd = b.build_right_shift(a, self.c32(13), false, "")?;
-        let odd = b.build_and(odd, self.c32(1), "")?;
-        let bias = self.c32((((15i32 - 127) << 23) + 0xfff) as u32);
-        let t = b.build_int_add(a, bias, "")?;
-        let t = b.build_int_add(t, odd, "")?;
-        let normal = b.build_right_shift(t, self.c32(13), false, "")?;
-        let mag = b.build_select(is_sub, sub, normal, "")?.into_int_value();
-        let mag = b.build_select(is_big, big, mag, "")?.into_int_value();
-        let sign16 = b.build_right_shift(sign, self.c32(16), false, "")?;
-        let bits = b.build_or(mag, sign16, "")?;
-        Ok(b.build_int_truncate(bits, self.i16(), "")?.into())
+        let shape = Self::shape_of(f);
+        let k = |v: u32| self.splat_const(self.c32(v).into(), shape);
+        let i32t = self.shaped(self.i32().into(), shape);
+        let f32t = self.shaped(self.ctx.f32_type().into(), shape);
+        let ucmp = |p: IntPredicate, x: BasicValueEnum<'ctx>, y: BasicValueEnum<'ctx>| {
+            Ok::<_, anyhow::Error>(anyi2!(x, y, |s, t| b.build_int_compare(p, s, t, "")?))
+        };
+        let x = self.bitcast(f, i32t)?;
+        let sign = anyi2!(x, k(0x8000_0000)?, |p, q| b.build_and(p, q, "")?);
+        let a = anyi2!(x, sign, |p, q| b.build_xor(p, q, "")?);
+        let is_big = ucmp(IntPredicate::UGE, a, k(0x4780_0000)?)?;
+        let is_nan = ucmp(IntPredicate::UGT, a, k(0x7f80_0000)?)?;
+        let big = anyi1!(is_nan, |c| b.build_select(c, k(0x7e00)?, k(0x7c00)?, "")?);
+        let is_sub = ucmp(IntPredicate::ULT, a, k(0x3880_0000)?)?;
+        let af = self.bitcast(a, f32t)?;
+        let magic = self.splat_const(
+            self.ctx
+                .f32_type()
+                .const_float(f32::from_bits(0x3f00_0000) as f64)
+                .into(),
+            shape,
+        )?;
+        let sum = anyf2!(af, magic, |p, q| b.build_float_add(p, q, "")?);
+        let sum_bits = self.bitcast(sum, i32t)?;
+        let sub = anyi2!(sum_bits, k(0x3f00_0000)?, |p, q| b
+            .build_int_sub(p, q, "")?);
+        let odd = anyi2!(a, k(13)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let odd = anyi2!(odd, k(1)?, |p, q| b.build_and(p, q, "")?);
+        let bias = k((((15i32 - 127) << 23) + 0xfff) as u32)?;
+        let t = anyi2!(a, bias, |p, q| b.build_int_add(p, q, "")?);
+        let t = anyi2!(t, odd, |p, q| b.build_int_add(p, q, "")?);
+        let normal = anyi2!(t, k(13)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let mag = anyi1!(is_sub, |c| b.build_select(c, sub, normal, "")?);
+        let mag = anyi1!(is_big, |c| b.build_select(c, big, mag, "")?);
+        let sign16 = anyi2!(sign, k(16)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let bits = anyi2!(mag, sign16, |p, q| b.build_or(p, q, "")?);
+        self.trunc_to_i16(bits)
+    }
+
+    /// i32 (or i32 lanes) -> i16 (or i16 lanes).
+    fn trunc_to_i16(&self, v: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+        let t = self.shaped(self.i16().into(), Self::shape_of(v));
+        Ok(self
+            .builder
+            .build_cast(InstructionOpcode::Trunc, v, t, "")?)
     }
 
     /// bfloat16 bits (i16, or i16 lanes) -> f32. Exact.
@@ -771,19 +796,57 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.bitcast(x, self.shaped(self.ctx.f32_type().into(), shape))
     }
 
+    /// f32 (or f32 lanes) -> bfloat16 bits (i16, or i16 lanes), rounding to nearest-even;
+    /// NaNs are quieted. The same sequence as Cranelift's `f32_to_bf16`.
     fn f32_to_bf16(&self, f: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let x = b.build_bit_cast(f, self.i32(), "")?.into_int_value();
-        let hi = b.build_right_shift(x, self.c32(16), false, "")?;
-        let lsb = b.build_and(hi, self.c32(1), "")?;
-        let r = b.build_int_add(x, self.c32(0x7fff), "")?;
-        let r = b.build_int_add(r, lsb, "")?;
-        let rounded = b.build_right_shift(r, self.c32(16), false, "")?;
-        let quiet = b.build_or(hi, self.c32(0x40), "")?;
-        let abs = b.build_and(x, self.c32(0x7fff_ffff), "")?;
-        let is_nan = b.build_int_compare(IntPredicate::UGT, abs, self.c32(0x7f80_0000), "")?;
-        let bits = b.build_select(is_nan, quiet, rounded, "")?.into_int_value();
-        Ok(b.build_int_truncate(bits, self.i16(), "")?.into())
+        let shape = Self::shape_of(f);
+        let k = |v: u32| self.splat_const(self.c32(v).into(), shape);
+        let x = self.bitcast(f, self.shaped(self.i32().into(), shape))?;
+        let hi = anyi2!(x, k(16)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let lsb = anyi2!(hi, k(1)?, |p, q| b.build_and(p, q, "")?);
+        let r = anyi2!(x, k(0x7fff)?, |p, q| b.build_int_add(p, q, "")?);
+        let r = anyi2!(r, lsb, |p, q| b.build_int_add(p, q, "")?);
+        let rounded = anyi2!(r, k(16)?, |p, q| b.build_right_shift(p, q, false, "")?);
+        let quiet = anyi2!(hi, k(0x40)?, |p, q| b.build_or(p, q, "")?);
+        let abs = anyi2!(x, k(0x7fff_ffff)?, |p, q| b.build_and(p, q, "")?);
+        let is_nan = anyi2!(abs, k(0x7f80_0000)?, |p, q| b.build_int_compare(
+            IntPredicate::UGT,
+            p,
+            q,
+            ""
+        )?);
+        let bits = anyi1!(is_nan, |c| b.build_select(c, quiet, rounded, "")?);
+        self.trunc_to_i16(bits)
+    }
+
+    /// f16 bits (i16 lanes) -> f32 lanes: the hardware conversion where the target has one
+    /// (`LowerOptions::native_f16`), else the integer sequence. Equal for every non-NaN.
+    fn f16_lanes_to_f32(&self, h: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+        if !self.opts.native_f16 {
+            return self.f16_to_f32(h);
+        }
+        let shape = Self::shape_of(h);
+        let halves = self.bitcast(h, self.shaped(self.ctx.f16_type().into(), shape))?;
+        let f32t = self.shaped(self.ctx.f32_type().into(), shape);
+        Ok(self
+            .builder
+            .build_cast(InstructionOpcode::FPExt, halves, f32t, "")?)
+    }
+
+    /// f32 lanes -> f16 bits (i16 lanes), as `f16_lanes_to_f32` chooses.
+    fn f32_lanes_to_f16(&self, f: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
+        if !self.opts.native_f16 {
+            return self.f32_to_f16(f);
+        }
+        let shape = Self::shape_of(f);
+        let halves = self.builder.build_cast(
+            InstructionOpcode::FPTrunc,
+            f,
+            self.shaped(self.ctx.f16_type().into(), shape),
+            "",
+        )?;
+        self.bitcast(halves, self.shaped(self.i16().into(), shape))
     }
 
     // ---------------------------------------------------------------------------------
@@ -1922,17 +1985,23 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
             }
             VUnaryOp::Exp => self.vexp(x)?,
-            VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+            VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
                 // The low or high half of the lanes (for SVE, the index scales with vscale).
                 let n = self.lanes_min(vty, src_lane);
                 let half_ty = self.vec_of(self.scalar_type(src_lane), n / 2, self.scalable(vty));
-                let at = if op == VUnaryOp::WidenLo { 0 } else { n / 2 };
+                let at = if op.is_low_half() { 0 } else { n / 2 };
                 let half = self.intr(
                     "llvm.vector.extract",
                     &[half_ty, x.get_type()],
                     &[x, self.c64(at as i64).into()],
                 )?;
-                b.build_cast(InstructionOpcode::SExt, half, self.lane_vec(vty, lane), "")?
+                match src_lane {
+                    Type::F16 => self.f16_lanes_to_f32(half)?,
+                    Type::BF16 => self.bf16_to_f32(half)?,
+                    _ => {
+                        b.build_cast(InstructionOpcode::SExt, half, self.lane_vec(vty, lane), "")?
+                    }
+                }
             }
         };
         self.to_canon(r, vty)
@@ -1947,11 +2016,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         hi: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
         let b = &self.builder;
-        let wide = if lane == Type::I8 {
-            Type::I16
-        } else {
-            Type::I32
-        };
+        let wide = achainsaw_ir::validator::vnarrow_source_lane(lane);
         let (min, max) = if lane == Type::I8 {
             (i8::MIN as i64, i8::MAX as i64)
         } else {
@@ -1959,9 +2024,14 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         };
         let n = self.lanes_min(vty, wide);
         let half_ty = self.vec_of(self.scalar_type(lane), n, self.scalable(vty));
-        let wide_int = self.scalar_type(wide).into_int_type();
         let narrow = |v: BasicValueEnum<'ctx>| -> Result<BasicValueEnum<'ctx>> {
             let x = self.as_lanes(v, vty, wide)?;
+            match lane {
+                Type::F16 => return self.f32_lanes_to_f16(x),
+                Type::BF16 => return self.f32_to_bf16(x),
+                _ => {}
+            }
+            let wide_int = self.scalar_type(wide).into_int_type();
             let shape = Self::shape_of(x);
             let hi_c = self.splat_const(wide_int.const_int(max as u64, true).into(), shape)?;
             let lo_c = self.splat_const(wide_int.const_int(min as u64, true).into(), shape)?;

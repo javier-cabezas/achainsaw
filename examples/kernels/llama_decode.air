@@ -492,12 +492,6 @@ fn mat_chunk_into(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     tile = alloc 2048:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    mag_mask = cst 32767:i32
-    v_mag_mask = splat mag_mask:vx
-    sign_bit = cst -2147483648:i32
-    v_sign_bit = splat sign_bit:vx
-    two_112 = cst 2004877312:i32
-    v_two_112 = splat two_112:vx
     lo_mask = cst 15:i8
     v_lo_mask = splat lo_mask:vx
     eight = cst 8:i8
@@ -648,25 +642,18 @@ fn mat_chunk_into(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     j_more = lt j, 64:i64
     br j_more, accum_body, sub_next
   accum_body:
-    # Two vectors of outputs per step, from one full vector of f16 scales (a partial load
-    # would cost a lane-by-lane copy on Cranelift). f16 to f32 is exact for finite values:
-    # the magnitude bits shifted into an f32 exponent and mantissa, times 2^112 (the bias
-    # difference; also right for subnormals), and the sign of the sign-extended value.
+    # Two vectors of outputs per step, from one full vector of f16 scales (its low and high
+    # halves widened to f32); a partial load would cost a lane-by-lane copy on Cranelift.
     j_rest = sub 64:i64, j
     sj_off = mul j, 2:i64
     ps = add sb, sj_off
-    s16 = ldm ps:vx, j_rest:i16
+    s16 = ldm ps:vx, j_rest:f16
     j_off = mul j, 4:i64
     pp = add dots, j_off
     py = add dst, j_off
     p = ldm pp:vx, j_rest:i32
     pf = vitof p:f32
-    s32 = vwidenlo s16:i32
-    s_mag = vand s32, v_mag_mask:i32
-    s_exp = vshl s_mag, 13:i32
-    s_abs = vmul s_exp, v_two_112:f32
-    s_sgn = vand s32, v_sign_bit:i32
-    s = vor s_abs, s_sgn:i32
+    s = vfwidenlo s16:f16
     ds = vmul s, vd:f32
     acc = ldm py:vx, j_rest:f32
     acc2 = vfma pf, ds, acc:f32
@@ -678,12 +665,7 @@ fn mat_chunk_into(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     pyh = add dst, jh_off
     ph = ldm pph:vx, jh_rest:i32
     pfh = vitof ph:f32
-    s32h = vwidenhi s16:i32
-    s_magh = vand s32h, v_mag_mask:i32
-    s_exph = vshl s_magh, 13:i32
-    s_absh = vmul s_exph, v_two_112:f32
-    s_sgnh = vand s32h, v_sign_bit:i32
-    sh = vor s_absh, s_sgnh:i32
+    sh = vfwidenhi s16:f16
     dsh = vmul sh, vd:f32
     acch = ldm pyh:vx, jh_rest:f32
     acc2h = vfma pfh, dsh, acch:f32
