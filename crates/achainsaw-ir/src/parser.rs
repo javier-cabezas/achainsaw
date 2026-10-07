@@ -248,27 +248,44 @@ impl<'a> Parser<'a> {
     pub fn parse_module(&mut self) -> Result<Module, Diagnostic> {
         let mut extern_functions = Vec::new();
         let mut functions = Vec::new();
+        let mut uses = Vec::new();
         self.skip_newlines();
 
         while self.peek_kind() != &TokenKind::Eof {
-            if self.peek_kind() == &TokenKind::ExtFn {
+            if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "use") {
+                // `use name, ...`: standard library functions to link in (see `stdlib`).
+                self.advance();
+                loop {
+                    uses.push(self.expect_ident()?);
+                    if self.peek_kind() != &TokenKind::Comma {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect_eol()?;
+            } else if self.peek_kind() == &TokenKind::ExtFn {
                 extern_functions.push(self.parse_extern_function()?);
             } else if self.peek_kind() == &TokenKind::Fn {
                 functions.push(self.parse_function()?);
             } else {
                 return Err(Diagnostic::error(
                     "ERR_UNEXPECTED_TOKEN",
-                    format!("Expected 'fn' or 'extfn', found {:?}", self.peek_kind()),
+                    format!(
+                        "Expected 'fn', 'extfn' or 'use', found {:?}",
+                        self.peek_kind()
+                    ),
                     self.peek().span,
                 ));
             }
             self.skip_newlines();
         }
 
-        Ok(Module {
+        let mut module = Module {
             extern_functions,
             functions,
-        })
+        };
+        crate::stdlib::link(&mut module, &uses)?;
+        Ok(module)
     }
 
     fn parse_signature(&mut self) -> Result<Signature, Diagnostic> {

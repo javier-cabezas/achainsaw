@@ -9,9 +9,12 @@
 # of 64; chunk c holds
 #   wq     + c * k * 64:        q for its rows, k-major ([k x 64] i8, row kk = column kk)
 #   scales + c * (k/32) * 128:  their scales ([k/32 x 64] f16)
-# so each chunk is contiguous and one `par` task computes it: per block, one i8 `mm`
-# [1 x 32] . [32 x 64] gives the 64 int32 dots (AMX, SME, vector or Cranelift tiles), which
-# are converted to f32 (vitof) and accumulated into y.
+# so each chunk is contiguous and one `par` task computes it with the standard library's
+# qmat_chunk: per block, one i8 `mm` [1 x 32] . [32 x 64] gives the 64 int32 dots (AMX, SME,
+# vector or Cranelift tiles), which are converted to f32 (vitof) and accumulated into y.
+
+use quantize_q8, qmat_chunk
+
 fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
     nb = udiv k, 32:i64
@@ -19,178 +22,24 @@ fn q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
     nb4 = mul nb, 4:i64
     dx = alloc nb4
     call quantize_q8(x, xq, dx, k)
+    # The matrix as qmat_chunk takes it: weights, scales, format (0).
+    mat = alloc 24:i64
+    st mat, wq
+    mat1 = add mat, 8:i64
+    st mat1, scales
+    mat2 = add mat, 16:i64
+    st mat2, 0:i64
     chunks = udiv m, 64:i64
-    par chunks, q8_chunk(wq, scales, xq, dx, y, k)
+    par chunks, q8_gemv_chunk(mat, xq, dx, y, k)
+    free mat
     free dx
     free xq
     ret
 
-# xq[32b + t] = round(x[32b + t] / dx[b]) (halves away from zero), dx[b] = max|x| / 127.
-# At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with the value's
-# sign, then vftoi and two saturating vnarrows down to i8, stored a vector's worth at a time.
-fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
-  b0:
-    w = vl f32
-    nb = udiv k, 32:i64
-    zf = cst 0.0:f32
-    v_zero = splat zf:vx
-    abs_bits = cst 2147483647:i32
-    v_abs = splat abs_bits:vx
-    sign_bits = cst -2147483648:i32
-    v_sign = splat sign_bits:vx
-    half = cst 0.5:f32
-    v_half = splat half:vx
-    jmp blocks(0:i64)
-  blocks(b:i64):
-    b_more = lt b, nb
-    br b_more, block_start, done
-  block_start:
-    base = mul b, 32:i64
-    base4 = mul base, 4:i64
-    bx = add x, base4
-    jmp amax(0:i64, v_zero)
-  amax(t:i64, a:vx):
-    t_more = lt t, 32:i64
-    br t_more, amax_body, scale
-  amax_body:
-    rest = sub 32:i64, t
-    to = mul t, 4:i64
-    pv = add bx, to
-    v = ldm pv:vx, rest:f32
-    av = vand v, v_abs:i32
-    a2 = vmax a, av:f32
-    t2 = add t, w
-    jmp amax(t2, a2)
-  scale:
-    am = vmaxr a:f32
-    d = div am, 127.0:f32
-    pos = gt d, zf
-    inv = div 1.0:f32, d
-    id = select pos, inv, zf
-    b_off = mul b, 4:i64
-    pd = add dx, b_off
-    st pd, d
-    v_id = splat id:vx
-    jmp quant(0:i64)
-  quant(s:i64):
-    s_more = lt s, 32:i64
-    br s_more, quant_body, block_next
-  quant_body:
-    rest_q = sub 32:i64, s
-    so = mul s, 4:i64
-    pq_in = add bx, so
-    xv = ldm pq_in:vx, rest_q:f32
-    sv = vmul xv, v_id:f32
-    sgn = vand sv, v_sign:i32
-    hv = vor sgn, v_half:i32
-    rv = vadd sv, hv:f32
-    qi = vftoi rv:i32
-    q16 = vnarrow qi, qi:i16
-    q8 = vnarrow q16, q16:i8
-    q_off = add base, s
-    po = add xq, q_off
-    cnt = min rest_q, w
-    stm po, q8, cnt:i8
-    s2 = add s, w
-    jmp quant(s2)
-  block_next:
-    b2 = add b, 1:i64
-    jmp blocks(b2)
-  done:
-    ret
-
 # y[64c .. 64c + 64] for chunk c.
-fn q8_chunk(c:i64, wq:ptr, scales:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
+fn q8_gemv_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
   b0:
-    w = vl f32
-    nb = udiv k, 32:i64
-    chunk_w = mul k, 64:i64
-    w_off = mul c, chunk_w
-    wc = add wq, w_off
-    chunk_s = mul nb, 128:i64
-    s_off = mul c, chunk_s
-    sc = add scales, s_off
     y_off = mul c, 256:i64
     yc = add y, y_off
-    dots = alloc 256:i64
-    zf = cst 0.0:f32
-    v_zero = splat zf:vx
-    jmp zero_y(0:i64)
-  zero_y(z:i64):
-    z_more = lt z, 64:i64
-    br z_more, zero_y_body, blocks(0:i64)
-  zero_y_body:
-    z_rest = sub 64:i64, z
-    z_off = mul z, 4:i64
-    pz = add yc, z_off
-    stm pz, v_zero, z_rest:f32
-    z2 = add z, w
-    jmp zero_y(z2)
-  blocks(b:i64):
-    b_more = lt b, nb
-    br b_more, block_start, done
-  block_start:
-    jmp zero_dots(0:i64)
-  zero_dots(zd:i64):
-    zd_more = lt zd, 64:i64
-    br zd_more, zero_dots_body, block_mm
-  zero_dots_body:
-    zd_rest = sub 64:i64, zd
-    zd_off = mul zd, 4:i64
-    pzd = add dots, zd_off
-    stm pzd, v_zero, zd_rest:i32
-    zd2 = add zd, w
-    jmp zero_dots(zd2)
-  block_mm:
-    xb_off = mul b, 32:i64
-    xb = add xq, xb_off
-    wb_off = mul b, 2048:i64
-    wb = add wc, wb_off
-    mm dots, xb, wb, 1:i64, 64:i64, 32:i64:i8
-    d_off = mul b, 4:i64
-    pd = add dx, d_off
-    d = ld pd:f32
-    vd = splat d:vx
-    sb_off = mul b, 128:i64
-    sb = add sc, sb_off
-    jmp accum(0:i64)
-  accum(j:i64):
-    j_more = lt j, 64:i64
-    br j_more, accum_body, block_next
-  accum_body:
-    # Two vectors of outputs per step, from one full vector of f16 scales (its low and high
-    # halves widened to f32); a partial load would cost a lane-by-lane copy on Cranelift.
-    j_rest = sub 64:i64, j
-    sj_off = mul j, 2:i64
-    ps = add sb, sj_off
-    s16 = ldm ps:vx, j_rest:f16
-    j_off = mul j, 4:i64
-    pp = add dots, j_off
-    py = add yc, j_off
-    p = ldm pp:vx, j_rest:i32
-    pf = vitof p:f32
-    s = vfwidenlo s16:f16
-    ds = vmul s, vd:f32
-    acc = ldm py:vx, j_rest:f32
-    acc2 = vfma pf, ds, acc:f32
-    stm py, acc2, j_rest:f32
-    jh = add j, w
-    jh_rest = sub 64:i64, jh
-    jh_off = mul jh, 4:i64
-    pph = add dots, jh_off
-    pyh = add yc, jh_off
-    ph = ldm pph:vx, jh_rest:i32
-    pfh = vitof ph:f32
-    sh = vfwidenhi s16:f16
-    dsh = vmul sh, vd:f32
-    acch = ldm pyh:vx, jh_rest:f32
-    acc2h = vfma pfh, dsh, acch:f32
-    stm pyh, acc2h, jh_rest:f32
-    j2 = add jh, w
-    jmp accum(j2)
-  block_next:
-    b2 = add b, 1:i64
-    jmp blocks(b2)
-  done:
-    free dots
+    call qmat_chunk(c, mat, xq, dx, yc, k)
     ret

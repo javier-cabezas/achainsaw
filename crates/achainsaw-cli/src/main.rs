@@ -150,6 +150,13 @@ enum Commands {
         json: bool,
     },
 
+    /// List the AIR standard library (functions a module imports with `use name`), or print a
+    /// function's AIR source
+    Std {
+        /// A library function whose source to print
+        name: Option<String>,
+    },
+
     /// Run Model Context Protocol (MCP) server over standard I/O (stdio)
     Mcp,
 }
@@ -193,6 +200,30 @@ fn main() {
     };
 
     match cli.command {
+        Commands::Std { name } => {
+            use achainsaw_ir::stdlib;
+            match name {
+                Some(name) => match stdlib::source_of(&name) {
+                    Some(src) => print!("{src}"),
+                    None => {
+                        print_error_json(
+                            &anyhow!("'{name}' is not in the standard library"),
+                            "ERR_UNKNOWN_STD_FUNCTION",
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    for f in stdlib::functions() {
+                        println!("{}", f.signature);
+                        for line in f.doc.lines() {
+                            println!("    {line}");
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
         Commands::Cpu { json } => match cpu::target_report() {
             Ok(report) => {
                 if json {
