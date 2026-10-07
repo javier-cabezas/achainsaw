@@ -19,10 +19,11 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 /// without having seen the language before. Keep in sync with the parser and validator.
 pub const SERVER_INSTRUCTIONS: &str = "\
 achainsaw compiles AIR (Agent Intermediate Representation), a flat SSA IR, to native code via Cranelift.
-Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features, which backends are available, and each backend's vx width.
+Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, span, context.available_registers) -> air_run. air_optimize shows simplified IR; air_assemble/air_disassemble convert to and from base64 AIRB bytecode; air_target reports host vector features, which backends are available, and each backend's vx width; air_std lists the standard library.
 
 AIR syntax:
 - Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits: 128 on cranelift, up to 512 or SVE-scalable on llvm; always get the lane count via `vl`, never assume it). Vectors are untyped bits; each vector op names its lane type.
+- Standard library: a top-level line `use quantize_q8, qmat_chunk` links those AIR functions (and the library functions they call) into the module, ready to `call` or `par`; air_std lists them with signatures and docs, and returns a function's source by name.
 - Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`. Float min/max (min max vmin vmax vminr vmaxr) propagate NaN and order -0.0 below +0.0; air_run's `fast_math` compiles them as compare-and-select instead, `max(a,b) = a > b ? a : b` (a NaN operand or two zeros give b): faster, still identical on both backends.
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
 - One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
@@ -519,6 +520,33 @@ pub fn handle_air_target(_arguments: &Value) -> Value {
     }
 }
 
+/// Lists the AIR standard library (functions a module imports with `use name`), or with
+/// `name` returns that function's AIR source.
+pub fn handle_air_std(arguments: &Value) -> Value {
+    use achainsaw_ir::stdlib;
+    match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(name) => match stdlib::source_of(name) {
+            Some(source) => {
+                json_tool_result(json!({ "status": "ok", "name": name, "source": source }))
+            }
+            None => json_tool_error(json!({
+                "status": "error",
+                "error_code": "ERR_UNKNOWN_STD_FUNCTION",
+                "message": format!("'{name}' is not in the standard library"),
+                "context": { "available": stdlib::functions().iter().map(|f| f.name.clone()).collect::<Vec<_>>() },
+            })),
+        },
+        None => json_tool_result(json!({
+            "status": "ok",
+            "usage": "Put `use name, ...` on a top-level line; the functions (and library functions they call) are linked into the module.",
+            "functions": stdlib::functions()
+                .into_iter()
+                .map(|f| json!({ "name": f.name, "signature": f.signature, "doc": f.doc }))
+                .collect::<Vec<_>>(),
+        })),
+    }
+}
+
 pub fn handle_initialize(params: &Value) -> Value {
     let requested = params.get("protocolVersion").and_then(|v| v.as_str());
     json!({
@@ -633,6 +661,19 @@ pub fn get_tools_list() -> Value {
                 }
             },
             {
+                "name": "air_std",
+                "description": "List the AIR standard library: functions a module imports with a top-level `use name, ...` line (quantization, quantized matrix chunks, RoPE, softmax exp, SwiGLU), with signatures and documentation. With `name`, return that function's AIR source.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "A library function whose source to return"
+                        }
+                    }
+                }
+            },
+            {
                 "name": "air_optimize",
                 "description": "Run IR optimization engine passes (constant folding, algebraic simplification, branch folding, dead code & block elimination).",
                 "inputSchema": {
@@ -731,6 +772,7 @@ pub fn run_mcp_server() -> Result<()> {
                     "air_disassemble" => handle_air_disassemble(&arguments),
                     "air_optimize" => handle_air_optimize(&arguments),
                     "air_target" => handle_air_target(&arguments),
+                    "air_std" => handle_air_std(&arguments),
                     unknown => error_response(&format!("Unknown tool: '{unknown}'")),
                 };
 
@@ -1067,6 +1109,37 @@ mod tests {
         let code = "fn poke(i:i64, p:ptr)\n  b0:\n    off = mul i, 1048576:i64\n    q = add p, off\n    st q, i\n    ret\n\nfn main()->i32\n  b0:\n    p = alloc 64:i64\n    par 8:i64, poke(p)\n    ret 1:i32\n";
         let text = run_error_text(json!({ "code": code, "max_memory_mb": 1 }));
         assert!(text.contains("ERR_MEMORY_VIOLATION"), "{text}");
+    }
+
+    #[test]
+    fn test_mcp_air_std_lists_and_returns_sources() {
+        let res = handle_air_std(&json!({}));
+        assert_eq!(res["isError"], false, "{res}");
+        let payload: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        let names: Vec<&str> = payload["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"quantize_q8") && names.contains(&"qmat_chunk"),
+            "{names:?}"
+        );
+        let res = handle_air_std(&json!({ "name": "silu_mul" }));
+        let payload: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload["source"].as_str().unwrap().contains("fn silu_mul("));
+        let bad = handle_air_std(&json!({ "name": "nope" }));
+        assert_eq!(bad["isError"], true);
+        // A module importing from the library runs through air_run.
+        let code = "use exp_shift\n\nfn main()->f32\n  b0:\n    p = alloc 8:i64\n    st p, 0.0:f32\n    q = add p, 4:i64\n    st q, 0.0:f32\n    s = call exp_shift(p, 2:i64, 0.0:f32)\n    free p\n    ret s\n";
+        let res = handle_air_run(&json!({ "code": code }));
+        assert_eq!(res["isError"], false, "{res}");
+        let payload: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["result"], 2.0);
     }
 
     #[test]
