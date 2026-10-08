@@ -21,7 +21,9 @@ out="${TMPDIR:-/tmp}/achainsaw-qemu-aarch64"
 mkdir -p "$out"
 
 achainsaw="${ACHAINSAW:-$root/target/debug/achainsaw}"
-"$achainsaw" --backend llvm build "$here/mm.air" --target aarch64-unknown-linux-gnu \
+# --fast-math lets bf16 use SME's bfmopa too (it flushes bf16 subnormals, which the
+# harness's random inputs never are), so every SME kernel runs.
+"$achainsaw" --backend llvm --fast-math build "$here/mm.air" --target aarch64-unknown-linux-gnu \
   --target-features "$features" -o "$out/mm.o" >/dev/null
 
 sysroot="$(rustc --print sysroot)"

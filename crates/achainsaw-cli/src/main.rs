@@ -31,7 +31,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "BACKEND")]
     backend: Option<String>,
     /// For run, bench and build: float min/max (min, max, vmin, vmax, vminr, vmaxr) compare
-    /// and select (`a > b ? a : b`) instead of propagating NaN and ordering -0.0 below +0.0.
+    /// and select (`a > b ? a : b`) instead of propagating NaN and ordering -0.0 below +0.0,
+    /// and bf16 `mm` may use AMX/SME, which treat bf16 subnormal inputs as zero.
     #[arg(long, global = true)]
     fast_math: bool,
     #[command(subcommand)]
