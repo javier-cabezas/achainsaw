@@ -68,6 +68,8 @@ fn k(pa:ptr, po:ptr)->f64
     uh = vunziphi ul, zh:f16
     dp = vdup uh, 15:i16
     st po, dp
+    dt = vdot c, a, b:i8
+    st po, dt
     ret t
 "#;
 
@@ -161,6 +163,35 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("rv = vrev rs:bf16"));
     assert!(text.contains("uh = vunziphi ul, zh:f16"));
     assert!(text.contains("dp = vdup uh, 15:i16"));
+    assert!(text.contains("dt = vdot c, a, b:i8"));
+}
+
+#[test]
+fn vdot_rules() {
+    let one = |body: &str| {
+        format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
+    };
+    assert!(parse_and_validate(&one("    r = vdot a, a, b:i8\n")).is_ok());
+    // Only i8 operands (four per i32 lane), three vectors of one width.
+    assert_eq!(
+        err_code(&one("    r = vdot a, a, b:i16\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vdot a, a, b\n")),
+        "ERR_EXPECTED_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    c = ld p:v128\n    r = vdot c, a, a:i8\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr, x:i32)\n  b0:\n    a = ld p:v128\n    r = vdot x, a, a:i8\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    // Still an ordinary register name.
+    let src = "fn k(vdot:i32)->i32\n  b0:\n    r = add vdot, vdot\n    ret r\n";
+    assert!(parse_and_validate(src).is_ok());
 }
 
 #[test]

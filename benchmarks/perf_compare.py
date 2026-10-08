@@ -8,7 +8,8 @@ Each DIR is a checkout with its achainsaw extension (achainsaw.so, or .pyd on Wi
 root. Each side runs its own benchmark scripts, so a change to a kernel's source counts the
 same as a change to the compiler:
   benchmark_kernels.py   every kernel on every backend (NumPy timing skipped)
-  benchmark_decode.py    llama_decode.air on a 4-layer random Q4_0 model
+  benchmark_decode.py    llama_decode.air on a 4-layer random Q4_0 model: a 64-token prefill
+                         (when the script has --prompt-tokens) and decode
 The sides alternate for --rounds rounds, in ABBA order to cancel drift, each run in a fresh
 process. Every (benchmark, backend) keeps its best time over the rounds: noise only ever
 adds time, and a process can be unlucky as a whole (memory layout), so the minimum is the
@@ -70,11 +71,16 @@ def run_side(root, workdir, tag, skipped):
         out = os.path.join(workdir, f"{tag}-decode.json")
         cmd = [sys.executable, decode, "--layers", "4", "--tokens", "16", "--weights", "q4",
                "--no-numpy", "--json", out]
+        if supports(decode, "--prompt-tokens", env):
+            cmd += ["--prompt-tokens", "64"]
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=root)
         if res.returncode != 0:
             raise RuntimeError(f"{decode} failed:\n{res.stdout[-3000:]}\n{res.stderr[-3000:]}")
         for r in json.load(open(out, encoding="utf-8"))["results"]:
             times[("llama_decode (4 layers, Q4_0)", r["backend"])] = r["ms_per_token"] * 1e3
+            if r.get("prompt_tokens", 1) > 1:
+                key = f"llama_prefill (4 layers, Q4_0, {r['prompt_tokens']} tokens, per token)"
+                times[(key, r["backend"])] = r["prompt_ms_per_token"] * 1e3
     return times
 
 

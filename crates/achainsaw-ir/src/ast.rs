@@ -671,6 +671,17 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
+    /// `r = vdot acc, a, b:i8`: `acc` has i32 lanes and `a`, `b` lanes of type `lane` (i8),
+    /// four per i32 lane; lane `i` of the result is `acc[i] + a[4i]*b[4i] + ... +
+    /// a[4i+3]*b[4i+3]`, signed products summed exactly and added with i32 wrapping.
+    VDot {
+        dst: String,
+        acc: String,
+        a: String,
+        b: String,
+        lane: Type,
+        span: Span,
+    },
     /// Lane count of `vx` for `lane` (`n = vl f32`), as an i64.
     VLen {
         dst: String,
@@ -734,6 +745,7 @@ impl Instruction {
             | Instruction::VShift { dst, .. }
             | Instruction::VZip { dst, .. }
             | Instruction::VDup { dst, .. }
+            | Instruction::VDot { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => Some(dst),
             Instruction::Call { dst, .. } => dst.as_deref(),
             Instruction::Store { .. }
@@ -777,7 +789,10 @@ impl Instruction {
                 else_val: c,
                 ..
             }
-            | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+            | Instruction::VFma { a, b, c, .. }
+            | Instruction::VDot {
+                acc: a, a: b, b: c, ..
+            } => vec![a, b, c],
             Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
             Instruction::MaskedStore {
                 ptr, val, count, ..
@@ -829,7 +844,10 @@ impl Instruction {
                 else_val: c,
                 ..
             }
-            | Instruction::VFma { a, b, c, .. } => vec![a, b, c],
+            | Instruction::VFma { a, b, c, .. }
+            | Instruction::VDot {
+                acc: a, a: b, b: c, ..
+            } => vec![a, b, c],
             Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
             Instruction::MaskedStore {
                 ptr, val, count, ..

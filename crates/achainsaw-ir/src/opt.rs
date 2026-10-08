@@ -131,6 +131,7 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                     | Instruction::VCmp { dst, lhs, .. }
                     | Instruction::VZip { dst, lhs, .. }
                     | Instruction::VDup { dst, vec: lhs, .. }
+                    | Instruction::VDot { dst, acc: lhs, .. }
                     | Instruction::VFma { dst, a: lhs, .. }
                     | Instruction::VSelect {
                         dst, then_val: lhs, ..
@@ -1077,7 +1078,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VNarrow { dst, .. }
                 | Instruction::VShift { dst, .. }
                 | Instruction::VZip { dst, .. }
-                | Instruction::VDup { dst, .. } => used.contains(dst),
+                | Instruction::VDup { dst, .. }
+                | Instruction::VDot { dst, .. } => used.contains(dst),
 
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }

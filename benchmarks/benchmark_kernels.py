@@ -336,8 +336,10 @@ def make_cases():
     qq = rng.integers(-127, 128, size=(qm, qk), dtype=np.int8)
     # f16 scales, as GGUF stores them (NumPy uses the same values in f32).
     qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float16)
-    # Packed layout: 64-row chunks, k-major within a chunk.
-    q_packed = np.ascontiguousarray(qq.reshape(qm // 64, 64, qk).transpose(0, 2, 1))
+    # Packed layout: 64-row chunks; per 32-block, 4 consecutive values of a row per 32-bit
+    # lane, lanes ordered by group then row (see qmat_chunk).
+    q_packed = np.ascontiguousarray(
+        qq.reshape(qm // 64, 64, qnb, 8, 4).transpose(0, 2, 3, 1, 4))
     s_packed = np.ascontiguousarray(qs.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
     qs = qs.astype(np.float32)
     qx = rng.standard_normal(qk).astype(np.float32)
@@ -361,12 +363,13 @@ def make_cases():
     ))
 
     # Q4_0: 4-bit weights q in 0..15 (value q - 8), llama.cpp's nibble bytes per block (byte t:
-    # values t and t + 16), packed per chunk and block as 1024 bytes [16 x 64].
+    # values t and t + 16), packed per chunk and block as 1024 bytes in Q8_0's lane order.
     q4 = rng.integers(0, 16, size=(qm, qk), dtype=np.uint8)
     q4s = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (4.6 * np.sqrt(qk))).astype(np.float16)
     nib = q4.reshape(qm, qnb, 32)
     nib = nib[:, :, :16] | (nib[:, :, 16:] << 4)                     # [m x k/32 x 16]
-    q4_packed = np.ascontiguousarray(nib.reshape(qm // 64, 64, qnb, 16).transpose(0, 2, 3, 1))
+    q4_packed = np.ascontiguousarray(
+        nib.reshape(qm // 64, 64, qnb, 4, 4).transpose(0, 2, 3, 1, 4))
     q4s_packed = np.ascontiguousarray(q4s.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
     q4s = q4s.astype(np.float32)
     q4_vals = q4.astype(np.int8) - np.int8(8)

@@ -12,9 +12,14 @@
 # then the final RMSNorm and the LM head with a fused argmax: each task keeps only the best
 # of its 64 logits, so the logits are never written.
 #
+# llama_prefill runs n prompt tokens through the same passes in one call: every projection
+# task applies its weights to 4 tokens at a time (qmat_batch), so a weight matrix is read
+# once per 4 tokens rather than once per token, and attention, norms and epilogues run per
+# token. Its results are exactly those of n llama_decode calls.
+#
 # Each weight matrix is Q8_0, Q4_0 or Q6_K, chosen per matrix: 8-, 4- or 6-bit weights with
 # f16 scales per 32 (Q6_K: 16) values of a row, packed in chunks of 64 output rows;
-# activations are quantized to int8 per 32-block on the fly and the int8 dots run on `mm`.
+# activations are quantized to int8 per 32-block on the fly and the int8 dots run on `vdot`.
 # The matrix chunks (qmat_chunk), the quantization, RoPE, softmax's exp (vexp, no libm call)
 # and SwiGLU's gating come from the AIR standard library (`use`).
 #
@@ -33,7 +38,7 @@
 #   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn]
 # cache: per layer, K then V, each f32 [max_ctx x kv_heads x head_dim]
 # h: f32 [d], the residual stream; holds the final hidden state on return.
-use qmat_chunk, quantize_q8, rope_half, exp_shift, silu_mul
+use qmat_chunk, qmat_batch, quantize_q8, rope_half, exp_shift, silu_mul
 
 fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
@@ -139,6 +144,19 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
 
   final:
     call norm_quant(h, norm_out, xn, xq, dx, d, eps)
+    next = call lm_argmax(lm, xq, dx, d, vocab)
+    free adx
+    free aq
+    free dx
+    free xq
+    free qbuf
+    free xn
+    ret next
+
+# Greedy next token: the LM head on the quantized final hidden state (xq, dx) with a fused
+# argmax (lm_chunk); the first index wins ties.
+fn lm_argmax(lm:ptr, xq:ptr, dx:ptr, d:i64, vocab:i64)->i64
+  b0:
     vchunks = udiv vocab, 64:i64
     vb4 = mul vchunks, 4:i64
     best = alloc vb4
@@ -150,7 +168,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     jmp pick(1:i64, b_first, i_first)
   pick(pc:i64, pv:f32, pi:i64):
     pc_more = lt pc, vchunks
-    br pc_more, pick_body, done(pi)
+    br pc_more, pick_body, done
   pick_body:
     pv_off = mul pc, 4:i64
     ppv = add best, pv_off
@@ -163,16 +181,10 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     pi2 = select better, ci, pi
     pc2 = add pc, 1:i64
     jmp pick(pc2, pv2, pi2)
-  done(next:i64):
+  done:
     free best_idx
     free best
-    free adx
-    free aq
-    free dx
-    free xq
-    free qbuf
-    free xn
-    ret next
+    ret pi
 
 # xn = RMSNorm(h) * w, then xq/dx = Q8 quantization of xn.
 fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
@@ -451,4 +463,361 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
     tok = add base, bj
     st pi, tok
     free tmp
+    ret
+
+# Prefill: n prompt tokens (i64 [n] at `tokens`) at positions pos .. pos + n - 1, with the
+# model, cache and h of llama_decode (pos + n <= max_ctx). Returns the greedy token after
+# the last one; h holds the last token's final hidden state. Per layer: 2 norm passes over
+# the tokens, then the same 5 `par` regions as llama_decode, each task computing its rows
+# for every token (4 tokens per weight load); attention runs per token over the cache up to
+# its own position, so tokens never see later ones.
+fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
+  b0:
+    d = ld cfg:i64
+    c1 = add cfg, 8:i64
+    nl = ld c1:i64
+    c2 = add cfg, 16:i64
+    nh = ld c2:i64
+    c3 = add cfg, 24:i64
+    nkv = ld c3:i64
+    c4 = add cfg, 32:i64
+    hd = ld c4:i64
+    c5 = add cfg, 40:i64
+    f = ld c5:i64
+    c6 = add cfg, 48:i64
+    vocab = ld c6:i64
+    c7 = add cfg, 56:i64
+    max_ctx = ld c7:i64
+    embd = ld model:ptr
+    m1 = add model, 8:i64
+    norm_out = ld m1:ptr
+    lm = add model, 16:i64
+    m5 = add model, 40:i64
+    cos_t = ld m5:ptr
+    m6 = add model, 48:i64
+    sin_t = ld m6:ptr
+    w = vl f32
+    d4 = mul d, 4:i64
+    # hs: the residual streams of the n tokens, f32 [n x d].
+    hs_sz = mul n, d4
+    hs = alloc hs_sz
+    jmp embed_tok(0:i64)
+  embed_tok(s:i64):
+    s_more = lt s, n
+    br s_more, embed_start, setup
+  embed_start:
+    so = mul s, 8:i64
+    pt = add tokens, so
+    tok = ld pt:i64
+    e_off = mul tok, d4
+    e_row = add embd, e_off
+    h_off = mul s, d4
+    h_row = add hs, h_off
+    jmp embed(0:i64)
+  embed(ei:i64):
+    e_more = lt ei, d
+    br e_more, embed_body, embed_next
+  embed_body:
+    e_rest = sub d, ei
+    eo = mul ei, 4:i64
+    pe = add e_row, eo
+    ph = add h_row, eo
+    ev = ldm pe:vx, e_rest:f32
+    stm ph, ev, e_rest:f32
+    ei2 = add ei, w
+    jmp embed(ei2)
+  embed_next:
+    s2 = add s, 1:i64
+    jmp embed_tok(s2)
+
+  setup:
+    qd = mul nh, hd
+    kmax0 = max d, qd
+    # xs: bytes per token in the int8 activation buffers (any projection's input fits).
+    xs = max kmax0, f
+    xn = alloc hs_sz
+    qd4 = mul qd, 4:i64
+    qb_sz = mul n, qd4
+    qbuf = alloc qb_sz
+    xq_sz = mul n, xs
+    xq = alloc xq_sz
+    aq = alloc xq_sz
+    dx_sz = udiv xq_sz, 8:i64
+    dx = alloc dx_sz
+    adx = alloc dx_sz
+    kv_row = mul nkv, hd
+    kv_plane0 = mul max_ctx, kv_row
+    kv_plane = mul kv_plane0, 4:i64
+    kv_layer = mul kv_plane, 2:i64
+    heads_all0 = mul nkv, 2:i64
+    heads_all = add nh, heads_all0
+    dchunks = udiv d, 64:i64
+    fchunks = udiv f, 64:i64
+    jmp layers(0:i64)
+
+  layers(l:i64):
+    l_more = lt l, nl
+    br l_more, layer_body, final
+  layer_body:
+    slot0 = mul l, 14:i64
+    slot = add slot0, 7:i64
+    lp_off = mul slot, 8:i64
+    lp = add model, lp_off
+    attn_norm = ld lp:ptr
+    m_qkv = add lp, 8:i64
+    m_o = add lp, 32:i64
+    lp7 = add lp, 56:i64
+    ffn_norm = ld lp7:ptr
+    m_gu = add lp, 64:i64
+    m_dn = add lp, 88:i64
+    kc_off = mul l, kv_layer
+    kc = add cache, kc_off
+    vc = add kc, kv_plane
+    par n, norm_tok(hs, attn_norm, xn, xq, dx, d, eps, xs)
+    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, cos_t, sin_t, n, xs)
+    par nh, attn_head_n(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, n, xs)
+    par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d)
+    par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
+    par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs)
+    par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d)
+    l2 = add l, 1:i64
+    jmp layers(l2)
+
+  final:
+    last = sub n, 1:i64
+    last_off = mul last, d4
+    h_last = add hs, last_off
+    jmp copy(0:i64)
+  copy(ci:i64):
+    c_more = lt ci, d
+    br c_more, copy_body, head
+  copy_body:
+    c_rest = sub d, ci
+    co = mul ci, 4:i64
+    pl = add h_last, co
+    po = add h, co
+    cv = ldm pl:vx, c_rest:f32
+    stm po, cv, c_rest:f32
+    ci2 = add ci, w
+    jmp copy(ci2)
+  head:
+    call norm_quant(h, norm_out, xn, xq, dx, d, eps)
+    next = call lm_argmax(lm, xq, dx, d, vocab)
+    free adx
+    free dx
+    free aq
+    free xq
+    free qbuf
+    free xn
+    free hs
+    ret next
+
+# norm_quant for token s of a prefill: its residual stream row of hs, its xn row, and its
+# int8 activations xs bytes apart (scales xs / 8 apart).
+fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i64)
+  b0:
+    d4 = mul d, 4:i64
+    r_off = mul s, d4
+    h_s = add hs, r_off
+    xn_s = add xn, r_off
+    q_off = mul s, xs
+    xq_s = add xq, q_off
+    ds = udiv xs, 8:i64
+    d_off = mul s, ds
+    dx_s = add dx, d_off
+    call norm_quant(h_s, wt, xn_s, xq_s, dx_s, d, eps)
+    ret
+
+# qkv_head for n tokens: head t's 64-row chunks for every token (qmat_batch), each token's
+# rows written to its q row or its position's KV-cache slot, then RoPE at its position.
+fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64)
+  b0:
+    w = vl f32
+    hd4 = mul hd, 4:i64
+    qd4 = mul nh, hd4
+    is_q = lt t, nh
+    nhk = add nh, nkv
+    is_k = lt t, nhk
+    q_off = mul t, hd4
+    tk = sub t, nh
+    tv = sub t, nhk
+    kv_head = select is_k, tk, tv
+    kv_off = mul kv_head, hd4
+    row = mul nkv, hd4
+    kv_base0 = select is_k, kc, vc
+    kv_base = add kv_base0, kv_off
+    half = udiv hd, 2:i64
+    rope_row = mul half, 4:i64
+    per_head = udiv hd, 64:i64
+    c0 = mul t, per_head
+    tmp_sz = mul n, 256:i64
+    tmp = alloc tmp_sz
+    jmp chunks(0:i64)
+  chunks(i:i64):
+    i_more = lt i, per_head
+    br i_more, chunk_body, rope(0:i64)
+  chunk_body:
+    c = add c0, i
+    call qmat_batch(c, mat, xq, dx, tmp, d, n, xs)
+    o = mul i, 256:i64
+    jmp scatter(0:i64)
+  scatter(s:i64):
+    s_more = lt s, n
+    br s_more, scatter_start, chunk_next
+  scatter_start:
+    sq = mul s, qd4
+    q_dst0 = add qbuf, sq
+    q_dst = add q_dst0, q_off
+    p = add pos, s
+    kv_slot = mul p, row
+    kv_dst = add kv_base, kv_slot
+    dst0 = select is_q, q_dst, kv_dst
+    dst = add dst0, o
+    st_off = mul s, 256:i64
+    src = add tmp, st_off
+    jmp copy(0:i64)
+  copy(j:i64):
+    j_more = lt j, 64:i64
+    br j_more, copy_body, scatter_next
+  copy_body:
+    j_rest = sub 64:i64, j
+    jo = mul j, 4:i64
+    ps = add src, jo
+    pd = add dst, jo
+    v = ldm ps:vx, j_rest:f32
+    stm pd, v, j_rest:f32
+    j2 = add j, w
+    jmp copy(j2)
+  scatter_next:
+    s2 = add s, 1:i64
+    jmp scatter(s2)
+  chunk_next:
+    i2 = add i, 1:i64
+    jmp chunks(i2)
+  rope(r:i64):
+    r_more = lt r, n
+    br r_more, rope_body, done
+  rope_body:
+    br is_k, rotate, done
+  rotate:
+    rq0 = mul r, qd4
+    rq1 = add qbuf, rq0
+    rq = add rq1, q_off
+    rp = add pos, r
+    rkv0 = mul rp, row
+    rkv = add kv_base, rkv0
+    x = select is_q, rq, rkv
+    rr = mul rp, rope_row
+    cos_r = add cos_t, rr
+    sin_r = add sin_t, rr
+    call rope_half(x, hd, cos_r, sin_r)
+    r2 = add r, 1:i64
+    jmp rope(r2)
+  done:
+    free tmp
+    ret
+
+# attn_head for n tokens: q head hq of token s attends over positions 0 .. pos + s and
+# writes its Q8 output into token s's activations.
+fn attn_head_n(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64, n:i64, xs:i64)
+  b0:
+    qd = mul nh, hd
+    qd4 = mul qd, 4:i64
+    ds = udiv xs, 8:i64
+    jmp toks(0:i64)
+  toks(s:i64):
+    s_more = lt s, n
+    br s_more, tok_body, done
+  tok_body:
+    q_off = mul s, qd4
+    q_s = add qbuf, q_off
+    x_off = mul s, xs
+    xq_s = add xq, x_off
+    d_off = mul s, ds
+    dx_s = add dx, d_off
+    p = add pos, s
+    call attn_head(hq, q_s, kc, vc, xq_s, dx_s, nh, nkv, hd, p)
+    s2 = add s, 1:i64
+    jmp toks(s2)
+  done:
+    ret
+
+# proj_add for n tokens: rows 64c..64c+63 of every token's residual stream += (W x).
+fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i64)
+  b0:
+    w = vl f32
+    tmp_sz = mul n, 256:i64
+    tmp = alloc tmp_sz
+    call qmat_batch(c, mat, xq, dx, tmp, k, n, xs)
+    d4 = mul d, 4:i64
+    c_off = mul c, 256:i64
+    jmp toks(0:i64)
+  toks(s:i64):
+    s_more = lt s, n
+    br s_more, tok_start, done
+  tok_start:
+    r_off = mul s, d4
+    row = add hs, r_off
+    hc = add row, c_off
+    t_off = mul s, 256:i64
+    ts = add tmp, t_off
+    jmp add_loop(0:i64)
+  add_loop(j:i64):
+    more = lt j, 64:i64
+    br more, add_body, tok_next
+  add_body:
+    rest = sub 64:i64, j
+    o = mul j, 4:i64
+    pt = add ts, o
+    ph = add hc, o
+    tv = ldm pt:vx, rest:f32
+    hv = ldm ph:vx, rest:f32
+    sum = vadd hv, tv:f32
+    stm ph, sum, rest:f32
+    j2 = add j, w
+    jmp add_loop(j2)
+  tok_next:
+    s2 = add s, 1:i64
+    jmp toks(s2)
+  done:
+    free tmp
+    ret
+
+# gate_up for n tokens: MLP rows 64c..64c+63 of every token, SwiGLU, then Q8 quantization
+# into the token's down-projection input.
+fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i64)
+  b0:
+    tmp_sz = mul n, 256:i64
+    g = alloc tmp_sz
+    u = alloc tmp_sz
+    a = alloc 256:i64
+    cg = mul c, 2:i64
+    cu = add cg, 1:i64
+    call qmat_batch(cg, mat, xq, dx, g, k, n, xs)
+    call qmat_batch(cu, mat, xq, dx, u, k, n, xs)
+    ds = udiv xs, 8:i64
+    q_off = mul c, 64:i64
+    d_off = mul c, 8:i64
+    jmp toks(0:i64)
+  toks(s:i64):
+    s_more = lt s, n
+    br s_more, tok_body, done
+  tok_body:
+    t_off = mul s, 256:i64
+    gs = add g, t_off
+    us = add u, t_off
+    call silu_mul(gs, us, a, 64:i64)
+    x_off = mul s, xs
+    aq_s = add aq, x_off
+    aq_c = add aq_s, q_off
+    dd_off = mul s, ds
+    adx_s = add adx, dd_off
+    adx_c = add adx_s, d_off
+    call quantize_q8(a, aq_c, adx_c, 64:i64)
+    s2 = add s, 1:i64
+    jmp toks(s2)
+  done:
+    free a
+    free u
+    free g
     ret

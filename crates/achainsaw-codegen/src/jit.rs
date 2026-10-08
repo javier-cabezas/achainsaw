@@ -1492,6 +1492,7 @@ enum Codegen {
         vector_width: Option<u32>,
         matrix: achainsaw_llvm::MatrixUnits,
         native_f16: bool,
+        int8_dot: achainsaw_llvm::Int8Dot,
         vx_bits: u32,
         /// One LLJIT per `compile_module` call; kept alive so earlier code stays valid.
         modules: Vec<achainsaw_llvm::LlvmJit>,
@@ -1565,6 +1566,7 @@ impl JitEngine {
                 let vx_bits = features.native_vector_bits();
                 let matrix = features.llvm_matrix_units();
                 let native_f16 = features.llvm_native_f16();
+                let int8_dot = features.llvm_int8_dot();
                 let (cpu, features) = features.llvm_target();
                 Codegen::Llvm {
                     target: achainsaw_llvm::TargetSpec {
@@ -1576,6 +1578,7 @@ impl JitEngine {
                     vector_width,
                     matrix,
                     native_f16,
+                    int8_dot,
                     vx_bits,
                     modules: Vec::new(),
                 }
@@ -1719,6 +1722,7 @@ impl JitEngine {
                 vector_width,
                 matrix,
                 native_f16,
+                int8_dot,
                 modules,
                 ..
             } => {
@@ -1744,6 +1748,7 @@ impl JitEngine {
                     vector_width: *vector_width,
                     matrix: *matrix,
                     native_f16: *native_f16,
+                    int8_dot: *int8_dot,
                     fast_math: self.fast_math,
                     ..Default::default()
                 };

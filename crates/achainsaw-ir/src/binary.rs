@@ -334,6 +334,16 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("{dst} = vdup {vec}, {lane}:{ty}"));
                     }
+                    Instruction::VDot {
+                        dst,
+                        acc,
+                        a,
+                        b,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = vdot {acc}, {a}, {b}:{lane}"));
+                    }
                 }
                 out.push('\n');
             }
@@ -894,6 +904,18 @@ impl BinaryEncoder {
                 self.push_regs(&[dst, vec]);
                 self.buf.extend_from_slice(&lane.to_le_bytes());
                 self.buf.push(encode_type(*ty));
+            }
+            Instruction::VDot {
+                dst,
+                acc,
+                a,
+                b,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x2E);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, acc, a, b]);
             }
             Instruction::Par {
                 count, func, args, ..
@@ -1487,6 +1509,17 @@ impl<'a> BinaryDecoder<'a> {
                     vec,
                     lane,
                     ty,
+                    span,
+                })
+            }
+            0x2E => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VDot {
+                    dst: self.read_string()?,
+                    acc: self.read_string()?,
+                    a: self.read_string()?,
+                    b: self.read_string()?,
+                    lane,
                     span,
                 })
             }

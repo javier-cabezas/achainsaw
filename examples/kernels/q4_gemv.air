@@ -7,13 +7,13 @@
 #
 # Packed layout, for m a multiple of 64 and k a multiple of 32: output rows come in chunks
 # of 64; chunk c holds
-#   wq     + c * k * 32:        nibbles for its rows, 1024 bytes per block b: byte t * 64 + j
-#                               holds q[64c + j][32b + t] (low nibble) and q[64c + j][32b +
-#                               16 + t] (high nibble), t < 16
+#   wq     + c * k * 32:        nibbles for its rows, 1024 bytes per block b: byte (g * 64 + j)
+#                               * 4 + t holds q[64c + j][32b + 4g + t] (low nibble) and
+#                               q[64c + j][32b + 16 + 4g + t] (high nibble), g < 4, t < 4
 #   scales + c * (k/32) * 128:  their scales ([k/32 x 64] f16)
-# so a block unpacks with a mask, a shift and a subtraction per byte into the [32 x 64] i8
-# tile that q8_gemv stores directly (low nibbles fill rows 0..15, high nibbles rows 16..31),
-# and the same i8 `mm` gives the 64 int32 dots.
+# so a vector of nibble bytes unpacks with a mask, a shift and a subtraction into two vectors
+# in q8_gemv's lane order (values 0..15 from the low nibbles, 16..31 from the high ones), and
+# the same `vdot`s give the int32 dots.
 
 use quantize_q8, qmat_chunk
 
