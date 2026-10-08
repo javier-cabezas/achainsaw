@@ -718,8 +718,16 @@ fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
 /// Cranelift) exactly: C = 0 + 1.0 * B, at every ISA level.
 #[test]
 fn mm_widens_every_half_value_exactly() {
-    for (level, features) in host_levels() {
-        let engine = jit(MM, &features);
+    // With fast_math, bf16 may run on AMX or SME, which treat bf16 subnormal inputs as zero;
+    // everything else stays exact. (GitHub's x86 runners sometimes have AMX.)
+    let modes = host_levels()
+        .into_iter()
+        .flat_map(|(level, features)| [false, true].map(|fast| (level, features, fast)));
+    for (level, features, fast) in modes {
+        let module = parse_and_validate(MM).unwrap();
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.set_fast_math(fast);
+        engine.compile_module(&module).unwrap();
         for dtype in [Type::F16, Type::BF16] {
             let f: MmFn =
                 unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
@@ -742,9 +750,10 @@ fn mm_widens_every_half_value_exactly() {
                 };
                 let j = h as usize * 4;
                 let got = f32::from_le_bytes(c[j..j + 4].try_into().unwrap());
+                let flushed = fast && dtype == Type::BF16 && want.is_subnormal() && got == 0.0;
                 assert!(
-                    got == want || (got.is_nan() && want.is_nan()),
-                    "{dtype} {h:#06x} at {level}: got {got}, want {want}"
+                    got == want || (got.is_nan() && want.is_nan()) || flushed,
+                    "{dtype} {h:#06x} at {level}, fast_math={fast}: got {got}, want {want}"
                 );
             }
         }
@@ -893,83 +902,111 @@ fn new_ops_compile_for_every_llvm_target() {
 
 /// Each target gets the `mm` kernel its hardware supports, visible in the assembly: AMX on
 /// Sapphire/Granite Rapids (AMX-FP16 only on Granite Rapids), SME outer products on SME
-/// targets, and vector FMAs elsewhere. AMX code cannot run on the CI hosts, so this (plus the
-/// LLVM verifier) is its only check.
+/// targets, and vector FMAs elsewhere; bf16 uses AMX's `tdpbf16ps` and SME's `bfmopa` only
+/// with fast_math, since they treat bf16 subnormal inputs as zero. AMX runs only when CI lands
+/// on an AMX runner, so the assembly is its main check.
 #[cfg(feature = "llvm")]
 #[test]
 fn mm_kernels_match_target_matrix_engines() {
-    use achainsaw_codegen::{compile_assembly, Backend};
+    use achainsaw_codegen::{compile_assembly, Backend, CodegenOptions};
     let module = parse_and_validate(MM).unwrap();
-    /// (triple, cpu, features, instructions expected, instructions not expected)
+    /// (triple, cpu, features, fast_math, instructions expected, instructions not expected)
     type Case = (
         &'static str,
         &'static str,
         &'static str,
+        bool,
         &'static [&'static str],
         &'static [&'static str],
     );
+    const X86: &str = "x86_64-unknown-linux-gnu";
+    const ARM: &str = "aarch64-unknown-linux-gnu";
     let cases: &[Case] = &[
         (
-            "x86_64-unknown-linux-gnu",
+            X86,
             "sapphirerapids",
             "",
-            &["ldtilecfg", "tdpbf16ps", "tdpbssd", "tilestored", "vfmadd"],
+            false,
+            &["ldtilecfg", "tdpbssd", "tilestored", "vfmadd"],
+            &["tdpbf16ps", "tdpfp16ps"],
+        ),
+        (
+            X86,
+            "sapphirerapids",
+            "",
+            true,
+            &["tdpbf16ps", "tdpbssd"],
             &["tdpfp16ps"],
         ),
         (
-            "x86_64-unknown-linux-gnu",
+            X86,
             "graniterapids",
             "",
+            false,
+            &["tdpbssd", "tdpfp16ps"],
+            &["tdpbf16ps"],
+        ),
+        (
+            X86,
+            "graniterapids",
+            "",
+            true,
             &["tdpbf16ps", "tdpbssd", "tdpfp16ps"],
             &[],
         ),
         (
-            "x86_64-unknown-linux-gnu",
+            X86,
             "x86-64-v4",
             "",
+            true,
             &["vfmadd", "zmm"],
             &["tdpbf16ps"],
         ),
         (
-            "aarch64-unknown-linux-gnu",
+            ARM,
             "generic",
             "+sve,+sme",
+            false,
+            &["smstart", "fmopa", "smopa", "smstop"],
+            &["bfmopa"],
+        ),
+        (
+            ARM,
+            "generic",
+            "+sve,+sme",
+            true,
             &["smstart", "fmopa", "bfmopa", "smopa", "smstop"],
             &[],
         ),
         (
-            "aarch64-unknown-linux-gnu",
+            ARM,
             "neoverse-v2",
             "",
+            true,
             &["whilelo"],
             &["fmopa", "smstart"],
         ),
-        (
-            "aarch64-unknown-linux-gnu",
-            "generic",
-            "",
-            &["fmla"],
-            &["whilelo", "fmopa"],
-        ),
+        (ARM, "generic", "", true, &["fmla"], &["whilelo", "fmopa"]),
     ];
-    for (triple, cpu, features, want, not_want) in cases {
+    for (triple, cpu, features, fast, want, not_want) in cases {
         let target = AotTarget {
             triple: Some((*triple).into()),
             cpu: Some((*cpu).into()),
             features: (!features.is_empty()).then(|| (*features).into()),
         };
-        let (asm, _) = compile_assembly(&module, &target, Backend::Llvm, &Default::default())
+        let options = CodegenOptions { fast_math: *fast };
+        let (asm, _) = compile_assembly(&module, &target, Backend::Llvm, &options)
             .unwrap_or_else(|e| panic!("{cpu} {features}: {e}"));
         for w in *want {
             assert!(
                 asm.contains(w),
-                "{cpu} {features}: expected `{w}` in assembly"
+                "{cpu} {features} fast_math={fast}: expected `{w}` in assembly"
             );
         }
         for w in *not_want {
             assert!(
                 !asm.contains(w),
-                "{cpu} {features}: unexpected `{w}` in assembly"
+                "{cpu} {features} fast_math={fast}: unexpected `{w}` in assembly"
             );
         }
     }

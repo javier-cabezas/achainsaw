@@ -31,6 +31,9 @@ pub struct CodegenOptions {
     /// zeros give `b`. Without it they propagate NaN and order -0.0 below +0.0. Either way
     /// results are identical on every backend; compare and select is cheaper, notably on
     /// Cranelift's 128-bit vectors.
+    ///
+    /// Also lets bf16 `mm` use AMX or SME (LLVM backend), which treat bf16 subnormal inputs
+    /// as zero; without it bf16 `mm` uses exact vector FMAs on those targets.
     pub fast_math: bool,
 }
 

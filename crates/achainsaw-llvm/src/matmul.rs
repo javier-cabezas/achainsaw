@@ -10,7 +10,11 @@
 //!   `broadcast(A[i][kk]) * B[kk][strip]` over `kk`, with masked tails.
 //!
 //! Float results agree with the scalar reference within rounding error (fused or widened
-//! products round differently); i8 results are exact.
+//! products round differently); i8 results are exact. bf16 uses AMX or SME only with
+//! `LowerOptions::fast_math`: AMX's `tdpbf16ps` and SME's `bfmopa` (as BFDOT, without
+//! FEAT_EBF16's extended behavior) treat bf16 subnormal inputs as zero, while AIR widens every
+//! bf16 value exactly. AMX-FP16, SME's widening f16 and f32 outer products, and the int8
+//! engines are exact, so they are always used.
 
 use super::*;
 
@@ -29,15 +33,17 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
 
     pub(super) fn mm_kernel(&self, dtype: Type) -> MmKernel {
         let units = self.opts.matrix;
+        // The bf16 matrix engines flush subnormal inputs (see the module docs).
+        let exact = dtype != Type::BF16 || self.opts.fast_math;
         let amx = match dtype {
             Type::BF16 => units.amx_bf16,
             Type::I8 => units.amx_int8,
             Type::F16 => units.amx_fp16,
             _ => false,
         };
-        if amx {
+        if amx && exact {
             MmKernel::Amx
-        } else if units.sme {
+        } else if units.sme && exact {
             MmKernel::Sme
         } else {
             MmKernel::Fma

@@ -443,7 +443,8 @@ pub fn compile_binary(
 /// follows ACHAINSAW_BACKEND, else LLVM for wide-vector modules when built in, else
 /// Cranelift). `fast_math` compiles float min/max (min, max, vmin, vmax, vminr, vmaxr) as
 /// compare and select, `max(a, b) = a > b ? a : b`, so a NaN operand or two zeros give `b`;
-/// by default they propagate NaN and order -0.0 below +0.0.
+/// by default they propagate NaN and order -0.0 below +0.0. It also lets bf16 `mm` use AMX or
+/// SME, which treat bf16 subnormal inputs as zero; by default bf16 `mm` is exact.
 #[pyfunction]
 #[pyo3(signature = (source, backend=None, fast_math=false))]
 pub fn compile(

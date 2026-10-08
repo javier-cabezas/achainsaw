@@ -100,7 +100,8 @@ pub struct LowerOptions {
     /// Matrix engines for `mm`; without one, `mm` uses vector FMAs at `vx` width.
     pub matrix: MatrixUnits,
     /// Float min/max compare and select instead of propagating NaN and ordering signed
-    /// zeros (`achainsaw_codegen::CodegenOptions::fast_math`).
+    /// zeros, and bf16 `mm` on AMX/SME, which flush bf16 subnormal inputs
+    /// (`achainsaw_codegen::CodegenOptions::fast_math`).
     pub fast_math: bool,
     /// The target converts f16 <-> f32 vectors in hardware (x86 F16C, AArch64), so
     /// `vfwiden*`/`vnarrow` on f16 use `fpext`/`fptrunc` instead of integer sequences. Both

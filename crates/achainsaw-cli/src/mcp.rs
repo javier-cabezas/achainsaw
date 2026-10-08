@@ -24,7 +24,7 @@ Workflow: write AIR -> air_check -> fix using the JSON diagnostic (error_code, s
 AIR syntax:
 - Types: i8 i16 i32 i64 f32 f64 ptr; f16 bf16 are storage-only (ld/st, `f = fext h:f32`, `h = ftrunc f:f16`, not in signatures); vectors v128 v256 v512 vx (scalable, >=128 bits: 128 on cranelift, up to 512 or SVE-scalable on llvm; always get the lane count via `vl`, never assume it). Vectors are untyped bits; each vector op names its lane type.
 - Standard library: a top-level line `use quantize_q8, qmat_chunk` links those AIR functions (and the library functions they call) into the module, ready to `call` or `par`; air_std lists them with signatures and docs, and returns a function's source by name.
-- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`. Float min/max (min max vmin vmax vminr vmaxr) propagate NaN and order -0.0 below +0.0; air_run's `fast_math` compiles them as compare-and-select instead, `max(a,b) = a > b ? a : b` (a NaN operand or two zeros give b): faster, still identical on both backends.
+- Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void), then indented blocks `label:` or `label(x:i64, acc:f32):`. Float min/max (min max vmin vmax vminr vmaxr) propagate NaN and order -0.0 below +0.0; air_run's `fast_math` compiles them as compare-and-select instead, `max(a,b) = a > b ? a : b` (a NaN operand or two zeros give b): faster, still identical on both backends. It also lets bf16 `mm` use AMX/SME, which flush bf16 subnormal inputs to zero (by default bf16 mm is exact).
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
 - One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
 - Each block ends with exactly one terminator: `jmp b(args)` | `br cond, b_then(args), b_else(args)` | `ret v` | `ret`.
@@ -618,7 +618,7 @@ pub fn get_tools_list() -> Value {
                         },
                         "fast_math": {
                             "type": "boolean",
-                            "description": "Compile float min/max (min max vmin vmax vminr vmaxr) as compare and select, max(a,b) = a > b ? a : b, so a NaN operand or two zeros give b (default false: NaN-propagating, -0.0 < +0.0). Faster, notably on cranelift; identical on both backends"
+                            "description": "Compile float min/max (min max vmin vmax vminr vmaxr) as compare and select, max(a,b) = a > b ? a : b, so a NaN operand or two zeros give b (default false: NaN-propagating, -0.0 < +0.0); also lets bf16 mm use AMX/SME matrix engines, which treat bf16 subnormal inputs as zero. Faster, notably on cranelift"
                         }
                     },
                     "required": ["code"]
