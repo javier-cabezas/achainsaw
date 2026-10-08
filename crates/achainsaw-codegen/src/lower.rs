@@ -928,6 +928,113 @@ fn native_fma(isa: &dyn cranelift_codegen::isa::TargetIsa) -> bool {
     }
 }
 
+/// How `vdot` reaches the hardware's int8 dot product. Cranelift folds fixed trees of
+/// widening ops into one instruction: the signed tree into AArch64 `sdot` (with FEAT_DotProd)
+/// and the unsigned-by-signed tree into x86 VNNI `vpdpbusd`.
+#[derive(Clone, Copy, PartialEq)]
+enum DotKind {
+    /// x86 with AVX-VNNI or AVX512-VNNI: `vpdpbusd` with the sign bias.
+    X86Vnni,
+    /// Other x86: two `pmaddwd`s and a pairwise add.
+    X86,
+    /// AArch64: the `sdot` tree.
+    Arm,
+}
+
+fn dot_kind(isa: &dyn cranelift_codegen::isa::TargetIsa) -> DotKind {
+    let flag = |name: &str| {
+        isa.isa_flags()
+            .iter()
+            .any(|f| f.name == name && f.as_bool() == Some(true))
+    };
+    match isa.triple().architecture {
+        target_lexicon::Architecture::X86_64 if flag("has_avx_vnni") || flag("has_avx512vnni") => {
+            DotKind::X86Vnni
+        }
+        target_lexicon::Architecture::X86_64 => DotKind::X86,
+        _ => DotKind::Arm,
+    }
+}
+
+/// `c + sum of the four products a[4i+q] * b[4i+q]` per i32 lane of a 128-bit part, for i8
+/// lanes `a` and `b`: exact, with i32 wrapping.
+fn vdot_part(
+    builder: &mut FunctionBuilder,
+    kind: DotKind,
+    c: ClifValue,
+    a: ClifValue,
+    b: ClifValue,
+) -> ClifValue {
+    let c = as_lanes(builder, c, Type::I32);
+    let a = as_lanes(builder, a, Type::I8);
+    let b = as_lanes(builder, b, Type::I8);
+    // The tree Cranelift folds into `sdot c, x, y` (`unsigned`: `vpdpbusd`, y unsigned). Each
+    // i16 product of two i8 values is exact, and so is every sum in i32.
+    let tree = |builder: &mut FunctionBuilder, c, x, y, unsigned: bool| {
+        let mut halves = [ClifValue::from_u32(0); 2];
+        for (half, high) in halves.iter_mut().zip([false, true]) {
+            let xw = if high {
+                builder.ins().swiden_high(x)
+            } else {
+                builder.ins().swiden_low(x)
+            };
+            let yw = match (unsigned, high) {
+                (false, false) => builder.ins().swiden_low(y),
+                (false, true) => builder.ins().swiden_high(y),
+                (true, false) => builder.ins().uwiden_low(y),
+                (true, true) => builder.ins().uwiden_high(y),
+            };
+            let p = builder.ins().imul(xw, yw);
+            let lo = builder.ins().swiden_low(p);
+            let hi = builder.ins().swiden_high(p);
+            *half = builder.ins().iadd_pairwise(lo, hi);
+        }
+        let sums = builder.ins().iadd_pairwise(halves[0], halves[1]);
+        builder.ins().iadd(sums, c)
+    };
+    let r = match kind {
+        DotKind::Arm => tree(builder, c, a, b, false),
+        // vpdpbusd multiplies unsigned bytes by signed ones: with a' = a ^ 0x80 = a + 128 as
+        // u8, sum(a' * b) = sum(a * b) + 128 * sum(b), and the correction depends only on b.
+        // The correction is the sum of each lane's four bytes of b (two pairwise adds,
+        // `pmaddubsw` and `pmaddwd` by ones) times 128.
+        DotKind::X86Vnni => {
+            let m = builder.ins().iconst(types::I8, -128);
+            let bias = builder.ins().splat(types::I8X16, m);
+            let (bl, bh) = (builder.ins().swiden_low(b), builder.ins().swiden_high(b));
+            let pairs = builder.ins().iadd_pairwise(bl, bh);
+            let (pl, ph) = (
+                builder.ins().swiden_low(pairs),
+                builder.ins().swiden_high(pairs),
+            );
+            let sums = builder.ins().iadd_pairwise(pl, ph);
+            let corr = builder.ins().ishl_imm_u(sums, 7);
+            let c = builder.ins().isub(c, corr);
+            let au = builder.ins().bxor(a, bias);
+            tree(builder, c, b, au, true)
+        }
+        // Each pair of i16 products summed in i32 (`pmaddwd`), then adjacent pairs.
+        DotKind::X86 => {
+            let mut pairs = [ClifValue::from_u32(0); 2];
+            for (pair, high) in pairs.iter_mut().zip([false, true]) {
+                let (x, y) = if high {
+                    (builder.ins().swiden_high(a), builder.ins().swiden_high(b))
+                } else {
+                    (builder.ins().swiden_low(a), builder.ins().swiden_low(b))
+                };
+                let (xl, yl) = (builder.ins().swiden_low(x), builder.ins().swiden_low(y));
+                let (xh, yh) = (builder.ins().swiden_high(x), builder.ins().swiden_high(y));
+                let pl = builder.ins().imul(xl, yl);
+                let ph = builder.ins().imul(xh, yh);
+                *pair = builder.ins().iadd_pairwise(pl, ph);
+            }
+            let sums = builder.ins().iadd_pairwise(pairs[0], pairs[1]);
+            builder.ins().iadd(sums, c)
+        }
+    };
+    to_part(builder, r)
+}
+
 /// Operands and strides of one `mm`.
 struct Mm {
     pc: ClifValue,
@@ -1997,6 +2104,16 @@ pub fn lower_function<M: ClifModule>(
                     let index = ((byte % 16) / lane_bytes) as usize;
                     let r = shuffle_lanes(&mut builder, part, part, *ty, |_| index);
                     values.insert(dst.clone(), (vec![r; part_count(vec_ty)], vec_ty));
+                }
+                Instruction::VDot { dst, acc, a, b, .. } => {
+                    let (c_parts, vec_ty) = parts(&values, acc);
+                    let (a_parts, _) = parts(&values, a);
+                    let (b_parts, _) = parts(&values, b);
+                    let kind = dot_kind(module.isa());
+                    let out = (0..c_parts.len())
+                        .map(|k| vdot_part(&mut builder, kind, c_parts[k], a_parts[k], b_parts[k]))
+                        .collect();
+                    values.insert(dst.clone(), (out, vec_ty));
                 }
                 Instruction::VZip {
                     op,

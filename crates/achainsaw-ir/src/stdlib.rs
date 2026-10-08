@@ -189,9 +189,17 @@ mod tests {
         for f in functions() {
             let src = source_of(&f.name).unwrap();
             assert!(src.contains(&f.signature));
-            // It parses alone (none of them call another library function yet).
-            let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{}: {d:?}", f.name));
-            assert_eq!(module.functions.len(), 1, "{}", f.name);
+            // It parses alone unless it calls other library functions, which `use` links.
+            let calls_library = src.contains("call qmat_chunk");
+            if !calls_library {
+                let module =
+                    parse_and_validate(&src).unwrap_or_else(|d| panic!("{}: {d:?}", f.name));
+                assert_eq!(module.functions.len(), 1, "{}", f.name);
+            }
+            let module = parse_and_validate(&format!("use {}\n", f.name))
+                .unwrap_or_else(|d| panic!("{}: {d:?}", f.name));
+            assert!(module.functions.iter().any(|m| m.name == f.name));
+            assert_eq!(module.functions.len() > 1, calls_library, "{}", f.name);
         }
         assert!(source_of("nope").is_none());
     }

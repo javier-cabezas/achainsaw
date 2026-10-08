@@ -61,6 +61,16 @@ pub struct MatrixUnits {
     pub sme: bool,
 }
 
+/// Int8 dot-product instructions `vdot` may use (SVE's `sdot` is always available with SVE).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int8Dot {
+    /// Widest x86 VNNI `vpdpbusd` in bits: 256 with AVX-VNNI, 512 with AVX512-VNNI and
+    /// AVX512VL, 0 without VNNI.
+    pub x86_vnni_bits: u32,
+    /// AArch64 FEAT_DotProd: NEON `sdot`.
+    pub arm_dotprod: bool,
+}
+
 /// Shape of `vx` for one compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VxShape {
@@ -107,6 +117,8 @@ pub struct LowerOptions {
     /// `vfwiden*`/`vnarrow` on f16 use `fpext`/`fptrunc` instead of integer sequences. Both
     /// give the same results except NaN payloads.
     pub native_f16: bool,
+    /// Int8 dot products for `vdot`; without one, `vdot` widens and adds.
+    pub int8_dot: Int8Dot,
 }
 
 fn lane_bits(lane: Type) -> u32 {
@@ -1226,6 +1238,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let r = self.splat(x, *ty, vty)?;
                 st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
             }
+            Instruction::VDot { dst, acc, a, b, .. } => {
+                let (c, vty) = self.val(st, acc);
+                let r = self.vdot(vty, c, self.val(st, a).0, self.val(st, b).0)?;
+                st.values.insert(dst.clone(), (r, vty));
+            }
             Instruction::VZip {
                 op,
                 dst,
@@ -2054,6 +2071,131 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
         };
         self.to_canon(r, vty)
+    }
+
+    /// `vdot acc, a, b:i8`: per i32 lane, `acc` plus the four products of i8 lanes. SVE and
+    /// NEON (FEAT_DotProd) have it as `sdot`. x86 VNNI's `vpdpbusd` multiplies unsigned by
+    /// signed bytes, so with a' = a ^ 0x80 = a + 128 as u8, sum(a' * b) = sum(a * b) + 128 *
+    /// sum(b), and `128 * sum(b)` (one more `vpdpbusd`, depending only on b) is subtracted.
+    /// Without either, the products are widened to i32 and summed in groups of four.
+    fn vdot(
+        &self,
+        vty: Type,
+        c: BasicValueEnum<'ctx>,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let bld = &self.builder;
+        let c = self.as_lanes(c, vty, Type::I32)?;
+        let a = self.as_lanes(a, vty, Type::I8)?;
+        let b = self.as_lanes(b, vty, Type::I8)?;
+        if self.scalable(vty) {
+            let r = self.intr("llvm.aarch64.sve.sdot", &[c.get_type()], &[c, a, b])?;
+            return self.to_canon(r, vty);
+        }
+        let bits = self.vec_bits(vty);
+        let dot = self.opts.int8_dot;
+        let piece = if dot.x86_vnni_bits > 0 {
+            dot.x86_vnni_bits.min(bits)
+        } else if dot.arm_dotprod {
+            128
+        } else {
+            bits
+        };
+        // Splits a fixed vector into `piece`-bit parts and joins them back.
+        let split = |v: BasicValueEnum<'ctx>, lane: Type| -> Result<Vec<BasicValueEnum<'ctx>>> {
+            if piece == bits {
+                return Ok(vec![v]);
+            }
+            let n = piece / lane_bits(lane);
+            let part_ty = self.vec_of(self.scalar_type(lane), n, false);
+            (0..bits / piece)
+                .map(|i| {
+                    self.intr(
+                        "llvm.vector.extract",
+                        &[part_ty, v.get_type()],
+                        &[v, self.c64((i * n) as i64).into()],
+                    )
+                })
+                .collect()
+        };
+        let (cs, as_, bs) = (
+            split(c, Type::I32)?,
+            split(a, Type::I8)?,
+            split(b, Type::I8)?,
+        );
+        let full_ty = c.get_type();
+        let mut out = full_ty.const_zero();
+        for (i, ((c, a), b)) in cs.into_iter().zip(as_).zip(bs).enumerate() {
+            let r = if dot.x86_vnni_bits > 0 {
+                let f = self.intrinsic(&format!("llvm.x86.avx512.vpdpbusd.{piece}"), &[]);
+                // The declaration's own operand types (LLVM has changed them between versions).
+                let params = f.get_type().get_param_types();
+                let arg = |v: BasicValueEnum<'ctx>, k: usize| -> Result<BasicValueEnum<'ctx>> {
+                    self.bitcast(v, BasicTypeEnum::try_from(params[k]).unwrap())
+                };
+                let shape = Self::shape_of(a);
+                let bias =
+                    self.splat_const(self.ctx.i8_type().const_int(0x80, false).into(), shape)?;
+                let zero = c.get_type().const_zero();
+                let corr = self.call1(f, &[arg(zero, 0)?, arg(bias, 1)?, arg(b, 2)?])?;
+                let corr = self.bitcast(corr, c.get_type())?;
+                let c2 = vec2!(c, corr, |x, y| bld.build_int_sub(x, y, "")?);
+                let au = vec2!(a, bias, |x, y| bld.build_xor(x, y, "")?);
+                let r = self.call1(f, &[arg(c2, 0)?, arg(au, 1)?, arg(b, 2)?])?;
+                self.bitcast(r, c.get_type())?
+            } else if dot.arm_dotprod {
+                self.intr(
+                    "llvm.aarch64.neon.sdot",
+                    &[c.get_type(), a.get_type()],
+                    &[c, a, b],
+                )?
+            } else {
+                self.dot_widened(c, a, b)?
+            };
+            out = if piece == bits {
+                r
+            } else {
+                let n = piece / 32;
+                self.intr(
+                    "llvm.vector.insert",
+                    &[full_ty, r.get_type()],
+                    &[out, r, self.c64((i as u32 * n) as i64).into()],
+                )?
+            };
+        }
+        self.to_canon(out, vty)
+    }
+
+    /// `vdot` on fixed vectors without a dot-product instruction: the products as i32, then
+    /// each lane's four summed as (p0 + p1) + (p2 + p3).
+    fn dot_widened(
+        &self,
+        c: BasicValueEnum<'ctx>,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let bld = &self.builder;
+        let (a, b, c) = (
+            a.into_vector_value(),
+            b.into_vector_value(),
+            c.into_vector_value(),
+        );
+        let n = c.get_type().get_size();
+        let wide = self.i32().vec_type(4 * n);
+        let p = bld.build_int_mul(
+            bld.build_int_s_extend(a, wide, "")?,
+            bld.build_int_s_extend(b, wide, "")?,
+            "",
+        )?;
+        let pick = |q: u32| -> Result<_> {
+            let mask: Vec<_> = (0..n).map(|i| self.c32(4 * i + q)).collect();
+            Ok(bld.build_shuffle_vector(p, p, VectorType::const_vector(&mask), "")?)
+        };
+        let s01 = bld.build_int_add(pick(0)?, pick(1)?, "")?;
+        let s23 = bld.build_int_add(pick(2)?, pick(3)?, "")?;
+        let s = bld.build_int_add(s01, s23, "")?;
+        Ok(bld.build_int_add(c, s, "")?.into())
     }
 
     /// `VZip` lane permutations: a shuffle of fixed vectors; scalable vectors, whose lane

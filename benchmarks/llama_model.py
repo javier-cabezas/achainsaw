@@ -125,24 +125,29 @@ class Mat:
         return self.q.nbytes + self.d.nbytes
 
     def pack(self):
-        """The kernel's layout (see mat_chunk_into in llama_decode.air): 64-row chunks; per
-        chunk the weights (k-major [k x 64] int8 for Q8_0; for Q4_0, 1024 bytes per 32-block
-        whose byte t * 64 + j is row j's nibble byte t; for Q6_K, per 32-block the low 4 bits
-        as Q4_0's nibbles then the high 2 bits of values t, t + 8, t + 16, t + 24 in byte
-        t * 64 + j of a 512-byte plane) and the f16 scales [k/sub x 64]."""
+        """The kernel's layout (see qmat_chunk in the AIR standard library): 64-row chunks;
+        per chunk and 32-block, groups of 4 consecutive bytes of a row form one 32-bit lane,
+        byte (g * 64 + j) * 4 + q holding row j's byte 4g + q: its int8 values for Q8_0, its
+        nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q); for Q6_K the low 4 bits as
+        Q4_0's nibbles, then a 512-byte plane whose byte (g * 64 + j) * 4 + q holds the high
+        2 bits of values 8p + 4g + q in bit pair p. Then the f16 scales [k/sub x 64]."""
         c, nb = self.rows // 64, self.k // 32
+
+        def lanes(v, n):
+            # [c, 64, nb, n] row bytes -> [c, nb, n/4 groups, 64 rows, 4]
+            return v.reshape(c, 64, nb, n // 4, 4).transpose(0, 2, 3, 1, 4).reshape(c, nb, -1)
+
         if self.fmt == "q4":
-            q = self.q.reshape(c, 64, nb, 16).transpose(0, 2, 3, 1)
+            q = lanes(self.q, 16)
         elif self.fmt == "q6":
-            u = (self.q.astype(np.int16) + 32).astype(np.uint8)
-            u = u.reshape(c, 64, nb, 32).transpose(0, 2, 3, 1)            # [c, b, t, j]
+            u = (self.q.astype(np.int16) + 32).astype(np.uint8).reshape(c, 64, nb, 32)
             lo, hi = u & 15, u >> 4
-            nib = lo[:, :, :16] | (lo[:, :, 16:] << 4)
-            top = hi[:, :, 0:8] | (hi[:, :, 8:16] << 2) | (hi[:, :, 16:24] << 4) | \
-                (hi[:, :, 24:32] << 6)
-            q = np.concatenate([nib.reshape(c, nb, 1024), top.reshape(c, nb, 512)], axis=2)
+            nib = lo[..., :16] | (lo[..., 16:] << 4)
+            top = hi[..., 0:8] | (hi[..., 8:16] << 2) | (hi[..., 16:24] << 4) | \
+                (hi[..., 24:32] << 6)
+            q = np.concatenate([lanes(nib, 16), lanes(top, 8)], axis=2)
         else:
-            q = self.q.reshape(c, 64, self.k).transpose(0, 2, 1)
+            q = lanes(self.q, 32)
         self.packed_q = np.ascontiguousarray(q)
         per = 32 // self.sub
         self.packed_s = np.ascontiguousarray(

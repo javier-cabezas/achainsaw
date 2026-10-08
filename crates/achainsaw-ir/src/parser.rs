@@ -688,7 +688,11 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let arity = if name == "vfma" { 3 } else { 2 };
+        let arity = if name == "vfma" || name == "vdot" {
+            3
+        } else {
+            2
+        };
         let mut regs = Vec::with_capacity(arity);
         for i in 0..arity {
             if i > 0 {
@@ -701,6 +705,16 @@ impl<'a> Parser<'a> {
 
         let mut regs = regs.into_iter();
         let mut next = || regs.next().unwrap();
+        if name == "vdot" {
+            return Ok(Instruction::VDot {
+                dst,
+                acc: next(),
+                a: next(),
+                b: next(),
+                lane,
+                span,
+            });
+        }
         if name == "vfma" {
             return Ok(Instruction::VFma {
                 dst,

@@ -534,7 +534,7 @@ fn add_rmsnorm_matches_reference() {
 }
 
 /// Q8_0 or Q4_0 weights in `q8_gemv`'s / `q4_gemv`'s chunked layout (64 output rows per
-/// chunk; k-major int8 for Q8_0, per block 1024 nibble bytes [16 x 64] for Q4_0) with f16
+/// chunk; per block, groups of 4 consecutive values of a row in one 32-bit lane) with f16
 /// scales, plus the logical values q (q - 8 for Q4_0) and the scales as f32. Scales include
 /// negative values (Q4_0's usually are), zero and f16 subnormals.
 fn q_pack(rng: &mut Rng, m: usize, k: usize, q4: bool) -> (Vec<u8>, Vec<u16>, Vec<i8>, Vec<f32>) {
@@ -565,12 +565,14 @@ fn q_pack(rng: &mut Rng, m: usize, k: usize, q4: bool) -> (Vec<u8>, Vec<u16>, Ve
         for kk in 0..k {
             for r in 0..64 {
                 let v = q[(c * 64 + r) * k + kk];
+                // Byte q of group g's 32-bit lane for row r (see `qmat_chunk`).
+                let (b, t) = (kk / 32, kk % 32);
                 if q4 {
-                    let (b, t) = (kk / 32, kk % 32);
-                    wq[c * k * 32 + b * 1024 + (t % 16) * 64 + r] |=
+                    let n = t % 16;
+                    wq[c * k * 32 + b * 1024 + ((n / 4) * 64 + r) * 4 + n % 4] |=
                         ((v + 8) as u8) << (4 * (t / 16));
                 } else {
-                    wq[c * k * 64 + kk * 64 + r] = v as u8;
+                    wq[c * k * 64 + b * 2048 + ((t / 4) * 64 + r) * 4 + t % 4] = v as u8;
                 }
             }
         }

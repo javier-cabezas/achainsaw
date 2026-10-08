@@ -95,6 +95,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
 | Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
+| Int8 dot product | `r = vdot c, a, b:i8` adds to each i32 lane of `c` the four products of the matching i8 lanes of `a` and `b`, exactly (i32 wrapping). One `sdot` on NEON (FEAT_DotProd) and SVE; on x86 with VNNI, `vpdpbusd` on `a ^ 0x80` minus `128 * sum(b)` (it multiplies unsigned by signed bytes), on both backends | i8 |
 | Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
 | Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
 | Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
@@ -446,9 +447,9 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `rope.air` | `(x:ptr, heads:i64, dim:i64, cos:ptr, sin:ptr)` | Rotary position embedding in place, LLaMA/NeoX rotate-half layout, from a row of the cos/sin cache |
 | `swiglu.air` | `(gate:ptr, up:ptr, out:ptr, n:i64)` | `silu(gate) * up` with `exp` vectorized in AIR (Cephes polynomial; 2^n built by reading the f32 lanes as i32), no libm call |
 | `argmax.air` | `(x:ptr, n:i64)->i64` | Greedy decoding: first index of the largest logit, one pass with four independent (value, index) accumulator sets |
-| `q8_gemv.air` | `q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q8_0 (llama.cpp) matrix-vector product on all cores: int8 weights in 32-blocks with f16 scales (as GGUF stores them), packed in 64-row chunks; activations quantized on the fly; int8 dots on `mm` |
-| `q4_gemv.air` | `q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q4_0 (llama.cpp) matrix-vector product: 4-bit weights, half of Q8_0's bytes; each 32-block's nibbles (GGUF's own bytes, regrouped per 64 rows) unpack into an int8 tile for the same `mm` |
-| `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out: see [Single-call decode](#single-call-decode-deep-fusion) |
+| `q8_gemv.air` | `q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q8_0 (llama.cpp) matrix-vector product on all cores: int8 weights in 32-blocks with f16 scales (as GGUF stores them), packed in 64-row chunks with each row's 4 consecutive values in one 32-bit lane; activations quantized on the fly; int8 dots on `vdot` |
+| `q4_gemv.air` | `q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q4_0 (llama.cpp) matrix-vector product: 4-bit weights, half of Q8_0's bytes; GGUF's own nibble bytes in the same lane order, unpacked in registers (a mask, a shift, a subtraction) for the same `vdot`s |
+| `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64`, `llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out; and a whole prompt in one call: see [Single-call decode](#single-call-decode-deep-fusion) |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
 
@@ -467,20 +468,20 @@ Compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits 
 
 | Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|
-| Q8_0 GEMV 4096x4096, all cores | 6.07 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 429 µs (14.2x) | 145 µs (41.9x) |
-| Q4_0 GEMV 4096x4096, all cores | 5.89 ms (the same, from 4-bit values) | 528 µs (11.2x) | 164 µs (35.8x) |
-| RoPE, 32 heads x 128 | 7.7 µs | 2.0 µs (3.8x) | 0.80 µs (9.6x) |
-| Residual add + RMSNorm, n=4096 | 6.3 µs | 4.2 µs (1.5x) | 1.5 µs (4.2x) |
-| Cosine similarity, n=1024 | 2.3 µs | 0.70 µs (3.3x) | 0.54 µs (4.3x) |
-| RMSNorm, n=4096 | 5.6 µs | 3.9 µs (1.4x) | 1.4 µs (3.9x) |
-| Softmax, n=1000 | 2.9 µs | 1.8 µs (1.6x) | 0.93 µs (3.2x) |
-| Euclidean distance, n=1024 | 1.4 µs | 0.67 µs (2.1x) | 0.54 µs (2.6x) |
-| GEMM bf16 -> f32, 256³, all cores | 172 µs | 251 µs (0.69x) | 76 µs (2.3x) |
-| SwiGLU, n=14336 | 11.2 µs | 14.7 µs (0.76x) | 5.0 µs (2.2x) |
-| Greedy argmax, vocabulary 128256 | 6.9 µs | 16.2 µs (0.43x) | 4.9 µs (1.4x) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.42 ms | 2.20 ms (0.65x) | 1.06 ms (1.3x) |
-| GEMV f32 512x1024, all cores | 6.2 µs | 17.7 µs (0.35x) | 9.6 µs (0.64x) |
-| GEMV f32 512x1024, 1 core | 6.0 µs (all cores) | 39.8 µs (0.15x) | 21.8 µs (0.27x) |
+| Q4_0 GEMV 4096x4096, all cores | 5.63 ms (the same, from 4-bit values) | 247 µs (22.9x) | 62.5 µs (90.2x) |
+| Q8_0 GEMV 4096x4096, all cores | 5.73 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 254 µs (22.6x) | 76.4 µs (75.0x) |
+| RoPE, 32 heads x 128 | 7.7 µs | 1.9 µs (4.0x) | 0.86 µs (9.0x) |
+| Residual add + RMSNorm, n=4096 | 6.1 µs | 4.1 µs (1.5x) | 1.6 µs (3.9x) |
+| Cosine similarity, n=1024 | 2.2 µs | 0.70 µs (3.1x) | 0.56 µs (3.9x) |
+| RMSNorm, n=4096 | 5.4 µs | 3.8 µs (1.4x) | 1.4 µs (3.8x) |
+| Softmax, n=1000 | 2.8 µs | 1.8 µs (1.6x) | 0.92 µs (3.1x) |
+| Euclidean distance, n=1024 | 1.3 µs | 0.69 µs (1.9x) | 0.56 µs (2.4x) |
+| SwiGLU, n=14336 | 10.5 µs | 14.4 µs (0.73x) | 4.7 µs (2.2x) |
+| GEMM bf16 -> f32, 256³, all cores | 156 µs | 204 µs (0.77x) | 75.1 µs (2.1x) |
+| Greedy argmax, vocabulary 128256 | 6.4 µs | 15.8 µs (0.41x) | 4.5 µs (1.4x) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.25 ms | 1.86 ms (0.68x) | 974 µs (1.3x) |
+| GEMV f32 512x1024, all cores | 5.4 µs | 14.4 µs (0.38x) | 10.7 µs (0.51x) |
+| GEMV f32 512x1024, 1 core | 5.4 µs (all cores) | 36.9 µs (0.15x) | 21.0 µs (0.26x) |
 
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
 
@@ -488,8 +489,9 @@ Every pull request also runs a performance check in CI: [`benchmarks/perf_compar
 
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
-- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads. With weights streaming from memory, as in LLM decode, the Q8_0 GEMV is 35x faster than NumPy.
-- **Q4_0 against Q8_0.** At 4096x4096 the weights stay mostly in the 16 MB L3 across calls, so unpacking the nibbles makes Q4_0 slightly slower. Streaming from memory, it reads half the bytes at the same bandwidth: a 128256x2048 matrix (Llama 3's LM head) takes 2.66 ms as Q4_0 and 5.12 ms as Q8_0 on LLVM, both at about 55 GB/s. On Cranelift, whose 128-bit `mm` is compute-bound, Q4_0 does not pay off.
+- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads.
+
+**Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is now faster than Q8_0 on both.
 
 Fuel checks are inline (a decrement and a compare per branch, on a counter kept in a register), so loops pay almost nothing for runaway protection. The rare slow path calls the runtime through a stub that preserves every register, so it does not make Cranelift spill loop values: before that, the fuel checks made Cranelift's GEMV 2.6x slower.
 
@@ -508,7 +510,9 @@ Fuel checks are inline (a decrement and a compare per branch, on a counter kept 
 
 That is 2 serial norms and 5 `par` regions per layer. Each weight matrix has its own format, Q8_0, Q4_0 or Q6_K, in the chunked layout of `q8_gemv` and `q4_gemv` (Q6_K adds a plane of high bits and a scale per 16 values), so every task owns its output rows and applies its epilogue without a cross-task reduction. `crates/achainsaw-codegen/tests/llama_decode.rs` checks it against an f64 reference model, with all three formats mixed, over several positions, at every ISA level on both backends.
 
-**A real model.** [`benchmarks/gguf.py`](benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, Q8_0, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. A prompt runs through the same kernel one token at a time.
+**Prefill.** `llama_prefill` runs a whole prompt of n tokens through the same passes in one call. Every projection task applies its rows to 4 tokens per weight load (`qmat_batch`, which runs the standard library's `qmat_chunk4` on tiles of 4 tokens and `qmat_chunk` on the rest), so the weights are read once per 4 tokens instead of once per token, and the work turns from memory-bound into compute-bound. Norms, RoPE, epilogues and attention (each token over the cache up to its own position) run per token. Each token's operations are exactly those of `llama_decode`, so a prefill leaves the same KV cache, hidden state and next token bit for bit as decoding the prompt token by token (`llama_prefill_matches_decode_exactly`, in one call or in pieces).
+
+**A real model.** [`benchmarks/gguf.py`](benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, Q8_0, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
 
 ```bash
 curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -521,20 +525,27 @@ Llama 3.2 1B Instruct in Q4_0 (Q4_0 layers, two Q4_1 down projections, a Q6_K em
 | | ms/token | tokens/s | weights read per token |
 |---|---|---|---|
 | llama.cpp (CPU, `llama-bench -n 64 -t 8`) | 15.4 | 64.8 | 765 MB at 50 GB/s |
-| AIR on LLVM, one call per token | 16.4 | 60.9 | 794 MB at 48 GB/s |
-| AIR on Cranelift, one call per token | 43.7 | 23 | 794 MB at 18 GB/s |
+| AIR on LLVM, one call per token | 15.4 | 65.1 | 794 MB at 52 GB/s |
+| AIR on Cranelift, one call per token | 24.8 | 40.4 | 794 MB at 32 GB/s |
 | NumPy, same data types | 578 | 1.7 | |
 
 The kernel prints the same text as llama.cpp (`llama-simple`, greedy), and its tokens match the NumPy implementation of the same arithmetic. Both are bound by memory bandwidth at about the same rate; the kernel reads 4% more bytes, because the two Q4_1 matrices become Q8_0 and its Q6_K scales take 0.5 bit more per weight than llama.cpp's packing.
+
+Prefill of a 542-token prompt (`--prompt` with a long text), against the decode steps that follow it in the same run (one `llama_decode` call per token, the cost of feeding a prompt without prefill):
+
+| | `llama_prefill`, ms/token | tokens/s | `llama_decode`, ms/token |
+|---|---|---|---|
+| AIR on LLVM | 2.32 | 432 | 16.3 |
+| AIR on Cranelift | 11.8 | 85 | 28.0 |
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
 | Weights | AIR on LLVM | AIR on Cranelift | NumPy, same data types |
 |---|---|---|---|
-| Q8_0, 1.31 GB | 24.2 ms/token (41 tokens/s, 54 GB/s) | 32.5 ms/token | 547 ms/token |
-| Q4_0, 0.70 GB | 14.2 ms/token (71 tokens/s, 49 GB/s) | 38.2 ms/token | 657 ms/token |
+| Q8_0, 1.31 GB | 26.0 ms/token (38 tokens/s, 51 GB/s) | 28.7 ms/token | 558 ms/token |
+| Q4_0, 0.70 GB | 13.1 ms/token (76 tokens/s, 53 GB/s) | 23.7 ms/token | 608 ms/token |
 
-On LLVM decode streams the weights at close to the memory's bandwidth, so Q4_0 is 1.7x faster than Q8_0. Cranelift's 128-bit `mm` is compute-bound, and unpacking the nibbles costs more than the bytes it saves. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token.
+On LLVM decode streams the weights at close to the memory's bandwidth (run to run, about ±5%), so Q4_0 is about 2x faster than Q8_0. On Cranelift, `vdot` and in-register unpacking make the int8 dots cheap enough that Q4_0's half-size weights pay off too. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
@@ -769,7 +780,7 @@ achainsaw/
 │   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
 │   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
 ├── examples/                   # Each .air has matching .airb bytecode
-│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, GEMM, attention, RoPE, SwiGLU, Q8 GEMV, argmax, single-call decode
+│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, GEMM, attention, RoPE, SwiGLU, Q8/Q4 GEMV, argmax, single-call decode and prefill
 │   ├── fibonacci.air           # Iterative Fibonacci (branches, block parameters)
 │   ├── sum_loop.air            # Iterative accumulator loop
 │   ├── dot_product.air         # Scalar dot product with pointer arithmetic

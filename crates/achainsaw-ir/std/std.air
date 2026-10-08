@@ -6,15 +6,18 @@
 # dst[0 .. 64] = rows 64c .. 64c + 64 of the quantized matrix `mat` times the int8
 # activations xq (scales dx per 32-block, from quantize_q8); k is the matrix's row length.
 # `mat` points to 3 words: packed weights, f16 scales, format (0 Q8_0, 1 Q4_0, 2 Q6_K).
-# Per 32-block of a chunk's 64 rows:
-#   Q8_0 (format 0): 2048 bytes, k-major int8 [32 x 64], fed to `mm` directly.
-#   Q4_0 (format 1): 1024 bytes [16 x 64]: byte t * 64 + j holds row j's value t (low
-#                    nibble) and t + 16 (high), each offset by 8.
-#   Q6_K (format 2): 1536 bytes: the low 4 bits as Q4_0's nibbles, then a 512-byte plane
-#                    [8 x 64] whose byte t * 64 + j holds the high 2 bits of row j's values
-#                    t, t + 8, t + 16, t + 24 (bit pairs 0..3); values offset by 32.
-# Q4_0 and Q6_K unpack into an int8 tile [32 x 64]. Scales are f16 [64] vectors per block:
-# one for Q8_0 and Q4_0, two for Q6_K (one per 16 values, so two `mm`s of k = 16).
+# Weights come in chunks of 64 rows; per 32-block of a chunk, each group of 4 consecutive
+# values of a row fills one 32-bit lane, so `vdot` multiplies them by 4 activations:
+#   Q8_0 (format 0): 2048 bytes: byte (g * 64 + j) * 4 + q is row j's value 4g + q (g < 8).
+#   Q4_0 (format 1): 1024 bytes: byte (g * 64 + j) * 4 + q (g < 4) holds row j's values
+#                    4g + q (low nibble) and 16 + 4g + q (high), offset by 8: GGUF's own
+#                    nibble bytes, regrouped.
+#   Q6_K (format 2): 1536 bytes: the low 4 bits of the values offset by 32, as Q4_0's
+#                    nibbles, then 512 bytes whose byte (g * 64 + j) * 4 + q (g < 2) holds
+#                    the high 2 bits of row j's value 8p + 4g + q in bit pair p (p < 4).
+# Scales are f16 [64] vectors per block: one for Q8_0 and Q4_0, two for Q6_K (one per 16
+# values). For each strip of `vl i32` rows and each block, two exact int32 dot chains (values
+# 0..15 and 16..31, Q6_K's two scale groups) are converted and added as scale * dx * dot.
 fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
   b0:
     wq = ld mat:ptr
@@ -24,8 +27,7 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     fmt = ld mat2:i64
     is_q4 = eq fmt, 1:i64
     is_q6 = eq fmt, 2:i64
-    w = vl f32
-    w8 = vl i8
+    w = vl i32
     nb = udiv k, 32:i64
     blk_q4 = cst 1024:i64
     blk_q6 = cst 1536:i64
@@ -42,10 +44,10 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     chunk_s = mul nb, sc_blk
     s_off = mul c, chunk_s
     sc = add scales, s_off
-    dots = alloc 256:i64
-    tile = alloc 2048:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
+    zi = cst 0:i32
+    vi_zero = splat zi:vx
     lo_mask = cst 15:i8
     v_lo_mask = splat lo_mask:vx
     eight = cst 8:i8
@@ -54,187 +56,529 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     v_three = splat three:vx
     off32 = cst 32:i8
     v_32 = splat off32:vx
-    four = cst 4:i32
-    jmp zero_y(0:i64)
-  zero_y(z:i64):
+    jmp zero(0:i64)
+  zero(z:i64):
     z_more = lt z, 64:i64
-    br z_more, zero_y_body, blocks(0:i64)
-  zero_y_body:
-    z_rest = sub 64:i64, z
-    z_off = mul z, 4:i64
-    pz = add dst, z_off
-    stm pz, v_zero, z_rest:f32
+    br z_more, zero_body, blocks(0:i64)
+  zero_body:
+    z4 = mul z, 4:i64
+    pz = add dst, z4
+    st pz, v_zero
     z2 = add z, w
-    jmp zero_y(z2)
+    jmp zero(z2)
   blocks(b:i64):
     b_more = lt b, nb
     br b_more, block_start, done
   block_start:
     blk_off = mul b, blk_bytes
-    wb = add wc, blk_off
-    br is_q4, unpack4(0:i64), not_q4
-  not_q4:
-    br is_q6, unpack6_lo(0:i64), sub(0:i64, wb)
-  unpack4(u:i64):
-    u_more = lt u, 1024:i64
-    br u_more, unpack4_body, sub(0:i64, tile)
-  unpack4_body:
-    pn = add wb, u
-    nv = ld pn:vx
-    lo = vand nv, v_lo_mask:i8
-    lo_q = vsub lo, v_eight:i8
-    hi = vushr nv, four:i8
-    hi_q = vsub hi, v_eight:i8
-    plo = add tile, u
-    st plo, lo_q
-    hi_off = add u, 1024:i64
-    phi = add tile, hi_off
-    st phi, hi_q
-    u2 = add u, w8
-    jmp unpack4(u2)
-  unpack6_lo(u6:i64):
-    u6_more = lt u6, 1024:i64
-    br u6_more, unpack6_lo_body, unpack6_hi(0:i64)
-  unpack6_lo_body:
-    pn6 = add wb, u6
-    nv6 = ld pn6:vx
-    lo6 = vand nv6, v_lo_mask:i8
-    hi6 = vushr nv6, four:i8
-    plo6 = add tile, u6
-    st plo6, lo6
-    hi6_off = add u6, 1024:i64
-    phi6 = add tile, hi6_off
-    st phi6, hi6
-    u6b = add u6, w8
-    jmp unpack6_lo(u6b)
-  unpack6_hi(uh:i64):
-    uh_more = lt uh, 512:i64
-    br uh_more, unpack6_hi_body, sub(0:i64, tile)
-  unpack6_hi_body:
-    hb_base = add wb, 1024:i64
-    phb = add hb_base, uh
-    hb = ld phb:vx
-    hbits0 = vand hb, v_three:i8
-    htop0 = vshl hbits0, four:i8
-    ht_off0 = add uh, 0:i64
-    pt0 = add tile, ht_off0
-    tl0 = ld pt0:vx
-    tq0 = vor tl0, htop0:i8
-    tv0 = vsub tq0, v_32:i8
-    st pt0, tv0
-    hs1 = vushr hb, 2:i8
-    hbits1 = vand hs1, v_three:i8
-    htop1 = vshl hbits1, four:i8
-    ht_off1 = add uh, 512:i64
-    pt1 = add tile, ht_off1
-    tl1 = ld pt1:vx
-    tq1 = vor tl1, htop1:i8
-    tv1 = vsub tq1, v_32:i8
-    st pt1, tv1
-    hs2 = vushr hb, 4:i8
-    hbits2 = vand hs2, v_three:i8
-    htop2 = vshl hbits2, four:i8
-    ht_off2 = add uh, 1024:i64
-    pt2 = add tile, ht_off2
-    tl2 = ld pt2:vx
-    tq2 = vor tl2, htop2:i8
-    tv2 = vsub tq2, v_32:i8
-    st pt2, tv2
-    hs3 = vushr hb, 6:i8
-    hbits3 = vand hs3, v_three:i8
-    htop3 = vshl hbits3, four:i8
-    ht_off3 = add uh, 1536:i64
-    pt3 = add tile, ht_off3
-    tl3 = ld pt3:vx
-    tq3 = vor tl3, htop3:i8
-    tv3 = vsub tq3, v_32:i8
-    st pt3, tv3
-    uh2 = add uh, w8
-    jmp unpack6_hi(uh2)
-  sub(si:i64, wt:ptr):
-    si_more = lt si, nsub
-    br si_more, sub_start, block_next
-  sub_start:
-    jmp zero_dots(0:i64)
-  zero_dots(zd:i64):
-    zd_more = lt zd, 64:i64
-    br zd_more, zero_dots_body, sub_mm
-  zero_dots_body:
-    zd_rest = sub 64:i64, zd
-    zd_off = mul zd, 4:i64
-    pzd = add dots, zd_off
-    stm pzd, v_zero, zd_rest:i32
-    zd2 = add zd, w
-    jmp zero_dots(zd2)
-  sub_mm:
-    br is_q6, mm16, mm32
-  mm32:
+    wb0 = add wc, blk_off
     xb_off = mul b, 32:i64
-    xb = add xq, xb_off
-    mm dots, xb, wt, 1:i64, 64:i64, 32:i64:i8
-    jmp sub_scale
-  mm16:
-    x16_b = mul b, 32:i64
-    x16_s = mul si, 16:i64
-    x16_off = add x16_b, x16_s
-    xb16 = add xq, x16_off
-    w16_off = mul si, 1024:i64
-    wt16 = add wt, w16_off
-    mm dots, xb16, wt16, 1:i64, 64:i64, 16:i64:i8
-    jmp sub_scale
-  sub_scale:
+    sb_off = mul b, sc_blk
+    sb = add sc, sb_off
     d_off = mul b, 4:i64
+    xb = add xq, xb_off
     pd = add dx, d_off
     d = ld pd:f32
     vd = splat d:vx
-    sb_b = mul b, nsub
-    sb_i = add sb_b, si
-    sb_off = mul sb_i, 128:i64
-    sb = add sc, sb_off
-    jmp accum(0:i64)
-  accum(j:i64):
+    jmp strips(0:i64)
+  strips(j:i64):
     j_more = lt j, 64:i64
-    br j_more, accum_body, sub_next
-  accum_body:
-    # Two vectors of outputs per step, from one full vector of f16 scales (its low and high
-    # halves widened to f32); a partial load would cost a lane-by-lane copy on Cranelift.
-    j_rest = sub 64:i64, j
-    sj_off = mul j, 2:i64
-    ps = add sb, sj_off
-    s16 = ldm ps:vx, j_rest:f16
-    j_off = mul j, 4:i64
-    pp = add dots, j_off
-    py = add dst, j_off
-    p = ldm pp:vx, j_rest:i32
-    pf = vitof p:f32
-    s = vfwidenlo s16:f16
-    ds = vmul s, vd:f32
-    acc = ldm py:vx, j_rest:f32
-    acc2 = vfma pf, ds, acc:f32
-    stm py, acc2, j_rest:f32
-    jh = add j, w
-    jh_rest = sub 64:i64, jh
-    jh_off = mul jh, 4:i64
-    pph = add dots, jh_off
-    pyh = add dst, jh_off
-    ph = ldm pph:vx, jh_rest:i32
-    pfh = vitof ph:f32
-    sh = vfwidenhi s16:f16
-    dsh = vmul sh, vd:f32
-    acch = ldm pyh:vx, jh_rest:f32
-    acc2h = vfma pfh, dsh, acch:f32
-    stm pyh, acc2h, jh_rest:f32
-    j2 = add jh, w
-    jmp accum(j2)
-  sub_next:
-    si2 = add si, 1:i64
-    jmp sub(si2, wt)
+    br j_more, strip_start, block_next
+  strip_start:
+    j4 = mul j, 4:i64
+    wb = add wb0, j4
+    br is_q4, q4(0:i64, vi_zero, vi_zero), not_q4
+  not_q4:
+    br is_q6, q6(0:i64, vi_zero, vi_zero), q8(0:i64, vi_zero, vi_zero)
   block_next:
     b2 = add b, 1:i64
     jmp blocks(b2)
+  q8(gq8:i64, q8l:vx, q8h:vx):
+    q8_more = lt gq8, 4:i64
+    br q8_more, q8_body, scale(q8l, q8h)
+  q8_body:
+    q8_go = mul gq8, 256:i64
+    q8_pl = add wb, q8_go
+    q8_wl = ld q8_pl:vx
+    q8_ph = add q8_pl, 1024:i64
+    q8_wh = ld q8_ph:vx
+    q8_g4 = mul gq8, 4:i64
+    q8_pxl = add xb, q8_g4
+    q8_xl = ld q8_pxl:i32
+    q8_vxl = splat q8_xl:vx
+    q8_pxh = add q8_pxl, 16:i64
+    q8_xh = ld q8_pxh:i32
+    q8_vxh = splat q8_xh:vx
+    q8l2 = vdot q8l, q8_wl, q8_vxl:i8
+    q8h2 = vdot q8h, q8_wh, q8_vxh:i8
+    q8_g2 = add gq8, 1:i64
+    jmp q8(q8_g2, q8l2, q8h2)
+  q4(gq4:i64, q4l:vx, q4h:vx):
+    q4_more = lt gq4, 4:i64
+    br q4_more, q4_body, scale(q4l, q4h)
+  q4_body:
+    q4_go = mul gq4, 256:i64
+    q4_pn = add wb, q4_go
+    q4_nv = ld q4_pn:vx
+    q4_lo = vand q4_nv, v_lo_mask:i8
+    q4_wl = vsub q4_lo, v_eight:i8
+    q4_hi = vushr q4_nv, 4:i8
+    q4_wh = vsub q4_hi, v_eight:i8
+    q4_g4 = mul gq4, 4:i64
+    q4_pxl = add xb, q4_g4
+    q4_xl = ld q4_pxl:i32
+    q4_vxl = splat q4_xl:vx
+    q4_pxh = add q4_pxl, 16:i64
+    q4_xh = ld q4_pxh:i32
+    q4_vxh = splat q4_xh:vx
+    q4l2 = vdot q4l, q4_wl, q4_vxl:i8
+    q4h2 = vdot q4h, q4_wh, q4_vxh:i8
+    q4_g2 = add gq4, 1:i64
+    jmp q4(q4_g2, q4l2, q4h2)
+  q6(gq6:i64, q6l:vx, q6h:vx):
+    q6_more = lt gq6, 4:i64
+    br q6_more, q6_body, scale(q6l, q6h)
+  q6_body:
+    q6_go = mul gq6, 256:i64
+    q6_pn = add wb, q6_go
+    q6_nv = ld q6_pn:vx
+    q6_l4 = vand q6_nv, v_lo_mask:i8
+    q6_h4 = vushr q6_nv, 4:i8
+    q6_gp = and gq6, 1:i64
+    q6_gpo = mul q6_gp, 256:i64
+    q6_hpb = add wb, 1024:i64
+    q6_php = add q6_hpb, q6_gpo
+    q6_hp = ld q6_php:vx
+    q6_pair = ushr gq6, 1:i64
+    q6_shl = mul q6_pair, 2:i64
+    q6_shh = add q6_shl, 4:i64
+    q6_bl0 = vushr q6_hp, q6_shl:i8
+    q6_bl = vand q6_bl0, v_three:i8
+    q6_bl4 = vshl q6_bl, 4:i8
+    q6_wla = vor q6_l4, q6_bl4:i8
+    q6_wl = vsub q6_wla, v_32:i8
+    q6_bh0 = vushr q6_hp, q6_shh:i8
+    q6_bh = vand q6_bh0, v_three:i8
+    q6_bh4 = vshl q6_bh, 4:i8
+    q6_wha = vor q6_h4, q6_bh4:i8
+    q6_wh = vsub q6_wha, v_32:i8
+    q6_g4 = mul gq6, 4:i64
+    q6_pxl = add xb, q6_g4
+    q6_xl = ld q6_pxl:i32
+    q6_vxl = splat q6_xl:vx
+    q6_pxh = add q6_pxl, 16:i64
+    q6_xh = ld q6_pxh:i32
+    q6_vxh = splat q6_xh:vx
+    q6l2 = vdot q6l, q6_wl, q6_vxl:i8
+    q6h2 = vdot q6h, q6_wh, q6_vxh:i8
+    q6_g2 = add gq6, 1:i64
+    jmp q6(q6_g2, q6l2, q6h2)
+  scale(sl:vx, sh:vx):
+    j2b = mul j, 2:i64
+    ps = add sb, j2b
+    s_rest = sub 64:i64, j
+    s16 = ldm ps:vx, s_rest:f16
+    s = vfwidenlo s16:f16
+    py = add dst, j4
+    acc = ld py:vx
+    ds = vmul s, vd:f32
+    br is_q6, scale6, scale4
+  scale4:
+    dsum = vadd sl, sh:i32
+    pf = vitof dsum:f32
+    acc2 = vfma pf, ds, acc:f32
+    st py, acc2
+    j2 = add j, w
+    jmp strips(j2)
+  scale6:
+    ps1 = add ps, 128:i64
+    s16h = ldm ps1:vx, s_rest:f16
+    s1 = vfwidenlo s16h:f16
+    pfl = vitof sl:f32
+    accl = vfma pfl, ds, acc:f32
+    ds1 = vmul s1, vd:f32
+    pfh = vitof sh:f32
+    acch = vfma pfh, ds1, accl:f32
+    st py, acch
+    j3 = add j, w
+    jmp strips(j3)
   done:
-    free tile
-    free dots
+    ret
+
+# qmat_chunk for 4 tokens at once: token t's int8 activations at xq + t * xs, its scales
+# at dx + t * xs / 8, its 64 results at dst + 256 t. Each weight vector is loaded and
+# unpacked once for the four tokens; every result is exactly qmat_chunk's.
+fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
+  b0:
+    wq = ld mat:ptr
+    mat1 = add mat, 8:i64
+    scales = ld mat1:ptr
+    mat2 = add mat, 16:i64
+    fmt = ld mat2:i64
+    is_q4 = eq fmt, 1:i64
+    is_q6 = eq fmt, 2:i64
+    w = vl i32
+    nb = udiv k, 32:i64
+    blk_q4 = cst 1024:i64
+    blk_q6 = cst 1536:i64
+    blk_q8 = cst 2048:i64
+    blk_a = select is_q4, blk_q4, blk_q8
+    blk_bytes = select is_q6, blk_q6, blk_a
+    one = cst 1:i64
+    two = cst 2:i64
+    nsub = select is_q6, two, one
+    chunk_w = mul nb, blk_bytes
+    w_off = mul c, chunk_w
+    wc = add wq, w_off
+    sc_blk = mul nsub, 128:i64
+    chunk_s = mul nb, sc_blk
+    s_off = mul c, chunk_s
+    sc = add scales, s_off
+    zf = cst 0.0:f32
+    v_zero = splat zf:vx
+    zi = cst 0:i32
+    vi_zero = splat zi:vx
+    lo_mask = cst 15:i8
+    v_lo_mask = splat lo_mask:vx
+    eight = cst 8:i8
+    v_eight = splat eight:vx
+    three = cst 3:i8
+    v_three = splat three:vx
+    off32 = cst 32:i8
+    v_32 = splat off32:vx
+    ds_stride = udiv xs, 8:i64
+    xq0 = add xq, 0:i64
+    dx0 = add dx, 0:i64
+    xo1 = mul xs, 1:i64
+    xq1 = add xq, xo1
+    do1 = mul ds_stride, 1:i64
+    dx1 = add dx, do1
+    xo2 = mul xs, 2:i64
+    xq2 = add xq, xo2
+    do2 = mul ds_stride, 2:i64
+    dx2 = add dx, do2
+    xo3 = mul xs, 3:i64
+    xq3 = add xq, xo3
+    do3 = mul ds_stride, 3:i64
+    dx3 = add dx, do3
+    jmp zero(0:i64)
+  zero(z:i64):
+    z_more = lt z, 64:i64
+    br z_more, zero_body, blocks(0:i64)
+  zero_body:
+    z4 = mul z, 4:i64
+    pz0 = add dst, z4
+    st pz0, v_zero
+    zo1 = add z4, 256:i64
+    pz1 = add dst, zo1
+    st pz1, v_zero
+    zo2 = add z4, 512:i64
+    pz2 = add dst, zo2
+    st pz2, v_zero
+    zo3 = add z4, 768:i64
+    pz3 = add dst, zo3
+    st pz3, v_zero
+    z2 = add z, w
+    jmp zero(z2)
+  blocks(b:i64):
+    b_more = lt b, nb
+    br b_more, block_start, done
+  block_start:
+    blk_off = mul b, blk_bytes
+    wb0 = add wc, blk_off
+    xb_off = mul b, 32:i64
+    sb_off = mul b, sc_blk
+    sb = add sc, sb_off
+    d_off = mul b, 4:i64
+    xb0 = add xq0, xb_off
+    pd0 = add dx0, d_off
+    d0 = ld pd0:f32
+    vd0 = splat d0:vx
+    xb1 = add xq1, xb_off
+    pd1 = add dx1, d_off
+    d1 = ld pd1:f32
+    vd1 = splat d1:vx
+    xb2 = add xq2, xb_off
+    pd2 = add dx2, d_off
+    d2 = ld pd2:f32
+    vd2 = splat d2:vx
+    xb3 = add xq3, xb_off
+    pd3 = add dx3, d_off
+    d3 = ld pd3:f32
+    vd3 = splat d3:vx
+    jmp strips(0:i64)
+  strips(j:i64):
+    j_more = lt j, 64:i64
+    br j_more, strip_start, block_next
+  strip_start:
+    j4 = mul j, 4:i64
+    wb = add wb0, j4
+    br is_q4, q4(0:i64, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero), not_q4
+  not_q4:
+    br is_q6, q6(0:i64, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero), q8(0:i64, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero, vi_zero)
+  block_next:
+    b2 = add b, 1:i64
+    jmp blocks(b2)
+  q8(gq8:i64, q8l0:vx, q8h0:vx, q8l1:vx, q8h1:vx, q8l2:vx, q8h2:vx, q8l3:vx, q8h3:vx):
+    q8_more = lt gq8, 4:i64
+    br q8_more, q8_body, scale(q8l0, q8h0, q8l1, q8h1, q8l2, q8h2, q8l3, q8h3)
+  q8_body:
+    q8_go = mul gq8, 256:i64
+    q8_pl = add wb, q8_go
+    q8_wl = ld q8_pl:vx
+    q8_ph = add q8_pl, 1024:i64
+    q8_wh = ld q8_ph:vx
+    q8_g4 = mul gq8, 4:i64
+    q8_pxl0 = add xb0, q8_g4
+    q8_xl0 = ld q8_pxl0:i32
+    q8_vxl0 = splat q8_xl0:vx
+    q8_pxh0 = add q8_pxl0, 16:i64
+    q8_xh0 = ld q8_pxh0:i32
+    q8_vxh0 = splat q8_xh0:vx
+    q8l20 = vdot q8l0, q8_wl, q8_vxl0:i8
+    q8h20 = vdot q8h0, q8_wh, q8_vxh0:i8
+    q8_pxl1 = add xb1, q8_g4
+    q8_xl1 = ld q8_pxl1:i32
+    q8_vxl1 = splat q8_xl1:vx
+    q8_pxh1 = add q8_pxl1, 16:i64
+    q8_xh1 = ld q8_pxh1:i32
+    q8_vxh1 = splat q8_xh1:vx
+    q8l21 = vdot q8l1, q8_wl, q8_vxl1:i8
+    q8h21 = vdot q8h1, q8_wh, q8_vxh1:i8
+    q8_pxl2 = add xb2, q8_g4
+    q8_xl2 = ld q8_pxl2:i32
+    q8_vxl2 = splat q8_xl2:vx
+    q8_pxh2 = add q8_pxl2, 16:i64
+    q8_xh2 = ld q8_pxh2:i32
+    q8_vxh2 = splat q8_xh2:vx
+    q8l22 = vdot q8l2, q8_wl, q8_vxl2:i8
+    q8h22 = vdot q8h2, q8_wh, q8_vxh2:i8
+    q8_pxl3 = add xb3, q8_g4
+    q8_xl3 = ld q8_pxl3:i32
+    q8_vxl3 = splat q8_xl3:vx
+    q8_pxh3 = add q8_pxl3, 16:i64
+    q8_xh3 = ld q8_pxh3:i32
+    q8_vxh3 = splat q8_xh3:vx
+    q8l23 = vdot q8l3, q8_wl, q8_vxl3:i8
+    q8h23 = vdot q8h3, q8_wh, q8_vxh3:i8
+    q8_g2 = add gq8, 1:i64
+    jmp q8(q8_g2, q8l20, q8h20, q8l21, q8h21, q8l22, q8h22, q8l23, q8h23)
+  q4(gq4:i64, q4l0:vx, q4h0:vx, q4l1:vx, q4h1:vx, q4l2:vx, q4h2:vx, q4l3:vx, q4h3:vx):
+    q4_more = lt gq4, 4:i64
+    br q4_more, q4_body, scale(q4l0, q4h0, q4l1, q4h1, q4l2, q4h2, q4l3, q4h3)
+  q4_body:
+    q4_go = mul gq4, 256:i64
+    q4_pn = add wb, q4_go
+    q4_nv = ld q4_pn:vx
+    q4_lo = vand q4_nv, v_lo_mask:i8
+    q4_wl = vsub q4_lo, v_eight:i8
+    q4_hi = vushr q4_nv, 4:i8
+    q4_wh = vsub q4_hi, v_eight:i8
+    q4_g4 = mul gq4, 4:i64
+    q4_pxl0 = add xb0, q4_g4
+    q4_xl0 = ld q4_pxl0:i32
+    q4_vxl0 = splat q4_xl0:vx
+    q4_pxh0 = add q4_pxl0, 16:i64
+    q4_xh0 = ld q4_pxh0:i32
+    q4_vxh0 = splat q4_xh0:vx
+    q4l20 = vdot q4l0, q4_wl, q4_vxl0:i8
+    q4h20 = vdot q4h0, q4_wh, q4_vxh0:i8
+    q4_pxl1 = add xb1, q4_g4
+    q4_xl1 = ld q4_pxl1:i32
+    q4_vxl1 = splat q4_xl1:vx
+    q4_pxh1 = add q4_pxl1, 16:i64
+    q4_xh1 = ld q4_pxh1:i32
+    q4_vxh1 = splat q4_xh1:vx
+    q4l21 = vdot q4l1, q4_wl, q4_vxl1:i8
+    q4h21 = vdot q4h1, q4_wh, q4_vxh1:i8
+    q4_pxl2 = add xb2, q4_g4
+    q4_xl2 = ld q4_pxl2:i32
+    q4_vxl2 = splat q4_xl2:vx
+    q4_pxh2 = add q4_pxl2, 16:i64
+    q4_xh2 = ld q4_pxh2:i32
+    q4_vxh2 = splat q4_xh2:vx
+    q4l22 = vdot q4l2, q4_wl, q4_vxl2:i8
+    q4h22 = vdot q4h2, q4_wh, q4_vxh2:i8
+    q4_pxl3 = add xb3, q4_g4
+    q4_xl3 = ld q4_pxl3:i32
+    q4_vxl3 = splat q4_xl3:vx
+    q4_pxh3 = add q4_pxl3, 16:i64
+    q4_xh3 = ld q4_pxh3:i32
+    q4_vxh3 = splat q4_xh3:vx
+    q4l23 = vdot q4l3, q4_wl, q4_vxl3:i8
+    q4h23 = vdot q4h3, q4_wh, q4_vxh3:i8
+    q4_g2 = add gq4, 1:i64
+    jmp q4(q4_g2, q4l20, q4h20, q4l21, q4h21, q4l22, q4h22, q4l23, q4h23)
+  q6(gq6:i64, q6l0:vx, q6h0:vx, q6l1:vx, q6h1:vx, q6l2:vx, q6h2:vx, q6l3:vx, q6h3:vx):
+    q6_more = lt gq6, 4:i64
+    br q6_more, q6_body, scale(q6l0, q6h0, q6l1, q6h1, q6l2, q6h2, q6l3, q6h3)
+  q6_body:
+    q6_go = mul gq6, 256:i64
+    q6_pn = add wb, q6_go
+    q6_nv = ld q6_pn:vx
+    q6_l4 = vand q6_nv, v_lo_mask:i8
+    q6_h4 = vushr q6_nv, 4:i8
+    q6_gp = and gq6, 1:i64
+    q6_gpo = mul q6_gp, 256:i64
+    q6_hpb = add wb, 1024:i64
+    q6_php = add q6_hpb, q6_gpo
+    q6_hp = ld q6_php:vx
+    q6_pair = ushr gq6, 1:i64
+    q6_shl = mul q6_pair, 2:i64
+    q6_shh = add q6_shl, 4:i64
+    q6_bl0 = vushr q6_hp, q6_shl:i8
+    q6_bl = vand q6_bl0, v_three:i8
+    q6_bl4 = vshl q6_bl, 4:i8
+    q6_wla = vor q6_l4, q6_bl4:i8
+    q6_wl = vsub q6_wla, v_32:i8
+    q6_bh0 = vushr q6_hp, q6_shh:i8
+    q6_bh = vand q6_bh0, v_three:i8
+    q6_bh4 = vshl q6_bh, 4:i8
+    q6_wha = vor q6_h4, q6_bh4:i8
+    q6_wh = vsub q6_wha, v_32:i8
+    q6_g4 = mul gq6, 4:i64
+    q6_pxl0 = add xb0, q6_g4
+    q6_xl0 = ld q6_pxl0:i32
+    q6_vxl0 = splat q6_xl0:vx
+    q6_pxh0 = add q6_pxl0, 16:i64
+    q6_xh0 = ld q6_pxh0:i32
+    q6_vxh0 = splat q6_xh0:vx
+    q6l20 = vdot q6l0, q6_wl, q6_vxl0:i8
+    q6h20 = vdot q6h0, q6_wh, q6_vxh0:i8
+    q6_pxl1 = add xb1, q6_g4
+    q6_xl1 = ld q6_pxl1:i32
+    q6_vxl1 = splat q6_xl1:vx
+    q6_pxh1 = add q6_pxl1, 16:i64
+    q6_xh1 = ld q6_pxh1:i32
+    q6_vxh1 = splat q6_xh1:vx
+    q6l21 = vdot q6l1, q6_wl, q6_vxl1:i8
+    q6h21 = vdot q6h1, q6_wh, q6_vxh1:i8
+    q6_pxl2 = add xb2, q6_g4
+    q6_xl2 = ld q6_pxl2:i32
+    q6_vxl2 = splat q6_xl2:vx
+    q6_pxh2 = add q6_pxl2, 16:i64
+    q6_xh2 = ld q6_pxh2:i32
+    q6_vxh2 = splat q6_xh2:vx
+    q6l22 = vdot q6l2, q6_wl, q6_vxl2:i8
+    q6h22 = vdot q6h2, q6_wh, q6_vxh2:i8
+    q6_pxl3 = add xb3, q6_g4
+    q6_xl3 = ld q6_pxl3:i32
+    q6_vxl3 = splat q6_xl3:vx
+    q6_pxh3 = add q6_pxl3, 16:i64
+    q6_xh3 = ld q6_pxh3:i32
+    q6_vxh3 = splat q6_xh3:vx
+    q6l23 = vdot q6l3, q6_wl, q6_vxl3:i8
+    q6h23 = vdot q6h3, q6_wh, q6_vxh3:i8
+    q6_g2 = add gq6, 1:i64
+    jmp q6(q6_g2, q6l20, q6h20, q6l21, q6h21, q6l22, q6h22, q6l23, q6h23)
+  scale(sl0:vx, sh0:vx, sl1:vx, sh1:vx, sl2:vx, sh2:vx, sl3:vx, sh3:vx):
+    j2b = mul j, 2:i64
+    ps = add sb, j2b
+    s_rest = sub 64:i64, j
+    s16 = ldm ps:vx, s_rest:f16
+    s = vfwidenlo s16:f16
+    py0 = add dst, j4
+    acc0 = ld py0:vx
+    ds0 = vmul s, vd0:f32
+    yo1 = add j4, 256:i64
+    py1 = add dst, yo1
+    acc1 = ld py1:vx
+    ds1 = vmul s, vd1:f32
+    yo2 = add j4, 512:i64
+    py2 = add dst, yo2
+    acc2 = ld py2:vx
+    ds2 = vmul s, vd2:f32
+    yo3 = add j4, 768:i64
+    py3 = add dst, yo3
+    acc3 = ld py3:vx
+    ds3 = vmul s, vd3:f32
+    br is_q6, scale6, scale4
+  scale4:
+    dsum0 = vadd sl0, sh0:i32
+    pf0 = vitof dsum0:f32
+    acc20 = vfma pf0, ds0, acc0:f32
+    st py0, acc20
+    dsum1 = vadd sl1, sh1:i32
+    pf1 = vitof dsum1:f32
+    acc21 = vfma pf1, ds1, acc1:f32
+    st py1, acc21
+    dsum2 = vadd sl2, sh2:i32
+    pf2 = vitof dsum2:f32
+    acc22 = vfma pf2, ds2, acc2:f32
+    st py2, acc22
+    dsum3 = vadd sl3, sh3:i32
+    pf3 = vitof dsum3:f32
+    acc23 = vfma pf3, ds3, acc3:f32
+    st py3, acc23
+    j2 = add j, w
+    jmp strips(j2)
+  scale6:
+    ps1 = add ps, 128:i64
+    s16h = ldm ps1:vx, s_rest:f16
+    s1 = vfwidenlo s16h:f16
+    pfl0 = vitof sl0:f32
+    accl0 = vfma pfl0, ds0, acc0:f32
+    ds10 = vmul s1, vd0:f32
+    pfh0 = vitof sh0:f32
+    acch0 = vfma pfh0, ds10, accl0:f32
+    st py0, acch0
+    pfl1 = vitof sl1:f32
+    accl1 = vfma pfl1, ds1, acc1:f32
+    ds11 = vmul s1, vd1:f32
+    pfh1 = vitof sh1:f32
+    acch1 = vfma pfh1, ds11, accl1:f32
+    st py1, acch1
+    pfl2 = vitof sl2:f32
+    accl2 = vfma pfl2, ds2, acc2:f32
+    ds12 = vmul s1, vd2:f32
+    pfh2 = vitof sh2:f32
+    acch2 = vfma pfh2, ds12, accl2:f32
+    st py2, acch2
+    pfl3 = vitof sl3:f32
+    accl3 = vfma pfl3, ds3, acc3:f32
+    ds13 = vmul s1, vd3:f32
+    pfh3 = vitof sh3:f32
+    acch3 = vfma pfh3, ds13, accl3:f32
+    st py3, acch3
+    j3 = add j, w
+    jmp strips(j3)
+  done:
+    ret
+
+# dst[64t .. 64t + 64] = rows 64c .. 64c + 64 of `mat` times token t's int8 activations,
+# for n tokens xs bytes apart in xq (their scales xs / 8 bytes apart in dx): four at a time
+# with qmat_chunk4, the rest with qmat_chunk, so every result is exactly qmat_chunk's.
+fn qmat_batch(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, n:i64, xs:i64)
+  b0:
+    ds = udiv xs, 8:i64
+    jmp tiles(0:i64)
+  tiles(t:i64):
+    t4 = add t, 4:i64
+    full = le t4, n
+    br full, tile_body, rest(t)
+  tile_body:
+    xo = mul t, xs
+    pxq = add xq, xo
+    dofs = mul t, ds
+    pdx = add dx, dofs
+    oo = mul t, 256:i64
+    po = add dst, oo
+    call qmat_chunk4(c, mat, pxq, pdx, po, k, xs)
+    jmp tiles(t4)
+  rest(r:i64):
+    r_more = lt r, n
+    br r_more, rest_body, done
+  rest_body:
+    rxo = mul r, xs
+    rxq = add xq, rxo
+    rdo = mul r, ds
+    rdx = add dx, rdo
+    roo = mul r, 256:i64
+    ro = add dst, roo
+    call qmat_chunk(c, mat, rxq, rdx, ro, k)
+    r2 = add r, 1:i64
+    jmp rest(r2)
+  done:
     ret
 
 # Q8_0 quantization of x[0 .. k] (k a multiple of 32), as llama.cpp's quantize_row_q8_0:

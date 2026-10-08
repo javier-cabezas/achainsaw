@@ -62,6 +62,8 @@ enum Kernel {
     Zip(VZipOp, Type, Type),
     /// Lane type, width, lane index.
     Dup(Type, Type, u32),
+    /// `vdot c, a, b:i8`.
+    Dot(Type),
 }
 
 impl Kernel {
@@ -80,6 +82,7 @@ impl Kernel {
             Kernel::FastReduce(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
             Kernel::Zip(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Dup(l, w, i) => format!("k_vdup{i}_{l}_{w}"),
+            Kernel::Dot(w) => format!("k_vdot_{w}"),
         }
     }
 
@@ -103,6 +106,7 @@ impl Kernel {
             Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
             Kernel::Zip(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
             Kernel::Dup(l, w, i) => format!("{}    r = vdup a, {i}:{l}\n", loads(*w)),
+            Kernel::Dot(w) => format!("{}    r = vdot c, a, b:i8\n", loads(*w)),
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
@@ -129,7 +133,7 @@ impl Kernel {
             | Kernel::FastReduce(_, l, _)
             | Kernel::Zip(_, l, _)
             | Kernel::Dup(l, _, _) => *l,
-            Kernel::Sel(_) => Type::I8,
+            Kernel::Sel(_) | Kernel::Dot(_) => Type::I8,
         }
     }
 
@@ -164,7 +168,8 @@ impl Kernel {
             | Kernel::FastBin(_, _, w)
             | Kernel::FastReduce(_, _, w)
             | Kernel::Zip(_, _, w)
-            | Kernel::Dup(_, w, _) => *w,
+            | Kernel::Dup(_, w, _)
+            | Kernel::Dot(w) => *w,
         }
     }
 
@@ -193,7 +198,8 @@ impl Kernel {
             | Kernel::Sel(..)
             | Kernel::Shift(..)
             | Kernel::Zip(..)
-            | Kernel::Dup(..) => false,
+            | Kernel::Dup(..)
+            | Kernel::Dot(..) => false,
         }
     }
 }
@@ -248,6 +254,7 @@ fn all_kernels() -> Vec<Kernel> {
                 ks.push(Kernel::Dup(l, w, i));
             }
         }
+        ks.push(Kernel::Dot(w));
         for l in [Type::F32, Type::F64] {
             for op in [VBinOp::Min, VBinOp::Max] {
                 ks.push(Kernel::FastBin(op, l, w));
@@ -638,6 +645,16 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 out[i * s..i * s + s].copy_from_slice(&ab[j * s..j * s + s]);
             }
         }
+        // Four exact i8 products per i32 lane, added to c's lane with wrapping.
+        Kernel::Dot(_) => {
+            for i in 0..w / 4 {
+                let dot: i64 = (0..4)
+                    .map(|q| get_int(a, Type::I8, 4 * i + q) * get_int(b, Type::I8, 4 * i + q))
+                    .sum();
+                let r = (get_int(c, Type::I32, i) as i32).wrapping_add(dot as i32);
+                put_int(&mut out, Type::I32, i, r as i64);
+            }
+        }
         Kernel::Dup(l, _, k) => {
             let (s, k) = (l.byte_size(), k as usize);
             for i in 0..n {
@@ -988,25 +1005,29 @@ fn check_against_reference(kernels: &[Kernel], levels: Vec<(IsaLevel, CpuFeature
 #[test]
 fn vector_ops_compile_for_every_target() {
     let modules = modules_by_mode(&all_kernels());
+    // VNNI and DotProd select other `vdot` sequences.
     let targets = [
-        ("x86_64-unknown-linux-gnu", "x86-64"),
-        ("x86_64-unknown-linux-gnu", "x86-64-v2"),
-        ("x86_64-unknown-linux-gnu", "x86-64-v3"),
-        ("x86_64-unknown-linux-gnu", "x86-64-v4"),
-        ("aarch64-unknown-linux-gnu", "generic"),
+        ("x86_64-unknown-linux-gnu", "x86-64", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v2", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v3", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v3", "+avxvnni"),
+        ("x86_64-unknown-linux-gnu", "x86-64-v4", ""),
+        ("x86_64-unknown-linux-gnu", "x86-64-v4", "+avx512vnni"),
+        ("aarch64-unknown-linux-gnu", "generic", ""),
+        ("aarch64-unknown-linux-gnu", "generic", "+dotprod"),
     ];
-    for (triple, cpu) in targets {
+    for (triple, cpu, features) in targets {
         for (fast, _, module) in &modules {
             let mut compiler = AotCompiler::with_target(&AotTarget {
                 triple: Some(triple.into()),
                 cpu: Some(cpu.into()),
-                features: None,
+                features: (!features.is_empty()).then(|| features.into()),
             })
             .unwrap();
             compiler.set_fast_math(*fast);
             compiler
                 .compile_module(module)
-                .unwrap_or_else(|e| panic!("{triple} {cpu} fast_math={fast}: {e}"));
+                .unwrap_or_else(|e| panic!("{triple} {cpu} {features} fast_math={fast}: {e}"));
             assert!(!compiler.finish().unwrap().is_empty());
         }
     }
@@ -1132,8 +1153,11 @@ fn shift(pa:ptr, po:ptr)
 pub const LLVM_TARGETS: &[(&str, &str, &str)] = &[
     ("x86_64-unknown-linux-gnu", "x86-64", ""),
     ("x86_64-unknown-linux-gnu", "x86-64-v3", ""),
+    ("x86_64-unknown-linux-gnu", "x86-64-v3", "+avxvnni"),
     ("x86_64-unknown-linux-gnu", "x86-64-v4", ""),
+    ("x86_64-unknown-linux-gnu", "x86-64-v4", "+avx512vnni"),
     ("aarch64-unknown-linux-gnu", "generic", ""),
+    ("aarch64-unknown-linux-gnu", "generic", "+dotprod"),
     ("aarch64-unknown-linux-gnu", "generic", "+sve"),
     ("aarch64-unknown-linux-gnu", "generic", "+sve2"),
 ];

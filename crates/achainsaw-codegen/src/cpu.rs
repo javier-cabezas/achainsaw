@@ -573,6 +573,23 @@ impl CpuFeatures {
         }
     }
 
+    /// Int8 dot-product instructions LLVM `vdot` may use with these features.
+    #[cfg(feature = "llvm")]
+    pub fn llvm_int8_dot(&self) -> achainsaw_llvm::Int8Dot {
+        let x86 = self.arch == Arch::X86_64;
+        let x86_vnni_bits = if x86 && self.has(F::Avx512vnni) && self.has(F::Avx512vl) {
+            512
+        } else if x86 && self.has(F::AvxVnni) {
+            256
+        } else {
+            0
+        };
+        achainsaw_llvm::Int8Dot {
+            x86_vnni_bits,
+            arm_dotprod: self.arch == Arch::Aarch64 && self.has(F::Dotprod),
+        }
+    }
+
     /// Whether these features convert f16 <-> f32 vectors in hardware: x86 F16C, or any
     /// AArch64 (FCVTL/FCVTN are baseline).
     #[cfg(feature = "llvm")]

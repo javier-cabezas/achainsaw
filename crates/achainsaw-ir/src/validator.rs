@@ -156,6 +156,9 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
     }
 }
 
+/// Operand lane types of `vdot` (four per i32 lane of the accumulator).
+pub const VDOT_LANE_TYPES: &[Type] = &[Type::I8];
+
 /// Lane types of the permutations (`vrev`, `vziplo` and the other `VZipOp`s, `vdup`), which
 /// only move lanes: every lane width, including the 16-bit floats.
 pub const VPERM_LANE_TYPES: &[Type] = COUNT_LANES;
@@ -966,6 +969,18 @@ impl Validator {
             } => {
                 Self::check_lane("vfma", *lane, VFMA_LANE_TYPES, *span)?;
                 let vec_ty = self.check_same_vectors(ctx, "vfma", &[a, b, c], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VDot {
+                dst,
+                acc,
+                a,
+                b,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vdot", *lane, VDOT_LANE_TYPES, *span)?;
+                let vec_ty = self.check_same_vectors(ctx, "vdot", &[acc, a, b], scope, *span)?;
                 Self::define(scope, defs, dst, vec_ty, *span)?;
             }
             Instruction::VCmp {

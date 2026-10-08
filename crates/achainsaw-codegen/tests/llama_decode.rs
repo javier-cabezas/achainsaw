@@ -47,11 +47,13 @@ impl Fmt {
 }
 
 /// A Q8_0, Q4_0 or Q6_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0, -32..=31 for
-/// Q6_K) and f16 scales `s` [k/group x rows], plus the kernel's packed layout: 64-row chunks
-/// with, per 32-block, k-major int8 [32 x 64] for Q8_0; 1024 bytes for Q4_0 whose byte
-/// t * 64 + r holds row r's element t (low nibble) and t + 16 (high nibble), offset by 8;
-/// for Q6_K those nibbles of the low 4 bits of the values offset by 32, then 512 bytes whose
-/// byte t * 64 + r holds the high 2 bits of elements t, t + 8, t + 16, t + 24.
+/// Q6_K) and f16 scales `s` [k/group x rows], plus the kernel's packed layout (see
+/// `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of 4 consecutive
+/// elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row r's element
+/// 4g + q for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and 16 + 4g + q (high
+/// nibble), offset by 8; for Q6_K those nibbles of the low 4 bits of the values offset by
+/// 32, then 512 bytes whose byte (g * 64 + r) * 4 + q (g < 2) holds the high 2 bits of
+/// element 8p + 4g + q in bit pair p.
 struct Mat {
     rows: usize,
     k: usize,
@@ -102,15 +104,17 @@ impl Mat {
                 let blk = (c * nb + b) * block_bytes;
                 for r in 0..64 {
                     let v = q[(c * 64 + r) * k + kk];
+                    // Byte q of group g's 32-bit lane for row r.
+                    let at = |g: usize, q: usize| blk + (g * 64 + r) * 4 + q;
+                    let n = t % 16;
                     match fmt {
-                        Fmt::Q8 => packed_q[blk + t * 64 + r] = v as u8,
-                        Fmt::Q4 => {
-                            packed_q[blk + (t % 16) * 64 + r] |= ((v + 8) as u8) << (4 * (t / 16))
-                        }
+                        Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8,
+                        Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
                         Fmt::Q6 => {
                             let u = (v + 32) as u8;
-                            packed_q[blk + (t % 16) * 64 + r] |= (u & 15) << (4 * (t / 16));
-                            packed_q[blk + 1024 + (t % 8) * 64 + r] |= (u >> 4) << (2 * (t / 8));
+                            packed_q[at(n / 4, n % 4)] |= (u & 15) << (4 * (t / 16));
+                            let e = t % 8;
+                            packed_q[at(e / 4, e % 4) + 1024] |= (u >> 4) << (2 * (t / 8));
                         }
                     }
                 }
@@ -496,5 +500,83 @@ fn check_decode(mixed: bool) {
             checked_tokens >= 3,
             "only {checked_tokens} clear-cut tokens at {level}"
         );
+    }
+}
+
+type Prefill =
+    extern "C" fn(*const usize, *const i64, *mut f32, *const i64, i64, i64, *mut f32, f32) -> i64;
+
+/// `llama_prefill` over a prompt gives exactly what `llama_decode` gives token by token:
+/// the same KV cache bits, final hidden state bits and next token, whether the prompt goes
+/// in one call (a 4-token tile and a remainder) or in pieces starting past position 0.
+#[test]
+fn llama_prefill_matches_decode_exactly() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/kernels/llama_decode.air"
+    ))
+    .unwrap();
+    let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
+    let prompt: [i64; 6] = [7, 300, 42, 511, 0, 99];
+    for mixed in [false, true] {
+        let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
+        let (table, cfg) = model.tables();
+        let cache_len = model.layers.len() * 2 * model.max_ctx * model.nkv * model.hd;
+        for (level, features) in host_levels() {
+            let mut engine = JitEngine::with_features(&features).unwrap();
+            engine.compile_module(&module).unwrap();
+            let decode: Decode =
+                unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
+            let prefill: Prefill =
+                unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
+            let ctx = format!("{level}{}", if mixed { " mixed Q4/Q8/Q6" } else { "" });
+
+            let mut cache = vec![0f32; cache_len];
+            let mut h = vec![f32::NAN; model.d];
+            let mut next = 0;
+            for (pos, &tok) in prompt.iter().enumerate() {
+                next = decode(
+                    table.as_ptr(),
+                    cfg.as_ptr(),
+                    cache.as_mut_ptr(),
+                    tok,
+                    pos as i64,
+                    h.as_mut_ptr(),
+                    model.eps,
+                );
+            }
+
+            for pieces in [&[6usize][..], &[1, 5]] {
+                let mut p_cache = vec![0f32; cache_len];
+                let mut p_h = vec![f32::NAN; model.d];
+                let mut p_next = -1;
+                let mut pos = 0;
+                for &n in pieces {
+                    p_next = prefill(
+                        table.as_ptr(),
+                        cfg.as_ptr(),
+                        p_cache.as_mut_ptr(),
+                        prompt[pos..].as_ptr(),
+                        n as i64,
+                        pos as i64,
+                        p_h.as_mut_ptr(),
+                        model.eps,
+                    );
+                    pos += n;
+                }
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(p_next, next, "next token, pieces {pieces:?}, {ctx}");
+                assert_eq!(
+                    bits(&p_h),
+                    bits(&h),
+                    "hidden state, pieces {pieces:?}, {ctx}"
+                );
+                assert_eq!(
+                    bits(&p_cache),
+                    bits(&cache),
+                    "KV cache, pieces {pieces:?}, {ctx}"
+                );
+            }
+        }
     }
 }
