@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use achainsaw_ir::ast::{
     vexp, BinaryOp, CastOp, Constant, Function, Instruction, Module, Terminator, UnaryOp, VBinOp,
-    VCmpOp, VShiftOp, VUnaryOp, VectorReduceOp,
+    VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
@@ -1213,6 +1213,31 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 )?);
                 st.values.insert(dst.clone(), (x, *ty));
             }
+            Instruction::VDup {
+                dst, vec, lane, ty, ..
+            } => {
+                let (v, vty) = self.val(st, vec);
+                let lanes = self.as_lanes(v, vty, *ty)?;
+                let x = vec1!(lanes, |l| b.build_extract_element(
+                    l,
+                    self.c32(*lane),
+                    ""
+                )?);
+                let r = self.splat(x, *ty, vty)?;
+                st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
+            }
+            Instruction::VZip {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                ..
+            } => {
+                let (lv, vty) = self.val(st, lhs);
+                let r = self.vzip(*op, *lane, vty, lv, self.val(st, rhs).0)?;
+                st.values.insert(dst.clone(), (r, vty));
+            }
             Instruction::Alloc { dst, size, .. } => {
                 let (s, sty) = self.val(st, size);
                 let s = if matches!(sty, Type::I64 | Type::Ptr) {
@@ -1986,6 +2011,29 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
             }
             VUnaryOp::Exp => self.vexp(x)?,
+            VUnaryOp::Abs if lane.is_float() => self.intr("llvm.fabs", &[x.get_type()], &[x])?,
+            // `false`: the minimum integer gives itself rather than poison.
+            VUnaryOp::Abs => self.intr(
+                "llvm.abs",
+                &[x.get_type()],
+                &[x, self.i1().const_zero().into()],
+            )?,
+            VUnaryOp::Neg if lane.is_float() => vec1!(x, |a| b.build_float_neg(a, "")?),
+            VUnaryOp::Neg => vec1!(x, |a| b.build_int_neg(a, "")?),
+            VUnaryOp::Sqrt => self.intr("llvm.sqrt", &[x.get_type()], &[x])?,
+            // 1 / sqrt(x) with no fast-math flags, so LLVM never substitutes an estimate.
+            VUnaryOp::Rsqrt => {
+                let root = self.intr("llvm.sqrt", &[x.get_type()], &[x])?;
+                let one = self.splat_const(
+                    self.scalar_type(lane)
+                        .into_float_type()
+                        .const_float(1.0)
+                        .into(),
+                    Self::shape_of(x),
+                )?;
+                vec2!(one, root, |a, c| b.build_float_div(a, c, "")?)
+            }
+            VUnaryOp::Rev => self.intr("llvm.vector.reverse", &[x.get_type()], &[x])?,
             VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
                 // The low or high half of the lanes (for SVE, the index scales with vscale).
                 let n = self.lanes_min(vty, src_lane);
@@ -2006,6 +2054,63 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
         };
         self.to_canon(r, vty)
+    }
+
+    /// `VZip` lane permutations: a shuffle of fixed vectors; scalable vectors, whose lane
+    /// count is only known at run time, use LLVM's interleave and deinterleave intrinsics
+    /// (SVE `zip1`/`zip2`, `uzp1`/`uzp2`).
+    fn vzip(
+        &self,
+        op: VZipOp,
+        lane: Type,
+        vty: Type,
+        l: BasicValueEnum<'ctx>,
+        r: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let x = self.as_lanes(l, vty, lane)?;
+        let y = self.as_lanes(r, vty, lane)?;
+        let n = self.lanes_min(vty, lane);
+        let res = match (x, y) {
+            (BasicValueEnum::VectorValue(x), BasicValueEnum::VectorValue(y)) => {
+                // Lane j of the result is lane pick(j) of x followed by y.
+                let pick = |j: u32| match op {
+                    VZipOp::ZipLo => j / 2 + (j % 2) * n,
+                    VZipOp::ZipHi => n / 2 + j / 2 + (j % 2) * n,
+                    VZipOp::UnzipLo => 2 * j,
+                    VZipOp::UnzipHi => 2 * j + 1,
+                };
+                let mask: Vec<_> = (0..n).map(|j| self.c32(pick(j))).collect();
+                b.build_shuffle_vector(x, y, VectorType::const_vector(&mask), "")?
+                    .into()
+            }
+            (x, y) => {
+                let half_ty = x.get_type();
+                let both_ty = self.vec_of(self.scalar_type(lane), 2 * n, true);
+                // Halves of a scalable vector start at multiples of vscale * n.
+                let half = |i: u32| -> BasicValueEnum<'ctx> { self.c64((i * n) as i64).into() };
+                if op.is_zip() {
+                    let both = self.intr("llvm.vector.interleave2", &[both_ty], &[x, y])?;
+                    let at = half(u32::from(!op.is_lo()));
+                    self.intr("llvm.vector.extract", &[half_ty, both_ty], &[both, at])?
+                } else {
+                    let both = self.intr(
+                        "llvm.vector.insert",
+                        &[both_ty, half_ty],
+                        &[both_ty.const_zero(), x, half(0)],
+                    )?;
+                    let both = self.intr(
+                        "llvm.vector.insert",
+                        &[both_ty, half_ty],
+                        &[both, y, half(1)],
+                    )?;
+                    let pair = self.intr("llvm.vector.deinterleave2", &[both_ty], &[both])?;
+                    let index = u32::from(!op.is_lo());
+                    b.build_extract_value(pair.into_struct_value(), index, "")?
+                }
+            }
+        };
+        self.to_canon(res, vty)
     }
 
     /// `vnarrow lo, hi:lane`: signed saturation to `lane`, `lo`'s lanes then `hi`'s.

@@ -239,16 +239,14 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
 
 # Q8_0 quantization of x[0 .. k] (k a multiple of 32), as llama.cpp's quantize_row_q8_0:
 # dx[b] = max|x in block b| / 127 and xq[32b + t] = round(x[32b + t] / dx[b]), halves away
-# from zero. At full vector width: |x| by clearing the sign bit, rounding by adding 0.5 with
-# the value's sign, then vftoi and two saturating vnarrows down to i8.
+# from zero. At full vector width: |x| with vabs, rounding by adding 0.5 with the value's
+# sign, then vftoi and two saturating vnarrows down to i8.
 fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   b0:
     w = vl f32
     nb = udiv k, 32:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
-    abs_bits = cst 2147483647:i32
-    v_abs = splat abs_bits:vx
     sign_bits = cst -2147483648:i32
     v_sign = splat sign_bits:vx
     half = cst 0.5:f32
@@ -270,7 +268,7 @@ fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
     to = mul t, 4:i64
     pv = add bx, to
     v = ldm pv:vx, rest:f32
-    av = vand v, v_abs:i32
+    av = vabs v:f32
     a2 = vmax a, av:f32
     t2 = add t, w
     jmp amax(t2, a2)

@@ -534,6 +534,33 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses `v, 3:f32` (the operands of `extlane` and `vdup`) up to the end of the line.
+    fn parse_lane_ref(&mut self) -> Result<(String, u32, Type), Diagnostic> {
+        let (vec, _) = self.expect_ident()?;
+        self.expect(TokenKind::Comma)?;
+        let lane = match self.peek_kind() {
+            TokenKind::IntLit(n) => u32::try_from(*n).map_err(|_| {
+                Diagnostic::error(
+                    "ERR_EXPECTED_LANE_INDEX",
+                    format!("Lane index {n} is out of range"),
+                    self.peek().span,
+                )
+            })?,
+            _ => {
+                return Err(Diagnostic::error(
+                    "ERR_EXPECTED_LANE_INDEX",
+                    format!("Expected lane index integer, found {:?}", self.peek_kind()),
+                    self.peek().span,
+                ));
+            }
+        };
+        self.advance();
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect_eol()?;
+        Ok((vec, lane, ty))
+    }
+
     /// Parses the operands of a vector op whose mnemonic `name` was just consumed.
     fn parse_vector_op(
         &mut self,
@@ -584,6 +611,31 @@ impl<'a> Parser<'a> {
                 dst,
                 src,
                 amount,
+                lane,
+                span,
+            });
+        }
+        if name == "vdup" {
+            let (vec, lane, ty) = self.parse_lane_ref()?;
+            return Ok(Instruction::VDup {
+                dst,
+                vec,
+                lane,
+                ty,
+                span,
+            });
+        }
+        if let Some(op) = VZipOp::from_str_opt(name) {
+            let lhs = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let rhs = self.parse_operand(instructions, None)?;
+            let lane = self.parse_lane_suffix(&format!("{name} a, b:f32"))?;
+            self.expect_eol()?;
+            return Ok(Instruction::VZip {
+                op,
+                dst,
+                lhs,
+                rhs,
                 lane,
                 span,
             });
@@ -854,28 +906,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Extlane => {
                 self.advance();
-                let (vec, _) = self.expect_ident()?;
-                self.expect(TokenKind::Comma)?;
-                let lane = match self.peek_kind() {
-                    TokenKind::IntLit(n) => u32::try_from(*n).map_err(|_| {
-                        Diagnostic::error(
-                            "ERR_EXPECTED_LANE_INDEX",
-                            format!("Lane index {n} is out of range"),
-                            self.peek().span,
-                        )
-                    })?,
-                    _ => {
-                        return Err(Diagnostic::error(
-                            "ERR_EXPECTED_LANE_INDEX",
-                            format!("Expected lane index integer, found {:?}", self.peek_kind()),
-                            self.peek().span,
-                        ));
-                    }
-                };
-                self.advance();
-                self.expect(TokenKind::Colon)?;
-                let ty = self.parse_type()?;
-                self.expect_eol()?;
+                let (vec, lane, ty) = self.parse_lane_ref()?;
                 Ok(Instruction::ExtractLane {
                     dst,
                     vec,

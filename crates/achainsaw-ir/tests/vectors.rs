@@ -57,6 +57,17 @@ fn k(pa:ptr, po:ptr)->f64
     stm po, hm, hn:bf16
     st po, nh
     st po, nb
+    ab = vabs a:i8
+    ng = vneg ab:f64
+    sq = vsqrt ng:f32
+    rs = vrsqrt sq:f64
+    rv = vrev rs:bf16
+    zl = vziplo rv, a:i16
+    zh = vziphi zl, a:f32
+    ul = vunziplo zh, zl:i64
+    uh = vunziphi ul, zh:f16
+    dp = vdup uh, 15:i16
+    st po, dp
     ret t
 "#;
 
@@ -146,6 +157,79 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("hb = vfwidenhi a:bf16"), "{text}");
     assert!(text.contains("nh = vnarrow hf, hb:f16"));
     assert!(text.contains("hm = ldm pa:vx, hn:f16"));
+    assert!(text.contains("rs = vrsqrt sq:f64"), "{text}");
+    assert!(text.contains("rv = vrev rs:bf16"));
+    assert!(text.contains("uh = vunziphi ul, zh:f16"));
+    assert!(text.contains("dp = vdup uh, 15:i16"));
+}
+
+#[test]
+fn permutation_and_unary_rules() {
+    let one = |body: &str| {
+        format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
+    };
+    // Square roots are float-only; abs and neg take every arithmetic lane, not f16.
+    for bad in [
+        "r = vsqrt a:i32",
+        "r = vrsqrt a:f16",
+        "r = vabs a:bf16",
+        "r = vneg a:ptr",
+    ] {
+        assert_eq!(
+            err_code(&one(&format!("    {bad}\n"))),
+            "ERR_INVALID_LANE_TYPE",
+            "{bad}"
+        );
+    }
+    // Permutations only move lanes, so they take the 16-bit floats too.
+    for ok in [
+        "r = vziplo a, b:f16",
+        "r = vunziphi a, b:bf16",
+        "r = vrev a:i8",
+        "r = vdup a, 15:bf16",
+    ] {
+        assert!(
+            parse_and_validate(&one(&format!("    {ok}\n"))).is_ok(),
+            "{ok}"
+        );
+    }
+    assert_eq!(
+        err_code(&one("    r = vziplo a, b:ptr\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vziphi a, b\n")),
+        "ERR_EXPECTED_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v128\n    r = vunziplo a, b:i8\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    // vdup's lane index is checked like extlane's: within the width, and within 128 bits
+    // for vx.
+    assert_eq!(
+        err_code(&one("    r = vdup a, 16:i16\n")),
+        "ERR_OUT_OF_BOUNDS_LANE"
+    );
+    assert_eq!(
+        err_code(&one("    r = vdup a, x:i16\n")),
+        "ERR_EXPECTED_LANE_INDEX"
+    );
+    assert_eq!(
+        err_code(
+            "fn k(p:ptr)\n  b0:\n    a = ld p:vx\n    r = vdup a, 4:f32\n    st p, r\n    ret\n"
+        ),
+        "ERR_OUT_OF_BOUNDS_LANE"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr, x:f32)\n  b0:\n    r = vdup x, 0:f32\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    // The result has the operand's vector type.
+    assert!(parse_and_validate("fn k(p:ptr)->f32\n  b0:\n    a = ld p:v512\n    r = vdup a, 15:f32\n    e = extlane r, 0:f32\n    ret e\n").is_ok());
+    // The new mnemonics are still ordinary register names.
+    let src = "fn k(vdup:i32, vziplo:i32)->i32\n  b0:\n    vrev = add vdup, vziplo\n    vabs = mul vrev, vdup\n    ret vabs\n";
+    assert!(parse_and_validate(src).is_ok());
 }
 
 #[test]
