@@ -11,12 +11,12 @@
 
 use achainsaw_codegen::cpu::{CpuFeatures, IsaLevel};
 use achainsaw_codegen::{AotCompiler, AotTarget, JitEngine};
-use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VectorReduceOp};
+use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp};
 use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::{
     vbin_lane_types, vnarrow_source_lane, vunary_lane_types, VFMA_LANE_TYPES, VNARROW_LANE_TYPES,
-    VSHIFT_LANE_TYPES,
+    VPERM_LANE_TYPES, VSHIFT_LANE_TYPES,
 };
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
@@ -59,6 +59,9 @@ enum Kernel {
     FastBin(VBinOp, Type, Type),
     /// `vminr`/`vmaxr` compiled with `fast_math`.
     FastReduce(VectorReduceOp, Type, Type),
+    Zip(VZipOp, Type, Type),
+    /// Lane type, width, lane index.
+    Dup(Type, Type, u32),
 }
 
 impl Kernel {
@@ -75,6 +78,8 @@ impl Kernel {
             Kernel::Shift(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::FastBin(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
             Kernel::FastReduce(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
+            Kernel::Zip(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
+            Kernel::Dup(l, w, i) => format!("k_vdup{i}_{l}_{w}"),
         }
     }
 
@@ -96,6 +101,8 @@ impl Kernel {
             ),
             Kernel::FastBin(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
             Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
+            Kernel::Zip(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
+            Kernel::Dup(l, w, i) => format!("{}    r = vdup a, {i}:{l}\n", loads(*w)),
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
@@ -119,7 +126,9 @@ impl Kernel {
             | Kernel::Narrow(l, _)
             | Kernel::Shift(_, l, _)
             | Kernel::FastBin(_, l, _)
-            | Kernel::FastReduce(_, l, _) => *l,
+            | Kernel::FastReduce(_, l, _)
+            | Kernel::Zip(_, l, _)
+            | Kernel::Dup(l, _, _) => *l,
             Kernel::Sel(_) => Type::I8,
         }
     }
@@ -153,7 +162,9 @@ impl Kernel {
             | Kernel::Narrow(_, w)
             | Kernel::Shift(_, _, w)
             | Kernel::FastBin(_, _, w)
-            | Kernel::FastReduce(_, _, w) => *w,
+            | Kernel::FastReduce(_, _, w)
+            | Kernel::Zip(_, _, w)
+            | Kernel::Dup(_, w, _) => *w,
         }
     }
 
@@ -165,10 +176,12 @@ impl Kernel {
         }
     }
 
-    /// Whether output lanes are floats (compared NaN-tolerantly).
+    /// Whether output lanes are floats (compared NaN-tolerantly). Ops that only move lanes
+    /// or sign bits must keep NaNs bit for bit.
     fn float_output(&self) -> bool {
         match self {
             Kernel::Bin(op, l, _) => l.is_float() && !op.is_bitwise(),
+            Kernel::Unary(VUnaryOp::Abs | VUnaryOp::Neg | VUnaryOp::Rev, ..) => false,
             Kernel::Fma(..)
             | Kernel::Reduce(..)
             | Kernel::Splat(..)
@@ -176,7 +189,11 @@ impl Kernel {
             | Kernel::FastBin(..)
             | Kernel::FastReduce(..) => self.out_lane().is_float(),
             Kernel::Narrow(l, _) => l.is_half(),
-            Kernel::Cmp(..) | Kernel::Sel(..) | Kernel::Shift(..) => false,
+            Kernel::Cmp(..)
+            | Kernel::Sel(..)
+            | Kernel::Shift(..)
+            | Kernel::Zip(..)
+            | Kernel::Dup(..) => false,
         }
     }
 }
@@ -217,6 +234,18 @@ fn all_kernels() -> Vec<Kernel> {
         for op in VShiftOp::ALL {
             for &l in VSHIFT_LANE_TYPES {
                 ks.push(Kernel::Shift(op, l, w));
+            }
+        }
+        for &l in VPERM_LANE_TYPES {
+            for op in VZipOp::ALL {
+                ks.push(Kernel::Zip(op, l, w));
+            }
+            // The first lane, one in the middle, and the last (vx: of its guaranteed 128 bits).
+            let lanes = w.bit_width().unwrap_or(128) / l.bit_width().unwrap();
+            let mut indices = vec![0, lanes / 2, lanes - 1];
+            indices.dedup();
+            for i in indices {
+                ks.push(Kernel::Dup(l, w, i));
             }
         }
         for l in [Type::F32, Type::F64] {
@@ -548,7 +577,73 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                     out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
                 }
             }
+            // Floats: the sign bit cleared or flipped, NaNs included.
+            VUnaryOp::Abs | VUnaryOp::Neg if l.is_float() => {
+                let sign = 1i64 << (l.bit_width().unwrap() - 1);
+                let bits = int_of(l);
+                for i in 0..n {
+                    let x = get_int(a, bits, i);
+                    let r = if op == VUnaryOp::Abs {
+                        x & !sign
+                    } else {
+                        x ^ sign
+                    };
+                    put_int(&mut out, bits, i, r);
+                }
+            }
+            VUnaryOp::Abs | VUnaryOp::Neg => {
+                for i in 0..n {
+                    let x = get_int(a, l, i);
+                    let r = if op == VUnaryOp::Abs {
+                        x.wrapping_abs()
+                    } else {
+                        x.wrapping_neg()
+                    };
+                    put_int(&mut out, l, i, l.wrap_int(r));
+                }
+            }
+            VUnaryOp::Sqrt | VUnaryOp::Rsqrt if l == Type::F32 => {
+                for i in 0..n {
+                    let r = get_f32(a, i).sqrt();
+                    let r = if op == VUnaryOp::Sqrt { r } else { 1.0 / r };
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            VUnaryOp::Sqrt | VUnaryOp::Rsqrt => {
+                for i in 0..n {
+                    let r = get_f64(a, i).sqrt();
+                    let r = if op == VUnaryOp::Sqrt { r } else { 1.0 / r };
+                    out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            VUnaryOp::Rev => {
+                let s = l.byte_size();
+                for i in 0..n {
+                    let j = n - 1 - i;
+                    out[i * s..i * s + s].copy_from_slice(&a[j * s..j * s + s]);
+                }
+            }
         },
+        Kernel::Zip(op, l, _) => {
+            // Lane `pick(i)` of a followed by b.
+            let s = l.byte_size();
+            let ab: Vec<u8> = a[..w].iter().chain(&b[..w]).copied().collect();
+            for i in 0..n {
+                let j = match op {
+                    VZipOp::ZipLo => i / 2 + (i % 2) * n,
+                    VZipOp::ZipHi => n / 2 + i / 2 + (i % 2) * n,
+                    VZipOp::UnzipLo => 2 * i,
+                    VZipOp::UnzipHi => 2 * i + 1,
+                };
+                out[i * s..i * s + s].copy_from_slice(&ab[j * s..j * s + s]);
+            }
+        }
+        Kernel::Dup(l, _, k) => {
+            let (s, k) = (l.byte_size(), k as usize);
+            for i in 0..n {
+                out[i * s..i * s + s].copy_from_slice(&a[k * s..k * s + s]);
+            }
+        }
         Kernel::Narrow(l, _) if l.is_half() => {
             let half = w / 4;
             for i in 0..half {

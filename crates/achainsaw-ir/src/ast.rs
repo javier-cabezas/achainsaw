@@ -268,13 +268,17 @@ impl CastOp {
     }
 }
 
-/// Lane-wise vector op with one operand. Like scalar casts, the suffix names the result lane
+/// Vector op with one operand. Like scalar casts, the suffix names the result lane
 /// type: `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN
 /// to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends the low / high half of the
 /// narrower lanes), `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
 /// The exception is `w = vfwidenlo v:f16` / `vfwidenhi` (also `:bf16`): the result is always
 /// f32, so the suffix names the 16-bit float lanes whose low / high half is widened (exactly;
 /// a NaN stays a NaN, its payload unspecified).
+/// `vabs` and `vneg` wrap on integers (`vabs` of the minimum is the minimum) and clear or flip
+/// the sign bit of floats; `vsqrt` is IEEE's correctly rounded square root and `vrsqrt` is
+/// `1 / vsqrt(x)` (two roundings, not a hardware estimate, so results are identical
+/// everywhere). `vrev` reverses the order of the lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VUnaryOp {
     Itof,
@@ -284,10 +288,16 @@ pub enum VUnaryOp {
     Exp,
     FWidenLo,
     FWidenHi,
+    Abs,
+    Neg,
+    Sqrt,
+    Rsqrt,
+    Rev,
 }
 
 impl VUnaryOp {
-    pub const ALL: [VUnaryOp; 7] = [
+    /// Every op, in AIRB encoding order (append new ops at the end).
+    pub const ALL: [VUnaryOp; 12] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
@@ -295,6 +305,11 @@ impl VUnaryOp {
         VUnaryOp::Exp,
         VUnaryOp::FWidenLo,
         VUnaryOp::FWidenHi,
+        VUnaryOp::Abs,
+        VUnaryOp::Neg,
+        VUnaryOp::Sqrt,
+        VUnaryOp::Rsqrt,
+        VUnaryOp::Rev,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -310,6 +325,11 @@ impl VUnaryOp {
             VUnaryOp::Exp => "vexp",
             VUnaryOp::FWidenLo => "vfwidenlo",
             VUnaryOp::FWidenHi => "vfwidenhi",
+            VUnaryOp::Abs => "vabs",
+            VUnaryOp::Neg => "vneg",
+            VUnaryOp::Sqrt => "vsqrt",
+            VUnaryOp::Rsqrt => "vrsqrt",
+            VUnaryOp::Rev => "vrev",
         }
     }
 
@@ -345,6 +365,10 @@ impl VUnaryOp {
             (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I32) => Type::I16,
             (VUnaryOp::WidenLo | VUnaryOp::WidenHi, _) => Type::I32,
             (VUnaryOp::Exp, _) => Type::F32,
+            (
+                VUnaryOp::Abs | VUnaryOp::Neg | VUnaryOp::Sqrt | VUnaryOp::Rsqrt | VUnaryOp::Rev,
+                _,
+            ) => lane,
         }
     }
 }
@@ -396,6 +420,52 @@ impl VShiftOp {
             VShiftOp::Shr => "vshr",
             VShiftOp::Ushr => "vushr",
         }
+    }
+}
+
+/// Two-operand lane permutation (`r = vziplo a, b:f32`). With `n` lanes per vector:
+/// `vziplo` interleaves the low halves, `r = [a0, b0, a1, b1, ..., a(n/2-1), b(n/2-1)]`, and
+/// `vziphi` the high halves, `r = [a(n/2), b(n/2), ..., a(n-1), b(n-1)]`. `vunziplo` takes the
+/// even lanes of `a` then `b`, `r = [a0, a2, ..., b0, b2, ...]`, and `vunziphi` the odd lanes,
+/// so `vunziplo`/`vunziphi` of `vziplo a, b` and `vziphi a, b` give back `a` and `b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VZipOp {
+    ZipLo,
+    ZipHi,
+    UnzipLo,
+    UnzipHi,
+}
+
+impl VZipOp {
+    /// Every op, in AIRB encoding order.
+    pub const ALL: [VZipOp; 4] = [
+        VZipOp::ZipLo,
+        VZipOp::ZipHi,
+        VZipOp::UnzipLo,
+        VZipOp::UnzipHi,
+    ];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VZipOp::ZipLo => "vziplo",
+            VZipOp::ZipHi => "vziphi",
+            VZipOp::UnzipLo => "vunziplo",
+            VZipOp::UnzipHi => "vunziphi",
+        }
+    }
+
+    /// Whether the op interleaves (`vzip*`) rather than deinterleaves (`vunzip*`).
+    pub fn is_zip(&self) -> bool {
+        matches!(self, VZipOp::ZipLo | VZipOp::ZipHi)
+    }
+
+    /// Whether the op takes the low halves (`vziplo`) or the even lanes (`vunziplo`).
+    pub fn is_lo(&self) -> bool {
+        matches!(self, VZipOp::ZipLo | VZipOp::UnzipLo)
     }
 }
 
@@ -557,8 +627,7 @@ pub enum Instruction {
         else_val: String,
         span: Span,
     },
-    /// One-operand lane-wise op (`vitof`, `vftoi`, `vwidenlo`, `vwidenhi`, `vexp`); `lane` is
-    /// the result lane type.
+    /// One-operand vector op (see `VUnaryOp`); `lane` is the result lane type.
     VUnary {
         op: VUnaryOp,
         dst: String,
@@ -582,6 +651,24 @@ pub enum Instruction {
         src: String,
         amount: String,
         lane: Type,
+        span: Span,
+    },
+    /// Lane permutation of two vectors (see `VZipOp`).
+    VZip {
+        op: VZipOp,
+        dst: String,
+        lhs: String,
+        rhs: String,
+        lane: Type,
+        span: Span,
+    },
+    /// `r = vdup v, 3:f32`: lane `lane` of `vec` (lanes of type `ty`) in every lane of a vector
+    /// of `vec`'s type. The index is checked like `extlane`'s.
+    VDup {
+        dst: String,
+        vec: String,
+        lane: u32,
+        ty: Type,
         span: Span,
     },
     /// Lane count of `vx` for `lane` (`n = vl f32`), as an i64.
@@ -645,6 +732,8 @@ impl Instruction {
             | Instruction::VUnary { dst, .. }
             | Instruction::VNarrow { dst, .. }
             | Instruction::VShift { dst, .. }
+            | Instruction::VZip { dst, .. }
+            | Instruction::VDup { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => Some(dst),
             Instruction::Call { dst, .. } => dst.as_deref(),
             Instruction::Store { .. }
@@ -661,7 +750,8 @@ impl Instruction {
             Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
-            | Instruction::VCmp { lhs, rhs, .. } => vec![lhs, rhs],
+            | Instruction::VCmp { lhs, rhs, .. }
+            | Instruction::VZip { lhs, rhs, .. } => vec![lhs, rhs],
             Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
             Instruction::Store { ptr, val, .. } => vec![ptr, val],
             Instruction::Call { args, .. } => args.iter().collect(),
@@ -673,7 +763,7 @@ impl Instruction {
             | Instruction::VectorReduce { src, .. } => vec![src],
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
-            Instruction::ExtractLane { vec, .. } => vec![vec],
+            Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
                 cond: a,
@@ -710,7 +800,8 @@ impl Instruction {
             Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
-            | Instruction::VCmp { lhs, rhs, .. } => vec![lhs, rhs],
+            | Instruction::VCmp { lhs, rhs, .. }
+            | Instruction::VZip { lhs, rhs, .. } => vec![lhs, rhs],
             Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
             Instruction::Store { ptr, val, .. } => vec![ptr, val],
             Instruction::Call { args, .. } => args.iter_mut().collect(),
@@ -724,7 +815,7 @@ impl Instruction {
             | Instruction::VectorReduce { src, .. } => vec![src],
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
-            Instruction::ExtractLane { vec, .. } => vec![vec],
+            Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
                 cond: a,

@@ -150,8 +150,15 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
         VUnaryOp::WidenLo | VUnaryOp::WidenHi => &[Type::I16, Type::I32, Type::I64],
         VUnaryOp::Exp => &[Type::F32],
         VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => &[Type::F16, Type::BF16],
+        VUnaryOp::Abs | VUnaryOp::Neg => ALL_LANES,
+        VUnaryOp::Sqrt | VUnaryOp::Rsqrt => &[Type::F32, Type::F64],
+        VUnaryOp::Rev => VPERM_LANE_TYPES,
     }
 }
+
+/// Lane types of the permutations (`vrev`, `vziplo` and the other `VZipOp`s, `vdup`), which
+/// only move lanes: every lane width, including the 16-bit floats.
+pub const VPERM_LANE_TYPES: &[Type] = COUNT_LANES;
 
 /// Result lane types of `vnarrow`: i8 and i16 from i16 and i32 lanes (saturating), f16 and
 /// bf16 from f32 lanes (rounding to nearest-even, as `ftrunc`).
@@ -697,27 +704,40 @@ impl Validator {
                 span,
             } => {
                 let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
-                let Some(lanes) = ty.lanes_in(vec_ty) else {
+                if ty.lanes_in(vec_ty).is_none() {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
                         format!("ExtractLane result type must be a numeric scalar, found '{ty}'"),
                         *span,
                     ));
-                };
-                if *lane >= lanes {
-                    let what = if vec_ty == Type::Vx {
-                        format!("'vx' is only guaranteed {} bits, i.e. {lanes} lanes of type '{ty}'; store the vector to memory to read higher lanes", crate::types::MIN_VX_BITS)
-                    } else {
-                        format!("a '{vec_ty}' vector has {lanes} lanes of type '{ty}'")
-                    };
-                    return Err(Diagnostic::error(
-                        "ERR_OUT_OF_BOUNDS_LANE",
-                        format!("ExtractLane index {lane} out of bounds: {what}"),
-                        *span,
-                    )
-                    .with_context(serde_json::json!({ "lane": lane, "lanes": lanes, "type": ty.as_str(), "vector": vec_ty.as_str() })));
                 }
+                Self::check_lane_index("ExtractLane", vec_ty, *lane, *ty, *span)?;
                 Self::define(scope, defs, dst, *ty, *span)?;
+            }
+            Instruction::VDup {
+                dst,
+                vec,
+                lane,
+                ty,
+                span,
+            } => {
+                Self::check_lane("vdup", *ty, VPERM_LANE_TYPES, *span)?;
+                let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
+                Self::check_lane_index("vdup", vec_ty, *lane, *ty, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
+            }
+            Instruction::VZip {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                span,
+            } => {
+                Self::check_lane(op.as_str(), *lane, VPERM_LANE_TYPES, *span)?;
+                let vec_ty =
+                    self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
+                Self::define(scope, defs, dst, vec_ty, *span)?;
             }
             Instruction::Alloc { dst, size, span } => {
                 let size_ty = self.check_reg(ctx, size, scope, *span)?;
@@ -1093,6 +1113,33 @@ impl Validator {
             }
         }
         Ok(())
+    }
+
+    /// Checks a constant lane index (`extlane`, `vdup`) against the lanes of `ty` in `vec_ty`;
+    /// `vx` only guarantees `MIN_VX_BITS`.
+    fn check_lane_index(
+        op: &str,
+        vec_ty: Type,
+        lane: u32,
+        ty: Type,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let vec_bits = vec_ty.bit_width().unwrap_or(crate::types::MIN_VX_BITS);
+        let lanes = vec_bits / ty.bit_width().expect("lane type has a width");
+        if lane < lanes {
+            return Ok(());
+        }
+        let what = if vec_ty == Type::Vx {
+            format!("'vx' is only guaranteed {} bits, i.e. {lanes} lanes of type '{ty}'; store the vector to memory to read higher lanes", crate::types::MIN_VX_BITS)
+        } else {
+            format!("a '{vec_ty}' vector has {lanes} lanes of type '{ty}'")
+        };
+        Err(Diagnostic::error(
+            "ERR_OUT_OF_BOUNDS_LANE",
+            format!("{op} index {lane} out of bounds: {what}"),
+            span,
+        )
+        .with_context(serde_json::json!({ "lane": lane, "lanes": lanes, "type": ty.as_str(), "vector": vec_ty.as_str() })))
     }
 
     fn check_lane(op: &str, lane: Type, allowed: &[Type], span: Span) -> Result<(), Diagnostic> {

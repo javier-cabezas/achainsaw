@@ -1,6 +1,6 @@
 use achainsaw_ir::ast::{
     vexp, BinaryOp, CastOp, Constant, Function, Instruction, Terminator, UnaryOp, VBinOp, VCmpOp,
-    VShiftOp, VUnaryOp, VectorReduceOp,
+    VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::vnarrow_source_lane;
@@ -9,8 +9,8 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    AbiParam, Block as ClifBlock, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
-    Value as ClifValue,
+    AbiParam, Block as ClifBlock, ConstantData, FuncRef, InstBuilder, MemFlagsData, StackSlotData,
+    StackSlotKind, Value as ClifValue,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module as ClifModule};
@@ -519,6 +519,38 @@ fn vunary_parts(
                 to_part(builder, r)
             })
             .collect(),
+        VUnaryOp::Abs | VUnaryOp::Neg | VUnaryOp::Sqrt | VUnaryOp::Rsqrt => src
+            .iter()
+            .map(|&p| {
+                let x = as_lanes(builder, p, lane);
+                let r = match (op, lane.is_float()) {
+                    (VUnaryOp::Abs, true) => builder.ins().fabs(x),
+                    (VUnaryOp::Abs, false) => builder.ins().iabs(x),
+                    (VUnaryOp::Neg, true) => builder.ins().fneg(x),
+                    (VUnaryOp::Neg, false) => builder.ins().ineg(x),
+                    (VUnaryOp::Sqrt, _) => builder.ins().sqrt(x),
+                    // 1 / sqrt(x), correctly rounded twice (never an estimate).
+                    _ => {
+                        let one = if lane == Type::F32 {
+                            builder.ins().f32const(1.0)
+                        } else {
+                            builder.ins().f64const(1.0)
+                        };
+                        let one = builder.ins().splat(lane_vec_type(lane), one);
+                        let root = builder.ins().sqrt(x);
+                        builder.ins().fdiv(one, root)
+                    }
+                };
+                to_part(builder, r)
+            })
+            .collect(),
+        VUnaryOp::Rev => {
+            let m = 16 / lane.byte_size();
+            src.iter()
+                .rev()
+                .map(|&p| shuffle_lanes(builder, p, p, lane, |j| m - 1 - j))
+                .collect()
+        }
         VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
             let narrow = op.source_lane(lane);
             let lo = op.is_low_half();
@@ -559,6 +591,60 @@ fn vunary_parts(
             out
         }
     }
+}
+
+/// Permutes the `lane` lanes of two 128-bit parts: lane `j` of the result is lane `pick(j)`
+/// of `a` followed by `b` (indices from `16 / lane bytes` on select from `b`).
+fn shuffle_lanes(
+    builder: &mut FunctionBuilder,
+    a: ClifValue,
+    b: ClifValue,
+    lane: Type,
+    pick: impl Fn(usize) -> usize,
+) -> ClifValue {
+    let s = lane.byte_size();
+    let mask: Vec<u8> = (0..16).map(|i| (pick(i / s) * s + i % s) as u8).collect();
+    let mask = builder.func.dfg.immediates.push(ConstantData::from(mask));
+    let x = as_lanes(builder, a, Type::I8);
+    let y = as_lanes(builder, b, Type::I8);
+    let r = builder.ins().shuffle(x, y, mask);
+    to_part(builder, r)
+}
+
+/// `VZip` on the 128-bit parts of two vectors. A zip of the low (high) halves reads the low
+/// (high) half of each operand's parts, and each of those part pairs gives two result parts;
+/// an unzip reads `a`'s parts followed by `b`'s, each consecutive pair giving one result part.
+fn vzip_parts(
+    builder: &mut FunctionBuilder,
+    op: VZipOp,
+    lane: Type,
+    a: &[ClifValue],
+    b: &[ClifValue],
+) -> Parts {
+    let m = 16 / lane.byte_size();
+    // Interleaves the low or high half of two parts' lanes.
+    let zip = |builder: &mut FunctionBuilder, x, y, high: bool| {
+        let base = if high { m / 2 } else { 0 };
+        shuffle_lanes(builder, x, y, lane, |j| base + j / 2 + (j % 2) * m)
+    };
+    if op.is_zip() {
+        if a.len() == 1 {
+            return vec![zip(builder, a[0], b[0], !op.is_lo())];
+        }
+        let half = a.len() / 2;
+        let start = if op.is_lo() { 0 } else { half };
+        let mut out = Vec::with_capacity(a.len());
+        for k in start..start + half {
+            out.push(zip(builder, a[k], b[k], false));
+            out.push(zip(builder, a[k], b[k], true));
+        }
+        return out;
+    }
+    let odd = usize::from(!op.is_lo());
+    let all: Vec<ClifValue> = a.iter().chain(b).copied().collect();
+    all.chunks(2)
+        .map(|pair| shuffle_lanes(builder, pair[0], pair[1], lane, |j| 2 * j + odd))
+        .collect()
 }
 
 /// `vexp` on four f32 lanes: e^clamp(x, -87, 88) by the fixed sequence AIR defines (also in
@@ -1900,6 +1986,30 @@ pub fn lower_function<M: ClifModule>(
                     let lanes = as_lanes(&mut builder, part, *ty);
                     let scalar_val = builder.ins().extractlane(lanes, index);
                     values.insert(dst.clone(), (vec![scalar_val], *ty));
+                }
+                Instruction::VDup {
+                    dst, vec, lane, ty, ..
+                } => {
+                    let (vec_parts, vec_ty) = parts(&values, vec);
+                    let lane_bytes = ty.byte_size() as u32;
+                    let byte = lane * lane_bytes;
+                    let part = vec_parts[(byte / 16) as usize];
+                    let index = ((byte % 16) / lane_bytes) as usize;
+                    let r = shuffle_lanes(&mut builder, part, part, *ty, |_| index);
+                    values.insert(dst.clone(), (vec![r; part_count(vec_ty)], vec_ty));
+                }
+                Instruction::VZip {
+                    op,
+                    dst,
+                    lhs,
+                    rhs,
+                    lane,
+                    ..
+                } => {
+                    let (l_parts, vec_ty) = parts(&values, lhs);
+                    let (r_parts, _) = parts(&values, rhs);
+                    let out = vzip_parts(&mut builder, *op, *lane, &l_parts, &r_parts);
+                    values.insert(dst.clone(), (out, vec_ty));
                 }
                 Instruction::Alloc { dst, size, .. } => {
                     let (size_val, size_ty) = scalar(&values, size);

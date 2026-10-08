@@ -319,6 +319,21 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("{dst} = {} {src}, {amount}:{lane}", op.as_str()));
                     }
+                    Instruction::VZip {
+                        op,
+                        dst,
+                        lhs,
+                        rhs,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = {} {lhs}, {rhs}:{lane}", op.as_str()));
+                    }
+                    Instruction::VDup {
+                        dst, vec, lane, ty, ..
+                    } => {
+                        out.push_str(&format!("{dst} = vdup {vec}, {lane}:{ty}"));
+                    }
                 }
                 out.push('\n');
             }
@@ -857,6 +872,28 @@ impl BinaryEncoder {
                     .push(VShiftOp::ALL.iter().position(|o| o == op).unwrap() as u8);
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst, src, amount]);
+            }
+            Instruction::VZip {
+                op,
+                dst,
+                lhs,
+                rhs,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x2C);
+                self.buf
+                    .push(VZipOp::ALL.iter().position(|o| o == op).unwrap() as u8);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, lhs, rhs]);
+            }
+            Instruction::VDup {
+                dst, vec, lane, ty, ..
+            } => {
+                self.buf.push(0x2D);
+                self.push_regs(&[dst, vec]);
+                self.buf.extend_from_slice(&lane.to_le_bytes());
+                self.buf.push(encode_type(*ty));
             }
             Instruction::Par {
                 count, func, args, ..
@@ -1426,6 +1463,33 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x2C => {
+                let op = *VZipOp::ALL
+                    .get(self.read_u8()? as usize)
+                    .ok_or_else(|| self.err("Invalid vector zip op in AIRB"))?;
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VZip {
+                    op,
+                    dst: self.read_string()?,
+                    lhs: self.read_string()?,
+                    rhs: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x2D => {
+                let dst = self.read_string()?;
+                let vec = self.read_string()?;
+                let lane = self.read_u32()?;
+                let ty = self.read_lane_type()?;
+                Ok(Instruction::VDup {
+                    dst,
+                    vec,
+                    lane,
+                    ty,
+                    span,
+                })
+            }
             0x28 => {
                 let count = self.read_string()?;
                 let func = self.read_string()?;
@@ -1448,8 +1512,8 @@ impl<'a> BinaryDecoder<'a> {
     }
 
     fn read_lane_type(&mut self) -> Result<Type, Diagnostic> {
-        // Arithmetic lanes, or f16/bf16 (`vfwiden*`, `vnarrow`, lane counts); the validator
-        // checks each op's lane types.
+        // Arithmetic lanes, or f16/bf16 (`vfwiden*`, `vnarrow`, permutations, lane counts);
+        // the validator checks each op's lane types.
         decode_type(self.read_u8()?)
             .filter(|t| t.is_lane() || t.is_half())
             .ok_or_else(|| self.err("Invalid vector lane type in AIRB"))
