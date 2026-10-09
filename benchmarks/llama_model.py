@@ -30,7 +30,9 @@ def quantize(x):
     with np.errstate(divide="ignore"):
         inv = np.where(d > 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
     v = blocks * inv[:, None]
-    return np.trunc(v + np.where(v >= 0, np.float32(0.5), np.float32(-0.5))).reshape(-1), d
+    t = np.trunc(v)
+    # Halves away from zero, exactly (C's roundf): every step is exact in f32.
+    return (t + np.where(np.abs(v - t) >= np.float32(0.5), np.sign(v), np.float32(0.0))).reshape(-1), d
 
 
 def quantize_rows(w, chunk=4096):

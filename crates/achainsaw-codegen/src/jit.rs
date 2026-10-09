@@ -1368,7 +1368,7 @@ impl CraneliftJit {
             if let Some(r_ty) = ext_fn.ret_type {
                 push_abi_params(&mut sig.returns, r_ty);
             }
-            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
+            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type.into_iter().collect());
 
             let func_id = self
                 .module
@@ -1382,10 +1382,10 @@ impl CraneliftJit {
             for (_, p_ty) in &func.params {
                 push_abi_params(&mut sig.params, *p_ty);
             }
-            if let Some(r_ty) = func.ret_type {
-                push_abi_params(&mut sig.returns, r_ty);
+            for r_ty in &func.rets {
+                push_abi_params(&mut sig.returns, *r_ty);
             }
-            func_returns.insert(func.name.clone(), func.ret_type);
+            func_returns.insert(func.name.clone(), func.rets.clone());
 
             let func_id = self
                 .module
@@ -1398,13 +1398,7 @@ impl CraneliftJit {
         // take their addresses.
         let mut tramp_ids = HashMap::new();
         for func in &ir_mod.functions {
-            if func
-                .params
-                .iter()
-                .map(|(_, ty)| ty)
-                .chain(func.ret_type.iter())
-                .any(|t| t.is_vector())
-            {
+            if !func.has_trampoline() {
                 continue;
             }
             let tid = crate::lower::declare_trampoline(&mut self.module, &func.name)?;
@@ -1459,7 +1453,7 @@ impl CraneliftJit {
                     &func.name,
                     func_id,
                     &param_tys,
-                    func.ret_type,
+                    func.single_ret().ok().flatten(),
                 )?;
             }
         }
@@ -1702,6 +1696,9 @@ impl JitEngine {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
+        // `inline fn` calls are expanded before lowering, for both backends.
+        let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+        let ir_mod = &*inlined;
         let sandbox = self.sandbox.as_ref().map(|arena| {
             let arena = lock(arena);
             (arena.base as i64, arena.len() as i64)
@@ -1781,8 +1778,10 @@ impl JitEngine {
 
         for func in &ir_mod.functions {
             let param_tys: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-            self.signatures
-                .insert(func.name.clone(), (param_tys, func.ret_type));
+            self.signatures.insert(
+                func.name.clone(),
+                (param_tys, func.single_ret().ok().flatten()),
+            );
         }
         for (name, ptr, tramp) in compiled {
             self.function_ptrs.insert(name.clone(), ptr);

@@ -36,6 +36,8 @@ pub enum TokenKind {
     Equal,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Arrow,
 
     // Literals & Identifiers
@@ -172,6 +174,8 @@ impl<'a> Lexer<'a> {
             '=' => Some(TokenKind::Equal),
             '(' => Some(TokenKind::LParen),
             ')' => Some(TokenKind::RParen),
+            '[' => Some(TokenKind::LBracket),
+            ']' => Some(TokenKind::RBracket),
             _ => None,
         };
 
@@ -328,7 +332,8 @@ impl<'a> Lexer<'a> {
                 | "vmaxr" | "vminr" | "vl" | "ldm" | "stm" | "mm" | "vitof" | "vftoi"
                 | "vwidenlo" | "vwidenhi" | "vfwidenlo" | "vfwidenhi" | "vexp" | "vnarrow"
                 | "vshl" | "vshr" | "vushr" | "vabs" | "vneg" | "vsqrt" | "vrsqrt" | "vrev"
-                | "vziplo" | "vziphi" | "vunziplo" | "vunziphi" | "vdup" | "vdot" => {
+                | "vziplo" | "vziphi" | "vunziplo" | "vunziphi" | "vdup" | "vdot" | "vfloor"
+                | "vceil" | "vround" | "vroundeven" | "vroundz" | "vcopysign" => {
                     TokenKind::VOp(ident)
                 }
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"

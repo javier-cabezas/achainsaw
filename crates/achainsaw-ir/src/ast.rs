@@ -38,6 +38,11 @@ pub enum BinaryOp {
     Ugt,
     Ule,
     Uge,
+    /// `copysign a, b`: a's magnitude with b's sign bit (floats).
+    Copysign,
+    /// Rotations by `b` modulo the bit width (integers).
+    Rotl,
+    Rotr,
 }
 
 impl std::str::FromStr for BinaryOp {
@@ -78,6 +83,9 @@ impl BinaryOp {
             "ugt" => Some(BinaryOp::Ugt),
             "ule" => Some(BinaryOp::Ule),
             "uge" => Some(BinaryOp::Uge),
+            "copysign" => Some(BinaryOp::Copysign),
+            "rotl" => Some(BinaryOp::Rotl),
+            "rotr" => Some(BinaryOp::Rotr),
             _ => None,
         }
     }
@@ -126,10 +134,11 @@ pub enum VBinOp {
     And,
     Or,
     Xor,
+    Copysign,
 }
 
 impl VBinOp {
-    pub const ALL: [VBinOp; 9] = [
+    pub const ALL: [VBinOp; 10] = [
         VBinOp::Add,
         VBinOp::Sub,
         VBinOp::Mul,
@@ -139,6 +148,7 @@ impl VBinOp {
         VBinOp::And,
         VBinOp::Or,
         VBinOp::Xor,
+        VBinOp::Copysign,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -156,6 +166,7 @@ impl VBinOp {
             VBinOp::And => "vand",
             VBinOp::Or => "vor",
             VBinOp::Xor => "vxor",
+            VBinOp::Copysign => "vcopysign",
         }
     }
 
@@ -201,21 +212,42 @@ impl VCmpOp {
     }
 }
 
+/// Scalar op with one operand. Float rounding to an integral value: `floor`, `ceil`,
+/// `round` (halfway cases away from zero, as C's `round`), `roundeven` (halfway cases to
+/// even) and `roundz` (toward zero); integer bit counts: `popcnt`, `clz` and `ctz` (the bit
+/// width for 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Sqrt,
     Neg,
     Abs,
+    Floor,
+    Ceil,
+    Round,
+    RoundEven,
+    RoundZ,
+    Popcnt,
+    Clz,
+    Ctz,
 }
 
 impl UnaryOp {
+    pub const ALL: [UnaryOp; 11] = [
+        UnaryOp::Sqrt,
+        UnaryOp::Neg,
+        UnaryOp::Abs,
+        UnaryOp::Floor,
+        UnaryOp::Ceil,
+        UnaryOp::Round,
+        UnaryOp::RoundEven,
+        UnaryOp::RoundZ,
+        UnaryOp::Popcnt,
+        UnaryOp::Clz,
+        UnaryOp::Ctz,
+    ];
+
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s {
-            "sqrt" => Some(UnaryOp::Sqrt),
-            "neg" => Some(UnaryOp::Neg),
-            "abs" => Some(UnaryOp::Abs),
-            _ => None,
-        }
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -223,7 +255,28 @@ impl UnaryOp {
             UnaryOp::Sqrt => "sqrt",
             UnaryOp::Neg => "neg",
             UnaryOp::Abs => "abs",
+            UnaryOp::Floor => "floor",
+            UnaryOp::Ceil => "ceil",
+            UnaryOp::Round => "round",
+            UnaryOp::RoundEven => "roundeven",
+            UnaryOp::RoundZ => "roundz",
+            UnaryOp::Popcnt => "popcnt",
+            UnaryOp::Clz => "clz",
+            UnaryOp::Ctz => "ctz",
         }
+    }
+
+    /// Rounding of a float to an integral float value.
+    pub fn is_rounding(&self) -> bool {
+        matches!(
+            self,
+            UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round | UnaryOp::RoundEven | UnaryOp::RoundZ
+        )
+    }
+
+    /// Bit counts of an integer.
+    pub fn is_bit_count(&self) -> bool {
+        matches!(self, UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz)
     }
 }
 
@@ -237,6 +290,10 @@ pub enum CastOp {
     Fext,
     Ftrunc,
     Bitcast,
+    /// Unsigned integer to float.
+    Uitof,
+    /// Float to unsigned integer, saturating (negative and NaN to 0).
+    Ftoui,
 }
 
 impl CastOp {
@@ -250,6 +307,8 @@ impl CastOp {
             "fext" => Some(CastOp::Fext),
             "ftrunc" => Some(CastOp::Ftrunc),
             "bitcast" => Some(CastOp::Bitcast),
+            "uitof" => Some(CastOp::Uitof),
+            "ftoui" => Some(CastOp::Ftoui),
             _ => None,
         }
     }
@@ -264,6 +323,8 @@ impl CastOp {
             CastOp::Fext => "fext",
             CastOp::Ftrunc => "ftrunc",
             CastOp::Bitcast => "bitcast",
+            CastOp::Uitof => "uitof",
+            CastOp::Ftoui => "ftoui",
         }
     }
 }
@@ -293,11 +354,16 @@ pub enum VUnaryOp {
     Sqrt,
     Rsqrt,
     Rev,
+    Floor,
+    Ceil,
+    Round,
+    RoundEven,
+    RoundZ,
 }
 
 impl VUnaryOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VUnaryOp; 12] = [
+    pub const ALL: [VUnaryOp; 17] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
@@ -310,6 +376,11 @@ impl VUnaryOp {
         VUnaryOp::Sqrt,
         VUnaryOp::Rsqrt,
         VUnaryOp::Rev,
+        VUnaryOp::Floor,
+        VUnaryOp::Ceil,
+        VUnaryOp::Round,
+        VUnaryOp::RoundEven,
+        VUnaryOp::RoundZ,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -330,6 +401,11 @@ impl VUnaryOp {
             VUnaryOp::Sqrt => "vsqrt",
             VUnaryOp::Rsqrt => "vrsqrt",
             VUnaryOp::Rev => "vrev",
+            VUnaryOp::Floor => "vfloor",
+            VUnaryOp::Ceil => "vceil",
+            VUnaryOp::Round => "vround",
+            VUnaryOp::RoundEven => "vroundeven",
+            VUnaryOp::RoundZ => "vroundz",
         }
     }
 
@@ -366,7 +442,16 @@ impl VUnaryOp {
             (VUnaryOp::WidenLo | VUnaryOp::WidenHi, _) => Type::I32,
             (VUnaryOp::Exp, _) => Type::F32,
             (
-                VUnaryOp::Abs | VUnaryOp::Neg | VUnaryOp::Sqrt | VUnaryOp::Rsqrt | VUnaryOp::Rev,
+                VUnaryOp::Abs
+                | VUnaryOp::Neg
+                | VUnaryOp::Sqrt
+                | VUnaryOp::Rsqrt
+                | VUnaryOp::Rev
+                | VUnaryOp::Floor
+                | VUnaryOp::Ceil
+                | VUnaryOp::Round
+                | VUnaryOp::RoundEven
+                | VUnaryOp::RoundZ,
                 _,
             ) => lane,
         }
@@ -500,6 +585,22 @@ impl VectorReduceOp {
     }
 }
 
+/// Element index of a memory access: `p[i]` addresses `p + i * size`, the size being that of
+/// `unit` when given (`p[i:f32]`), else of the access's own element type: the loaded or
+/// stored scalar type, or the lane type of `ldm`/`stm`. `reg` is an i64 register.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Index {
+    pub reg: String,
+    pub unit: Option<Type>,
+}
+
+impl Index {
+    /// The type whose size scales the index, for an access whose element type is `implied`.
+    pub fn unit_or(&self, implied: Type) -> Type {
+        self.unit.unwrap_or(implied)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
     AssignConst {
@@ -518,16 +619,20 @@ pub enum Instruction {
     Load {
         dst: String,
         ptr: String,
+        index: Option<Index>,
         ty: Type,
         span: Span,
     },
     Store {
         ptr: String,
+        index: Option<Index>,
         val: String,
         span: Span,
     },
+    /// `call f(a)`, `r = call f(a)` or `q, r = call f(a)`: the destinations receive the
+    /// callee's results in order (none: results discarded).
     Call {
-        dst: Option<String>,
+        dsts: Vec<String>,
         func: String,
         args: Vec<String>,
         span: Span,
@@ -577,6 +682,14 @@ pub enum Instruction {
         dst: String,
         src: String,
         ty: Type,
+        span: Span,
+    },
+    /// Scalar fused multiply-add `a * b + c` with one rounding (f32, f64).
+    Fma {
+        dst: String,
+        a: String,
+        b: String,
+        c: String,
         span: Span,
     },
     Select {
@@ -693,6 +806,7 @@ pub enum Instruction {
     MaskedLoad {
         dst: String,
         ptr: String,
+        index: Option<Index>,
         count: String,
         ty: Type,
         lane: Type,
@@ -701,6 +815,7 @@ pub enum Instruction {
     /// Tail-masked store: `stm p, v, n:f32` writes only the first `min(max(n, 0), lanes)` lanes.
     MaskedStore {
         ptr: String,
+        index: Option<Index>,
         val: String,
         count: String,
         lane: Type,
@@ -722,7 +837,16 @@ pub enum Instruction {
 }
 
 impl Instruction {
-    /// Register defined by this instruction, if any.
+    /// Registers defined by this instruction (several for a call of a function returning
+    /// several values).
+    pub fn dsts(&self) -> Vec<&str> {
+        if let Instruction::Call { dsts, .. } = self {
+            return dsts.iter().map(String::as_str).collect();
+        }
+        self.dst().into_iter().collect()
+    }
+
+    /// The register defined by this instruction, if it defines exactly one.
     pub fn dst(&self) -> Option<&str> {
         match self {
             Instruction::AssignConst { dst, .. }
@@ -746,8 +870,12 @@ impl Instruction {
             | Instruction::VZip { dst, .. }
             | Instruction::VDup { dst, .. }
             | Instruction::VDot { dst, .. }
+            | Instruction::Fma { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => Some(dst),
-            Instruction::Call { dst, .. } => dst.as_deref(),
+            Instruction::Call { dsts, .. } => match dsts.as_slice() {
+                [d] => Some(d),
+                _ => None,
+            },
             Instruction::Store { .. }
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
@@ -756,8 +884,61 @@ impl Instruction {
         }
     }
 
+    /// Mutable access to the registers this instruction defines.
+    pub fn dsts_mut(&mut self) -> Vec<&mut String> {
+        match self {
+            Instruction::AssignConst { dst, .. }
+            | Instruction::Binary { dst, .. }
+            | Instruction::Load { dst, .. }
+            | Instruction::Splat { dst, .. }
+            | Instruction::ExtractLane { dst, .. }
+            | Instruction::Alloc { dst, .. }
+            | Instruction::Select { dst, .. }
+            | Instruction::Unary { dst, .. }
+            | Instruction::Cast { dst, .. }
+            | Instruction::VectorReduce { dst, .. }
+            | Instruction::VBinary { dst, .. }
+            | Instruction::VFma { dst, .. }
+            | Instruction::VCmp { dst, .. }
+            | Instruction::VSelect { dst, .. }
+            | Instruction::VLen { dst, .. }
+            | Instruction::VUnary { dst, .. }
+            | Instruction::VNarrow { dst, .. }
+            | Instruction::VShift { dst, .. }
+            | Instruction::VZip { dst, .. }
+            | Instruction::VDup { dst, .. }
+            | Instruction::VDot { dst, .. }
+            | Instruction::Fma { dst, .. }
+            | Instruction::MaskedLoad { dst, .. } => vec![dst],
+            Instruction::Call { dsts, .. } => dsts.iter_mut().collect(),
+            Instruction::Store { .. }
+            | Instruction::Free { .. }
+            | Instruction::MaskedStore { .. }
+            | Instruction::MatMul { .. }
+            | Instruction::Par { .. } => vec![],
+        }
+    }
+
     /// Registers read by this instruction, in operand order.
     pub fn operands(&self) -> Vec<&String> {
+        let index = self.index().map(|ix| &ix.reg);
+        let mut regs = self.direct_operands();
+        regs.extend(index);
+        regs
+    }
+
+    /// The element index of a memory access (`p[i]`), if it has one.
+    pub fn index(&self) -> Option<&Index> {
+        match self {
+            Instruction::Load { index, .. }
+            | Instruction::Store { index, .. }
+            | Instruction::MaskedLoad { index, .. }
+            | Instruction::MaskedStore { index, .. } => index.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn direct_operands(&self) -> Vec<&String> {
         match self {
             Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
@@ -790,6 +971,7 @@ impl Instruction {
                 ..
             }
             | Instruction::VFma { a, b, c, .. }
+            | Instruction::Fma { a, b, c, .. }
             | Instruction::VDot {
                 acc: a, a: b, b: c, ..
             } => vec![a, b, c],
@@ -809,7 +991,8 @@ impl Instruction {
         }
     }
 
-    /// Mutable access to the registers read by this instruction.
+    /// Mutable access to the registers read by this instruction (a memory access's index
+    /// register last, as in `operands`).
     pub fn operands_mut(&mut self) -> Vec<&mut String> {
         match self {
             Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
@@ -817,8 +1000,16 @@ impl Instruction {
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
             | Instruction::VZip { lhs, rhs, .. } => vec![lhs, rhs],
-            Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
-            Instruction::Store { ptr, val, .. } => vec![ptr, val],
+            Instruction::Load { ptr, index, .. } => std::iter::once(ptr)
+                .chain(index.as_mut().map(|ix| &mut ix.reg))
+                .collect(),
+            Instruction::Free { ptr, .. } => vec![ptr],
+            Instruction::Store {
+                ptr, val, index, ..
+            } => [ptr, val]
+                .into_iter()
+                .chain(index.as_mut().map(|ix| &mut ix.reg))
+                .collect(),
             Instruction::Call { args, .. } => args.iter_mut().collect(),
             Instruction::Par { count, args, .. } => {
                 std::iter::once(count).chain(args.iter_mut()).collect()
@@ -845,13 +1036,26 @@ impl Instruction {
                 ..
             }
             | Instruction::VFma { a, b, c, .. }
+            | Instruction::Fma { a, b, c, .. }
             | Instruction::VDot {
                 acc: a, a: b, b: c, ..
             } => vec![a, b, c],
-            Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
+            Instruction::MaskedLoad {
+                ptr, count, index, ..
+            } => [ptr, count]
+                .into_iter()
+                .chain(index.as_mut().map(|ix| &mut ix.reg))
+                .collect(),
             Instruction::MaskedStore {
-                ptr, val, count, ..
-            } => vec![ptr, val, count],
+                ptr,
+                val,
+                count,
+                index,
+                ..
+            } => [ptr, val, count]
+                .into_iter()
+                .chain(index.as_mut().map(|ix| &mut ix.reg))
+                .collect(),
             Instruction::MatMul {
                 pc,
                 pa,
@@ -880,10 +1084,8 @@ pub enum Terminator {
         else_args: Vec<String>,
         span: Span,
     },
-    Ret {
-        val: Option<String>,
-        span: Span,
-    },
+    /// `ret`, `ret v` or `ret a, b` (as many values as the function returns).
+    Ret { vals: Vec<String>, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -899,9 +1101,36 @@ pub struct Block {
 pub struct Function {
     pub name: String,
     pub params: Vec<(String, Type)>,
-    pub ret_type: Option<Type>,
+    /// Result types: none, one (`->i32`) or several (`->(vx, vx)`).
+    pub rets: Vec<Type>,
+    /// `inline fn`: every call is replaced by the body before code generation
+    /// (`crate::inline`); the function also stays callable on its own.
+    pub inline: bool,
     pub blocks: Vec<Block>,
     pub span: Span,
+}
+
+impl Function {
+    /// Whether hosts can call the function through a scalar trampoline: no vector
+    /// parameters or results, and at most one result. Others are callable only from AIR.
+    pub fn has_trampoline(&self) -> bool {
+        self.rets.len() <= 1
+            && self
+                .params
+                .iter()
+                .map(|(_, t)| *t)
+                .chain(self.rets.iter().copied())
+                .all(|t| !t.is_vector())
+    }
+
+    /// The single result type, `None` for no result; `Err` with the count for several.
+    pub fn single_ret(&self) -> Result<Option<Type>, usize> {
+        match self.rets.as_slice() {
+            [] => Ok(None),
+            [t] => Ok(Some(*t)),
+            many => Err(many.len()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

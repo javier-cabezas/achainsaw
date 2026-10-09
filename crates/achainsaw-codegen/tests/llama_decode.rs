@@ -174,7 +174,8 @@ fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
         dx[b] = d;
         for t in 0..32 {
             let v = blk[t] * id;
-            xq[b * 32 + t] = (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i32 as i8;
+            // Halves away from zero, as `vround`.
+            xq[b * 32 + t] = v.round() as i32 as i8;
         }
     }
     (xq, dx)

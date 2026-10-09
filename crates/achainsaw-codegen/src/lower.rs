@@ -1,6 +1,6 @@
 use achainsaw_ir::ast::{
-    vexp, BinaryOp, CastOp, Constant, Function, Instruction, Terminator, UnaryOp, VBinOp, VCmpOp,
-    VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
+    vexp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Terminator, UnaryOp, VBinOp,
+    VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::vnarrow_source_lane;
@@ -478,6 +478,25 @@ fn scalar(values: &Values, name: &str) -> (ClifValue, Type) {
     (parts[0], *ty)
 }
 
+/// Address of a memory operand: `ptr`, or `ptr + i * size` for `ptr[i]`, the size being the
+/// index's unit or `implied` (a power of two, so a shift that folds into x86 addressing).
+fn mem_addr(
+    builder: &mut FunctionBuilder,
+    values: &Values,
+    ptr: &str,
+    index: Option<&Index>,
+    implied: Type,
+) -> ClifValue {
+    let (p, _) = scalar(values, ptr);
+    let Some(ix) = index else {
+        return p;
+    };
+    let (i, _) = scalar(values, &ix.reg);
+    let size = ix.unit_or(implied).byte_size() as i64;
+    let off = builder.ins().ishl_imm_u(i, size.trailing_zeros() as i64);
+    builder.ins().iadd(p, off)
+}
+
 fn parts(values: &Values, name: &str) -> (Parts, Type) {
     values[name].clone()
 }
@@ -544,6 +563,24 @@ fn vunary_parts(
                 to_part(builder, r)
             })
             .collect(),
+        VUnaryOp::Floor
+        | VUnaryOp::Ceil
+        | VUnaryOp::Round
+        | VUnaryOp::RoundEven
+        | VUnaryOp::RoundZ => src
+            .iter()
+            .map(|&p| {
+                let x = as_lanes(builder, p, lane);
+                let r = match op {
+                    VUnaryOp::Floor => builder.ins().floor(x),
+                    VUnaryOp::Ceil => builder.ins().ceil(x),
+                    VUnaryOp::Round => round_away(builder, x),
+                    VUnaryOp::RoundEven => builder.ins().nearest(x),
+                    _ => builder.ins().trunc(x),
+                };
+                to_part(builder, r)
+            })
+            .collect(),
         VUnaryOp::Rev => {
             let m = 16 / lane.byte_size();
             src.iter()
@@ -590,6 +627,52 @@ fn vunary_parts(
             }
             out
         }
+    }
+}
+
+/// `mag` with the sign bit of `sgn`, for floats or float vectors.
+fn copysign(builder: &mut FunctionBuilder, mag: ClifValue, sgn: ClifValue) -> ClifValue {
+    let ty = builder.func.dfg.value_type(mag);
+    if !ty.is_vector() {
+        return builder.ins().fcopysign(mag, sgn);
+    }
+    let (int_lane, bit) = if ty.lane_type() == types::F32 {
+        (types::I32, 1i64 << 31)
+    } else {
+        (types::I64, i64::MIN)
+    };
+    let m = builder.ins().iconst(int_lane, bit);
+    let m = builder.ins().splat(ty.as_int(), m);
+    let m = builder.ins().bitcast(ty, bitcast_flags(), m);
+    builder.ins().bitselect(m, sgn, mag)
+}
+
+/// Rounds floats (scalar or vector) to the nearest integral value, halfway cases away from
+/// zero (C's `round`): t = trunc(x), plus copysign(1, x) when |x - t| >= 0.5. Every step is
+/// exact, so it matches LLVM's `llvm.round` bit for bit.
+fn round_away(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
+    let ty = builder.func.dfg.value_type(x);
+    let t = builder.ins().trunc(x);
+    let d = builder.ins().fsub(x, t);
+    let ad = builder.ins().fabs(d);
+    let (half, one) = if ty.lane_type() == types::F32 {
+        (builder.ins().f32const(0.5), builder.ins().f32const(1.0))
+    } else {
+        (builder.ins().f64const(0.5), builder.ins().f64const(1.0))
+    };
+    let (half, one) = if ty.is_vector() {
+        (builder.ins().splat(ty, half), builder.ins().splat(ty, one))
+    } else {
+        (half, one)
+    };
+    let one = copysign(builder, one, x);
+    let up = builder.ins().fadd(t, one);
+    let c = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, ad, half);
+    if ty.is_vector() {
+        let m = builder.ins().bitcast(ty, bitcast_flags(), c);
+        builder.ins().bitselect(m, up, t)
+    } else {
+        builder.ins().select(c, up, t)
     }
 }
 
@@ -793,6 +876,7 @@ fn vbinary_part(
         (VBinOp::Max, false) => builder.ins().smax(a, b),
         // The validator only allows float lanes for vdiv.
         (VBinOp::Div, _) => builder.ins().fdiv(a, b),
+        (VBinOp::Copysign, _) => copysign(builder, a, b),
         (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
     };
     to_part(builder, res)
@@ -1610,7 +1694,7 @@ pub fn lower_function<M: ClifModule>(
     builder_context: &mut FunctionBuilderContext,
     func: &Function,
     func_ids: &HashMap<String, FuncId>,
-    func_returns: &HashMap<String, Option<Type>>,
+    func_returns: &HashMap<String, Vec<Type>>,
     config: &LowerConfig,
 ) -> Result<()> {
     ctx.func
@@ -1619,8 +1703,8 @@ pub fn lower_function<M: ClifModule>(
     for (_, p_ty) in &func.params {
         push_abi_params(&mut ctx.func.signature.params, *p_ty);
     }
-    if let Some(r_ty) = func.ret_type {
-        push_abi_params(&mut ctx.func.signature.returns, r_ty);
+    for r_ty in &func.rets {
+        push_abi_params(&mut ctx.func.signature.returns, *r_ty);
     }
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
@@ -1834,6 +1918,9 @@ pub fn lower_function<M: ClifModule>(
                                 ),
                                 lhs_ty,
                             ),
+                            BinaryOp::Copysign => {
+                                (builder.ins().fcopysign(lhs_val, rhs_val), lhs_ty)
+                            }
                             _ => return Err(anyhow!("Unsupported float op {:?}", op)),
                         },
                         _ => {
@@ -1947,6 +2034,12 @@ pub fn lower_function<M: ClifModule>(
                                 BinaryOp::Max => (builder.ins().smax(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Umin => (builder.ins().umin(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Umax => (builder.ins().umax(lhs_val, rhs_val), lhs_ty),
+                                // Rotation amounts are taken modulo the bit width.
+                                BinaryOp::Rotl => (builder.ins().rotl(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Rotr => (builder.ins().rotr(lhs_val, rhs_val), lhs_ty),
+                                BinaryOp::Copysign => {
+                                    unreachable!("the validator allows copysign on floats only")
+                                }
                                 BinaryOp::Ushr => (builder.ins().ushr(lhs_val, rhs_val), lhs_ty),
                                 BinaryOp::Ult => {
                                     let cmp = builder.ins().icmp(
@@ -2017,8 +2110,14 @@ pub fn lower_function<M: ClifModule>(
                     };
                     values.insert(dst.clone(), (vec![res_val], res_ty));
                 }
-                Instruction::Load { dst, ptr, ty, .. } => {
-                    let (ptr_val, _) = scalar(&values, ptr);
+                Instruction::Load {
+                    dst,
+                    ptr,
+                    index,
+                    ty,
+                    ..
+                } => {
+                    let ptr_val = mem_addr(&mut builder, &values, ptr, index.as_ref(), *ty);
                     emit_bounds_check_const(&mut builder, guard, ptr_val, access_bytes(*ty));
                     let mut loaded = Vec::with_capacity(part_count(*ty));
                     if ty.is_vector() {
@@ -2041,9 +2140,11 @@ pub fn lower_function<M: ClifModule>(
                     }
                     values.insert(dst.clone(), (loaded, *ty));
                 }
-                Instruction::Store { ptr, val, .. } => {
-                    let (ptr_val, _) = scalar(&values, ptr);
+                Instruction::Store {
+                    ptr, index, val, ..
+                } => {
                     let (val_parts, val_ty) = parts(&values, val);
+                    let ptr_val = mem_addr(&mut builder, &values, ptr, index.as_ref(), val_ty);
                     emit_bounds_check_const(&mut builder, guard, ptr_val, access_bytes(val_ty));
                     let flags = if val_ty.is_vector() {
                         user_mem_flags()
@@ -2055,7 +2156,7 @@ pub fn lower_function<M: ClifModule>(
                     }
                 }
                 Instruction::Call {
-                    dst,
+                    dsts,
                     func: callee_name,
                     args,
                     ..
@@ -2066,14 +2167,13 @@ pub fn lower_function<M: ClifModule>(
                     let callee = module.declare_func_in_func(target_func_id, builder.func);
                     let arg_vals = flat_args(&values, args);
                     let call_inst = builder.ins().call(callee, &arg_vals);
-                    if let Some(d) = dst {
-                        let results = builder.inst_results(call_inst).to_vec();
-                        let ret_ir_ty = func_returns
-                            .get(callee_name)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(Type::I32);
-                        values.insert(d.clone(), (results, ret_ir_ty));
+                    // The results' parts in order: one per scalar, one per 128-bit part.
+                    let results = builder.inst_results(call_inst).to_vec();
+                    let mut at = 0;
+                    for (d, ty) in dsts.iter().zip(&func_returns[callee_name]) {
+                        let n = part_count(*ty);
+                        values.insert(d.clone(), (results[at..at + n].to_vec(), *ty));
+                        at += n;
                     }
                 }
                 Instruction::Splat { dst, src, ty, .. } => {
@@ -2182,8 +2282,23 @@ pub fn lower_function<M: ClifModule>(
                             }
                         }
                         UnaryOp::Sqrt => builder.ins().sqrt(src_val),
+                        UnaryOp::Floor => builder.ins().floor(src_val),
+                        UnaryOp::Ceil => builder.ins().ceil(src_val),
+                        UnaryOp::Round => round_away(&mut builder, src_val),
+                        UnaryOp::RoundEven => builder.ins().nearest(src_val),
+                        UnaryOp::RoundZ => builder.ins().trunc(src_val),
+                        UnaryOp::Popcnt => builder.ins().popcnt(src_val),
+                        UnaryOp::Clz => builder.ins().clz(src_val),
+                        UnaryOp::Ctz => builder.ins().ctz(src_val),
                     };
                     values.insert(dst.clone(), (vec![res], src_ty));
+                }
+                Instruction::Fma { dst, a, b, c, .. } => {
+                    let (x, ty) = scalar(&values, a);
+                    let (y, _) = scalar(&values, b);
+                    let (z, _) = scalar(&values, c);
+                    let r = builder.ins().fma(x, y, z);
+                    values.insert(dst.clone(), (vec![r], ty));
                 }
                 Instruction::Cast {
                     op, dst, src, ty, ..
@@ -2206,6 +2321,15 @@ pub fn lower_function<M: ClifModule>(
                         // f16/bf16 <-> i16 bitcasts: both are carried as I16 already.
                         CastOp::Bitcast if to_clif_type(src_ty) == clif_target_ty => src_val,
                         CastOp::Itof => builder.ins().fcvt_from_sint(clif_target_ty, src_val),
+                        CastOp::Uitof => {
+                            let v = if matches!(src_ty, Type::I8 | Type::I16) {
+                                builder.ins().uextend(types::I32, src_val)
+                            } else {
+                                src_val
+                            };
+                            builder.ins().fcvt_from_uint(clif_target_ty, v)
+                        }
+                        CastOp::Ftoui => builder.ins().fcvt_to_uint_sat(clif_target_ty, src_val),
                         CastOp::Ftoi => {
                             if *ty == Type::I8 || *ty == Type::I16 {
                                 let i32_val = builder.ins().fcvt_to_sint_sat(types::I32, src_val);
@@ -2327,12 +2451,13 @@ pub fn lower_function<M: ClifModule>(
                 Instruction::MaskedLoad {
                     dst,
                     ptr,
+                    index,
                     count,
                     ty,
                     lane,
                     ..
                 } => {
-                    let (ptr_val, _) = scalar(&values, ptr);
+                    let ptr_val = mem_addr(&mut builder, &values, ptr, index.as_ref(), *lane);
                     let (count_val, _) = scalar(&values, count);
                     let parts =
                         emit_masked_load(&mut builder, guard, ptr_val, count_val, *ty, *lane);
@@ -2340,12 +2465,13 @@ pub fn lower_function<M: ClifModule>(
                 }
                 Instruction::MaskedStore {
                     ptr,
+                    index,
                     val,
                     count,
                     lane,
                     ..
                 } => {
-                    let (ptr_val, _) = scalar(&values, ptr);
+                    let ptr_val = mem_addr(&mut builder, &values, ptr, index.as_ref(), *lane);
                     let (count_val, _) = scalar(&values, count);
                     let (val_parts, val_ty) = parts(&values, val);
                     emit_masked_store(
@@ -2556,16 +2682,12 @@ pub fn lower_function<M: ClifModule>(
                     .ins()
                     .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
             }
-            Terminator::Ret { val, .. } => {
+            Terminator::Ret { vals, .. } => {
                 if let Some(f) = fuel {
                     f.spill(&mut builder);
                 }
-                if let Some(v) = val {
-                    let (ret_parts, _) = parts(&values, v);
-                    builder.ins().return_(&ret_parts);
-                } else {
-                    builder.ins().return_(&[]);
-                }
+                let ret_parts = flat_args(&values, vals);
+                builder.ins().return_(&ret_parts);
             }
         }
     }
@@ -2580,7 +2702,8 @@ pub fn lower_function<M: ClifModule>(
 
     if let Some(trap_block) = fuel_trap_block {
         builder.switch_to_block(trap_block);
-        if let Some(r_ty) = func.ret_type {
+        let mut zeros = Vec::new();
+        for &r_ty in &func.rets {
             let zero_val = match r_ty {
                 Type::F32 => builder.ins().f32const(0.0),
                 Type::F64 => builder.ins().f64const(0.0),
@@ -2594,10 +2717,9 @@ pub fn lower_function<M: ClifModule>(
                     builder.ins().splat(VEC_PART, zero_f)
                 }
             };
-            builder.ins().return_(&vec![zero_val; part_count(r_ty)]);
-        } else {
-            builder.ins().return_(&[]);
+            zeros.extend(vec![zero_val; part_count(r_ty)]);
         }
+        builder.ins().return_(&zeros);
     }
 
     builder.seal_all_blocks();

@@ -105,6 +105,8 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, taken modulo the lane width | i8 to i64 |
 | Absolute value / negate | `r = vabs v:i32`, `vneg`: integers wrap (`vabs` of the minimum is the minimum); floats clear or flip the sign bit, NaNs included | i8 to f64 |
 | Square root | `r = vsqrt v:f32` (correctly rounded), `vrsqrt` computes `1 / vsqrt(v)` with two roundings, never a hardware estimate, so results are identical on every CPU | f32, f64 |
+| Rounding | `r = vfloor v:f32`, `vceil`, `vround` (halfway cases away from zero, as C's `round`), `vroundeven` (to even), `vroundz` (toward zero) | f32, f64 |
+| Copy sign | `r = vcopysign a, b:f32`: `a`'s magnitude with `b`'s sign bit | f32, f64 |
 | Exponential | `e = vexp v:f32`: e^x within 2 ulp on [-87, 88], inputs clamped to that range, NaN propagated; a fixed algorithm, so results are bit-identical on every backend | f32 |
 | Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
 | Broadcast a lane | `r = vdup v, 3:f32` puts lane 3 of `v` in every lane | Any, including f16/bf16; index checked as for `extlane` |
@@ -183,6 +185,23 @@ On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32, 9
 | AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
 
 `v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
+
+## 🧩 Memory Operands, Several Results and Inline Functions
+
+**Indexed operands.** `ld`, `st`, `ldm` and `stm` take `p[i]`, which addresses `p + i * size` for an i64 index: the size of the loaded or stored scalar, or the lane type of `ldm`/`stm`. A vector access, or a byte offset, names its unit: `p[i:f32]`, `p[o:i8]`. The sandbox checks the address the index computes.
+
+```air
+  body:
+    rest = sub n, i
+    g = ldm gate[i]:vx, rest:f32      # was: off = mul i, 4:i64; pg = add gate, off; g = ldm pg:vx, rest:f32
+    st scores[t], s                   # s:f32 at scores + 4t
+```
+
+**Several results.** A function can return several values, `fn divmod(a:i64, b:i64)->(i64, i64)`, with `ret q, r`, received as `q, r = call divmod(x, 10:i64)`. Results of any type cross calls, `vx` included (on SVE, a struct of scalable vectors); hosts call only functions with at most one scalar result.
+
+**Inline functions.** `inline fn` marks a helper whose calls are replaced by its body before compiling, on both backends, JIT and AOT (`achainsaw opt` shows the expansion). A straight-line helper merges into the caller's block, so it adds no branches and no fuel checks; inline functions cannot be recursive (`ERR_RECURSIVE_INLINE`). The standard library's quantized matrix kernels are built this way: `qmat_chunk` (1 token) and `qmat_chunk4` (4 tokens) call the same inline steps (`qmat_w8`/`qmat_w4`/`qmat_w6` unpack two weight vectors, `qmat_dot` runs one token's `vdot`s, `qmat_acc1`/`qmat_acc2` scale and accumulate), so every token's arithmetic is identical by construction, and `llama_decode.air` reads its tables with `load_cfg`, `model_globals` and `layer_weights`. Together with indexed operands, this cut the standard library from 712 to 447 lines of code (`qmat_chunk` 185 to 80, `qmat_chunk4` 335 to 114) and `llama_decode.air` from 718 to 637, without slowing anything down: in the base-vs-head benchmark comparison every kernel is within noise, and Cranelift's quantized GEMVs and prefill got 6–7% faster (its index shifts fold into x86 addressing modes).
+
+**Scalar math.** Rounding to an integral value, `floor`, `ceil`, `round` (halfway away from zero), `roundeven` and `roundz` (toward zero); bit counts `popcnt`, `clz` and `ctz` (the bit width for 0); `copysign a, b` for floats, `rotl`/`rotr` for integers (amount modulo the width); `r = fma a, b, c` with one rounding; `uitof`/`ftoui` unsigned conversions (`ftoui` saturates, negative values and NaN to 0). All are single instructions or exact sequences, bit-identical on both backends and checked against Rust's own operations (`tests/scalar_math.rs`). `quantize_q8` rounds with `vround`, so it now matches llama.cpp's `roundf` exactly at halfway cases. These mnemonics are recognized only right after `=`, so programs that use them as register names still parse.
 
 ---
 

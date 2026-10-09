@@ -42,29 +42,8 @@ use qmat_chunk, qmat_batch, quantize_q8, rope_half, exp_shift, silu_mul
 
 fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
-    d = ld cfg:i64
-    c1 = add cfg, 8:i64
-    nl = ld c1:i64
-    c2 = add cfg, 16:i64
-    nh = ld c2:i64
-    c3 = add cfg, 24:i64
-    nkv = ld c3:i64
-    c4 = add cfg, 32:i64
-    hd = ld c4:i64
-    c5 = add cfg, 40:i64
-    f = ld c5:i64
-    c6 = add cfg, 48:i64
-    vocab = ld c6:i64
-    c7 = add cfg, 56:i64
-    max_ctx = ld c7:i64
-    embd = ld model:ptr
-    m1 = add model, 8:i64
-    norm_out = ld m1:ptr
-    lm = add model, 16:i64
-    m5 = add model, 40:i64
-    cos_t = ld m5:ptr
-    m6 = add model, 48:i64
-    sin_t = ld m6:ptr
+    d, nl, nh, nkv, hd, f, vocab, max_ctx = call load_cfg(cfg)
+    embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
     # h = embedding row of the token.
@@ -76,11 +55,8 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     br e_more, embed_body, setup
   embed_body:
     e_rest = sub d, ei
-    eo = mul ei, 4:i64
-    pe = add e_row, eo
-    ph = add h, eo
-    ev = ldm pe:vx, e_rest:f32
-    stm ph, ev, e_rest:f32
+    ev = ldm e_row[ei]:vx, e_rest:f32
+    stm h[ei], ev, e_rest:f32
     ei2 = add ei, w
     jmp embed(ei2)
 
@@ -118,17 +94,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    slot0 = mul l, 14:i64
-    slot = add slot0, 7:i64
-    lp_off = mul slot, 8:i64
-    lp = add model, lp_off
-    attn_norm = ld lp:ptr
-    m_qkv = add lp, 8:i64
-    m_o = add lp, 32:i64
-    lp7 = add lp, 56:i64
-    ffn_norm = ld lp7:ptr
-    m_gu = add lp, 64:i64
-    m_dn = add lp, 88:i64
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
@@ -170,12 +136,8 @@ fn lm_argmax(lm:ptr, xq:ptr, dx:ptr, d:i64, vocab:i64)->i64
     pc_more = lt pc, vchunks
     br pc_more, pick_body, done
   pick_body:
-    pv_off = mul pc, 4:i64
-    ppv = add best, pv_off
-    cv = ld ppv:f32
-    pi_off = mul pc, 8:i64
-    ppi = add best_idx, pi_off
-    ci = ld ppi:i64
+    cv = ld best[pc]:f32
+    ci = ld best_idx[pc]:i64
     better = gt cv, pv
     pv2 = select better, cv, pv
     pi2 = select better, ci, pi
@@ -198,9 +160,7 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
     br more, sum_body, scale
   sum_body:
     rest = sub d, i
-    off = mul i, 4:i64
-    ph = add h, off
-    hv = ldm ph:vx, rest:f32
+    hv = ldm h[i]:vx, rest:f32
     acc2 = vfma hv, hv, acc:f32
     i2 = add i, w
     jmp sum(i2, acc2)
@@ -218,15 +178,11 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
     br more_j, norm_body, quant
   norm_body:
     rest_j = sub d, j
-    off_j = mul j, 4:i64
-    ph_j = add h, off_j
-    pw_j = add wt, off_j
-    pn_j = add xn, off_j
-    hv_j = ldm ph_j:vx, rest_j:f32
-    wv = ldm pw_j:vx, rest_j:f32
+    hv_j = ldm h[j]:vx, rest_j:f32
+    wv = ldm wt[j]:vx, rest_j:f32
     hs = vmul hv_j, vinv:f32
     y = vmul hs, wv:f32
-    stm pn_j, y, rest_j:f32
+    stm xn[j], y, rest_j:f32
     j2 = add j, w
     jmp norm(j2)
   quant:
@@ -312,20 +268,15 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     br j_more, dot_body, dot_done
   dot_body:
     rest = sub hd, j
-    jo = mul j, 4:i64
-    pq = add q, jo
-    pk = add kt, jo
-    qv = ldm pq:vx, rest:f32
-    kv = ldm pk:vx, rest:f32
+    qv = ldm q[j]:vx, rest:f32
+    kv = ldm kt[j]:vx, rest:f32
     acc2 = vfma qv, kv, acc:f32
     j2 = add j, w
     jmp dot(j2, acc2)
   dot_done:
     s0 = vsum acc:f32
     s = mul s0, scale
-    so = mul t, 4:i64
-    ps = add scores, so
-    st ps, s
+    st scores[t], s
     mx2 = max mx, s
     t2 = add t, 1:i64
     jmp score(t2, mx2)
@@ -338,9 +289,7 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     br z_more, zero_out_body, mix(0:i64)
   zero_out_body:
     z_rest = sub hd, z
-    zo = mul z, 4:i64
-    pz = add out, zo
-    stm pz, zero, z_rest:f32
+    stm out[z], zero, z_rest:f32
     z2 = add z, w
     jmp zero_out(z2)
   # out = sum_t p_t * V_t / total
@@ -348,9 +297,7 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     u_more = lt u, npos
     br u_more, mix_start, quant
   mix_start:
-    uo = mul u, 4:i64
-    pu = add scores, uo
-    pr = ld pu:f32
+    pr = ld scores[u]:f32
     p = mul pr, inv
     vp = splat p:vx
     vt_off = mul u, row
@@ -361,13 +308,10 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     br c_more, mix_body, mix_next
   mix_body:
     c_rest = sub hd, c
-    co = mul c, 4:i64
-    pv = add vt, co
-    po = add out, co
-    vv = ldm pv:vx, c_rest:f32
-    ov = ldm po:vx, c_rest:f32
+    vv = ldm vt[c]:vx, c_rest:f32
+    ov = ldm out[c]:vx, c_rest:f32
     ov2 = vfma vp, vv, ov:f32
-    stm po, ov2, c_rest:f32
+    stm out[c], ov2, c_rest:f32
     c2 = add c, w
     jmp mix_cols(c2)
   mix_next:
@@ -399,13 +343,10 @@ fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
     br more, add_body, done
   add_body:
     rest = sub 64:i64, j
-    o = mul j, 4:i64
-    pt = add tmp, o
-    ph = add hc, o
-    tv = ldm pt:vx, rest:f32
-    hv = ldm ph:vx, rest:f32
+    tv = ldm tmp[j]:vx, rest:f32
+    hv = ldm hc[j]:vx, rest:f32
     s = vadd hv, tv:f32
-    stm ph, s, rest:f32
+    stm hc[j], s, rest:f32
     j2 = add j, w
     jmp add_loop(j2)
   done:
@@ -445,23 +386,17 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
     more = lt j, 64:i64
     br more, scan_body, done
   scan_body:
-    o = mul j, 4:i64
-    pt = add tmp, o
-    v = ld pt:f32
+    v = ld tmp[j]:f32
     better = gt v, bv
     bv2 = select better, v, bv
     bj2 = select better, j, bj
     j2 = add j, 1:i64
     jmp scan(j2, bv2, bj2)
   done:
-    bo = mul c, 4:i64
-    pb = add best, bo
-    st pb, bv
-    io = mul c, 8:i64
-    pi = add best_idx, io
+    st best[c], bv
     base = mul c, 64:i64
     tok = add base, bj
-    st pi, tok
+    st best_idx[c], tok
     free tmp
     ret
 
@@ -473,29 +408,8 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
 # its own position, so tokens never see later ones.
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
-    d = ld cfg:i64
-    c1 = add cfg, 8:i64
-    nl = ld c1:i64
-    c2 = add cfg, 16:i64
-    nh = ld c2:i64
-    c3 = add cfg, 24:i64
-    nkv = ld c3:i64
-    c4 = add cfg, 32:i64
-    hd = ld c4:i64
-    c5 = add cfg, 40:i64
-    f = ld c5:i64
-    c6 = add cfg, 48:i64
-    vocab = ld c6:i64
-    c7 = add cfg, 56:i64
-    max_ctx = ld c7:i64
-    embd = ld model:ptr
-    m1 = add model, 8:i64
-    norm_out = ld m1:ptr
-    lm = add model, 16:i64
-    m5 = add model, 40:i64
-    cos_t = ld m5:ptr
-    m6 = add model, 48:i64
-    sin_t = ld m6:ptr
+    d, nl, nh, nkv, hd, f, vocab, max_ctx = call load_cfg(cfg)
+    embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
     # hs: the residual streams of the n tokens, f32 [n x d].
@@ -506,9 +420,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     s_more = lt s, n
     br s_more, embed_start, setup
   embed_start:
-    so = mul s, 8:i64
-    pt = add tokens, so
-    tok = ld pt:i64
+    tok = ld tokens[s]:i64
     e_off = mul tok, d4
     e_row = add embd, e_off
     h_off = mul s, d4
@@ -519,11 +431,8 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     br e_more, embed_body, embed_next
   embed_body:
     e_rest = sub d, ei
-    eo = mul ei, 4:i64
-    pe = add e_row, eo
-    ph = add h_row, eo
-    ev = ldm pe:vx, e_rest:f32
-    stm ph, ev, e_rest:f32
+    ev = ldm e_row[ei]:vx, e_rest:f32
+    stm h_row[ei], ev, e_rest:f32
     ei2 = add ei, w
     jmp embed(ei2)
   embed_next:
@@ -559,17 +468,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    slot0 = mul l, 14:i64
-    slot = add slot0, 7:i64
-    lp_off = mul slot, 8:i64
-    lp = add model, lp_off
-    attn_norm = ld lp:ptr
-    m_qkv = add lp, 8:i64
-    m_o = add lp, 32:i64
-    lp7 = add lp, 56:i64
-    ffn_norm = ld lp7:ptr
-    m_gu = add lp, 64:i64
-    m_dn = add lp, 88:i64
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
@@ -593,11 +492,8 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     br c_more, copy_body, head
   copy_body:
     c_rest = sub d, ci
-    co = mul ci, 4:i64
-    pl = add h_last, co
-    po = add h, co
-    cv = ldm pl:vx, c_rest:f32
-    stm po, cv, c_rest:f32
+    cv = ldm h_last[ci]:vx, c_rest:f32
+    stm h[ci], cv, c_rest:f32
     ci2 = add ci, w
     jmp copy(ci2)
   head:
@@ -681,11 +577,8 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     br j_more, copy_body, scatter_next
   copy_body:
     j_rest = sub 64:i64, j
-    jo = mul j, 4:i64
-    ps = add src, jo
-    pd = add dst, jo
-    v = ldm ps:vx, j_rest:f32
-    stm pd, v, j_rest:f32
+    v = ldm src[j]:vx, j_rest:f32
+    stm dst[j], v, j_rest:f32
     j2 = add j, w
     jmp copy(j2)
   scatter_next:
@@ -767,13 +660,10 @@ fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i6
     br more, add_body, tok_next
   add_body:
     rest = sub 64:i64, j
-    o = mul j, 4:i64
-    pt = add ts, o
-    ph = add hc, o
-    tv = ldm pt:vx, rest:f32
-    hv = ldm ph:vx, rest:f32
+    tv = ldm ts[j]:vx, rest:f32
+    hv = ldm hc[j]:vx, rest:f32
     sum = vadd hv, tv:f32
-    stm ph, sum, rest:f32
+    stm hc[j], sum, rest:f32
     j2 = add j, w
     jmp add_loop(j2)
   tok_next:
@@ -821,3 +711,43 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
     free u
     free g
     ret
+
+# The 8 words of cfg: d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx.
+inline fn load_cfg(cfg:ptr)->(i64, i64, i64, i64, i64, i64, i64, i64)
+  b0:
+    d = ld cfg[0]:i64
+    nl = ld cfg[1]:i64
+    nh = ld cfg[2]:i64
+    nkv = ld cfg[3]:i64
+    hd = ld cfg[4]:i64
+    f = ld cfg[5]:i64
+    vocab = ld cfg[6]:i64
+    max_ctx = ld cfg[7]:i64
+    ret d, nl, nh, nkv, hd, f, vocab, max_ctx
+
+# The model table's global entries: embedding, final norm, the LM head's 3 words, RoPE
+# cos and sin tables.
+inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
+  b0:
+    embd = ld model[0]:ptr
+    norm_out = ld model[1]:ptr
+    lm = add model, 16:i64
+    cos_t = ld model[5]:ptr
+    sin_t = ld model[6]:ptr
+    ret embd, norm_out, lm, cos_t, sin_t
+
+# Layer l's entries (14 words at 7 + 14 l): its two norm weights, and pointers to the
+# 3-word entries of its QKV, O, gate/up and down matrices.
+inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr)
+  b0:
+    slot0 = mul l, 14:i64
+    slot = add slot0, 7:i64
+    lp_off = shl slot, 3:i64
+    lp = add model, lp_off
+    attn_norm = ld lp[0]:ptr
+    m_qkv = add lp, 8:i64
+    m_o = add lp, 32:i64
+    ffn_norm = ld lp[7]:ptr
+    m_gu = add lp, 64:i64
+    m_dn = add lp, 88:i64
+    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn

@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use achainsaw_ir::ast::{
-    vexp, BinaryOp, CastOp, Constant, Function, Instruction, Module, Terminator, UnaryOp, VBinOp,
-    VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
+    vexp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Module, Terminator, UnaryOp,
+    VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
@@ -121,6 +121,18 @@ pub struct LowerOptions {
     pub int8_dot: Int8Dot,
 }
 
+/// LLVM intrinsic of a scalar rounding op.
+fn round_intrinsic(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Floor => "llvm.floor",
+        UnaryOp::Ceil => "llvm.ceil",
+        UnaryOp::Round => "llvm.round",
+        UnaryOp::RoundEven => "llvm.roundeven",
+        UnaryOp::RoundZ => "llvm.trunc",
+        other => unreachable!("{other:?} is not a rounding op"),
+    }
+}
+
 fn lane_bits(lane: Type) -> u32 {
     lane.bit_width().expect("lane type has a width")
 }
@@ -218,11 +230,12 @@ pub fn lower_module<'ctx>(
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
-        let fn_ty = lw.fn_type(&ext.params, ext.ret_type);
+        let rets: Vec<Type> = ext.ret_type.into_iter().collect();
+        let fn_ty = lw.fn_type(&ext.params, &rets);
         module.add_function(&ext.name, fn_ty, Some(Linkage::External));
     }
     for func in &air.functions {
-        let fn_ty = lw.fn_type(&func.params, func.ret_type);
+        let fn_ty = lw.fn_type(&func.params, &func.rets);
         let f = module.add_function(&func.name, fn_ty, Some(Linkage::External));
         lw.add_target_attributes(f);
     }
@@ -247,13 +260,7 @@ pub fn lower_module<'ctx>(
     }
     if !opts.aot {
         for func in &air.functions {
-            let scalar_only = func
-                .params
-                .iter()
-                .map(|(_, t)| *t)
-                .chain(func.ret_type)
-                .all(|t| !t.is_vector());
-            if scalar_only {
+            if func.has_trampoline() {
                 lw.lower_trampoline(func)?;
             }
         }
@@ -411,19 +418,27 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
     }
 
+    /// Function type: void, the single result's type, or a struct of several results.
     fn fn_type(
         &self,
         params: &[(String, Type)],
-        ret: Option<Type>,
+        rets: &[Type],
     ) -> inkwell::types::FunctionType<'ctx> {
         let ps: Vec<BasicMetadataTypeEnum> = params
             .iter()
             .map(|(_, t)| self.air_type(*t).into())
             .collect();
-        match ret {
-            Some(r) => self.air_type(r).fn_type(&ps, false),
-            None => self.ctx.void_type().fn_type(&ps, false),
+        match rets {
+            [] => self.ctx.void_type().fn_type(&ps, false),
+            [r] => self.air_type(*r).fn_type(&ps, false),
+            many => self.rets_type(many).fn_type(&ps, false),
         }
+    }
+
+    /// The struct a function with several results returns.
+    fn rets_type(&self, rets: &[Type]) -> inkwell::types::StructType<'ctx> {
+        let fields: Vec<BasicTypeEnum> = rets.iter().map(|t| self.air_type(*t)).collect();
+        self.ctx.struct_type(&fields, false)
     }
 
     fn add_target_attributes(&self, f: FunctionValue<'ctx>) {
@@ -1040,13 +1055,17 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
         if let Some(trap) = st.trap {
             b.position_at_end(trap);
-            match func.ret_type {
-                Some(r) => {
-                    let zero = self.air_type(r).const_zero();
+            match func.rets.as_slice() {
+                [] => {
+                    b.build_return(None)?;
+                }
+                [r] => {
+                    let zero = self.air_type(*r).const_zero();
                     b.build_return(Some(&zero))?;
                 }
-                None => {
-                    b.build_return(None)?;
+                many => {
+                    let zero = self.rets_type(many).const_zero();
+                    b.build_return(Some(&zero))?;
                 }
             }
         }
@@ -1062,6 +1081,25 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     }
 
     /// Jumps to `target`, passing `args` to its block parameters.
+    /// Address of a memory operand: `ptr`, or `ptr + i * size` for `ptr[i]`, the size being
+    /// the index's unit or `implied`.
+    fn mem_addr(
+        &self,
+        st: &FnState<'ctx>,
+        ptr: &str,
+        index: Option<&Index>,
+        implied: Type,
+    ) -> Result<IntValue<'ctx>> {
+        let p = self.int(st, ptr);
+        let Some(ix) = index else {
+            return Ok(p);
+        };
+        let i = self.int(st, &ix.reg);
+        let size = self.c64(ix.unit_or(implied).byte_size() as i64);
+        let off = self.builder.build_int_mul(i, size, "")?;
+        Ok(self.builder.build_int_add(p, off, "")?)
+    }
+
     fn jump_with_args(
         &self,
         st: &FnState<'ctx>,
@@ -1116,12 +1154,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let e = self.edge(st, else_block, else_args)?;
                 b.build_conditional_branch(c, t, e)?;
             }
-            Terminator::Ret { val, .. } => match val {
-                Some(v) => {
+            Terminator::Ret { vals, .. } => match vals.as_slice() {
+                [] => {
+                    b.build_return(None)?;
+                }
+                [v] => {
                     b.build_return(Some(&st.values[v].0))?;
                 }
-                None => {
-                    b.build_return(None)?;
+                many => {
+                    let vs: Vec<BasicValueEnum> = many.iter().map(|v| st.values[v].0).collect();
+                    b.build_aggregate_return(&vs)?;
                 }
             },
         }
@@ -1155,22 +1197,30 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let res = self.lower_binary(st, *op, lhs, rhs)?;
                 st.values.insert(dst.clone(), res);
             }
-            Instruction::Load { dst, ptr, ty, .. } => {
-                let addr = self.int(st, ptr);
+            Instruction::Load {
+                dst,
+                ptr,
+                index,
+                ty,
+                ..
+            } => {
+                let addr = self.mem_addr(st, ptr, index.as_ref(), *ty)?;
                 let bytes = self.access_bytes(*ty)?;
                 self.bounds_check(st, addr, bytes)?;
                 let v = self.load(self.air_type(*ty), addr)?;
                 st.values.insert(dst.clone(), (v, *ty));
             }
-            Instruction::Store { ptr, val, .. } => {
-                let addr = self.int(st, ptr);
+            Instruction::Store {
+                ptr, index, val, ..
+            } => {
                 let (v, vty) = self.val(st, val);
+                let addr = self.mem_addr(st, ptr, index.as_ref(), vty)?;
                 let bytes = self.access_bytes(vty)?;
                 self.bounds_check(st, addr, bytes)?;
                 self.store(v, addr)?;
             }
             Instruction::Call {
-                dst, func, args, ..
+                dsts, func, args, ..
             } => {
                 let callee = self
                     .module
@@ -1187,25 +1237,32 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                     // Call the registered symbol as-is; do not fold or replace libm calls.
                     cs.add_attribute(AttributeLoc::Function, self.enum_attr("nobuiltin"));
                 }
-                if let Some(d) = dst {
-                    let ret_ty = air
+                if !dsts.is_empty() {
+                    let rets: Vec<Type> = air
                         .functions
                         .iter()
                         .find(|f| &f.name == func)
-                        .map(|f| f.ret_type)
+                        .map(|f| f.rets.clone())
                         .or_else(|| {
                             air.extern_functions
                                 .iter()
                                 .find(|f| &f.name == func)
-                                .map(|f| f.ret_type)
+                                .map(|f| f.ret_type.into_iter().collect())
                         })
-                        .flatten()
-                        .unwrap_or(Type::I32);
+                        .unwrap_or_default();
                     let v = cs
                         .try_as_basic_value()
                         .basic()
                         .ok_or_else(|| anyhow!("'{func}' returns no value"))?;
-                    st.values.insert(d.clone(), (v, ret_ty));
+                    if let [d] = dsts.as_slice() {
+                        st.values.insert(d.clone(), (v, rets[0]));
+                    } else {
+                        let agg = v.into_struct_value();
+                        for (i, (d, t)) in dsts.iter().zip(rets).enumerate() {
+                            let x = b.build_extract_value(agg, i as u32, "")?;
+                            st.values.insert(d.clone(), (x, t));
+                        }
+                    }
                 }
             }
             Instruction::Splat { dst, src, ty, .. } => {
@@ -1281,8 +1338,27 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                         self.intr("llvm.abs", &[t], &[s, self.i1().const_zero().into()])?
                     }
                     (UnaryOp::Sqrt, _) => self.intr("llvm.sqrt", &[t], &[s])?,
+                    (UnaryOp::Popcnt, _) => self.intr("llvm.ctpop", &[t], &[s])?,
+                    // `false`: a zero input gives the bit width rather than poison.
+                    (UnaryOp::Clz | UnaryOp::Ctz, _) => {
+                        let name = if *op == UnaryOp::Clz {
+                            "llvm.ctlz"
+                        } else {
+                            "llvm.cttz"
+                        };
+                        self.intr(name, &[t], &[s, self.i1().const_zero().into()])?
+                    }
+                    (rounding, _) => self.intr(round_intrinsic(*rounding), &[t], &[s])?,
                 };
                 st.values.insert(dst.clone(), (r, sty));
+            }
+            Instruction::Fma {
+                dst, a, b: bb, c, ..
+            } => {
+                let (x, ty) = self.val(st, a);
+                let args = [x, self.val(st, bb).0, self.val(st, c).0];
+                let r = self.intr("llvm.fma", &[x.get_type()], &args)?;
+                st.values.insert(dst.clone(), (r, ty));
             }
             Instruction::Cast {
                 dst, src, ty, op, ..
@@ -1415,12 +1491,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             Instruction::MaskedLoad {
                 dst,
                 ptr,
+                index,
                 count,
                 ty,
                 lane,
                 ..
             } => {
-                let addr = self.int(st, ptr);
+                let addr = self.mem_addr(st, ptr, index.as_ref(), *lane)?;
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(*ty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
                 self.bounds_check(st, addr, bytes)?;
@@ -1439,12 +1516,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
             Instruction::MaskedStore {
                 ptr,
+                index,
                 val,
                 count,
                 lane,
                 ..
             } => {
-                let addr = self.int(st, ptr);
+                let addr = self.mem_addr(st, ptr, index.as_ref(), *lane)?;
                 let (v, vty) = self.val(st, val);
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(vty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
@@ -1629,6 +1707,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 BinaryOp::Div => b.build_float_div(x, y, "")?.into(),
                 BinaryOp::Min => self.float_minmax(false, l, r)?,
                 BinaryOp::Max => self.float_minmax(true, l, r)?,
+                BinaryOp::Copysign => self.intr("llvm.copysign", &[l.get_type()], &[l, r])?,
                 _ => return Err(anyhow!("Unsupported float op {op:?}")),
             };
             return Ok((v, lty));
@@ -1695,6 +1774,10 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             BinaryOp::Max => self.intr("llvm.smax", &[int_ty.into()], &[l, r])?,
             BinaryOp::Umin => self.intr("llvm.umin", &[int_ty.into()], &[l, r])?,
             BinaryOp::Umax => self.intr("llvm.umax", &[int_ty.into()], &[l, r])?,
+            // Funnel shifts of x with itself rotate, by the amount modulo the bit width.
+            BinaryOp::Rotl => self.intr("llvm.fshl", &[int_ty.into()], &[l, l, r])?,
+            BinaryOp::Rotr => self.intr("llvm.fshr", &[int_ty.into()], &[l, l, r])?,
+            BinaryOp::Copysign => unreachable!("the validator allows copysign on floats only"),
             BinaryOp::Eq => return cmp(IntPredicate::EQ),
             BinaryOp::Ne => return cmp(IntPredicate::NE),
             BinaryOp::Lt => return cmp(IntPredicate::SLT),
@@ -1732,6 +1815,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             CastOp::Itof => b
                 .build_signed_int_to_float(s.into_int_value(), target.into_float_type(), "")?
                 .into(),
+            CastOp::Uitof => b
+                .build_unsigned_int_to_float(s.into_int_value(), target.into_float_type(), "")?
+                .into(),
+            // Saturating: negative values and NaN give 0.
+            CastOp::Ftoui => self.intr("llvm.fptoui.sat", &[target, s.get_type()], &[s])?,
             CastOp::Ftoi => {
                 // Saturating, NaN -> 0; i8/i16 saturate to i32 first, as on Cranelift.
                 let via = if matches!(ty, Type::I8 | Type::I16) {
@@ -1953,6 +2041,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             (VBinOp::Max, false) => self.intr("llvm.smax", &[t], &[x, y])?,
             // The validator only allows float lanes for vdiv.
             (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
+            (VBinOp::Copysign, _) => self.intr("llvm.copysign", &[t], &[x, y])?,
             (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
         };
         self.to_canon(res, vty)
@@ -2051,6 +2140,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 vec2!(one, root, |a, c| b.build_float_div(a, c, "")?)
             }
             VUnaryOp::Rev => self.intr("llvm.vector.reverse", &[x.get_type()], &[x])?,
+            VUnaryOp::Floor => self.intr("llvm.floor", &[x.get_type()], &[x])?,
+            VUnaryOp::Ceil => self.intr("llvm.ceil", &[x.get_type()], &[x])?,
+            VUnaryOp::Round => self.intr("llvm.round", &[x.get_type()], &[x])?,
+            VUnaryOp::RoundEven => self.intr("llvm.roundeven", &[x.get_type()], &[x])?,
+            VUnaryOp::RoundZ => self.intr("llvm.trunc", &[x.get_type()], &[x])?,
             VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
                 // The low or high half of the lanes (for SVE, the index scales with vscale).
                 let n = self.lanes_min(vty, src_lane);
@@ -2508,7 +2602,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
         let target = self.module.get_function(&func.name).unwrap();
         let cs = b.build_call(target, &argv, "")?;
-        if let Some(r_ty) = func.ret_type {
+        if let Ok(Some(r_ty)) = func.single_ret() {
             let res = cs.try_as_basic_value().basic().unwrap();
             let raw: IntValue = match r_ty {
                 Type::I64 | Type::Ptr => res.into_int_value(),

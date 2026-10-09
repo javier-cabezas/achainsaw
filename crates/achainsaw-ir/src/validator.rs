@@ -9,7 +9,8 @@ pub const RESERVED_PREFIX: &str = "__achainsaw";
 
 pub struct Validator {
     // Function table: name -> (param types, return type)
-    functions: HashMap<String, (Vec<Type>, Option<Type>)>,
+    /// Parameter and result types of every function.
+    functions: HashMap<String, (Vec<Type>, Vec<Type>)>,
     /// Names declared with `extfn`, which `par` may not run.
     externs: HashSet<String>,
 }
@@ -83,13 +84,17 @@ pub fn binary_result_type(
             )),
         },
         Type::F32 | Type::F64 => match op {
-            Add | Sub | Mul | Div | Min | Max => Ok(ty),
+            Add | Sub | Mul | Div | Min | Max | Copysign => Ok(ty),
             Eq | Ne | Lt | Gt | Le | Ge => Ok(Type::I32),
             _ => Err((
                 "ERR_INVALID_OP_FOR_TYPE",
                 format!("Operation '{op:?}' is not defined for floating-point type '{ty}'"),
             )),
         },
+        _ if op == Copysign => Err((
+            "ERR_INVALID_OP_FOR_TYPE",
+            format!("'copysign' is defined for f32 and f64, not '{ty}'"),
+        )),
         _ => {
             // I8 / I16 / I32 / I64
             if op.is_comparison() {
@@ -112,6 +117,7 @@ pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
         VBinOp::Mul => &[I16, I32, I64, F32, F64],
         VBinOp::Div => &[F32, F64],
         VBinOp::Min | VBinOp::Max => &[I8, I16, I32, F32, F64],
+        VBinOp::Copysign => &[F32, F64],
     }
 }
 
@@ -153,6 +159,11 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
         VUnaryOp::Abs | VUnaryOp::Neg => ALL_LANES,
         VUnaryOp::Sqrt | VUnaryOp::Rsqrt => &[Type::F32, Type::F64],
         VUnaryOp::Rev => VPERM_LANE_TYPES,
+        VUnaryOp::Floor
+        | VUnaryOp::Ceil
+        | VUnaryOp::Round
+        | VUnaryOp::RoundEven
+        | VUnaryOp::RoundZ => &[Type::F32, Type::F64],
     }
 }
 
@@ -257,8 +268,10 @@ impl Validator {
                 check_signature_type(ty, &ext_fn.name, true, ext_fn.span)?;
             }
             let param_types = ext_fn.params.iter().map(|(_, ty)| *ty).collect();
-            self.functions
-                .insert(ext_fn.name.clone(), (param_types, ext_fn.ret_type));
+            self.functions.insert(
+                ext_fn.name.clone(),
+                (param_types, ext_fn.ret_type.into_iter().collect()),
+            );
             self.externs.insert(ext_fn.name.clone());
         }
 
@@ -271,20 +284,19 @@ impl Validator {
                     func.span,
                 ));
             }
-            for ty in func.params.iter().map(|(_, t)| *t).chain(func.ret_type) {
+            for ty in func.params.iter().map(|(_, t)| *t).chain(func.rets.clone()) {
                 check_signature_type(ty, &func.name, false, func.span)?;
             }
             let param_types = func.params.iter().map(|(_, ty)| *ty).collect();
             self.functions
-                .insert(func.name.clone(), (param_types, func.ret_type));
+                .insert(func.name.clone(), (param_types, func.rets.clone()));
         }
 
         // Validate each function
         for func in &module.functions {
             self.validate_function(func)?;
         }
-
-        Ok(())
+        check_inline_recursion(module)
     }
 
     fn check_reserved(name: &str, span: Span) -> Result<(), Diagnostic> {
@@ -538,7 +550,14 @@ impl Validator {
                     .map_err(|(code, msg)| Diagnostic::error(code, msg, *span))?;
                 Self::define(scope, defs, dst, out_ty, *span)?;
             }
-            Instruction::Load { dst, ptr, ty, span } => {
+            Instruction::Load {
+                dst,
+                ptr,
+                index,
+                ty,
+                span,
+            } => {
+                self.check_index(ctx, index.as_ref(), *ty, "ld", scope, *span)?;
                 let ptr_ty = self.check_reg(ctx, ptr, scope, *span)?;
                 if ptr_ty != Type::Ptr {
                     return Err(Diagnostic::error(
@@ -551,7 +570,12 @@ impl Validator {
                 }
                 Self::define(scope, defs, dst, *ty, *span)?;
             }
-            Instruction::Store { ptr, val, span } => {
+            Instruction::Store {
+                ptr,
+                index,
+                val,
+                span,
+            } => {
                 let ptr_ty = self.check_reg(ctx, ptr, scope, *span)?;
                 if ptr_ty != Type::Ptr {
                     return Err(Diagnostic::error(
@@ -562,15 +586,16 @@ impl Validator {
                         *span,
                     ));
                 }
-                self.check_reg(ctx, val, scope, *span)?;
+                let val_ty = self.check_reg(ctx, val, scope, *span)?;
+                self.check_index(ctx, index.as_ref(), val_ty, "st", scope, *span)?;
             }
             Instruction::Call {
-                dst,
+                dsts,
                 func,
                 args,
                 span,
             } => {
-                let (param_types, ret_type) = self.functions.get(func).ok_or_else(|| {
+                let (param_types, rets) = self.functions.get(func).ok_or_else(|| {
                     Diagnostic::error(
                         "ERR_UNDEFINED_FUNCTION",
                         format!("Call to undefined function '{func}'"),
@@ -601,14 +626,27 @@ impl Validator {
                     }
                 }
 
-                if let Some(d) = dst {
-                    let rty = ret_type.ok_or_else(|| {
-                        Diagnostic::error(
-                            "ERR_VOID_ASSIGNMENT",
-                            format!("Function '{func}' does not return a value"),
-                            *span,
-                        )
-                    })?;
+                if !dsts.is_empty() && rets.is_empty() {
+                    return Err(Diagnostic::error(
+                        "ERR_VOID_ASSIGNMENT",
+                        format!("Function '{func}' does not return a value"),
+                        *span,
+                    ));
+                }
+                if !dsts.is_empty() && dsts.len() != rets.len() {
+                    return Err(Diagnostic::error(
+                        "ERR_RESULT_COUNT",
+                        format!(
+                            "Function '{func}' returns {} values, but the call assigns {} ({})",
+                            rets.len(),
+                            dsts.len(),
+                            dsts.join(", ")
+                        ),
+                        *span,
+                    )
+                    .with_context(serde_json::json!({ "function": func, "returns": rets.iter().map(|t| t.as_str()).collect::<Vec<_>>() })));
+                }
+                for (d, rty) in dsts.iter().zip(rets.clone()) {
                     Self::define(scope, defs, d, rty, *span)?;
                 }
             }
@@ -626,7 +664,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                let (param_types, ret_type) = self.functions.get(func).ok_or_else(|| {
+                let (param_types, rets) = self.functions.get(func).ok_or_else(|| {
                     Diagnostic::error(
                         "ERR_UNDEFINED_FUNCTION",
                         format!("par runs undefined function '{func}'"),
@@ -649,7 +687,7 @@ impl Validator {
                         "par cannot run external function '{func}'; wrap the call in an AIR function"
                     )));
                 }
-                if param_types.first() != Some(&Type::I64) || ret_type.is_some() {
+                if param_types.first() != Some(&Type::I64) || !rets.is_empty() {
                     return Err(signature_error(format!(
                         "par body '{func}' must take the index (i64) as its first parameter and return nothing"
                     )));
@@ -806,6 +844,26 @@ impl Validator {
                         }
                         src_ty
                     }
+                    _ if op.is_rounding() && !src_ty.is_float() => {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!(
+                                "'{}' operand must be float (f32 or f64), found '{src_ty}'",
+                                op.as_str()
+                            ),
+                            *span,
+                        ));
+                    }
+                    _ if op.is_bit_count() && !src_ty.is_int() => {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!(
+                                "'{}' operand must be an integer (i8 to i64), found '{src_ty}'",
+                                op.as_str()
+                            ),
+                            *span,
+                        ));
+                    }
                     UnaryOp::Neg | UnaryOp::Abs => {
                         if src_ty.is_vector() || src_ty.is_half() || src_ty == Type::Ptr {
                             return Err(Diagnostic::error(
@@ -816,6 +874,7 @@ impl Validator {
                         }
                         src_ty
                     }
+                    _ => src_ty,
                 };
                 Self::define(scope, defs, dst, out_ty, *span)?;
             }
@@ -836,6 +895,28 @@ impl Validator {
                                 "ERR_TYPE_MISMATCH",
                                 format!(
                                     "itof requires integer source and float destination, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Uitof => {
+                        if !src_ty.is_int() || !ty.is_float() {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "uitof requires integer source and float destination, found '{src_ty}' -> '{ty}'"
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                    CastOp::Ftoui => {
+                        if !src_ty.is_float() || !matches!(ty, Type::I32 | Type::I64) {
+                            return Err(Diagnostic::error(
+                                "ERR_TYPE_MISMATCH",
+                                format!(
+                                    "ftoui requires float source and i32 or i64 destination, found '{src_ty}' -> '{ty}'"
                                 ),
                                 *span,
                             ));
@@ -971,6 +1052,27 @@ impl Validator {
                 let vec_ty = self.check_same_vectors(ctx, "vfma", &[a, b, c], scope, *span)?;
                 Self::define(scope, defs, dst, vec_ty, *span)?;
             }
+            Instruction::Fma { dst, a, b, c, span } => {
+                let ty = self.check_reg(ctx, a, scope, *span)?;
+                for r in [b, c] {
+                    let t = self.check_reg(ctx, r, scope, *span)?;
+                    if t != ty {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!("fma operands must have one type, found '{ty}' and '{t}'"),
+                            *span,
+                        ));
+                    }
+                }
+                if !ty.is_float() {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("fma operands must be f32 or f64, found '{ty}'"),
+                        *span,
+                    ));
+                }
+                Self::define(scope, defs, dst, ty, *span)?;
+            }
             Instruction::VDot {
                 dst,
                 acc,
@@ -1015,11 +1117,13 @@ impl Validator {
             Instruction::MaskedLoad {
                 dst,
                 ptr,
+                index,
                 count,
                 ty,
                 lane,
                 span,
             } => {
+                self.check_index(ctx, index.as_ref(), *lane, "ldm", scope, *span)?;
                 self.check_typed(ctx, ptr, Type::Ptr, "ldm pointer", scope, *span)?;
                 self.check_typed(ctx, count, Type::I64, "ldm lane count", scope, *span)?;
                 if !ty.is_vector() {
@@ -1034,11 +1138,13 @@ impl Validator {
             }
             Instruction::MaskedStore {
                 ptr,
+                index,
                 val,
                 count,
                 lane,
                 span,
             } => {
+                self.check_index(ctx, index.as_ref(), *lane, "stm", scope, *span)?;
                 self.check_typed(ctx, ptr, Type::Ptr, "stm pointer", scope, *span)?;
                 self.check_vector(ctx, val, scope, *span)?;
                 self.check_typed(ctx, count, Type::I64, "stm lane count", scope, *span)?;
@@ -1126,6 +1232,35 @@ impl Validator {
                 Self::check_lane("vl", *lane, COUNT_LANES, *span)?;
                 Self::define(scope, defs, dst, Type::I64, *span)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Checks the index of a memory access (`p[i]`): an i64 register, scaled by a type with a
+    /// fixed size. Without a unit, the access's element type `implied` scales it, which must
+    /// not be a vector (`ld p[i]:v256` would be ambiguous).
+    fn check_index(
+        &self,
+        ctx: &FnCtx,
+        index: Option<&Index>,
+        implied: Type,
+        op: &str,
+        scope: &Visible,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(ix) = index else {
+            return Ok(());
+        };
+        self.check_typed(ctx, &ix.reg, Type::I64, &format!("{op} index"), scope, span)?;
+        let unit = ix.unit_or(implied);
+        if unit == Type::Vx || (ix.unit.is_none() && unit.is_vector()) {
+            let message = if ix.unit.is_some() {
+                format!("'{op}' index unit 'vx' has no fixed size; use a lane type, e.g. p[i:f32]")
+            } else {
+                format!("'{op}' of a vector needs the index unit, e.g. p[i:f32] (i counts f32 values) or p[i:v256]")
+            };
+            return Err(Diagnostic::error("ERR_INDEX_UNIT", message, span)
+                .with_context(serde_json::json!({ "op": op, "unit": unit.as_str() })));
         }
         Ok(())
     }
@@ -1348,9 +1483,23 @@ impl Validator {
                 self.check_target_args(ctx, then_block, then_args, scope, *span, "Branch")?;
                 self.check_target_args(ctx, else_block, else_args, scope, *span, "Branch")?;
             }
-            Terminator::Ret { val, span } => match (val, ctx.func.ret_type) {
-                (None, None) => {}
-                (Some(v), Some(expected_ty)) => {
+            Terminator::Ret { vals, span } => {
+                let rets = &ctx.func.rets;
+                if vals.len() != rets.len() {
+                    let message = match (vals.len(), rets.len()) {
+                        (_, 0) => format!(
+                            "Function has void return type, but returns {}",
+                            vals.join(", ")
+                        ),
+                        (0, 1) => format!(
+                            "Function expects return type '{}', but returned void",
+                            rets[0]
+                        ),
+                        (n, m) => format!("Function returns {m} values, but 'ret' gives {n}"),
+                    };
+                    return Err(Diagnostic::error("ERR_TYPE_MISMATCH", message, *span));
+                }
+                for (v, &expected_ty) in vals.iter().zip(rets) {
                     let actual_ty = self.check_reg(ctx, v, scope, *span)?;
                     if actual_ty != expected_ty {
                         return Err(Diagnostic::error(
@@ -1360,27 +1509,54 @@ impl Validator {
                         ));
                     }
                 }
-                (Some(v), None) => {
-                    return Err(Diagnostic::error(
-                        "ERR_TYPE_MISMATCH",
-                        format!("Function has void return type, but returns value '{v}'"),
-                        *span,
-                    ));
-                }
-                (None, Some(expected_ty)) => {
-                    return Err(Diagnostic::error(
-                        "ERR_TYPE_MISMATCH",
-                        format!("Function expects return type '{expected_ty}', but returned void"),
-                        *span,
-                    ));
-                }
-            },
+            }
         }
         Ok(())
     }
 }
 
 /// Adds the instruction index plus `function`/`block` context to a diagnostic.
+/// Rejects `inline fn`s that reach themselves through calls to inline functions, which
+/// inlining could never finish expanding.
+fn check_inline_recursion(module: &Module) -> Result<(), Diagnostic> {
+    let inline: HashMap<&str, &Function> = module
+        .functions
+        .iter()
+        .filter(|f| f.inline)
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    let callees = |f: &Function| -> Vec<String> {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| match i {
+                Instruction::Call { func, .. } if inline.contains_key(func.as_str()) => {
+                    Some(func.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for (&name, &f) in &inline {
+        // Depth-first from f's inline callees, looking for f.
+        let mut stack = callees(f);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = stack.pop() {
+            if c == name {
+                return Err(Diagnostic::error(
+                    "ERR_RECURSIVE_INLINE",
+                    format!("inline fn '{name}' calls itself through inline functions; remove 'inline' from one of them"),
+                    f.span,
+                ));
+            }
+            if seen.insert(c.clone()) {
+                stack.extend(callees(inline[c.as_str()]));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn annotate(mut diag: Diagnostic, func: &Function, block: &Block, inst_idx: usize) -> Diagnostic {
     if diag.instruction_index.is_none() {
         diag.instruction_index = Some(inst_idx);
