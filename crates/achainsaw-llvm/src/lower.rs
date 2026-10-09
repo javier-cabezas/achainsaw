@@ -22,8 +22,8 @@ use inkwell::llvm_sys::LLVMTailCallKind;
 use inkwell::module::{Linkage, Module as LModule};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, VectorType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue,
-    PhiValue, PointerValue,
+    AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+    InstructionOpcode, IntValue, PhiValue, PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
@@ -227,6 +227,7 @@ pub fn lower_module<'ctx>(
         opts,
         // `par` workers count fuel in their own counters.
         dynamic_fuel: air.uses_par(),
+        vnni_bias: Default::default(),
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
@@ -279,6 +280,10 @@ struct ModuleLowerer<'a, 'ctx> {
     /// Functions find their fuel counter on entry (`RT_FUEL_COUNTER`) instead of using
     /// `LowerOptions::fuel_counter` directly.
     dynamic_fuel: bool,
+    /// The frozen `a ^ 0x80` of x86 VNNI `vdot`s, by operand and block: `vdot`s of one
+    /// operand in one block (a weight vector for several tokens) share it, as they would an
+    /// unfrozen XOR, since LLVM does not merge separate `freeze`s.
+    vnni_bias: std::cell::RefCell<HashMap<(usize, usize), BasicValueEnum<'ctx>>>,
 }
 
 /// One AIR register: its LLVM value and AIR type.
@@ -568,6 +573,20 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         args: &[BasicValueEnum<'ctx>],
     ) -> Result<BasicValueEnum<'ctx>> {
         self.call1(self.intrinsic(name, overload), args)
+    }
+
+    /// `freeze v`: the same value for anything but poison, and a barrier to rewrites
+    /// through it.
+    fn freeze(&self, v: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        // SAFETY: a valid builder positioned in a block and a value of this context.
+        unsafe {
+            let r = inkwell::llvm_sys::core::LLVMBuildFreeze(
+                self.builder.as_mut_ptr(),
+                v.as_value_ref(),
+                c"".as_ptr(),
+            );
+            BasicValueEnum::new(r)
+        }
     }
 
     fn bitcast(
@@ -2235,7 +2254,21 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let corr = self.call1(f, &[arg(zero, 0)?, arg(bias, 1)?, arg(b, 2)?])?;
                 let corr = self.bitcast(corr, c.get_type())?;
                 let c2 = vec2!(c, corr, |x, y| bld.build_int_sub(x, y, "")?);
-                let au = vec2!(a, bias, |x, y| bld.build_xor(x, y, "")?);
+                // Frozen: when `a` is a broadcast, InstCombine turns the XOR into a shuffle of a
+                // partly poison constant, and LLVM 22's x86 instruction selection never finishes
+                // on that (`vdot_with_a_broadcast_operand_compiles`).
+                let block = bld.get_insert_block().expect("lowering inside a block");
+                let key = (a.as_value_ref() as usize, block.as_mut_ptr() as usize);
+                let cached = self.vnni_bias.borrow().get(&key).copied();
+                let au = match cached {
+                    Some(au) => au,
+                    None => {
+                        let au = vec2!(a, bias, |x, y| bld.build_xor(x, y, "")?);
+                        let au = self.freeze(au);
+                        self.vnni_bias.borrow_mut().insert(key, au);
+                        au
+                    }
+                };
                 let r = self.call1(f, &[arg(c2, 0)?, arg(au, 1)?, arg(b, 2)?])?;
                 self.bitcast(r, c.get_type())?
             } else if dot.arm_dotprod {

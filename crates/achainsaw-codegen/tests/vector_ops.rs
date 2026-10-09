@@ -1366,3 +1366,91 @@ fn vx_signatures_compile_for_every_llvm_target() {
             .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
     }
 }
+
+/// `vdot` with a broadcast operand (activations splatted against weight vectors), each side.
+fn broadcast_dot_source() -> String {
+    let mut src = String::new();
+    for w in WIDTHS {
+        for (name, a, b) in [("first", "s", "v"), ("second", "v", "s")] {
+            src += &format!(
+                "fn bdot_{name}_{w}(px:ptr, pv:ptr, pc:ptr, po:ptr)\n  b0:\n    x = ld px:i32\n    s = splat x:{w}\n    v = ld pv:{w}\n    c = ld pc:{w}\n    r = vdot c, {a}, {b}:i8\n    st po, r\n    ret\n\n"
+            );
+        }
+    }
+    src
+}
+
+/// `vdot` with a broadcast first operand compiles (LLVM 22's x86 instruction selection
+/// looped forever on it with VNNI until the biased operand was frozen) and computes the
+/// same as the reference, at every width, on the backend under test.
+#[test]
+fn vdot_with_a_broadcast_operand_compiles() {
+    let module = parse_and_validate(&broadcast_dot_source()).unwrap();
+    // First ahead of time for x86 VNNI (AVX512-VNNI and AVX-VNNI), on a thread, so a regression
+    // fails here instead of hanging (the JIT below would hang on a VNNI host).
+    #[cfg(feature = "llvm")]
+    {
+        use achainsaw_codegen::{compile_object, Backend};
+        // The hang depended on the CPU's cost model: znver4 hit it, generic x86-64-v4 did not.
+        let targets = [
+            ("znver4", "+avx512vnni,+avx512vl"),
+            ("sapphirerapids", "+avx512vnni,+avx512vl"),
+            ("x86-64-v4", "+avx512vnni,+avx512vl"),
+            ("x86-64-v3", "+avxvnni"),
+        ];
+        for (cpu, features) in targets {
+            let module = module.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let target = AotTarget {
+                    triple: Some("x86_64-unknown-linux-gnu".into()),
+                    cpu: Some(cpu.into()),
+                    features: Some(features.into()),
+                };
+                let _ = tx.send(
+                    compile_object(&module, &target, Backend::Llvm, &Default::default())
+                        .map(|o| o.bytes.len()),
+                );
+            });
+            let bytes = rx
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .unwrap_or_else(|_| panic!("LLVM did not finish compiling for {cpu} {features}"))
+                .unwrap_or_else(|e| panic!("{cpu} {features}: {e}"));
+            assert!(bytes > 0);
+        }
+    }
+
+    let mut engine = JitEngine::new().unwrap();
+    engine.compile_module(&module).unwrap();
+    let vx_bytes = engine.vx_bits() as usize / 8;
+    let mut rng = Rng(0x5EED);
+    for w in WIDTHS {
+        for first in [true, false] {
+            let name = format!("bdot_{}_{w}", if first { "first" } else { "second" });
+            let f: KernelFn = unsafe { std::mem::transmute(engine.get_fn_ptr(&name).unwrap()) };
+            for trial in 0..TRIALS {
+                let (mut x, mut v, mut c) = ([0u8; BUF], [0u8; BUF], [0u8; BUF]);
+                fill(&mut x, Type::I8, &mut rng, trial);
+                fill(&mut v, Type::I8, &mut rng, trial + 1);
+                fill(&mut c, Type::I8, &mut rng, trial + 2);
+                let mut out = [0u8; BUF];
+                f(x.as_ptr(), v.as_ptr(), c.as_ptr(), out.as_mut_ptr());
+                // The broadcast operand: x's first 4 bytes in every 32-bit lane.
+                let s: Vec<u8> = (0..BUF).map(|i| x[i % 4]).collect();
+                let (a, b) = if first {
+                    (&s[..], &v[..])
+                } else {
+                    (&v[..], &s[..])
+                };
+                let want = reference(Kernel::Dot(w), a, b, &c, vx_bytes);
+                check_output(
+                    Kernel::Dot(w),
+                    &want,
+                    &out,
+                    vx_bytes,
+                    &format!("{name} trial {trial}"),
+                );
+            }
+        }
+    }
+}
