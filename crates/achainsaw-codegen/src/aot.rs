@@ -112,6 +112,9 @@ impl AotCompiler {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
+        // `inline fn` calls are expanded before lowering.
+        let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+        let ir_mod = &*inlined;
         let mut func_ids = HashMap::new();
         let mut func_returns = HashMap::new();
 
@@ -124,7 +127,7 @@ impl AotCompiler {
             if let Some(r_ty) = ext_fn.ret_type {
                 push_abi_params(&mut sig.returns, r_ty);
             }
-            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type);
+            func_returns.insert(ext_fn.name.clone(), ext_fn.ret_type.into_iter().collect());
 
             let func_id = self
                 .module
@@ -138,10 +141,10 @@ impl AotCompiler {
             for (_, p_ty) in &func.params {
                 push_abi_params(&mut sig.params, *p_ty);
             }
-            if let Some(r_ty) = func.ret_type {
-                push_abi_params(&mut sig.returns, r_ty);
+            for r_ty in &func.rets {
+                push_abi_params(&mut sig.returns, *r_ty);
             }
-            func_returns.insert(func.name.clone(), func.ret_type);
+            func_returns.insert(func.name.clone(), func.rets.clone());
 
             let func_id = self
                 .module
@@ -212,7 +215,8 @@ pub fn compile_assembly(
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
             let (spec, opts) = llvm_aot_options(target, options)?;
-            achainsaw_llvm::compile_assembly(ir_mod, &spec, &opts)
+            let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+            achainsaw_llvm::compile_assembly(&inlined, &spec, &opts)
         }
         _ => {
             let _ = (ir_mod, target, options);
@@ -265,7 +269,8 @@ pub fn compile_object(
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
             let (spec, opts) = llvm_aot_options(target, options)?;
-            let (bytes, triple) = achainsaw_llvm::compile_object(ir_mod, &spec, &opts)?;
+            let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+            let (bytes, triple) = achainsaw_llvm::compile_object(&inlined, &spec, &opts)?;
             Ok(AotObject {
                 bytes,
                 triple,

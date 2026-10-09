@@ -57,6 +57,9 @@ pub fn to_air_text(module: &Module) -> String {
         if f_idx > 0 {
             out.push('\n');
         }
+        if func.inline {
+            out.push_str("inline ");
+        }
         out.push_str("fn ");
         out.push_str(&func.name);
         out.push('(');
@@ -69,9 +72,16 @@ pub fn to_air_text(module: &Module) -> String {
             out.push_str(p_ty.as_str());
         }
         out.push(')');
-        if let Some(ret_ty) = func.ret_type {
-            out.push_str("->");
-            out.push_str(ret_ty.as_str());
+        match func.rets.as_slice() {
+            [] => {}
+            [t] => {
+                out.push_str("->");
+                out.push_str(t.as_str());
+            }
+            many => {
+                let names: Vec<&str> = many.iter().map(|t| t.as_str()).collect();
+                out.push_str(&format!("->({})", names.join(", ")));
+            }
         }
         out.push('\n');
 
@@ -130,24 +140,32 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(", ");
                         out.push_str(rhs);
                     }
-                    Instruction::Load { dst, ptr, ty, .. } => {
+                    Instruction::Load {
+                        dst,
+                        ptr,
+                        index,
+                        ty,
+                        ..
+                    } => {
                         out.push_str(dst);
                         out.push_str(" = ld ");
-                        out.push_str(ptr);
+                        out.push_str(&mem_ref(ptr, index));
                         out.push(':');
                         out.push_str(ty.as_str());
                     }
-                    Instruction::Store { ptr, val, .. } => {
+                    Instruction::Store {
+                        ptr, index, val, ..
+                    } => {
                         out.push_str("st ");
-                        out.push_str(ptr);
+                        out.push_str(&mem_ref(ptr, index));
                         out.push_str(", ");
                         out.push_str(val);
                     }
                     Instruction::Call {
-                        dst, func, args, ..
+                        dsts, func, args, ..
                     } => {
-                        if let Some(d) = dst {
-                            out.push_str(d);
+                        if !dsts.is_empty() {
+                            out.push_str(&dsts.join(", "));
                             out.push_str(" = ");
                         }
                         out.push_str("call ");
@@ -266,21 +284,25 @@ pub fn to_air_text(module: &Module) -> String {
                     Instruction::MaskedLoad {
                         dst,
                         ptr,
+                        index,
                         count,
                         ty,
                         lane,
                         ..
                     } => {
-                        out.push_str(&format!("{dst} = ldm {ptr}:{ty}, {count}:{lane}"));
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("{dst} = ldm {p}:{ty}, {count}:{lane}"));
                     }
                     Instruction::MaskedStore {
                         ptr,
+                        index,
                         val,
                         count,
                         lane,
                         ..
                     } => {
-                        out.push_str(&format!("stm {ptr}, {val}, {count}:{lane}"));
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("stm {p}, {val}, {count}:{lane}"));
                     }
                     Instruction::MatMul {
                         pc,
@@ -344,6 +366,9 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("{dst} = vdot {acc}, {a}, {b}:{lane}"));
                     }
+                    Instruction::Fma { dst, a, b, c, .. } => {
+                        out.push_str(&format!("{dst} = fma {a}, {b}, {c}"));
+                    }
                 }
                 out.push('\n');
             }
@@ -399,11 +424,11 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push(')');
                     }
                 }
-                Terminator::Ret { val, .. } => {
+                Terminator::Ret { vals, .. } => {
                     out.push_str("ret");
-                    if let Some(v) = val {
+                    if !vals.is_empty() {
                         out.push(' ');
-                        out.push_str(v);
+                        out.push_str(&vals.join(", "));
                     }
                 }
             }
@@ -411,6 +436,15 @@ pub fn to_air_text(module: &Module) -> String {
         }
     }
     out
+}
+
+/// `p`, `p[i]` or `p[i:unit]`.
+fn mem_ref(ptr: &str, index: &Option<Index>) -> String {
+    match index {
+        None => ptr.to_string(),
+        Some(Index { reg, unit: None }) => format!("{ptr}[{reg}]"),
+        Some(Index { reg, unit: Some(u) }) => format!("{ptr}[{reg}:{u}]"),
+    }
 }
 
 /// Appends `dst = op r0, r1, ...[:lane]`.
@@ -480,7 +514,7 @@ impl BinaryEncoder {
                     self.intern(bp_name);
                 }
                 for inst in &block.instructions {
-                    if let Some(dst) = inst.dst() {
+                    for dst in inst.dsts() {
                         self.intern(dst);
                     }
                     if let Instruction::Call { func, .. } | Instruction::Par { func, .. } = inst {
@@ -515,8 +549,8 @@ impl BinaryEncoder {
                             self.intern(a);
                         }
                     }
-                    Terminator::Ret { val, .. } => {
-                        if let Some(v) = val {
+                    Terminator::Ret { vals, .. } => {
+                        for v in vals {
                             self.intern(v);
                         }
                     }
@@ -589,12 +623,11 @@ impl BinaryEncoder {
                 self.buf.push(encode_type(*ty));
             }
 
-            // Return Type
-            if let Some(ret_ty) = func.ret_type {
-                self.buf.push(1);
-                self.buf.push(encode_type(ret_ty));
-            } else {
-                self.buf.push(0);
+            // Result count (0x80 marks an `inline fn`), then the result types.
+            self.buf
+                .push(func.rets.len() as u8 | if func.inline { 0x80 } else { 0 });
+            for t in &func.rets {
+                self.buf.push(encode_type(*t));
             }
 
             // Blocks
@@ -628,6 +661,12 @@ impl BinaryEncoder {
     }
 
     fn encode_instruction(&mut self, inst: &Instruction) {
+        // An indexed memory access: a prefix with the index, then the access itself.
+        if let Some(ix) = inst.index() {
+            self.buf.push(0x30);
+            self.push_regs(&[&ix.reg]);
+            self.buf.push(ix.unit.map_or(0, encode_type));
+        }
         match inst {
             Instruction::AssignConst { dst, val, ty, .. } => match val {
                 Constant::Int(n) => {
@@ -673,15 +712,13 @@ impl BinaryEncoder {
                     .extend_from_slice(&self.string_map[val].to_le_bytes());
             }
             Instruction::Call {
-                dst, func, args, ..
+                dsts, func, args, ..
             } => {
                 self.buf.push(0x06);
-                if let Some(d) = dst {
-                    self.buf.push(1);
+                self.buf.push(dsts.len() as u8);
+                for d in dsts {
                     self.buf
                         .extend_from_slice(&self.string_map[d].to_le_bytes());
-                } else {
-                    self.buf.push(0);
                 }
                 self.buf
                     .extend_from_slice(&self.string_map[func].to_le_bytes());
@@ -917,6 +954,10 @@ impl BinaryEncoder {
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst, acc, a, b]);
             }
+            Instruction::Fma { dst, a, b, c, .. } => {
+                self.buf.push(0x2F);
+                self.push_regs(&[dst, a, b, c]);
+            }
             Instruction::Par {
                 count, func, args, ..
             } => {
@@ -979,14 +1020,12 @@ impl BinaryEncoder {
                         .extend_from_slice(&self.string_map[a].to_le_bytes());
                 }
             }
-            Terminator::Ret { val, .. } => {
+            Terminator::Ret { vals, .. } => {
                 self.buf.push(0x12);
-                if let Some(v) = val {
-                    self.buf.push(1);
+                self.buf.push(vals.len() as u8);
+                for v in vals {
                     self.buf
                         .extend_from_slice(&self.string_map[v].to_le_bytes());
-                } else {
-                    self.buf.push(0);
                 }
             }
         }
@@ -1150,14 +1189,15 @@ impl<'a> BinaryDecoder<'a> {
                 params.push((p_name, p_ty));
             }
 
-            let has_ret = self.read_u8()?;
-            let ret_type = if has_ret != 0 {
-                let r_ty = decode_type(self.read_u8()?)
-                    .ok_or_else(|| self.err("Invalid return type code in AIRB"))?;
-                Some(r_ty)
-            } else {
-                None
-            };
+            let header = self.read_u8()?;
+            let inline = header & 0x80 != 0;
+            let mut rets = Vec::new();
+            for _ in 0..header & 0x7F {
+                rets.push(
+                    decode_type(self.read_u8()?)
+                        .ok_or_else(|| self.err("Invalid return type code in AIRB"))?,
+                );
+            }
 
             let block_count = self.read_u32()?;
             let mut blocks = Vec::with_capacity(self.safe_capacity(block_count));
@@ -1194,7 +1234,8 @@ impl<'a> BinaryDecoder<'a> {
             functions.push(Function {
                 name,
                 params,
-                ret_type,
+                rets,
+                inline,
                 blocks,
                 span: Span::default(),
             });
@@ -1249,25 +1290,59 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x30 => {
+                let reg = self.read_string()?;
+                let code = self.read_u8()?;
+                let unit = if code == 0 {
+                    None
+                } else {
+                    Some(decode_type(code).ok_or_else(|| self.err("Invalid index unit in AIRB"))?)
+                };
+                let mut inst = self.decode_instruction()?;
+                match &mut inst {
+                    Instruction::Load { index, .. }
+                    | Instruction::Store { index, .. }
+                    | Instruction::MaskedLoad { index, .. }
+                    | Instruction::MaskedStore { index, .. }
+                        if index.is_none() =>
+                    {
+                        *index = Some(Index { reg, unit });
+                    }
+                    _ => {
+                        return Err(self.err("Index prefix before a non-memory instruction in AIRB"))
+                    }
+                }
+                Ok(inst)
+            }
             0x04 => {
                 let dst = self.read_string()?;
                 let ptr = self.read_string()?;
                 let ty = decode_type(self.read_u8()?)
                     .ok_or_else(|| self.err("Invalid load type in AIRB"))?;
-                Ok(Instruction::Load { dst, ptr, ty, span })
+                Ok(Instruction::Load {
+                    dst,
+                    ptr,
+                    index: None,
+                    ty,
+                    span,
+                })
             }
             0x05 => {
                 let ptr = self.read_string()?;
                 let val = self.read_string()?;
-                Ok(Instruction::Store { ptr, val, span })
+                Ok(Instruction::Store {
+                    ptr,
+                    index: None,
+                    val,
+                    span,
+                })
             }
             0x06 => {
-                let has_dst = self.read_u8()?;
-                let dst = if has_dst != 0 {
-                    Some(self.read_string()?)
-                } else {
-                    None
-                };
+                let dst_count = self.read_u8()?;
+                let mut dsts = Vec::with_capacity(dst_count as usize);
+                for _ in 0..dst_count {
+                    dsts.push(self.read_string()?);
+                }
                 let func = self.read_string()?;
                 let arg_count = self.read_u32()?;
                 let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
@@ -1275,7 +1350,7 @@ impl<'a> BinaryDecoder<'a> {
                     args.push(self.read_string()?);
                 }
                 Ok(Instruction::Call {
-                    dst,
+                    dsts,
                     func,
                     args,
                     span,
@@ -1418,6 +1493,7 @@ impl<'a> BinaryDecoder<'a> {
                 Ok(Instruction::MaskedLoad {
                     dst: self.read_string()?,
                     ptr: self.read_string()?,
+                    index: None,
                     count: self.read_string()?,
                     ty,
                     lane,
@@ -1428,6 +1504,7 @@ impl<'a> BinaryDecoder<'a> {
                 let lane = self.read_lane_type()?;
                 Ok(Instruction::MaskedStore {
                     ptr: self.read_string()?,
+                    index: None,
                     val: self.read_string()?,
                     count: self.read_string()?,
                     lane,
@@ -1512,6 +1589,13 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x2F => Ok(Instruction::Fma {
+                dst: self.read_string()?,
+                a: self.read_string()?,
+                b: self.read_string()?,
+                c: self.read_string()?,
+                span,
+            }),
             0x2E => {
                 let lane = self.read_lane_type()?;
                 Ok(Instruction::VDot {
@@ -1595,13 +1679,12 @@ impl<'a> BinaryDecoder<'a> {
                 })
             }
             0x12 => {
-                let has_val = self.read_u8()?;
-                let val = if has_val != 0 {
-                    Some(self.read_string()?)
-                } else {
-                    None
-                };
-                Ok(Terminator::Ret { val, span })
+                let count = self.read_u8()?;
+                let mut vals = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    vals.push(self.read_string()?);
+                }
+                Ok(Terminator::Ret { vals, span })
             }
             _ => Err(self.err(format!("Unknown terminator opcode tag 0x{tag:02X} in AIRB"))),
         }
@@ -1678,6 +1761,9 @@ fn encode_binary_op(op: BinaryOp) -> u8 {
         BinaryOp::Ugt => 25,
         BinaryOp::Ule => 26,
         BinaryOp::Uge => 27,
+        BinaryOp::Copysign => 28,
+        BinaryOp::Rotl => 29,
+        BinaryOp::Rotr => 30,
     }
 }
 
@@ -1710,6 +1796,9 @@ fn decode_binary_op(code: u8) -> Option<BinaryOp> {
         25 => Some(BinaryOp::Ugt),
         26 => Some(BinaryOp::Ule),
         27 => Some(BinaryOp::Uge),
+        28 => Some(BinaryOp::Copysign),
+        29 => Some(BinaryOp::Rotl),
+        30 => Some(BinaryOp::Rotr),
         _ => None,
     }
 }
@@ -1743,24 +1832,18 @@ fn binary_op_to_str(op: BinaryOp) -> &'static str {
         BinaryOp::Ugt => "ugt",
         BinaryOp::Ule => "ule",
         BinaryOp::Uge => "uge",
+        BinaryOp::Copysign => "copysign",
+        BinaryOp::Rotl => "rotl",
+        BinaryOp::Rotr => "rotr",
     }
 }
 
 fn encode_unary_op(op: UnaryOp) -> u8 {
-    match op {
-        UnaryOp::Sqrt => 1,
-        UnaryOp::Neg => 2,
-        UnaryOp::Abs => 3,
-    }
+    UnaryOp::ALL.iter().position(|o| *o == op).unwrap() as u8 + 1
 }
 
 fn decode_unary_op(code: u8) -> Option<UnaryOp> {
-    match code {
-        1 => Some(UnaryOp::Sqrt),
-        2 => Some(UnaryOp::Neg),
-        3 => Some(UnaryOp::Abs),
-        _ => None,
-    }
+    UnaryOp::ALL.get((code as usize).checked_sub(1)?).copied()
 }
 
 fn encode_cast_op(op: CastOp) -> u8 {
@@ -1773,6 +1856,8 @@ fn encode_cast_op(op: CastOp) -> u8 {
         CastOp::Fext => 6,
         CastOp::Ftrunc => 7,
         CastOp::Bitcast => 8,
+        CastOp::Uitof => 9,
+        CastOp::Ftoui => 10,
     }
 }
 
@@ -1786,6 +1871,8 @@ fn decode_cast_op(code: u8) -> Option<CastOp> {
         6 => Some(CastOp::Fext),
         7 => Some(CastOp::Ftrunc),
         8 => Some(CastOp::Bitcast),
+        9 => Some(CastOp::Uitof),
+        10 => Some(CastOp::Ftoui),
         _ => None,
     }
 }

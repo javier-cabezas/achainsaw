@@ -408,7 +408,10 @@ fn build_kernel(
     let mut signatures = HashMap::new();
     for func in &module.functions {
         let p_types: Vec<Type> = func.params.iter().map(|(_, ty)| *ty).collect();
-        signatures.insert(func.name.clone(), (p_types, func.ret_type));
+        signatures.insert(
+            func.name.clone(),
+            (p_types, func.single_ret().ok().flatten()),
+        );
     }
 
     let mut engine = JitEngine::for_module(backend, module).map_err(runtime_err)?;

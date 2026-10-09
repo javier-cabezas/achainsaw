@@ -38,13 +38,19 @@ pub struct StdFunction {
     pub doc: String,
 }
 
+/// The rest of a function's header line (`name(...)...`), for `fn` and `inline fn`.
+fn fn_header(line: &str) -> Option<&str> {
+    line.strip_prefix("fn ")
+        .or_else(|| line.strip_prefix("inline fn "))
+}
+
 /// Every library function, in source order, with the comment lines right above it as its
 /// documentation.
 pub fn functions() -> Vec<StdFunction> {
     let lines: Vec<&str> = SOURCE.lines().collect();
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let Some(rest) = line.strip_prefix("fn ") else {
+        let Some(rest) = fn_header(line) else {
             continue;
         };
         let name = rest.split('(').next().unwrap_or_default().to_string();
@@ -68,10 +74,9 @@ pub fn functions() -> Vec<StdFunction> {
 /// The AIR source of library function `name`: its documentation comment and definition.
 pub fn source_of(name: &str) -> Option<String> {
     let lines: Vec<&str> = SOURCE.lines().collect();
-    let start = lines.iter().position(|l| {
-        l.strip_prefix("fn ")
-            .is_some_and(|r| r.starts_with(&format!("{name}(")))
-    })?;
+    let start = lines
+        .iter()
+        .position(|l| fn_header(l).is_some_and(|r| r.starts_with(&format!("{name}("))))?;
     let mut first = start;
     while first > 0 && lines[first - 1].starts_with('#') {
         first -= 1;
@@ -180,7 +185,11 @@ mod tests {
         for (f, l) in lib.functions.iter().zip(&listed) {
             assert_eq!(f.name, l.name);
             assert!(!l.doc.is_empty(), "{} has no documentation comment", f.name);
-            assert!(l.signature.starts_with(&format!("fn {}(", f.name)));
+            let header = format!("fn {}(", f.name);
+            assert!(
+                l.signature.starts_with(&header)
+                    || l.signature.starts_with(&format!("inline {header}"))
+            );
         }
     }
 
@@ -190,7 +199,9 @@ mod tests {
             let src = source_of(&f.name).unwrap();
             assert!(src.contains(&f.signature));
             // It parses alone unless it calls other library functions, which `use` links.
-            let calls_library = src.contains("call qmat_chunk");
+            let calls_library = functions()
+                .iter()
+                .any(|g| g.name != f.name && src.contains(&format!("call {}(", g.name)));
             if !calls_library {
                 let module =
                     parse_and_validate(&src).unwrap_or_else(|d| panic!("{}: {d:?}", f.name));

@@ -152,13 +152,7 @@ impl LlvmJit {
                 let addr = this.lookup(&func.name)?;
                 this.functions.insert(func.name.clone(), addr);
                 let tramp = trampoline_name(&func.name);
-                let scalar_only = func
-                    .params
-                    .iter()
-                    .map(|(_, t)| *t)
-                    .chain(func.ret_type)
-                    .all(|t| !t.is_vector());
-                if scalar_only {
+                if func.has_trampoline() {
                     let addr = this.lookup(&tramp)?;
                     this.trampolines.insert(func.name.clone(), addr);
                 }

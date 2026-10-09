@@ -4,7 +4,7 @@ use crate::lexer::{Lexer, Token, TokenKind};
 use crate::types::Type;
 
 /// Function signature: name, typed params, optional return type.
-type Signature = (String, Vec<(String, Type)>, Option<Type>);
+type Signature = (String, Vec<(String, Type)>, Vec<Type>);
 
 pub struct Parser<'a> {
     _source: &'a str,
@@ -267,11 +267,16 @@ impl<'a> Parser<'a> {
                 extern_functions.push(self.parse_extern_function()?);
             } else if self.peek_kind() == &TokenKind::Fn {
                 functions.push(self.parse_function()?);
+            } else if self.at_inline_fn() {
+                self.advance();
+                let mut f = self.parse_function()?;
+                f.inline = true;
+                functions.push(f);
             } else {
                 return Err(Diagnostic::error(
                     "ERR_UNEXPECTED_TOKEN",
                     format!(
-                        "Expected 'fn', 'extfn' or 'use', found {:?}",
+                        "Expected 'fn', 'inline fn', 'extfn' or 'use', found {:?}",
                         self.peek_kind()
                     ),
                     self.peek().span,
@@ -288,42 +293,72 @@ impl<'a> Parser<'a> {
         Ok(module)
     }
 
+    /// Whether the next tokens are `inline fn`.
+    fn at_inline_fn(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(s) if s == "inline")
+            && self.peek_at(1) == Some(&TokenKind::Fn)
+    }
+
+    /// `name(params)`, then `->ty`, `->(ty, ty, ...)` or nothing.
     fn parse_signature(&mut self) -> Result<Signature, Diagnostic> {
         let (name, _) = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
         let params = self.parse_typed_params()?;
         self.expect(TokenKind::RParen)?;
 
-        let mut ret_type = None;
+        let mut rets = Vec::new();
         if self.peek_kind() == &TokenKind::Arrow {
             self.advance();
-            ret_type = Some(self.parse_type()?);
+            if self.peek_kind() == &TokenKind::LParen {
+                self.advance();
+                loop {
+                    rets.push(self.parse_type()?);
+                    if self.peek_kind() != &TokenKind::Comma {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect(TokenKind::RParen)?;
+            } else {
+                rets.push(self.parse_type()?);
+            }
         }
-        Ok((name, params, ret_type))
+        Ok((name, params, rets))
     }
 
     fn parse_extern_function(&mut self) -> Result<ExternFunction, Diagnostic> {
         let fn_span = self.expect(TokenKind::ExtFn)?;
-        let (name, params, ret_type) = self.parse_signature()?;
+        let (name, params, rets) = self.parse_signature()?;
+        if rets.len() > 1 {
+            return Err(Diagnostic::error(
+                "ERR_MULTI_RETURN_EXTERN",
+                format!(
+                    "External function '{name}' returns {} values; C functions return at most one",
+                    rets.len()
+                ),
+                fn_span,
+            ));
+        }
         self.skip_newlines();
 
         Ok(ExternFunction {
             name,
             params,
-            ret_type,
+            ret_type: rets.first().copied(),
             span: fn_span,
         })
     }
 
     fn parse_function(&mut self) -> Result<Function, Diagnostic> {
         let fn_span = self.expect(TokenKind::Fn)?;
-        let (name, params, ret_type) = self.parse_signature()?;
+        let (name, params, rets) = self.parse_signature()?;
         self.skip_newlines();
 
         let mut blocks = Vec::new();
         while self.peek_kind() != &TokenKind::Fn
             && self.peek_kind() != &TokenKind::ExtFn
             && self.peek_kind() != &TokenKind::Eof
+            && !self.at_inline_fn()
         {
             blocks.push(self.parse_block()?);
             self.skip_newlines();
@@ -341,7 +376,8 @@ impl<'a> Parser<'a> {
         Ok(Function {
             name,
             params,
-            ret_type,
+            rets,
+            inline: false,
             blocks,
             span: Span {
                 start: fn_span.start,
@@ -398,15 +434,20 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Ret => {
                     let span = self.advance().span;
-                    let val = if self.peek_kind() != &TokenKind::Newline
+                    let mut vals = Vec::new();
+                    if self.peek_kind() != &TokenKind::Newline
                         && self.peek_kind() != &TokenKind::Eof
                     {
-                        Some(self.parse_operand(&mut instructions, None)?)
-                    } else {
-                        None
-                    };
+                        loop {
+                            vals.push(self.parse_operand(&mut instructions, None)?);
+                            if self.peek_kind() != &TokenKind::Comma {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    }
                     self.expect_eol()?;
-                    break Terminator::Ret { val, span };
+                    break Terminator::Ret { vals, span };
                 }
                 TokenKind::Eof => {
                     return Err(Diagnostic::error(
@@ -492,7 +533,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Instruction, Diagnostic> {
         let span = self.advance().span;
         if name == "stm" {
-            let (ptr, _) = self.expect_ident()?;
+            let (ptr, index) = self.parse_mem_ref(instructions)?;
             self.expect(TokenKind::Comma)?;
             let val = self.parse_operand(instructions, None)?;
             self.expect(TokenKind::Comma)?;
@@ -501,6 +542,7 @@ impl<'a> Parser<'a> {
             self.expect_eol()?;
             return Ok(Instruction::MaskedStore {
                 ptr,
+                index,
                 val,
                 count,
                 lane,
@@ -532,6 +574,64 @@ impl<'a> Parser<'a> {
             dtype,
             span,
         })
+    }
+
+    /// Parses a memory operand: a pointer register, optionally indexed as `p[i]` or
+    /// `p[i:unit]` (the index an i64 register or integer literal).
+    fn parse_mem_ref(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(String, Option<Index>), Diagnostic> {
+        let (ptr, _) = self.expect_ident()?;
+        if self.peek_kind() != &TokenKind::LBracket {
+            return Ok((ptr, None));
+        }
+        self.advance();
+        let reg = match self.peek_kind().clone() {
+            // A literal index is an i64; a `:` after it names the unit, not its type.
+            TokenKind::IntLit(n) => {
+                let span = self.advance().span;
+                let imm = format!("__imm_{}", self.imm_counter);
+                self.imm_counter += 1;
+                instructions.push(Instruction::AssignConst {
+                    dst: imm.clone(),
+                    val: Constant::Int(n),
+                    ty: Type::I64,
+                    span,
+                });
+                imm
+            }
+            _ => self.expect_ident()?.0,
+        };
+        let unit = if self.peek_kind() == &TokenKind::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::RBracket)?;
+        Ok((ptr, Some(Index { reg, unit })))
+    }
+
+    /// Mnemonics recognized only after `=` (so older programs may use them as registers).
+    fn is_contextual_op(name: &str) -> bool {
+        matches!(
+            name,
+            "floor"
+                | "ceil"
+                | "round"
+                | "roundeven"
+                | "roundz"
+                | "popcnt"
+                | "clz"
+                | "ctz"
+                | "copysign"
+                | "rotl"
+                | "rotr"
+                | "fma"
+                | "uitof"
+                | "ftoui"
+        )
     }
 
     /// Parses `v, 3:f32` (the operands of `extlane` and `vdup`) up to the end of the line.
@@ -671,7 +771,7 @@ impl<'a> Parser<'a> {
         }
 
         if name == "ldm" {
-            let (ptr, _) = self.expect_ident()?;
+            let (ptr, index) = self.parse_mem_ref(instructions)?;
             self.expect(TokenKind::Colon)?;
             let ty = self.parse_type()?;
             self.expect(TokenKind::Comma)?;
@@ -681,6 +781,7 @@ impl<'a> Parser<'a> {
             return Ok(Instruction::MaskedLoad {
                 dst,
                 ptr,
+                index,
                 count,
                 ty,
                 lane,
@@ -787,11 +888,16 @@ impl<'a> Parser<'a> {
         // Check if store: st ptr, val
         if first_tok.kind == TokenKind::St {
             let span = self.advance().span;
-            let (ptr, _) = self.expect_ident()?;
+            let (ptr, index) = self.parse_mem_ref(instructions)?;
             self.expect(TokenKind::Comma)?;
             let val = self.parse_operand(instructions, None)?;
             self.expect_eol()?;
-            return Ok(Instruction::Store { ptr, val, span });
+            return Ok(Instruction::Store {
+                ptr,
+                index,
+                val,
+                span,
+            });
         }
 
         // Check if free: free ptr
@@ -809,15 +915,44 @@ impl<'a> Parser<'a> {
             let args = self.parse_paren_operands(instructions)?;
             self.expect_eol()?;
             return Ok(Instruction::Call {
-                dst: None,
+                dsts: Vec::new(),
                 func,
                 args,
                 span,
             });
         }
 
-        // Otherwise: dst = <op> ...
+        // Otherwise: dst = <op> ..., or `a, b = call f(...)` for several results.
         let (dst, dst_span) = self.expect_ident()?;
+        if self.peek_kind() == &TokenKind::Comma {
+            let mut dsts = vec![dst];
+            while self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+                dsts.push(self.expect_ident()?.0);
+            }
+            self.expect(TokenKind::Equal)?;
+            if self.peek_kind() != &TokenKind::Call {
+                return Err(Diagnostic::error(
+                    "ERR_EXPECTED_RVALUE",
+                    format!(
+                        "Only 'call' assigns several registers ({}), found {:?}",
+                        dsts.join(", "),
+                        self.peek_kind()
+                    ),
+                    self.peek().span,
+                ));
+            }
+            self.advance();
+            let (func, _) = self.expect_ident()?;
+            let args = self.parse_paren_operands(instructions)?;
+            self.expect_eol()?;
+            return Ok(Instruction::Call {
+                dsts,
+                func,
+                args,
+                span: dst_span,
+            });
+        }
         self.expect(TokenKind::Equal)?;
 
         match self.peek_kind().clone() {
@@ -860,13 +995,14 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ld => {
                 self.advance();
-                let (ptr, _) = self.expect_ident()?;
+                let (ptr, index) = self.parse_mem_ref(instructions)?;
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_type()?;
                 self.expect_eol()?;
                 Ok(Instruction::Load {
                     dst,
                     ptr,
+                    index,
                     ty,
                     span: dst_span,
                 })
@@ -877,7 +1013,7 @@ impl<'a> Parser<'a> {
                 let args = self.parse_paren_operands(instructions)?;
                 self.expect_eol()?;
                 Ok(Instruction::Call {
-                    dst: Some(dst),
+                    dsts: vec![dst],
                     func,
                     args,
                     span: dst_span,
@@ -985,6 +1121,57 @@ impl<'a> Parser<'a> {
                 self.expect_eol()?;
                 Ok(Instruction::Binary {
                     op,
+                    dst,
+                    lhs,
+                    rhs,
+                    span: dst_span,
+                })
+            }
+            // Scalar ops added after the reserved mnemonics are contextual: an identifier
+            // right after `=` names an op, and stays a valid register name elsewhere.
+            TokenKind::Ident(name) if Self::is_contextual_op(&name) => {
+                self.advance();
+                if let Some(op) = UnaryOp::from_str_opt(&name) {
+                    let src = self.parse_operand(instructions, None)?;
+                    self.expect_eol()?;
+                    return Ok(Instruction::Unary {
+                        op,
+                        dst,
+                        src,
+                        span: dst_span,
+                    });
+                }
+                if let Some(op) = CastOp::from_str_opt(&name) {
+                    let src = self.parse_operand(instructions, None)?;
+                    self.expect(TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    self.expect_eol()?;
+                    return Ok(Instruction::Cast {
+                        op,
+                        dst,
+                        src,
+                        ty,
+                        span: dst_span,
+                    });
+                }
+                let lhs = self.parse_operand(instructions, None)?;
+                self.expect(TokenKind::Comma)?;
+                let rhs = self.parse_operand(instructions, None)?;
+                if name == "fma" {
+                    self.expect(TokenKind::Comma)?;
+                    let c = self.parse_operand(instructions, None)?;
+                    self.expect_eol()?;
+                    return Ok(Instruction::Fma {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                        c,
+                        span: dst_span,
+                    });
+                }
+                self.expect_eol()?;
+                Ok(Instruction::Binary {
+                    op: BinaryOp::from_str_opt(&name).expect("contextual binary op"),
                     dst,
                     lhs,
                     rhs,

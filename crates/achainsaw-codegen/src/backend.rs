@@ -96,7 +96,7 @@ pub fn uses_wide_vectors(module: &Module) -> bool {
     let wide = |t: &Type| matches!(t, Type::V256 | Type::V512 | Type::Vx);
     module.functions.iter().any(|f| {
         f.params.iter().any(|(_, t)| wide(t))
-            || f.ret_type.as_ref().is_some_and(wide)
+            || f.rets.iter().any(wide)
             || f.blocks.iter().any(|b| {
                 b.params.iter().any(|(_, t)| wide(t))
                     || b.instructions.iter().any(|i| match i {

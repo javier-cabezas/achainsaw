@@ -418,7 +418,7 @@ fn int_bin(op: VBinOp, lane: Type, a: i64, b: i64) -> i64 {
         VBinOp::And => a & b,
         VBinOp::Or => a | b,
         VBinOp::Xor => a ^ b,
-        VBinOp::Div => unreachable!("integer vdiv is rejected by the validator"),
+        VBinOp::Div | VBinOp::Copysign => unreachable!("float-only, rejected by the validator"),
     };
     lane.wrap_int(r)
 }
@@ -433,6 +433,7 @@ macro_rules! float_bin {
                 VBinOp::Div => a / b,
                 VBinOp::Min => $min(a, b),
                 VBinOp::Max => $max(a, b),
+                VBinOp::Copysign => a.copysign(b),
                 _ => unreachable!(),
             }
         }
@@ -621,6 +622,29 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                     let r = get_f64(a, i).sqrt();
                     let r = if op == VUnaryOp::Sqrt { r } else { 1.0 / r };
                     out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            VUnaryOp::Floor
+            | VUnaryOp::Ceil
+            | VUnaryOp::Round
+            | VUnaryOp::RoundEven
+            | VUnaryOp::RoundZ => {
+                let f = |x: f64| match op {
+                    VUnaryOp::Floor => x.floor(),
+                    VUnaryOp::Ceil => x.ceil(),
+                    VUnaryOp::Round => x.round(),
+                    VUnaryOp::RoundEven => x.round_ties_even(),
+                    _ => x.trunc(),
+                };
+                for i in 0..n {
+                    if l == Type::F32 {
+                        // Exact in f64 too: rounding an f32 gives an f32.
+                        let r = f(get_f32(a, i) as f64) as f32;
+                        out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                    } else {
+                        let r = f(get_f64(a, i));
+                        out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                    }
                 }
             }
             VUnaryOp::Rev => {

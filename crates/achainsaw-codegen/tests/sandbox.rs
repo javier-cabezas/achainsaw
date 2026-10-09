@@ -348,3 +348,48 @@ fn sandbox_must_be_enabled_before_compiling() {
     e.compile_module(&module).unwrap();
     assert!(e.enable_sandbox(ARENA).is_err());
 }
+
+/// Indexed accesses `p[i]` are checked at the address they compute: element `i` of the
+/// arena, scaled by the element size (or the index's unit).
+#[test]
+fn indexed_accesses_are_checked_at_their_scaled_address() {
+    let engine = sandboxed(
+        r#"
+fn ld_idx(i:i64)->f32
+  b0:
+    p = alloc 4096:i64
+    v = ld p[i]:f32
+    ret v
+
+fn st_idx(i:i64)->i32
+  b0:
+    p = alloc 4096:i64
+    st p[i], 1.5:f64
+    ret 0:i32
+
+fn ldm_idx(i:i64, n:i64)->f32
+  b0:
+    p = alloc 4096:i64
+    v = ldm p[i]:v128, n:f32
+    s = vsum v:f32
+    ret s
+
+fn stm_idx(i:i64, n:i64)->i32
+  b0:
+    p = alloc 4096:i64
+    z = splat 0.0:f32:v128
+    stm p[i:v128], z, n:f32
+    ret 0:i32
+"#,
+    );
+    // The last element of each kind fits; one more does not.
+    assert!(call(&engine, "ld_idx", &i64s(&[1023])).is_ok());
+    expect_violation(&engine, "ld_idx", &i64s(&[1024]));
+    expect_violation(&engine, "ld_idx", &i64s(&[-1]));
+    assert!(call(&engine, "st_idx", &i64s(&[511])).is_ok());
+    expect_violation(&engine, "st_idx", &i64s(&[512]));
+    assert!(call(&engine, "ldm_idx", &i64s(&[1021, 3])).is_ok());
+    expect_violation(&engine, "ldm_idx", &i64s(&[1021, 4]));
+    assert!(call(&engine, "stm_idx", &i64s(&[255, 4])).is_ok());
+    expect_violation(&engine, "stm_idx", &i64s(&[256, 1]));
+}

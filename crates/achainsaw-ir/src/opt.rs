@@ -10,6 +10,8 @@ pub struct OptimizationStats {
     pub branches_folded: usize,
     pub dead_instructions_removed: usize,
     pub dead_blocks_removed: usize,
+    /// Calls to `inline fn`s replaced by their bodies.
+    pub calls_inlined: usize,
     pub iterations: usize,
 }
 
@@ -20,22 +22,26 @@ impl OptimizationStats {
             + self.branches_folded
             + self.dead_instructions_removed
             + self.dead_blocks_removed
+            + self.calls_inlined
     }
 }
 
-/// Return types of every callable (externs and module functions), by name.
-type Signatures = HashMap<String, Option<Type>>;
+/// Result types of every callable (externs and module functions), by name.
+type Signatures = HashMap<String, Vec<Type>>;
 
 /// Optimizes an entire IR module in-place, returning summary statistics.
 pub fn optimize_module(module: &mut Module) -> OptimizationStats {
-    let mut total_stats = OptimizationStats::default();
+    let mut total_stats = OptimizationStats {
+        calls_inlined: crate::inline::inline_in_place(module),
+        ..Default::default()
+    };
 
     let mut sigs: Signatures = HashMap::new();
     for ext in &module.extern_functions {
-        sigs.insert(ext.name.clone(), ext.ret_type);
+        sigs.insert(ext.name.clone(), ext.ret_type.into_iter().collect());
     }
     for func in &module.functions {
-        sigs.insert(func.name.clone(), func.ret_type);
+        sigs.insert(func.name.clone(), func.rets.clone());
     }
 
     for func in &mut module.functions {
@@ -122,6 +128,14 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
         let mut changed = false;
         for block in &func.blocks {
             for inst in &block.instructions {
+                if let Instruction::Call { dsts, func, .. } = inst {
+                    for (d, ty) in dsts.iter().zip(sigs.get(func).into_iter().flatten()) {
+                        if types.insert(d.clone(), *ty).is_none() {
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
                 let (dst, ty) = match inst {
                     Instruction::AssignConst { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Load { dst, ty, .. } => (dst, Some(*ty)),
@@ -132,6 +146,7 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                     | Instruction::VZip { dst, lhs, .. }
                     | Instruction::VDup { dst, vec: lhs, .. }
                     | Instruction::VDot { dst, acc: lhs, .. }
+                    | Instruction::Fma { dst, a: lhs, .. }
                     | Instruction::VFma { dst, a: lhs, .. }
                     | Instruction::VSelect {
                         dst, then_val: lhs, ..
@@ -142,11 +157,6 @@ fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> 
                     | Instruction::VNarrow { dst, lo: src, .. } => (dst, types.get(src).copied()),
                     Instruction::MaskedLoad { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
-                    Instruction::Call {
-                        dst: Some(dst),
-                        func,
-                        ..
-                    } => (dst, sigs.get(func).copied().flatten()),
                     Instruction::Binary {
                         op, dst, lhs, rhs, ..
                     } => {
@@ -582,6 +592,21 @@ fn fold_binary_op(
                     let ub = to_unsigned(b, bits);
                     ua.min(ub) as i64
                 }
+                BinaryOp::Rotl | BinaryOp::Rotr => {
+                    let ua = to_unsigned(a, bits);
+                    let s = if op == BinaryOp::Rotl {
+                        shift
+                    } else {
+                        (bits - shift) & (bits - 1)
+                    };
+                    let mask = if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
+                    (((ua << s) | (ua >> ((bits - s) % bits))) & mask) as i64
+                }
+                BinaryOp::Copysign => return None,
                 BinaryOp::Umax => {
                     let ua = to_unsigned(a, bits);
                     let ub = to_unsigned(b, bits);
@@ -705,7 +730,16 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
                     }
                     val.abs()
                 }
-                UnaryOp::Sqrt => return None,
+                UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz => {
+                    let u = to_unsigned(val, bits);
+                    match op {
+                        UnaryOp::Popcnt => u.count_ones() as i64,
+                        _ if u == 0 => bits as i64,
+                        UnaryOp::Clz => (u.leading_zeros() - (64 - bits)) as i64,
+                        _ => u.trailing_zeros() as i64,
+                    }
+                }
+                _ => return None,
             };
             Some((Constant::Int(ty.wrap_int(res)), ty))
         }
@@ -724,6 +758,12 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
                         }
                         f.sqrt()
                     }
+                    UnaryOp::Floor => f.floor(),
+                    UnaryOp::Ceil => f.ceil(),
+                    UnaryOp::Round => f.round(),
+                    UnaryOp::RoundEven => f.round_ties_even(),
+                    UnaryOp::RoundZ => f.trunc(),
+                    UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz => return None,
                 };
                 Some((Constant::Float(res as f64), Type::F32))
             } else {
@@ -737,6 +777,12 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
                         }
                         f.sqrt()
                     }
+                    UnaryOp::Floor => f.floor(),
+                    UnaryOp::Ceil => f.ceil(),
+                    UnaryOp::Round => f.round(),
+                    UnaryOp::RoundEven => f.round_ties_even(),
+                    UnaryOp::RoundZ => f.trunc(),
+                    UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz => return None,
                 };
                 Some((Constant::Float(res), Type::F64))
             }
@@ -903,8 +949,8 @@ fn substitute_terminator_operands(term: &mut Terminator, substitutions: &HashMap
                 }
             }
         }
-        Terminator::Ret { val, .. } => {
-            if let Some(v) = val {
+        Terminator::Ret { vals, .. } => {
+            for v in vals {
                 if let Some(new_v) = substitutions.get(v) {
                     *v = new_v.clone();
                 }
@@ -1039,10 +1085,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                         used.insert(a.clone());
                     }
                 }
-                Terminator::Ret { val, .. } => {
-                    if let Some(v) = val {
-                        used.insert(v.clone());
-                    }
+                Terminator::Ret { vals, .. } => {
+                    used.extend(vals.iter().cloned());
                 }
             }
         }
@@ -1079,7 +1123,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VShift { dst, .. }
                 | Instruction::VZip { dst, .. }
                 | Instruction::VDup { dst, .. }
-                | Instruction::VDot { dst, .. } => used.contains(dst),
+                | Instruction::VDot { dst, .. }
+                | Instruction::Fma { dst, .. } => used.contains(dst),
 
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }
@@ -1150,8 +1195,8 @@ mod tests {
         assert!(stats.algebraic_simplifications >= 1);
         // After simplification and DCE, b should return x
         let fn_0 = &module.functions[0];
-        if let Terminator::Ret { val, .. } = &fn_0.blocks[0].terminator {
-            assert_eq!(val.as_deref(), Some("x"));
+        if let Terminator::Ret { vals, .. } = &fn_0.blocks[0].terminator {
+            assert_eq!(vals, &["x"]);
         } else {
             panic!("Expected Ret x");
         }

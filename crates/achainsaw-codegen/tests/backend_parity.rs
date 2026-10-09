@@ -10,9 +10,21 @@ use achainsaw_ir::parse_and_validate;
 const INT_OPS: &[&str] = &[
     "add", "sub", "mul", "div", "rem", "and", "or", "xor", "shl", "shr", "min", "max", "umin",
     "umax", "udiv", "urem", "ushr", "eq", "ne", "lt", "gt", "le", "ge", "ult", "ugt", "ule", "uge",
+    "rotl", "rotr",
 ];
 const FLOAT_OPS: &[&str] = &[
-    "add", "sub", "mul", "div", "min", "max", "eq", "ne", "lt", "gt", "le", "ge",
+    "add", "sub", "mul", "div", "min", "max", "eq", "ne", "lt", "gt", "le", "ge", "copysign",
+];
+const INT_UNARY: &[&str] = &["neg", "abs", "popcnt", "clz", "ctz"];
+const FLOAT_UNARY: &[&str] = &[
+    "neg",
+    "abs",
+    "sqrt",
+    "floor",
+    "ceil",
+    "round",
+    "roundeven",
+    "roundz",
 ];
 const INT_TYPES: &[&str] = &["i8", "i16", "i32", "i64"];
 const FLOAT_TYPES: &[&str] = &["f32", "f64"];
@@ -33,14 +45,20 @@ fn module_src() -> String {
                 "fn {op}_{ty}(a:{ty}, b:{ty})->{ret}\n  b0:\n    r = {op} a, b\n    ret r\n\n"
             );
         }
-        for op in ["neg", "abs"] {
+        for op in INT_UNARY {
             src += &format!("fn {op}_{ty}(a:{ty})->{ty}\n  b0:\n    r = {op} a\n    ret r\n\n");
         }
         for fty in FLOAT_TYPES {
             src += &format!(
                 "fn itof_{ty}_{fty}(a:{ty})->{fty}\n  b0:\n    r = itof a:{fty}\n    ret r\n\n\
+                 fn uitof_{ty}_{fty}(a:{ty})->{fty}\n  b0:\n    r = uitof a:{fty}\n    ret r\n\n\
                  fn ftoi_{fty}_{ty}(a:{fty})->{ty}\n  b0:\n    r = ftoi a:{ty}\n    ret r\n\n"
             );
+            if matches!(*ty, "i32" | "i64") {
+                src += &format!(
+                    "fn ftoui_{fty}_{ty}(a:{fty})->{ty}\n  b0:\n    r = ftoui a:{ty}\n    ret r\n\n"
+                );
+            }
         }
     }
     for ty in FLOAT_TYPES {
@@ -50,9 +68,12 @@ fn module_src() -> String {
                 "fn {op}_{ty}(a:{ty}, b:{ty})->{ret}\n  b0:\n    r = {op} a, b\n    ret r\n\n"
             );
         }
-        for op in ["neg", "abs", "sqrt"] {
+        for op in FLOAT_UNARY {
             src += &format!("fn {op}_{ty}(a:{ty})->{ty}\n  b0:\n    r = {op} a\n    ret r\n\n");
         }
+        src += &format!(
+            "fn fma_{ty}(a:{ty}, b:{ty}, c:{ty})->{ty}\n  b0:\n    r = fma a, b, c\n    ret r\n\n"
+        );
     }
     src += "fn fext_f32(a:f32)->f64\n  b0:\n    r = fext a:f64\n    ret r\n\n";
     src += "fn ftrunc_f64(a:f64)->f32\n  b0:\n    r = ftrunc a:f32\n    ret r\n\n";
@@ -154,6 +175,14 @@ fn float_inputs() -> Vec<f64> {
         -1.0e20,
         2147483647.5,
         -2147483648.5,
+        0.5,
+        -0.5,
+        2.5,
+        -2.5,
+        0.49999997,
+        4503599627370497.0,
+        4294967295.5,
+        1.0e19,
         65504.0,
         65520.0,
         1.0e-40,
@@ -189,7 +218,7 @@ fn integer_ops_agree() {
                 }
             }
         }
-        for op in ["neg", "abs"] {
+        for op in INT_UNARY {
             for &a in &ins {
                 agree(&clif, &llvm, &format!("{op}_{ty}"), &[int_val(ty, a)]);
             }
@@ -214,9 +243,17 @@ fn float_ops_agree() {
                 }
             }
         }
-        for op in ["neg", "abs", "sqrt"] {
+        for op in FLOAT_UNARY {
             for &a in &ins {
                 agree(&clif, &llvm, &format!("{op}_{ty}"), &[float_val(ty, a)]);
+            }
+        }
+        for &a in &ins {
+            for &b in &ins {
+                for c in [0.0, -0.0, 1.0, f64::NAN] {
+                    let args = [float_val(ty, a), float_val(ty, b), float_val(ty, c)];
+                    agree(&clif, &llvm, &format!("fma_{ty}"), &args);
+                }
             }
         }
     }
@@ -235,6 +272,14 @@ fn conversions_agree() {
                     &[int_val(ity, a)],
                 );
             }
+            for &a in &int_inputs(ity[1..].parse().unwrap()) {
+                agree(
+                    &clif,
+                    &llvm,
+                    &format!("uitof_{ity}_{fty}"),
+                    &[int_val(ity, a)],
+                );
+            }
             for &a in &float_inputs() {
                 agree(
                     &clif,
@@ -242,6 +287,14 @@ fn conversions_agree() {
                     &format!("ftoi_{fty}_{ity}"),
                     &[float_val(fty, a)],
                 );
+                if matches!(*ity, "i32" | "i64") {
+                    agree(
+                        &clif,
+                        &llvm,
+                        &format!("ftoui_{fty}_{ity}"),
+                        &[float_val(fty, a)],
+                    );
+                }
             }
         }
     }

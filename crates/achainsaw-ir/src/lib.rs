@@ -2,6 +2,7 @@ pub mod ast;
 pub mod binary;
 pub mod cfg;
 pub mod diag;
+pub mod inline;
 pub mod lexer;
 pub mod opt;
 pub mod parser;
