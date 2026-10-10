@@ -1045,6 +1045,7 @@ fn dot_kind(isa: &dyn cranelift_codegen::isa::TargetIsa) -> DotKind {
 fn vdot_part(
     builder: &mut FunctionBuilder,
     kind: DotKind,
+    unsigned: bool,
     c: ClifValue,
     a: ClifValue,
     b: ClifValue,
@@ -1052,22 +1053,21 @@ fn vdot_part(
     let c = as_lanes(builder, c, Type::I32);
     let a = as_lanes(builder, a, Type::I8);
     let b = as_lanes(builder, b, Type::I8);
-    // The tree Cranelift folds into `sdot c, x, y` (`unsigned`: `vpdpbusd`, y unsigned). Each
-    // i16 product of two i8 values is exact, and so is every sum in i32.
-    let tree = |builder: &mut FunctionBuilder, c, x, y, unsigned: bool| {
+    // The tree Cranelift folds into one instruction: signed x by signed y into `sdot c, x, y`
+    // (Arm, FEAT_DotProd), unsigned x by signed y into `usdot c, x, y` (Arm, FEAT_I8MM), and
+    // signed x by unsigned y into `vpdpbusd c, y, x` (x86 VNNI). Each i16 product of two bytes
+    // is exact, and so is every sum in i32.
+    let tree = |builder: &mut FunctionBuilder, c, x, x_unsigned: bool, y, y_unsigned: bool| {
         let mut halves = [ClifValue::from_u32(0); 2];
         for (half, high) in halves.iter_mut().zip([false, true]) {
-            let xw = if high {
-                builder.ins().swiden_high(x)
-            } else {
-                builder.ins().swiden_low(x)
+            let mut widen = |v, uns: bool| match (uns, high) {
+                (false, false) => builder.ins().swiden_low(v),
+                (false, true) => builder.ins().swiden_high(v),
+                (true, false) => builder.ins().uwiden_low(v),
+                (true, true) => builder.ins().uwiden_high(v),
             };
-            let yw = match (unsigned, high) {
-                (false, false) => builder.ins().swiden_low(y),
-                (false, true) => builder.ins().swiden_high(y),
-                (true, false) => builder.ins().uwiden_low(y),
-                (true, true) => builder.ins().uwiden_high(y),
-            };
+            let xw = widen(x, x_unsigned);
+            let yw = widen(y, y_unsigned);
             let p = builder.ins().imul(xw, yw);
             let lo = builder.ins().swiden_low(p);
             let hi = builder.ins().swiden_high(p);
@@ -1076,13 +1076,14 @@ fn vdot_part(
         let sums = builder.ins().iadd_pairwise(halves[0], halves[1]);
         builder.ins().iadd(sums, c)
     };
-    let r = match kind {
-        DotKind::Arm => tree(builder, c, a, b, false),
+    let r = match (kind, unsigned) {
+        (DotKind::Arm, _) => tree(builder, c, a, unsigned, b, false),
+        (DotKind::X86Vnni, true) => tree(builder, c, b, false, a, true),
         // vpdpbusd multiplies unsigned bytes by signed ones: with a' = a ^ 0x80 = a + 128 as
         // u8, sum(a' * b) = sum(a * b) + 128 * sum(b), and the correction depends only on b.
         // The correction is the sum of each lane's four bytes of b (two pairwise adds,
         // `pmaddubsw` and `pmaddwd` by ones) times 128.
-        DotKind::X86Vnni => {
+        (DotKind::X86Vnni, false) => {
             let m = builder.ins().iconst(types::I8, -128);
             let bias = builder.ins().splat(types::I8X16, m);
             let (bl, bh) = (builder.ins().swiden_low(b), builder.ins().swiden_high(b));
@@ -1095,16 +1096,23 @@ fn vdot_part(
             let corr = builder.ins().ishl_imm_u(sums, 7);
             let c = builder.ins().isub(c, corr);
             let au = builder.ins().bxor(a, bias);
-            tree(builder, c, b, au, true)
+            tree(builder, c, b, false, au, true)
         }
-        // Each pair of i16 products summed in i32 (`pmaddwd`), then adjacent pairs.
-        DotKind::X86 => {
+        // Each pair of i16 products summed in i32 (`pmaddwd`), then adjacent pairs; unsigned
+        // bytes of a widen to i16 values 0..255, which pmaddwd reads as signed exactly.
+        (DotKind::X86, _) => {
             let mut pairs = [ClifValue::from_u32(0); 2];
             for (pair, high) in pairs.iter_mut().zip([false, true]) {
-                let (x, y) = if high {
-                    (builder.ins().swiden_high(a), builder.ins().swiden_high(b))
+                let x = match (unsigned, high) {
+                    (false, false) => builder.ins().swiden_low(a),
+                    (false, true) => builder.ins().swiden_high(a),
+                    (true, false) => builder.ins().uwiden_low(a),
+                    (true, true) => builder.ins().uwiden_high(a),
+                };
+                let y = if high {
+                    builder.ins().swiden_high(b)
                 } else {
-                    (builder.ins().swiden_low(a), builder.ins().swiden_low(b))
+                    builder.ins().swiden_low(b)
                 };
                 let (xl, yl) = (builder.ins().swiden_low(x), builder.ins().swiden_low(y));
                 let (xh, yh) = (builder.ins().swiden_high(x), builder.ins().swiden_high(y));
@@ -2205,13 +2213,29 @@ pub fn lower_function<M: ClifModule>(
                     let r = shuffle_lanes(&mut builder, part, part, *ty, |_| index);
                     values.insert(dst.clone(), (vec![r; part_count(vec_ty)], vec_ty));
                 }
-                Instruction::VDot { dst, acc, a, b, .. } => {
+                Instruction::VDot {
+                    dst,
+                    acc,
+                    a,
+                    b,
+                    unsigned,
+                    ..
+                } => {
                     let (c_parts, vec_ty) = parts(&values, acc);
                     let (a_parts, _) = parts(&values, a);
                     let (b_parts, _) = parts(&values, b);
                     let kind = dot_kind(module.isa());
                     let out = (0..c_parts.len())
-                        .map(|k| vdot_part(&mut builder, kind, c_parts[k], a_parts[k], b_parts[k]))
+                        .map(|k| {
+                            vdot_part(
+                                &mut builder,
+                                kind,
+                                *unsigned,
+                                c_parts[k],
+                                a_parts[k],
+                                b_parts[k],
+                            )
+                        })
                         .collect();
                     values.insert(dst.clone(), (out, vec_ty));
                 }

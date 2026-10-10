@@ -1079,10 +1079,12 @@ impl Validator {
                 a,
                 b,
                 lane,
+                unsigned,
                 span,
             } => {
-                Self::check_lane("vdot", *lane, VDOT_LANE_TYPES, *span)?;
-                let vec_ty = self.check_same_vectors(ctx, "vdot", &[acc, a, b], scope, *span)?;
+                let op = if *unsigned { "vdotu" } else { "vdot" };
+                Self::check_lane(op, *lane, VDOT_LANE_TYPES, *span)?;
+                let vec_ty = self.check_same_vectors(ctx, op, &[acc, a, b], scope, *span)?;
                 Self::define(scope, defs, dst, vec_ty, *span)?;
             }
             Instruction::VCmp {

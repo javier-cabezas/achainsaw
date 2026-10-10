@@ -64,6 +64,8 @@ enum Kernel {
     Dup(Type, Type, u32),
     /// `vdot c, a, b:i8`.
     Dot(Type),
+    /// `vdotu c, a, b:i8` (a unsigned).
+    Dotu(Type),
 }
 
 impl Kernel {
@@ -83,6 +85,7 @@ impl Kernel {
             Kernel::Zip(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Dup(l, w, i) => format!("k_vdup{i}_{l}_{w}"),
             Kernel::Dot(w) => format!("k_vdot_{w}"),
+            Kernel::Dotu(w) => format!("k_vdotu_{w}"),
         }
     }
 
@@ -107,6 +110,7 @@ impl Kernel {
             Kernel::Zip(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
             Kernel::Dup(l, w, i) => format!("{}    r = vdup a, {i}:{l}\n", loads(*w)),
             Kernel::Dot(w) => format!("{}    r = vdot c, a, b:i8\n", loads(*w)),
+            Kernel::Dotu(w) => format!("{}    r = vdotu c, a, b:i8\n", loads(*w)),
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
@@ -133,7 +137,7 @@ impl Kernel {
             | Kernel::FastReduce(_, l, _)
             | Kernel::Zip(_, l, _)
             | Kernel::Dup(l, _, _) => *l,
-            Kernel::Sel(_) | Kernel::Dot(_) => Type::I8,
+            Kernel::Sel(_) | Kernel::Dot(_) | Kernel::Dotu(_) => Type::I8,
         }
     }
 
@@ -169,7 +173,8 @@ impl Kernel {
             | Kernel::FastReduce(_, _, w)
             | Kernel::Zip(_, _, w)
             | Kernel::Dup(_, w, _)
-            | Kernel::Dot(w) => *w,
+            | Kernel::Dot(w)
+            | Kernel::Dotu(w) => *w,
         }
     }
 
@@ -199,7 +204,8 @@ impl Kernel {
             | Kernel::Shift(..)
             | Kernel::Zip(..)
             | Kernel::Dup(..)
-            | Kernel::Dot(..) => false,
+            | Kernel::Dot(..)
+            | Kernel::Dotu(..) => false,
         }
     }
 }
@@ -255,6 +261,7 @@ fn all_kernels() -> Vec<Kernel> {
             }
         }
         ks.push(Kernel::Dot(w));
+        ks.push(Kernel::Dotu(w));
         for l in [Type::F32, Type::F64] {
             for op in [VBinOp::Min, VBinOp::Max] {
                 ks.push(Kernel::FastBin(op, l, w));
@@ -669,11 +676,17 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 out[i * s..i * s + s].copy_from_slice(&ab[j * s..j * s + s]);
             }
         }
-        // Four exact i8 products per i32 lane, added to c's lane with wrapping.
-        Kernel::Dot(_) => {
+        // Four exact byte products per i32 lane, added to c's lane with wrapping; vdotu reads
+        // a's bytes as unsigned.
+        Kernel::Dot(_) | Kernel::Dotu(_) => {
+            let unsigned = matches!(k, Kernel::Dotu(_));
             for i in 0..w / 4 {
                 let dot: i64 = (0..4)
-                    .map(|q| get_int(a, Type::I8, 4 * i + q) * get_int(b, Type::I8, 4 * i + q))
+                    .map(|q| {
+                        let x = get_int(a, Type::I8, 4 * i + q);
+                        let x = if unsigned { x & 0xff } else { x };
+                        x * get_int(b, Type::I8, 4 * i + q)
+                    })
                     .sum();
                 let r = (get_int(c, Type::I32, i) as i32).wrapping_add(dot as i32);
                 put_int(&mut out, Type::I32, i, r as i64);
@@ -1039,6 +1052,7 @@ fn vector_ops_compile_for_every_target() {
         ("x86_64-unknown-linux-gnu", "x86-64-v4", "+avx512vnni"),
         ("aarch64-unknown-linux-gnu", "generic", ""),
         ("aarch64-unknown-linux-gnu", "generic", "+dotprod"),
+        ("aarch64-unknown-linux-gnu", "generic", "+dotprod,+i8mm"),
     ];
     for (triple, cpu, features) in targets {
         for (fast, _, module) in &modules {
@@ -1182,7 +1196,9 @@ pub const LLVM_TARGETS: &[(&str, &str, &str)] = &[
     ("x86_64-unknown-linux-gnu", "x86-64-v4", "+avx512vnni"),
     ("aarch64-unknown-linux-gnu", "generic", ""),
     ("aarch64-unknown-linux-gnu", "generic", "+dotprod"),
+    ("aarch64-unknown-linux-gnu", "generic", "+dotprod,+i8mm"),
     ("aarch64-unknown-linux-gnu", "generic", "+sve"),
+    ("aarch64-unknown-linux-gnu", "generic", "+sve,+i8mm"),
     ("aarch64-unknown-linux-gnu", "generic", "+sve2"),
 ];
 

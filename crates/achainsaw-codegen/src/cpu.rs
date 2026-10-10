@@ -587,6 +587,7 @@ impl CpuFeatures {
         achainsaw_llvm::Int8Dot {
             x86_vnni_bits,
             arm_dotprod: self.arch == Arch::Aarch64 && self.has(F::Dotprod),
+            arm_i8mm: self.arch == Arch::Aarch64 && self.has(F::I8mm),
         }
     }
 

@@ -96,6 +96,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
 | Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
 | Int8 dot product | `r = vdot c, a, b:i8` adds to each i32 lane of `c` the four products of the matching i8 lanes of `a` and `b`, exactly (i32 wrapping). One `sdot` on NEON (FEAT_DotProd) and SVE; on x86 with VNNI, `vpdpbusd` on `a ^ 0x80` minus `128 * sum(b)` (it multiplies unsigned by signed bytes), on both backends | i8 |
+| Unsigned-by-signed dot product | `r = vdotu c, a, b:i8`: the same with `a`'s bytes unsigned (0..255). One `vpdpbusd` on x86 VNNI and one `usdot` on Arm with FEAT_I8MM (NEON and SVE), on both backends; Arm without I8MM takes two `sdot`s. Use it when one operand is naturally unsigned (4- and 6-bit quantized weights) | i8 |
 | Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
 | Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
 | Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
