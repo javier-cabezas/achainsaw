@@ -789,7 +789,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let arity = if name == "vfma" || name == "vdot" {
+        let arity = if name == "vfma" || name == "vdot" || name == "vdotu" {
             3
         } else {
             2
@@ -806,13 +806,14 @@ impl<'a> Parser<'a> {
 
         let mut regs = regs.into_iter();
         let mut next = || regs.next().unwrap();
-        if name == "vdot" {
+        if name == "vdot" || name == "vdotu" {
             return Ok(Instruction::VDot {
                 dst,
                 acc: next(),
                 a: next(),
                 b: next(),
                 lane,
+                unsigned: name == "vdotu",
                 span,
             });
         }

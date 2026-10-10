@@ -787,12 +787,15 @@ pub enum Instruction {
     /// `r = vdot acc, a, b:i8`: `acc` has i32 lanes and `a`, `b` lanes of type `lane` (i8),
     /// four per i32 lane; lane `i` of the result is `acc[i] + a[4i]*b[4i] + ... +
     /// a[4i+3]*b[4i+3]`, signed products summed exactly and added with i32 wrapping.
+    /// `r = vdotu acc, a, b:i8` (`unsigned`) reads `a`'s bytes as unsigned (0..255): one
+    /// x86 VNNI `vpdpbusd`, or Arm `usdot` (FEAT_I8MM).
     VDot {
         dst: String,
         acc: String,
         a: String,
         b: String,
         lane: Type,
+        unsigned: bool,
         span: Span,
     },
     /// Lane count of `vx` for `lane` (`n = vl f32`), as an i64.

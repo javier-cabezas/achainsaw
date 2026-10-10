@@ -70,6 +70,8 @@ fn k(pa:ptr, po:ptr)->f64
     st po, dp
     dt = vdot c, a, b:i8
     st po, dt
+    du = vdotu c, a, b:i8
+    st po, du
     ret t
 "#;
 
@@ -164,6 +166,7 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("uh = vunziphi ul, zh:f16"));
     assert!(text.contains("dp = vdup uh, 15:i16"));
     assert!(text.contains("dt = vdot c, a, b:i8"));
+    assert!(text.contains("du = vdotu c, a, b:i8"));
 }
 
 #[test]
@@ -172,6 +175,11 @@ fn vdot_rules() {
         format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
     };
     assert!(parse_and_validate(&one("    r = vdot a, a, b:i8\n")).is_ok());
+    assert!(parse_and_validate(&one("    r = vdotu a, a, b:i8\n")).is_ok());
+    assert_eq!(
+        err_code(&one("    r = vdotu a, a, b:f32\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
     // Only i8 operands (four per i32 lane), three vectors of one width.
     assert_eq!(
         err_code(&one("    r = vdot a, a, b:i16\n")),

@@ -362,9 +362,11 @@ pub fn to_air_text(module: &Module) -> String {
                         a,
                         b,
                         lane,
+                        unsigned,
                         ..
                     } => {
-                        out.push_str(&format!("{dst} = vdot {acc}, {a}, {b}:{lane}"));
+                        let op = if *unsigned { "vdotu" } else { "vdot" };
+                        out.push_str(&format!("{dst} = {op} {acc}, {a}, {b}:{lane}"));
                     }
                     Instruction::Fma { dst, a, b, c, .. } => {
                         out.push_str(&format!("{dst} = fma {a}, {b}, {c}"));
@@ -948,9 +950,10 @@ impl BinaryEncoder {
                 a,
                 b,
                 lane,
+                unsigned,
                 ..
             } => {
-                self.buf.push(0x2E);
+                self.buf.push(if *unsigned { 0x31 } else { 0x2E });
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst, acc, a, b]);
             }
@@ -1596,7 +1599,7 @@ impl<'a> BinaryDecoder<'a> {
                 c: self.read_string()?,
                 span,
             }),
-            0x2E => {
+            0x2E | 0x31 => {
                 let lane = self.read_lane_type()?;
                 Ok(Instruction::VDot {
                     dst: self.read_string()?,
@@ -1604,6 +1607,7 @@ impl<'a> BinaryDecoder<'a> {
                     a: self.read_string()?,
                     b: self.read_string()?,
                     lane,
+                    unsigned: tag == 0x31,
                     span,
                 })
             }

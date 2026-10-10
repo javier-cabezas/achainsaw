@@ -69,6 +69,8 @@ pub struct Int8Dot {
     pub x86_vnni_bits: u32,
     /// AArch64 FEAT_DotProd: NEON `sdot`.
     pub arm_dotprod: bool,
+    /// AArch64 FEAT_I8MM: `usdot` (NEON, and SVE with SVE) for `vdotu`.
+    pub arm_i8mm: bool,
 }
 
 /// Shape of `vx` for one compilation.
@@ -1314,9 +1316,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let r = self.splat(x, *ty, vty)?;
                 st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
             }
-            Instruction::VDot { dst, acc, a, b, .. } => {
+            Instruction::VDot {
+                dst,
+                acc,
+                a,
+                b,
+                unsigned,
+                ..
+            } => {
                 let (c, vty) = self.val(st, acc);
-                let r = self.vdot(vty, c, self.val(st, a).0, self.val(st, b).0)?;
+                let r = self.vdot(vty, c, self.val(st, a).0, self.val(st, b).0, *unsigned)?;
                 st.values.insert(dst.clone(), (r, vty));
             }
             Instruction::VZip {
@@ -2191,23 +2200,32 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     /// signed bytes, so with a' = a ^ 0x80 = a + 128 as u8, sum(a' * b) = sum(a * b) + 128 *
     /// sum(b), and `128 * sum(b)` (one more `vpdpbusd`, depending only on b) is subtracted.
     /// Without either, the products are widened to i32 and summed in groups of four.
+    /// `unsigned` (`vdotu`): `a`'s bytes are unsigned, which is what x86 VNNI's `vpdpbusd`
+    /// and Arm's `usdot` (FEAT_I8MM) multiply, so it is one instruction there; Arm without
+    /// I8MM uses `sdot` on `a ^ 0x80` plus 128 times `sdot(1, b)`.
     fn vdot(
         &self,
         vty: Type,
         c: BasicValueEnum<'ctx>,
         a: BasicValueEnum<'ctx>,
         b: BasicValueEnum<'ctx>,
+        unsigned: bool,
     ) -> Result<BasicValueEnum<'ctx>> {
         let bld = &self.builder;
         let c = self.as_lanes(c, vty, Type::I32)?;
         let a = self.as_lanes(a, vty, Type::I8)?;
         let b = self.as_lanes(b, vty, Type::I8)?;
+        let dot = self.opts.int8_dot;
         if self.scalable(vty) {
-            let r = self.intr("llvm.aarch64.sve.sdot", &[c.get_type()], &[c, a, b])?;
+            let ty = &[c.get_type()];
+            let r = match (unsigned, dot.arm_i8mm) {
+                (false, _) => self.intr("llvm.aarch64.sve.sdot", ty, &[c, a, b])?,
+                (true, true) => self.intr("llvm.aarch64.sve.usdot", ty, &[c, a, b])?,
+                (true, false) => self.usdot_via_sdot("llvm.aarch64.sve.sdot", ty, c, a, b)?,
+            };
             return self.to_canon(r, vty);
         }
         let bits = self.vec_bits(vty);
-        let dot = self.opts.int8_dot;
         let piece = if dot.x86_vnni_bits > 0 {
             dot.x86_vnni_bits.min(bits)
         } else if dot.arm_dotprod {
@@ -2237,8 +2255,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             split(a, Type::I8)?,
             split(b, Type::I8)?,
         );
-        let full_ty = c.get_type();
-        let mut out = full_ty.const_zero();
+        let mut out = c.get_type().const_zero();
         for (i, ((c, a), b)) in cs.into_iter().zip(as_).zip(bs).enumerate() {
             let r = if dot.x86_vnni_bits > 0 {
                 let f = self.intrinsic(&format!("llvm.x86.avx512.vpdpbusd.{piece}"), &[]);
@@ -2247,6 +2264,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let arg = |v: BasicValueEnum<'ctx>, k: usize| -> Result<BasicValueEnum<'ctx>> {
                     self.bitcast(v, BasicTypeEnum::try_from(params[k]).unwrap())
                 };
+                if unsigned {
+                    let r = self.call1(f, &[arg(c, 0)?, arg(a, 1)?, arg(b, 2)?])?;
+                    out = self.join_piece(out, self.bitcast(r, c.get_type())?, i, piece, bits)?;
+                    continue;
+                }
                 let shape = Self::shape_of(a);
                 let bias =
                     self.splat_const(self.ctx.i8_type().const_int(0x80, false).into(), shape)?;
@@ -2272,35 +2294,71 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let r = self.call1(f, &[arg(c2, 0)?, arg(au, 1)?, arg(b, 2)?])?;
                 self.bitcast(r, c.get_type())?
             } else if dot.arm_dotprod {
-                self.intr(
-                    "llvm.aarch64.neon.sdot",
-                    &[c.get_type(), a.get_type()],
-                    &[c, a, b],
-                )?
+                let ty = &[c.get_type(), a.get_type()];
+                match (unsigned, dot.arm_i8mm) {
+                    (false, _) => self.intr("llvm.aarch64.neon.sdot", ty, &[c, a, b])?,
+                    (true, true) => self.intr("llvm.aarch64.neon.usdot", ty, &[c, a, b])?,
+                    (true, false) => self.usdot_via_sdot("llvm.aarch64.neon.sdot", ty, c, a, b)?,
+                }
             } else {
-                self.dot_widened(c, a, b)?
+                self.dot_widened(c, a, b, unsigned)?
             };
-            out = if piece == bits {
-                r
-            } else {
-                let n = piece / 32;
-                self.intr(
-                    "llvm.vector.insert",
-                    &[full_ty, r.get_type()],
-                    &[out, r, self.c64((i as u32 * n) as i64).into()],
-                )?
-            };
+            out = self.join_piece(out, r, i, piece, bits)?;
         }
         self.to_canon(out, vty)
     }
 
-    /// `vdot` on fixed vectors without a dot-product instruction: the products as i32, then
+    /// `out` with `r` as its `i`-th `piece`-bit part (`r` itself when it is the whole).
+    fn join_piece(
+        &self,
+        out: BasicValueEnum<'ctx>,
+        r: BasicValueEnum<'ctx>,
+        i: usize,
+        piece: u32,
+        bits: u32,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if piece == bits {
+            return Ok(r);
+        }
+        let n = piece / 32;
+        self.intr(
+            "llvm.vector.insert",
+            &[out.get_type(), r.get_type()],
+            &[out, r, self.c64((i as u32 * n) as i64).into()],
+        )
+    }
+
+    /// Unsigned-by-signed dot product from a signed `sdot` (intrinsic `name`, overloaded on
+    /// `ty`): with a' = a ^ 0x80 = a - 128 as i8, sum(a * b) = sum(a' * b) + 128 * sum(b).
+    fn usdot_via_sdot(
+        &self,
+        name: &str,
+        ty: &[BasicTypeEnum<'ctx>],
+        c: BasicValueEnum<'ctx>,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let bld = &self.builder;
+        let i8t = self.ctx.i8_type();
+        let bias = self.splat_const(i8t.const_int(0x80, false).into(), Self::shape_of(a))?;
+        let one = self.splat_const(i8t.const_int(1, false).into(), Self::shape_of(a))?;
+        let as_ = vec2!(a, bias, |x, y| bld.build_xor(x, y, "")?);
+        let r = self.intr(name, ty, &[c, as_, b])?;
+        let sums = self.intr(name, ty, &[c.get_type().const_zero(), one, b])?;
+        let seven = self.splat_const(self.i32().const_int(7, false).into(), Self::shape_of(c))?;
+        let corr = vec2!(sums, seven, |x, y| bld.build_left_shift(x, y, "")?);
+        Ok(vec2!(r, corr, |x, y| bld.build_int_add(x, y, "")?))
+    }
+
+    /// `vdot`/`vdotu` on fixed vectors without a dot-product instruction: the products as i32
+    /// (`a` zero-extended for `vdotu`), then
     /// each lane's four summed as (p0 + p1) + (p2 + p3).
     fn dot_widened(
         &self,
         c: BasicValueEnum<'ctx>,
         a: BasicValueEnum<'ctx>,
         b: BasicValueEnum<'ctx>,
+        unsigned: bool,
     ) -> Result<BasicValueEnum<'ctx>> {
         let bld = &self.builder;
         let (a, b, c) = (
@@ -2311,7 +2369,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let n = c.get_type().get_size();
         let wide = self.i32().vec_type(4 * n);
         let p = bld.build_int_mul(
-            bld.build_int_s_extend(a, wide, "")?,
+            if unsigned {
+                bld.build_int_z_extend(a, wide, "")?
+            } else {
+                bld.build_int_s_extend(a, wide, "")?
+            },
             bld.build_int_s_extend(b, wide, "")?,
             "",
         )?;
