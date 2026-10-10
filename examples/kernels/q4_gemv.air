@@ -11,9 +11,10 @@
 #                               * 4 + t holds q[64c + j][32b + 4g + t] (low nibble) and
 #                               q[64c + j][32b + 16 + 4g + t] (high nibble), g < 4, t < 4
 #   scales + c * (k/32) * 128:  their scales ([k/32 x 64] f16)
-# so a vector of nibble bytes unpacks with a mask, a shift and a subtraction into two vectors
+# so a vector of nibble bytes unpacks with a mask and a shift into two vectors
 # in q8_gemv's lane order (values 0..15 from the low nibbles, 16..31 from the high ones), and
-# the same `vdot`s give the int32 dots.
+# the same `vdotu`s give the int32 dots (the nibbles, 0..15, are the unsigned values; 8 times
+# the activation sums removes the offset).
 
 use quantize_q8, qmat_chunk
 

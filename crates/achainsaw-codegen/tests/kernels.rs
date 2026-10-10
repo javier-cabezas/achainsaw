@@ -572,7 +572,8 @@ fn q_pack(rng: &mut Rng, m: usize, k: usize, q4: bool) -> (Vec<u8>, Vec<u16>, Ve
                     wq[c * k * 32 + b * 1024 + ((n / 4) * 64 + r) * 4 + n % 4] |=
                         ((v + 8) as u8) << (4 * (t / 16));
                 } else {
-                    wq[c * k * 64 + b * 2048 + ((t / 4) * 64 + r) * 4 + t % 4] = v as u8;
+                    // Q8_0 values are stored unsigned: + 128.
+                    wq[c * k * 64 + b * 2048 + ((t / 4) * 64 + r) * 4 + t % 4] = v as u8 ^ 0x80;
                 }
             }
         }

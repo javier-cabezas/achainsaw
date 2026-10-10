@@ -19,7 +19,8 @@
 #
 # Each weight matrix is Q8_0, Q4_0 or Q6_K, chosen per matrix: 8-, 4- or 6-bit weights with
 # f16 scales per 32 (Q6_K: 16) values of a row, packed in chunks of 64 output rows;
-# activations are quantized to int8 per 32-block on the fly and the int8 dots run on `vdot`.
+# activations are quantized to int8 per 32-block on the fly and the int8 dots run on `vdotu`
+# (weights stored unsigned; the activation sums of quantize_q8 remove their offset).
 # The matrix chunks (qmat_chunk), the quantization, RoPE, softmax's exp (vexp, no libm call)
 # and SwiGLU's gating come from the AIR standard library (`use`).
 #

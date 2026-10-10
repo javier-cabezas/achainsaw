@@ -339,9 +339,9 @@ def make_cases():
     # f16 scales, as GGUF stores them (NumPy uses the same values in f32).
     qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float16)
     # Packed layout: 64-row chunks; per 32-block, 4 consecutive values of a row per 32-bit
-    # lane, lanes ordered by group then row (see qmat_chunk).
+    # lane, lanes ordered by group then row, values + 128 as unsigned bytes (see qmat_chunk).
     q_packed = np.ascontiguousarray(
-        qq.reshape(qm // 64, 64, qnb, 8, 4).transpose(0, 2, 3, 1, 4))
+        (qq.view(np.uint8) ^ np.uint8(0x80)).reshape(qm // 64, 64, qnb, 8, 4).transpose(0, 2, 3, 1, 4))
     s_packed = np.ascontiguousarray(qs.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
     qs = qs.astype(np.float32)
     qx = rng.standard_normal(qk).astype(np.float32)

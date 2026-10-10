@@ -50,7 +50,7 @@ impl Fmt {
 /// Q6_K) and f16 scales `s` [k/group x rows], plus the kernel's packed layout (see
 /// `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of 4 consecutive
 /// elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row r's element
-/// 4g + q for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and 16 + 4g + q (high
+/// 4g + q plus 128 for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and 16 + 4g + q (high
 /// nibble), offset by 8; for Q6_K those nibbles of the low 4 bits of the values offset by
 /// 32, then 512 bytes whose byte (g * 64 + r) * 4 + q (g < 2) holds the high 2 bits of
 /// element 8p + 4g + q in bit pair p.
@@ -108,7 +108,7 @@ impl Mat {
                     let at = |g: usize, q: usize| blk + (g * 64 + r) * 4 + q;
                     let n = t % 16;
                     match fmt {
-                        Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8,
+                        Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8 ^ 0x80,
                         Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
                         Fmt::Q6 => {
                             let u = (v + 32) as u8;

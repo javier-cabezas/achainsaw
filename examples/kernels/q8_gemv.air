@@ -7,14 +7,15 @@
 #
 # Packed layout, for m a multiple of 64 and k a multiple of 32: output rows come in chunks
 # of 64; chunk c holds
-#   wq     + c * k * 64:        q for its rows, 2048 bytes per block b: byte (g * 64 + j) * 4
-#                               + t holds q[64c + j][32b + 4g + t] (g < 8, t < 4), so each
-#                               32-bit lane holds 4 consecutive values of one row
+#   wq     + c * k * 64:        q + 128 for its rows (unsigned bytes), 2048 bytes per block b:
+#                               byte (g * 64 + j) * 4 + t holds q[64c + j][32b + 4g + t]
+#                               + 128 (g < 8, t < 4), so each 32-bit lane holds 4 consecutive
+#                               values of one row
 #   scales + c * (k/32) * 128:  their scales ([k/32 x 64] f16)
 # so each chunk is contiguous and one `par` task computes it with the standard library's
-# qmat_chunk: per block, `vdot` multiplies each lane's 4 values by 4 activations (VNNI
-# vpdpbusd, Arm sdot) into exact int32 dots, which are converted to f32 (vitof), scaled and
-# accumulated into y.
+# qmat_chunk: per block, `vdotu` multiplies each lane's 4 unsigned values by 4 activations
+# (one VNNI vpdpbusd, Arm usdot) into exact int32 dots, 128 times the block's activation sums
+# is subtracted, and the result is converted to f32 (vitof), scaled and accumulated into y.
 
 use quantize_q8, qmat_chunk
 

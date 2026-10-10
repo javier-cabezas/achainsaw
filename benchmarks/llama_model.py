@@ -129,7 +129,7 @@ class Mat:
     def pack(self):
         """The kernel's layout (see qmat_chunk in the AIR standard library): 64-row chunks;
         per chunk and 32-block, groups of 4 consecutive bytes of a row form one 32-bit lane,
-        byte (g * 64 + j) * 4 + q holding row j's byte 4g + q: its int8 values for Q8_0, its
+        byte (g * 64 + j) * 4 + q holding row j's byte 4g + q: its int8 values plus 128 for Q8_0, its
         nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q); for Q6_K the low 4 bits as
         Q4_0's nibbles, then a 512-byte plane whose byte (g * 64 + j) * 4 + q holds the high
         2 bits of values 8p + 4g + q in bit pair p. Then the f16 scales [k/sub x 64]."""
@@ -149,7 +149,8 @@ class Mat:
                 (hi[..., 24:32] << 6)
             q = np.concatenate([lanes(nib, 16), lanes(top, 8)], axis=2)
         else:
-            q = lanes(self.q, 32)
+            # Q8_0 stored unsigned: each int8 value + 128 (its top bit flipped).
+            q = lanes(self.q.view(np.uint8) ^ np.uint8(0x80), 32)
         self.packed_q = np.ascontiguousarray(q)
         per = 32 // self.sub
         self.packed_s = np.ascontiguousarray(
