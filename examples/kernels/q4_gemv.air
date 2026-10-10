@@ -21,8 +21,8 @@ fn q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
   b0:
     nb = udiv k, 32:i64
     xq = alloc k
-    nb4 = mul nb, 4:i64
-    dx = alloc nb4
+    nb16 = mul nb, 16:i64
+    dx = alloc nb16
     call quantize_q8(x, xq, dx, k)
     # The matrix as qmat_chunk takes it: weights, scales, format (1).
     mat = alloc 24:i64
