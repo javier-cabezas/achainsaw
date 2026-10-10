@@ -96,6 +96,12 @@ pub struct LowerOptions {
     /// Address of the engine's i64 fuel counter, decremented inline at every branch (also
     /// used for the halt checks of sandboxed code).
     pub fuel_counter: u64,
+    /// Address of an x86-64 stub that runs `RT_FUEL_EXHAUSTED` preserving every register the
+    /// generated code may use (general-purpose, full vector and mask registers), or 0. With
+    /// one, the fuel slow path calls it through inline asm that clobbers no registers and
+    /// continues while the reloaded counter is positive, so loop values are not spilled
+    /// around the cold call; without one it calls the hook.
+    pub fuel_stub: u64,
     /// Bounds-check memory accesses and stack depth (implies the halt checks at branches).
     pub sandbox: Option<SandboxBounds>,
     /// AOT objects: `alloc`/`free` call libc `malloc`/`free`, no runtime hooks, and no
@@ -301,8 +307,19 @@ struct FnState<'ctx> {
     trap: Option<BasicBlock<'ctx>>,
     /// Reports a sandbox violation `(addr, size)` and jumps to `trap`.
     fault: Option<(BasicBlock<'ctx>, PhiValue<'ctx>, PhiValue<'ctx>)>,
-    /// Address of this thread's fuel counter, found on entry (see `dynamic_fuel`).
-    fuel_counter: Option<IntValue<'ctx>>,
+    /// The function's fuel counter, when it has fuel checks.
+    fuel: Option<Fuel<'ctx>>,
+}
+
+/// Fuel counter of a function: kept in a stack slot that LLVM promotes to a register between
+/// checks, and in memory at `addr` whenever code outside the function may read or change it
+/// (`spill_fuel`/`reload_fuel`). Decrementing the counter in memory at every branch would cost
+/// a load and a store per iteration, which data stores may alias, so they stall the loop.
+#[derive(Clone, Copy)]
+struct Fuel<'ctx> {
+    slot: PointerValue<'ctx>,
+    /// This thread's counter (see `dynamic_fuel`) or the engine's.
+    addr: IntValue<'ctx>,
 }
 
 impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
@@ -950,15 +967,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         if !(self.opts.fuel || self.opts.sandbox.is_some()) || self.opts.aot {
             return Ok(());
         }
-        // Decrement the engine's counter in place; only when it reaches zero ask the runtime
-        // whether to unwind (budget spent, or a failure was recorded).
+        // Decrement the counter; only when it reaches zero write it back and ask the runtime
+        // whether to unwind (budget spent, or a failure was recorded) or continue with the
+        // counter it refilled.
         let b = &self.builder;
-        let addr = st
-            .fuel_counter
-            .unwrap_or_else(|| self.c64(self.opts.fuel_counter as i64));
-        let fuel = self.load(self.i64().into(), addr)?.into_int_value();
-        let left = b.build_int_sub(fuel, self.c64(1), "fuel")?;
-        self.store(left.into(), addr)?;
+        let fuel = st.fuel.expect("fuel counter of a function with branches");
+        let left = b
+            .build_load(self.i64(), fuel.slot, "fuel")?
+            .into_int_value();
+        let left = b.build_int_sub(left, self.c64(1), "fuel")?;
+        b.build_store(fuel.slot, left)?;
         let out = b.build_int_compare(IntPredicate::SLE, left, self.c64(0), "")?;
         let out = self
             .intr(
@@ -971,8 +989,66 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let cont = self.ctx.append_basic_block(st.func, "fueled");
         b.build_conditional_branch(out, slow, cont)?;
         b.position_at_end(slow);
-        self.check_hook(st, RT_FUEL_EXHAUSTED, &[], cont)?;
+        if self.opts.fuel_stub != 0 {
+            let refilled = self.call_fuel_stub(left, fuel.addr)?;
+            b.build_store(fuel.slot, refilled)?;
+            let stop = b.build_int_compare(IntPredicate::SLE, refilled, self.c64(0), "")?;
+            b.build_conditional_branch(stop, st.trap.expect("trap block"), cont)?;
+        } else {
+            self.spill_fuel(st)?;
+            let refilled = self.ctx.append_basic_block(st.func, "fuel.refilled");
+            self.check_hook(st, RT_FUEL_EXHAUSTED, &[], refilled)?;
+            b.position_at_end(refilled);
+            self.reload_fuel(st)?;
+            b.build_unconditional_branch(cont)?;
+        }
         b.position_at_end(cont);
+        Ok(())
+    }
+
+    /// Stores the counter `left` at `addr`, calls `LowerOptions::fuel_stub` and returns the
+    /// counter it leaves there, in one inline-asm statement (x86-64) that clobbers no
+    /// registers but the flags, since the stub saves everything else, and memory, since the
+    /// runtime may refill the counter. The call steps over the red zone, where the function may
+    /// keep data below the stack pointer.
+    fn call_fuel_stub(&self, left: IntValue<'ctx>, addr: IntValue<'ctx>) -> Result<IntValue<'ctx>> {
+        let i64t = self.i64();
+        let ty = i64t.fn_type(&[i64t.into(), i64t.into(), i64t.into()], false);
+        let stub = self.ctx.create_inline_asm(
+            ty,
+            "movq $1, ($2)\n\tlea -128(%rsp), %rsp\n\tcall *$3\n\t\
+             lea 128(%rsp), %rsp\n\tmovq ($2), $0"
+                .to_string(),
+            "=r,r,r,r,~{memory},~{dirflag},~{fpsr},~{flags}".to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
+        let args = [left, addr, self.c64(self.opts.fuel_stub as i64)].map(|v| v.into());
+        let cs = self.builder.build_indirect_call(ty, stub, &args, "fuel")?;
+        Ok(cs
+            .try_as_basic_value()
+            .basic()
+            .expect("counter")
+            .into_int_value())
+    }
+
+    /// Writes the fuel counter back to memory, before a call or a return.
+    fn spill_fuel(&self, st: &FnState<'ctx>) -> Result<()> {
+        if let Some(fuel) = st.fuel {
+            let v = self.builder.build_load(self.i64(), fuel.slot, "fuel")?;
+            self.store(v, fuel.addr)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the fuel counter from memory, after a call that may have used or refilled it.
+    fn reload_fuel(&self, st: &FnState<'ctx>) -> Result<()> {
+        if let Some(fuel) = st.fuel {
+            let v = self.load(self.i64().into(), fuel.addr)?;
+            self.builder.build_store(fuel.slot, v)?;
+        }
         Ok(())
     }
 
@@ -1016,7 +1092,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             blocks,
             trap,
             fault,
-            fuel_counter: None,
+            fuel: None,
         };
         for (i, (name, ty)) in func.params.iter().enumerate() {
             st.values
@@ -1028,17 +1104,22 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             .blocks
             .iter()
             .any(|b| !matches!(b.terminator, Terminator::Ret { .. }));
-        if checks && self.dynamic_fuel && has_branches {
-            // This thread's counter, or the engine's when no engine call is active.
-            let active = self
-                .call1(self.runtime_fn(RT_FUEL_COUNTER), &[])?
-                .into_int_value();
-            let none = b.build_int_compare(IntPredicate::EQ, active, self.c64(0), "")?;
+        if checks && has_branches {
             let engine = self.c64(self.opts.fuel_counter as i64);
-            st.fuel_counter = Some(
+            let addr = if self.dynamic_fuel {
+                // This thread's counter, or the engine's when no engine call is active.
+                let active = self
+                    .call1(self.runtime_fn(RT_FUEL_COUNTER), &[])?
+                    .into_int_value();
+                let none = b.build_int_compare(IntPredicate::EQ, active, self.c64(0), "")?;
                 b.build_select(none, engine, active, "fuel.counter")?
-                    .into_int_value(),
-            );
+                    .into_int_value()
+            } else {
+                engine
+            };
+            let slot = b.build_alloca(self.i64(), "fuel.slot")?;
+            st.fuel = Some(Fuel { slot, addr });
+            self.reload_fuel(&st)?;
         }
         let first = st.blocks[&func.blocks[0].label].0;
         if self.opts.sandbox.is_some() && !self.opts.aot {
@@ -1054,7 +1135,23 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 st.values.insert(name.clone(), (phi.as_basic_value(), *ty));
             }
             for inst in &block.instructions {
+                // Calls (AIR, runtime hooks, `mm` and `par` charging fuel) see the counter in
+                // memory and may change it.
+                let calls_out = matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::Alloc { .. }
+                        | Instruction::Free { .. }
+                        | Instruction::MatMul { .. }
+                        | Instruction::Par { .. }
+                );
+                if calls_out {
+                    self.spill_fuel(&st)?;
+                }
                 self.lower_inst(&mut st, inst, air)?;
+                if calls_out {
+                    self.reload_fuel(&st)?;
+                }
             }
             self.lower_terminator(&st, &block.terminator)?;
         }
@@ -1175,18 +1272,21 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let e = self.edge(st, else_block, else_args)?;
                 b.build_conditional_branch(c, t, e)?;
             }
-            Terminator::Ret { vals, .. } => match vals.as_slice() {
-                [] => {
-                    b.build_return(None)?;
+            Terminator::Ret { vals, .. } => {
+                self.spill_fuel(st)?;
+                match vals.as_slice() {
+                    [] => {
+                        b.build_return(None)?;
+                    }
+                    [v] => {
+                        b.build_return(Some(&st.values[v].0))?;
+                    }
+                    many => {
+                        let vs: Vec<BasicValueEnum> = many.iter().map(|v| st.values[v].0).collect();
+                        b.build_aggregate_return(&vs)?;
+                    }
                 }
-                [v] => {
-                    b.build_return(Some(&st.values[v].0))?;
-                }
-                many => {
-                    let vs: Vec<BasicValueEnum> = many.iter().map(|v| st.values[v].0).collect();
-                    b.build_aggregate_return(&vs)?;
-                }
-            },
+            }
         }
         Ok(())
     }
@@ -2125,6 +2225,40 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.to_canon(m, vty)
     }
 
+    /// `vftoi` f32 -> i32, saturating with NaN to 0 (`llvm.fptosi.sat`). AArch64 has that
+    /// conversion (`fcvtzs`), but x86 lowers the intrinsic lane by lane, so x86 code zeroes
+    /// NaNs, clamps below, converts with `fptosi` (`cvttps2dq`) and selects the maximum for
+    /// values from 2^31 up.
+    fn vftoi(
+        &self,
+        x: BasicValueEnum<'ctx>,
+        rt: BasicTypeEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let arm = matches!(self.opts.vx, VxShape::Scalable { .. })
+            || self.opts.target_features.contains("+neon");
+        if arm {
+            return self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x]);
+        }
+        let x = x.into_vector_value();
+        let n = x.get_type().get_size();
+        let f32t = self.ctx.f32_type();
+        let fsplat = |v: f64| VectorType::const_vector(&vec![f32t.const_float(v); n as usize]);
+        let zero = x.get_type().const_zero();
+        let nan = b.build_float_compare(FloatPredicate::UNO, x, x, "")?;
+        let x = b.build_select(nan, zero, x, "")?.into_vector_value();
+        let min = fsplat(-2147483648.0);
+        let low = b.build_float_compare(FloatPredicate::OLT, x, min, "")?;
+        let clamped = b.build_select(low, min, x, "")?.into_vector_value();
+        let high = b.build_float_compare(FloatPredicate::OGE, x, fsplat(2147483648.0), "")?;
+        let clamped = b.build_select(high, zero, clamped, "")?.into_vector_value();
+        let r = b.build_float_to_signed_int(clamped, rt.into_vector_type(), "")?;
+        let i32t = self.i32();
+        let max =
+            VectorType::const_vector(&vec![i32t.const_int(i32::MAX as u64, false); n as usize]);
+        Ok(b.build_select(high, max, r, "")?)
+    }
+
     /// `VUnary` (conversions name the result lane type, as in `VUnaryOp::source_lane`).
     fn vunary(
         &self,
@@ -2140,10 +2274,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             VUnaryOp::Itof => {
                 b.build_cast(InstructionOpcode::SIToFP, x, self.lane_vec(vty, lane), "")?
             }
-            VUnaryOp::Ftoi => {
-                let rt = self.lane_vec(vty, lane);
-                self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
-            }
+            VUnaryOp::Ftoi => self.vftoi(x, self.lane_vec(vty, lane))?,
             VUnaryOp::Exp => self.vexp(x)?,
             VUnaryOp::Abs if lane.is_float() => self.intr("llvm.fabs", &[x.get_type()], &[x])?,
             // `false`: the minimum integer gives itself rather than poison.

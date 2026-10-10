@@ -530,6 +530,77 @@ extern "C" fn rt_fuel_exhausted_preserve_all() {
     );
 }
 
+/// `rt_fuel_exhausted` for LLVM code, which may keep values in any register (`ymm`/`zmm`,
+/// AVX-512 mask registers): saves the caller-saved general-purpose registers and, with
+/// `xsave`, the x87, SSE, AVX and AVX-512 state (not AMX tiles, which no fuel-checked code
+/// holds) in a 64-byte aligned area, so it may be entered at any stack alignment. Like the
+/// Cranelift stub it returns nothing and the caller reloads the fuel counter.
+#[cfg(all(target_arch = "x86_64", feature = "llvm"))]
+#[unsafe(naked)]
+extern "C" fn rt_fuel_exhausted_xsave() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        // x87, SSE, AVX, opmask, ZMM_Hi256 and Hi16_ZMM end at byte 2688 of the standard
+        // layout. XSAVE writes only the XSTATE_BV bits it saves, and XRSTOR faults unless the
+        // rest of the 64-byte header is zero.
+        "sub rsp, 2688",
+        "and rsp, -64",
+        "xor eax, eax",
+        "mov [rsp + 512], rax",
+        "mov [rsp + 520], rax",
+        "mov [rsp + 528], rax",
+        "mov [rsp + 536], rax",
+        "mov [rsp + 544], rax",
+        "mov [rsp + 552], rax",
+        "mov [rsp + 560], rax",
+        "mov [rsp + 568], rax",
+        "mov eax, 0xe7",
+        "xor edx, edx",
+        "xsave [rsp]",
+        "sub rsp, 32",
+        "call {hook}",
+        "add rsp, 32",
+        "mov eax, 0xe7",
+        "xor edx, edx",
+        "xrstor [rsp]",
+        "lea rsp, [rbp - 72]",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "pop rbp",
+        "ret",
+        hook = sym rt_fuel_exhausted,
+    );
+}
+
+/// Stub the LLVM backend's fuel slow path calls with every register preserved
+/// (`LowerOptions::fuel_stub`), or 0 to call `rt_fuel_exhausted` directly: the `xsave` stub
+/// on x86-64. AArch64 calls the hook (SVE code would need z and p registers saved too).
+#[cfg(feature = "llvm")]
+fn llvm_fuel_stub() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("xsave") {
+        return rt_fuel_exhausted_xsave as *const () as u64;
+    }
+    0
+}
+
 /// Fuel counter of the code running on this thread, or null when no engine call is active
 /// (code reached through `get_fn_ptr`, which then uses its engine's counter). Called on
 /// entry by functions of modules that use `par`, whose workers each count their own fuel.
@@ -1737,6 +1808,7 @@ impl JitEngine {
                 let opts = achainsaw_llvm::LowerOptions {
                     fuel: self.fuel_enabled,
                     fuel_counter: fuel_counter as u64,
+                    fuel_stub: llvm_fuel_stub(),
                     sandbox: sandbox.map(|(base, len)| achainsaw_llvm::SandboxBounds {
                         base: base as u64,
                         len: len as u64,

@@ -796,7 +796,7 @@ impl Rng {
     }
 }
 
-const F32_SPECIAL: [f32; 12] = [
+const F32_SPECIAL: [f32; 16] = [
     0.0,
     -0.0,
     1.0,
@@ -809,6 +809,11 @@ const F32_SPECIAL: [f32; 12] = [
     f32::MAX,
     3.25,
     -7.0e-3,
+    // Around the i32 range, where `vftoi` starts to saturate.
+    2147483520.0,
+    2147483648.0,
+    -2147483648.0,
+    -2147483904.0,
 ];
 const F64_SPECIAL: [f64; 12] = [
     0.0,
