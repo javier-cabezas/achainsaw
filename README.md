@@ -471,37 +471,42 @@ achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphi
 | `q4_gemv.air` | `q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q4_0 (llama.cpp) matrix-vector product: 4-bit weights, half of Q8_0's bytes; GGUF's own nibble bytes in the same lane order, unpacked in registers (a mask and a shift) as unsigned values for the same `vdotu`s, minus 8 times the activation sums |
 | `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64`, `llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out; and a whole prompt in one call: see [Single-call decode](#single-call-decode-deep-fusion) |
 
-`crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level:
+`crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level, with NumPy and (when installed) PyTorch as baselines:
 
 ```bash
 python benchmarks/benchmark_kernels.py                  # host ISA, every available backend
 python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx2/avx512 (or neon/sve/...)
 python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
+python benchmarks/benchmark_kernels.py --no-torch       # without the PyTorch baseline
 ```
 
-Compared with NumPy on the same data types (bf16 inputs are stored as bf16 bits and widened in each call, Q8_0 and Q4_0 weights stay integers; NumPy's GEMV/GEMM use multithreaded OpenBLAS), from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS (8 cores, 16 threads). Kernels marked "all cores" use `par`; the others run on one core:
+Compared with NumPy and PyTorch, from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS (8 cores, 16 threads), best of three runs. Kernels marked "all cores" use `par`; the others run on one core:
+- **NumPy** computes with the kernels' data types: bf16 inputs are stored as bf16 bits and widened in each call, and Q8_0 and Q4_0 weights stay integers. Its GEMV and GEMM use multithreaded OpenBLAS (16 threads).
+- **PyTorch** 2.14 (CPU wheel, eager, its default 8 threads) runs its own fastest CPU path for each kernel, and the benchmark checks its results too. GEMM and attention use native bf16 (oneDNN; bf16 outputs). The quantized GEMVs use its weight-only kernels, the path torchao takes on CPU, with bf16 activations instead of int8 ones. Q4_0 maps to int4 with the same 32-blocks; Q8_0 maps to int8 with one scale per row, since PyTorch has no per-block int8 kernel, which is less work than Q8_0.
+
+The parentheses give the speedup over NumPy:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/kernels-vs-numpy-dark.svg">
-  <img alt="Speedup of each kernel over NumPy on a log scale, Cranelift and LLVM side by side; the numbers are in the table below" src="docs/kernels-vs-numpy-light.svg">
+  <img alt="Speedup of each kernel over NumPy on a log scale, PyTorch, Cranelift and LLVM side by side; the numbers are in the table below" src="docs/kernels-vs-numpy-light.svg">
 </picture>
 
-| Kernel | NumPy | Cranelift (128-bit) | LLVM (512-bit) |
-|---|---|---|---|
-| Q4_0 GEMV 4096x4096, all cores | 5.63 ms (the same, from 4-bit values) | 247 µs (22.9x) | 62.5 µs (90.2x) |
-| Q8_0 GEMV 4096x4096, all cores | 5.73 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 254 µs (22.6x) | 76.4 µs (75.0x) |
-| RoPE, 32 heads x 128 | 7.7 µs | 1.9 µs (4.0x) | 0.86 µs (9.0x) |
-| Residual add + RMSNorm, n=4096 | 6.1 µs | 4.1 µs (1.5x) | 1.6 µs (3.9x) |
-| Cosine similarity, n=1024 | 2.2 µs | 0.70 µs (3.1x) | 0.56 µs (3.9x) |
-| RMSNorm, n=4096 | 5.4 µs | 3.8 µs (1.4x) | 1.4 µs (3.8x) |
-| Softmax, n=1000 | 2.8 µs | 1.8 µs (1.6x) | 0.92 µs (3.1x) |
-| Euclidean distance, n=1024 | 1.3 µs | 0.69 µs (1.9x) | 0.56 µs (2.4x) |
-| SwiGLU, n=14336 | 10.5 µs | 14.4 µs (0.73x) | 4.7 µs (2.2x) |
-| GEMM bf16 -> f32, 256³, all cores | 156 µs | 204 µs (0.77x) | 75.1 µs (2.1x) |
-| Greedy argmax, vocabulary 128256 | 6.4 µs | 15.8 µs (0.41x) | 4.5 µs (1.4x) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.25 ms | 1.86 ms (0.68x) | 974 µs (1.3x) |
-| GEMV f32 512x1024, all cores | 5.4 µs | 14.4 µs (0.38x) | 10.7 µs (0.51x) |
-| GEMV f32 512x1024, 1 core | 5.4 µs (all cores) | 36.9 µs (0.15x) | 21.0 µs (0.26x) |
+| Kernel | NumPy | PyTorch | Cranelift (128-bit) | LLVM (512-bit) |
+|---|---|---|---|---|
+| Q4_0 GEMV 4096x4096, all cores | 5.69 ms (the same, from 4-bit values) | 117 µs (49x; int4 weight-only kernel, bf16 activations) | 219 µs (26x) | 53.1 µs (107x) |
+| Q8_0 GEMV 4096x4096, all cores | 5.82 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 142 µs (41x; int8 weight-only kernel, one scale per row, bf16 activations) | 216 µs (27x) | 73.3 µs (79x) |
+| RoPE, 32 heads x 128 | 7.5 µs | 9.9 µs (0.76x) | 1.9 µs (3.9x) | 0.76 µs (9.9x) |
+| Residual add + RMSNorm, n=4096 | 6.3 µs | 8.8 µs (0.71x) | 4.1 µs (1.5x) | 1.2 µs (5.3x) |
+| RMSNorm, n=4096 | 5.2 µs | 6.9 µs (0.76x) | 3.5 µs (1.5x) | 1.0 µs (5.1x) |
+| Cosine similarity, n=1024 | 2.1 µs | 5.5 µs (0.39x) | 0.64 µs (3.3x) | 0.47 µs (4.5x) |
+| Softmax, n=1000 | 2.6 µs | 1.2 µs (2.3x) | 1.7 µs (1.6x) | 0.76 µs (3.5x) |
+| Euclidean distance, n=1024 | 1.4 µs | 1.7 µs (0.81x) | 0.63 µs (2.2x) | 0.48 µs (2.8x) |
+| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 66.7 µs (2.5x) |
+| SwiGLU, n=14336 | 9.9 µs | 7.0 µs (1.4x) | 13.3 µs (0.74x) | 4.2 µs (2.3x) |
+| Greedy argmax, vocabulary 128256 | 6.0 µs | 49.9 µs (0.12x) | 15.7 µs (0.38x) | 4.6 µs (1.3x) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.18 ms | 890 µs (1.3x; `scaled_dot_product_attention`, bf16 output) | 1.80 ms (0.65x) | 911 µs (1.3x) |
+| GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 13.3 µs (0.39x) | 9.4 µs (0.56x) |
+| GEMV f32 512x1024, 1 core | 5.6 µs (all cores) | 25.6 µs (0.22x, all cores) | 33.2 µs (0.17x) | 19.3 µs (0.29x) |
 
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
 
@@ -509,9 +514,10 @@ Every pull request also runs a performance check in CI: [`benchmarks/perf_compar
 
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
-- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads.
+- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads. PyTorch's x86 wheel calls MKL here, which runs this size on one thread and is slower on AMD CPUs.
+- **bf16 GEMM against PyTorch.** On CPUs with AVX512-BF16 but no AMX (like this Zen 4), `mm` widens bf16 to f32 FMAs, while PyTorch's oneDNN uses AVX512-BF16 dot products, with twice the multiplies per instruction, and rounds its output to bf16. It is the one kernel where PyTorch leads LLVM by a clear margin (1.7x); attention, which is half `mm`, ties. Elsewhere LLVM is ahead: 2.2x on Q4_0 and 1.9x on Q8_0 against PyTorch's quantized kernels, and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch.
 
-**Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is now faster than Q8_0 on both.
+**Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is faster than Q8_0 on LLVM and as fast on Cranelift.
 
 Fuel checks are inline (a decrement and a compare per branch, on a counter kept in a register), so loops pay almost nothing for runaway protection. The rare slow path calls the runtime through a stub that preserves every register, so it does not make Cranelift spill loop values: before that, the fuel checks made Cranelift's GEMV 2.6x slower.
 
@@ -540,16 +546,19 @@ python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --t
 #  ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of ...
 ```
 
-Llama 3.2 1B Instruct in Q4_0 (Q4_0 layers, two Q4_1 down projections, a Q6_K embedding shared with the LM head), greedy decoding on a Ryzen 7 8845HS with 8 threads (one per core, the fastest setting for both):
+Llama 3.2 1B Instruct in Q4_0 (Q4_0 layers, two Q4_1 down projections, a Q6_K embedding shared with the LM head), greedy decoding on a Ryzen 7 8845HS with 8 threads (one per core, the fastest setting for each):
 
 | | ms/token | tokens/s | weights read per token |
 |---|---|---|---|
 | llama.cpp (CPU, `llama-bench -n 64 -t 8`) | 15.4 | 64.8 | 765 MB at 50 GB/s |
-| AIR on LLVM, one call per token | 15.4 | 65.1 | 794 MB at 52 GB/s |
-| AIR on Cranelift, one call per token | 24.8 | 40.4 | 794 MB at 32 GB/s |
-| NumPy, same data types | 578 | 1.7 | |
+| AIR on LLVM, one call per token | 14.6 | 68.4 | 794 MB at 54 GB/s |
+| AIR on Cranelift, one call per token | 21.4 | 46.8 | 794 MB at 37 GB/s |
+| PyTorch 2.14, weight-only int4/int8 kernels | 29.7 | 33.7 | 884 MB at 30 GB/s |
+| NumPy, same data types | 723 | 1.4 | |
 
 The kernel prints the same text as llama.cpp (`llama-simple`, greedy), and its tokens match the NumPy implementation of the same arithmetic. Both are bound by memory bandwidth at about the same rate; the kernel reads 4% more bytes, because the two Q4_1 matrices become Q8_0 and its Q6_K scales take 0.5 bit more per weight than llama.cpp's packing.
+
+PyTorch runs the same model eagerly on its weight-only quantized kernels (`benchmark_decode.py` uses them when PyTorch is installed; `--no-torch` skips it). Q4_0 matrices become int4 with the same 32-blocks; the Q8_0 down projections and the Q6_K LM head become int8 with one scale per row. Its tokens match too. Its int4 kernel streams weights at about half the rate of LLVM's `vdotu` loop, and it reads the int8 LM head instead of 6.5-bit Q6_K.
 
 Prefill of a 542-token prompt (`--prompt` with a long text), against the decode steps that follow it in the same run (one `llama_decode` call per token, the cost of feeding a prompt without prefill):
 
@@ -560,12 +569,12 @@ Prefill of a 542-token prompt (`--prompt` with a long text), against the decode 
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
-| Weights | AIR on LLVM | AIR on Cranelift | NumPy, same data types |
-|---|---|---|---|
-| Q8_0, 1.31 GB | 26.0 ms/token (38 tokens/s, 51 GB/s) | 28.7 ms/token | 558 ms/token |
-| Q4_0, 0.70 GB | 13.1 ms/token (76 tokens/s, 53 GB/s) | 23.7 ms/token | 608 ms/token |
+| Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |
+|---|---|---|---|---|
+| Q8_0, 1.31 GB | 24.2 ms/token (41 tokens/s, 54 GB/s) | 28.3 ms/token | 37.8 ms/token (int8, one scale per row) | 909 ms/token |
+| Q4_0, 0.70 GB | 13.2 ms/token (76 tokens/s, 53 GB/s) | 18.5 ms/token | 27.3 ms/token (int4) | 661 ms/token |
 
-On LLVM decode streams the weights at close to the memory's bandwidth (run to run, about ±5%), so Q4_0 is about 2x faster than Q8_0. On Cranelift, `vdot` and in-register unpacking make the int8 dots cheap enough that Q4_0's half-size weights pay off too. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token.
+On LLVM decode streams the weights at close to the memory's bandwidth (run to run, about ±5%), so Q4_0 is about 2x faster than Q8_0. On Cranelift, `vdot` and in-register unpacking make the int8 dots cheap enough that Q4_0's half-size weights pay off too. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. PyTorch's int4 and int8 kernels read the weights at 28–33 GB/s.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):

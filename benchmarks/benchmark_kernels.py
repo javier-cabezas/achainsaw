@@ -9,12 +9,20 @@ The kernels are vector-length agnostic, so the same source runs 128-bit vectors 
 Cranelift and up to 512-bit (or SVE-scalable) vectors on LLVM. Kernels compile with
 fast_math=True (float min/max as compare and select; the tests cover both modes).
 
+NumPy and, when it is installed, PyTorch (eager, CPU) are timed on the same work as
+baselines. NumPy computes with the kernels' data types. PyTorch runs its own fastest CPU
+path for each kernel, and its results are checked too. Where its types differ, the case
+says so: bf16 outputs for GEMM and attention, and for the quantized GEMVs PyTorch's
+weight-only int4 and int8 kernels, which take bf16 activations instead of int8 ones (int8
+with one scale per row, since PyTorch has no per-block int8 kernel).
+
     python benchmarks/benchmark_kernels.py                  # host ISA, all backends
     python benchmarks/benchmark_kernels.py --isa all        # sweep ISA levels too
     python benchmarks/benchmark_kernels.py --quick          # short run (CI)
     python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
+    python benchmarks/benchmark_kernels.py --no-torch       # skip the PyTorch baseline
 
-Exits non-zero if any kernel disagrees with NumPy.
+Exits non-zero if any kernel, or a PyTorch baseline, disagrees with the reference.
 """
 
 import argparse
@@ -24,6 +32,12 @@ import sys
 import time
 
 import numpy as np
+
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
 
 # Ensure achainsaw module is accessible
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -76,6 +90,19 @@ def np_q8_gemv(q_blocks, scales, x):
     return ((dots * dx[:, None]) * scales).sum(axis=0)
 
 
+def rel_err(out, ref):
+    """max |out - ref| / max |ref|, for a PyTorch result against the case's f64 reference."""
+    out = np.asarray(out.float() if torch is not None and isinstance(out, torch.Tensor) else out,
+                     dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    return float(np.max(np.abs(out.reshape(ref.shape) - ref)) / np.max(np.abs(ref)))
+
+
+def torch_bf16(bits):
+    """A PyTorch bf16 tensor over raw bf16 bits (zero copy)."""
+    return torch.from_numpy(np.ascontiguousarray(bits).view(np.int16)).view(torch.bfloat16)
+
+
 def time_call(func, budget_s, min_iters=5, chunks=5):
     """Seconds per call after a short warm-up: the run of about `budget_s` is split into
     `chunks` and the fastest chunk's average is returned, so a transient stall (another
@@ -95,21 +122,31 @@ def time_call(func, budget_s, min_iters=5, chunks=5):
     return best
 
 
+def tt(x):
+    """A PyTorch tensor sharing x's memory, or None without PyTorch (its cases' torch
+    callables are then never called)."""
+    return torch.from_numpy(x) if torch is not None else None
+
+
 def make_cases():
     """Each case: name, label, kernel source, args builder, verify(kernel) -> max error,
-    tolerance, NumPy baseline, and the work per call (for GFLOP/s)."""
+    tolerance, NumPy baseline, PyTorch baseline with its check(result) -> error (and its own
+    tolerance where its types differ), and the work per call (for GFLOP/s)."""
     rng = np.random.default_rng(42)
     cases = []
 
     dim = 1024  # embedding size of common text-embedding models
     a = rng.standard_normal(dim).astype(np.float32)
     b = rng.standard_normal(dim).astype(np.float32)
+    ta, tb = tt(a), tt(b)
     cos_ref = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
     cases.append(dict(
         name="cosine_similarity", label=f"Cosine similarity (n={dim})",
         run=lambda k: k(a, b, dim),
         verify=lambda k: abs(k(a, b, dim) - cos_ref), tol=1e-5,
         numpy=lambda: np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12),
+        torch=lambda: F.cosine_similarity(ta, tb, dim=0),
+        torch_check=lambda out: abs(float(out) - cos_ref),
         flops=6 * dim,
     ))
 
@@ -119,12 +156,15 @@ def make_cases():
         run=lambda k: k(a, b, dim),
         verify=lambda k: abs(k(a, b, dim) - l2_ref) / l2_ref, tol=1e-5,
         numpy=lambda: np.linalg.norm(a - b),
+        torch=lambda: torch.dist(ta, tb),
+        torch_check=lambda out: abs(float(out) - l2_ref) / l2_ref,
         flops=3 * dim,
     ))
 
     sm_n = 1000
     x_sm = (rng.standard_normal(sm_n) * 4.0).astype(np.float32)
     out_sm = np.zeros(sm_n, dtype=np.float32)
+    t_sm = tt(x_sm)
     e = np.exp(x_sm.astype(np.float64) - x_sm.max())
     sm_ref = e / e.sum()
 
@@ -139,13 +179,17 @@ def make_cases():
     cases.append(dict(
         name="softmax", label=f"Softmax (n={sm_n})",
         run=lambda k: k(x_sm, out_sm, sm_n),
-        verify=verify_softmax, tol=1e-6, numpy=np_softmax, flops=4 * sm_n,
+        verify=verify_softmax, tol=1e-6, numpy=np_softmax,
+        torch=lambda: torch.softmax(t_sm, 0),
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - sm_ref))),
+        flops=4 * sm_n,
     ))
 
     rms_n = 4096
     x_r = rng.standard_normal(rms_n).astype(np.float32)
     w_r = rng.uniform(0.8, 1.2, rms_n).astype(np.float32)
     out_r = np.zeros(rms_n, dtype=np.float32)
+    t_xr, t_wr = tt(x_r), tt(w_r)
     xd = x_r.astype(np.float64)
     rms_ref = xd / np.sqrt(np.mean(xd * xd) + 1e-6) * w_r
 
@@ -158,6 +202,8 @@ def make_cases():
         run=lambda k: k(x_r, w_r, out_r, rms_n),
         verify=verify_rms, tol=1e-5,
         numpy=lambda: x_r / np.sqrt(np.mean(x_r * x_r) + 1e-6) * w_r,
+        torch=lambda: F.rms_norm(t_xr, (rms_n,), t_wr, eps=1e-6),
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - rms_ref))),
         flops=4 * rms_n,
     ))
 
@@ -165,6 +211,7 @@ def make_cases():
     A = rng.standard_normal((gm, gk)).astype(np.float32)
     xg = rng.standard_normal(gk).astype(np.float32)
     yg = np.zeros(gm, dtype=np.float32)
+    tA, txg = tt(A), tt(xg)
     gemv_ref = A.astype(np.float64) @ xg.astype(np.float64)
 
     def verify_gemv(k):
@@ -174,7 +221,9 @@ def make_cases():
     cases.append(dict(
         name="gemv_f32", label=f"GEMV f32 ({gm}x{gk})",
         run=lambda k: k(A, xg, yg, gm, gk),
-        verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
+        verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg,
+        torch=lambda: torch.mv(tA, txg), torch_check=lambda out: rel_err(out, gemv_ref),
+        flops=2 * gm * gk,
     ))
 
     def verify_gemv_par(k):
@@ -185,7 +234,9 @@ def make_cases():
     cases.append(dict(
         name="gemv_par", label=f"GEMV f32, all cores via par ({gm}x{gk})",
         run=lambda k: k.run("gemv_par", A, xg, yg, gm, gk),
-        verify=verify_gemv_par, tol=1e-5, numpy=lambda: A @ xg, flops=2 * gm * gk,
+        verify=verify_gemv_par, tol=1e-5, numpy=lambda: A @ xg,
+        torch=lambda: torch.mv(tA, txg), torch_check=lambda out: rel_err(out, gemv_ref),
+        flops=2 * gm * gk,
     ))
 
     n = 256
@@ -193,6 +244,8 @@ def make_cases():
     Bb = bf16_bits(rng.standard_normal((n, n)))
     Af, Bf = bf16_values(Ab), bf16_values(Bb)
     C = np.zeros((n, n), dtype=np.float32)
+    if torch is not None:
+        tAb, tBb = torch_bf16(Ab), torch_bf16(Bb)
     gemm_ref = Af.astype(np.float64) @ Bf.astype(np.float64)
 
     def verify_gemm(k):
@@ -206,7 +259,10 @@ def make_cases():
         verify=verify_gemm, tol=1e-4,
         # Same types as the kernel: bf16 inputs (raw bits; NumPy has no bf16 matmul, so
         # they are widened to f32 in the call), f32 accumulation.
-        numpy=lambda: bf16_values(Ab) @ bf16_values(Bb), flops=2 * n * n * n,
+        numpy=lambda: bf16_values(Ab) @ bf16_values(Bb),
+        # PyTorch multiplies bf16 natively (f32 accumulation), rounding its output to bf16.
+        torch=lambda: torch.mm(tAb, tBb), torch_check=lambda out: rel_err(out, gemm_ref),
+        torch_tol=1e-2, flops=2 * n * n * n,
     ))
     # One decode step of DeepSeek V4 Pro's sparse attention: 128 query heads share one
     # 512-dim KV head (K = V) and attend to 1152 selected cache entries (sliding window 128
@@ -241,11 +297,27 @@ def make_cases():
         p = bf16_values(bf16_bits(e))
         return (p @ sel32) / (e.sum(axis=1, keepdims=True) + np.exp(fsink[:, None] - m))
 
+    if torch is not None:
+        # PyTorch's scaled_dot_product_attention in bf16 (f32 softmax inside, bf16 output),
+        # all heads as the queries of one KV head. The sink is one more key: a zero row
+        # appended to the cache (score 0) plus a mask of the sink logit on its column.
+        t_q = torch_bf16(fq).view(1, 1, fh, fd)
+        t_kv = torch.cat([torch_bf16(fkv), torch.zeros(1, fd, dtype=torch.bfloat16)])
+        t_idx = torch.from_numpy(np.append(fidx, fcache).astype(np.int64))
+        t_mask = torch.zeros(1, 1, fh, fnk + 1, dtype=torch.bfloat16)
+        t_mask[..., -1] = tt(fsink)
+
+    def torch_flash():
+        sel = t_kv[t_idx].view(1, 1, fnk + 1, fd)
+        return F.scaled_dot_product_attention(t_q, sel, sel, attn_mask=t_mask,
+                                              scale=float(fscale))
+
     cases.append(dict(
         name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
         run=lambda k: k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
-        verify=verify_flash, tol=1e-2,
-        numpy=np_flash, flops=2 * 2 * fh * fnk * fd,
+        verify=verify_flash, tol=1e-2, numpy=np_flash,
+        torch=torch_flash, torch_check=lambda out: rel_err(out, flash_ref),
+        flops=2 * 2 * fh * fnk * fd,
     ))
 
     # Decode-step glue at Llama 3 8B sizes (d = 4096, MLP 14336, 32 heads of 128,
@@ -254,6 +326,7 @@ def make_cases():
     gate = (rng.standard_normal(sw_n) * 3.0).astype(np.float32)
     up = rng.standard_normal(sw_n).astype(np.float32)
     sw_out = np.zeros(sw_n, dtype=np.float32)
+    t_gate, t_up = tt(gate), tt(up)
     gd = gate.astype(np.float64)
     sw_ref = gd / (1.0 + np.exp(-gd)) * up
 
@@ -265,17 +338,25 @@ def make_cases():
         name="swiglu", label=f"SwiGLU, vectorized exp (n={sw_n})",
         run=lambda k: k(gate, up, sw_out, sw_n),
         verify=verify_swiglu, tol=2e-6,
-        numpy=lambda: gate / (1.0 + np.exp(-gate)) * up, flops=8 * sw_n,
+        numpy=lambda: gate / (1.0 + np.exp(-gate)) * up,
+        torch=lambda: F.silu(t_gate) * t_up,
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - sw_ref) / (np.abs(sw_ref) + 1e-30))),
+        flops=8 * sw_n,
     ))
 
     vocab = 128256
     logits = rng.standard_normal(vocab).astype(np.float32)
     am_ref = int(np.argmax(logits))
+    t_logits = tt(logits)
     cases.append(dict(
         name="argmax", label=f"Greedy argmax (vocab={vocab})",
         run=lambda k: k(logits, vocab),
         verify=lambda k: float(k(logits, vocab) != am_ref), tol=0.0,
-        numpy=lambda: np.argmax(logits), flops=vocab,
+        numpy=lambda: np.argmax(logits),
+        # torch.max along the dimension finds the index faster than torch.argmax.
+        torch=lambda: torch.max(t_logits, 0),
+        torch_check=lambda out: float(int(out.indices) != am_ref),
+        flops=vocab,
     ))
 
     rh, rd, rpos = 32, 128, 1000
@@ -296,10 +377,19 @@ def make_cases():
         a, b = rq0[:, :rhalf], rq0[:, rhalf:]
         return np.concatenate([a * rcos - b * rsin, b * rcos + a * rsin], axis=1)
 
+    # PyTorch has no RoPE operator; models write it out like this.
+    t_rq0, t_rcos, t_rsin = tt(rq0), tt(rcos), tt(rsin)
+
+    def torch_rope():
+        a, b = t_rq0[:, :rhalf], t_rq0[:, rhalf:]
+        return torch.cat([a * t_rcos - b * t_rsin, b * t_rcos + a * t_rsin], dim=1)
+
     cases.append(dict(
         name="rope", label=f"RoPE, in place ({rh} heads x {rd})",
         run=lambda k: k(rq, rh, rd, rcos, rsin),
-        verify=verify_rope, tol=1e-5, numpy=np_rope, flops=6 * rh * rhalf,
+        verify=verify_rope, tol=1e-5, numpy=np_rope,
+        torch=torch_rope, torch_check=lambda out: float(np.max(np.abs(out.numpy() - rope_ref))),
+        flops=6 * rh * rhalf,
     ))
 
     an = 4096
@@ -316,6 +406,7 @@ def make_cases():
     ares[:] = ares0
     aw[:] = rng.uniform(0.8, 1.2, an)
     asum = ares0.astype(np.float64) + ax
+    t_ax, t_ares0, t_aw = tt(ax), tt(ares0), tt(aw)
     an_ref = asum / np.sqrt(np.mean(asum * asum) + 1e-5) * aw
 
     def verify_add_rmsnorm(k):
@@ -330,7 +421,10 @@ def make_cases():
     cases.append(dict(
         name="add_rmsnorm", label=f"Residual add + RMSNorm (n={an})",
         run=lambda k: k(ax, ares, aw, aout, an, 1e-5),
-        verify=verify_add_rmsnorm, tol=1e-5, numpy=np_add_rmsnorm, flops=5 * an,
+        verify=verify_add_rmsnorm, tol=1e-5, numpy=np_add_rmsnorm,
+        torch=lambda: F.rms_norm(t_ares0 + t_ax, (an,), t_aw, eps=1e-5),
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - an_ref))),
+        flops=5 * an,
     ))
 
     qm, qk = 4096, 4096
@@ -353,6 +447,15 @@ def make_cases():
                      xq_ints.reshape(qnb, 32).astype(np.int64))
     q8_ref = (dots * qs.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
 
+    # PyTorch's int8 weight-only GEMV (torchao's CPU path): the same int8 weights, but one
+    # scale per row (each row's mean block scale here; it has no per-block int8 kernel) and
+    # bf16 activations, so it is checked against its own f64 reference.
+    tx_bf16 = tt(qx).bfloat16() if torch is not None else None
+    if torch is not None:
+        t_w8 = tt(qq)
+        t_s8 = tt(qs.mean(axis=0)).bfloat16()
+        q8_ref_t = qq.astype(np.float64) @ tx_bf16.double().numpy() * t_s8.double().numpy()
+
     def verify_q8(k):
         k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q8_ref)) / np.max(np.abs(q8_ref)))
@@ -361,6 +464,8 @@ def make_cases():
         name="q8_gemv", label=f"Q8_0 GEMV, all cores ({qm}x{qk})",
         run=lambda k: k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk),
         verify=verify_q8, tol=1e-5, numpy=lambda: np_q8_gemv(q_blocks, qs, qx),
+        torch=lambda: torch.ops.aten._weight_int8pack_mm(tx_bf16[None], t_w8, t_s8),
+        torch_check=lambda out: rel_err(out, q8_ref_t), torch_tol=1e-2,
         flops=2 * qm * qk,
     ))
 
@@ -380,6 +485,17 @@ def make_cases():
                       xq_ints.reshape(qnb, 32).astype(np.int64))
     q4_ref = (dots4 * q4s.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
 
+    # PyTorch's int4 weight-only GEMV (torchao's CPU path): the same 4-bit values and
+    # 32-blocks, packed by PyTorch, its weights (q - 8) * scale + zero with bf16 scales and
+    # zeros (0 here), and bf16 activations; checked against its own f64 reference.
+    if torch is not None:
+        t_p4 = torch.ops.aten._convert_weight_to_int4pack_for_cpu(tt(q4.astype(np.int32)), 1)
+        t_s4 = tt(q4s).bfloat16()
+        t_sz4 = torch.stack([t_s4, torch.zeros_like(t_s4)], dim=-1).contiguous()
+        dots4t = np.einsum("rbt,bt->rb", q4_vals.reshape(qm, qnb, 32).astype(np.float64),
+                           tx_bf16.double().numpy().reshape(qnb, 32))
+        q4_ref_t = (dots4t * t_s4.double().numpy().T).sum(axis=1)
+
     def verify_q4(k):
         k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q4_ref)) / np.max(np.abs(q4_ref)))
@@ -388,6 +504,8 @@ def make_cases():
         name="q4_gemv", label=f"Q4_0 GEMV, all cores ({qm}x{qk})",
         run=lambda k: k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk),
         verify=verify_q4, tol=1e-5, numpy=lambda: np_q8_gemv(q4_blocks, q4s, qx),
+        torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tx_bf16[None], t_p4, 32, t_sz4),
+        torch_check=lambda out: rel_err(out, q4_ref_t), torch_tol=1e-2,
         flops=2 * qm * qk,
     ))
     return cases
@@ -415,7 +533,10 @@ def main():
     parser.add_argument("--json", metavar="PATH", help="also write results as JSON")
     parser.add_argument("--no-numpy", action="store_true",
                         help="skip timing NumPy (results still verified against it)")
+    parser.add_argument("--no-torch", action="store_true",
+                        help="skip the PyTorch baseline (skipped anyway without PyTorch)")
     args = parser.parse_args()
+    use_torch = torch is not None and not args.no_torch
 
     available = achainsaw.available_backends()
     backends = available if args.backends == "all" else args.backends.split(",")
@@ -429,6 +550,8 @@ def main():
     print(f"backends: {', '.join(backends)}  |  ISA levels: "
           f"{', '.join(l or 'host' for l in levels)}  |  host: "
           f"{achainsaw.cpu_features()['host']['max_isa']}")
+    if use_torch:
+        print(f"PyTorch {torch.__version__}, {torch.get_num_threads()} threads")
     print("=" * 96)
 
     results, failures = [], []
@@ -440,11 +563,23 @@ def main():
         time.sleep(0.02)
         np_s = None if args.no_numpy else time_call(case["numpy"], budget)
         row = dict(kernel=case["name"], label=case["label"],
-                   numpy_us=np_s and np_s * 1e6, runs=[])
+                   numpy_us=np_s and np_s * 1e6, torch_us=None, runs=[])
         print(f"\n{case['label']}")
         if np_s:
             print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  "
                   f"{case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
+        if use_torch:
+            err = case["torch_check"](case["torch"]())
+            tol = case.get("torch_tol", case["tol"])
+            if err > tol:
+                failures.append(f"{case['name']} on PyTorch: error {err:.2e}")
+            time.sleep(0.02)
+            pt_s = time_call(case["torch"], budget)
+            row["torch_us"], row["torch_error"] = pt_s * 1e6, err
+            vs = f"  {np_s / pt_s:6.2f}x NumPy" if np_s else ""
+            print(f"    {'PyTorch':<22} {pt_s * 1e6:10.2f} us  "
+                  f"{case['flops'] / pt_s / 1e9:8.2f} GFLOP/s{vs}  err {err:.1e} "
+                  f"{'PASS' if err <= tol else 'FAIL'}")
         for backend, level in configs:
             achainsaw.set_isa_cap(level)
             kernel = achainsaw.compile(src, backend=backend, fast_math=True)
@@ -456,6 +591,8 @@ def main():
             secs = time_call(lambda: case["run"](kernel), budget)
             tag = f"{backend}@{level or 'host'}"
             vs = f"  {np_s / secs:6.2f}x NumPy" if np_s else ""
+            if row["torch_us"]:
+                vs += f"  {row['torch_us'] / 1e6 / secs:6.2f}x PyTorch"
             print(f"    {tag:<22} {secs * 1e6:10.2f} us  {case['flops'] / secs / 1e9:8.2f} GFLOP/s"
                   f"{vs}  err {err:.1e} {'PASS' if ok else 'FAIL'}")
             row["runs"].append(dict(backend=backend, isa=level or "host", us=secs * 1e6,
@@ -466,7 +603,10 @@ def main():
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(dict(backends=backends, isa_levels=[l or "host" for l in levels],
-                           cpu=achainsaw.cpu_features(), results=results), f, indent=2)
+                           cpu=achainsaw.cpu_features(),
+                           torch=use_torch and dict(version=torch.__version__,
+                                                    threads=torch.get_num_threads()),
+                           results=results), f, indent=2)
 
     print("\n" + "=" * 96)
     if failures:
