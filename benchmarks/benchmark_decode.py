@@ -1,7 +1,7 @@
 """
 Single-call LLM inference: examples/kernels/llama_decode.air on a real Llama GGUF checkpoint
 or on a random model with Llama 3.2 1B's shapes, against a NumPy implementation of the same
-math.
+math and, when PyTorch is installed, a PyTorch one.
 
 The AIR kernel runs the whole prompt in one llama_prefill call (4 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
@@ -12,6 +12,12 @@ attention). They share the same weights (NumPy reads them block-major), so they 
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights
 to f32 in each call and runs the block dots as a batched f32 BLAS matmul (exact here).
 The kernel compiles with fast_math=True (float min/max as compare and select).
+
+PyTorch (eager, CPU) runs the same model on its weight-only quantized kernels, the path
+torchao uses on CPU, with bf16 activations into each matrix and f32 elsewhere. Q4_0
+matrices keep their 4-bit values and 32-blocks; Q8_0 and Q6_K ones are requantized to int8
+with one scale per row, as PyTorch has no per-block int8 kernel, so its tokens can differ a
+little from the kernel's.
 
     # Llama 3.2 1B Instruct, Q4_0 (773 MB):
     # https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -25,7 +31,7 @@ The kernel compiles with fast_math=True (float min/max as compare and select).
     python benchmarks/benchmark_decode.py --weights q8 --layers 4 --tokens 16 --no-numpy
     python benchmarks/benchmark_decode.py --prompt-tokens 512 --tokens 1 --no-numpy  # prefill
 
-NumPy runs the prompt one token at a time. The prompt speed is the prefill time per prompt
+NumPy and PyTorch run the prompt one token at a time. The prompt speed is the prefill time per prompt
 token; the decode speed covers the generated tokens only.
 """
 
@@ -40,7 +46,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import achainsaw  # noqa: E402
 from gguf import GGUF, Tokenizer  # noqa: E402
-from llama_model import Model  # noqa: E402
+from llama_model import Model, torch  # noqa: E402
 
 KERNEL = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels",
                                       "llama_decode.air"))
@@ -93,8 +99,11 @@ def main():
     parser.add_argument("--threads", type=int,
                         help="threads for the kernel's par loops (default: all logical cores)")
     parser.add_argument("--no-numpy", action="store_true", help="skip the NumPy baseline")
+    parser.add_argument("--no-torch", action="store_true",
+                        help="skip the PyTorch baseline (skipped anyway without PyTorch)")
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args = parser.parse_args()
+    use_torch = torch is not None and not args.no_torch
 
     t0 = time.perf_counter()
     if args.gguf:
@@ -104,7 +113,7 @@ def main():
         prompt_ids = tok.encode(prompt)
         stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>") if t in tok.ids}
         model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
-                                numpy=not args.no_numpy)
+                                numpy=not args.no_numpy, use_torch=use_torch)
         name = g.meta.get("general.name", os.path.basename(args.gguf))
         formats = ", ".join(f"{k} {'/'.join(v)}" for k, v in model.formats.items())
         print(f"{name}: {len(model.layers)} layers, {model.weight_bytes() / 1e9:.2f} GB of "
@@ -116,7 +125,7 @@ def main():
             0, 128256, max(args.prompt_tokens, 1))]
         model = Model.random(d=2048, layers=args.layers, heads=32, kv_heads=8, head_dim=64,
                              ffn=8192, vocab=128256, max_ctx=len(prompt_ids) + args.tokens + 1,
-                             fmt=args.weights, numpy=not args.no_numpy)
+                             fmt=args.weights, numpy=not args.no_numpy, use_torch=use_torch)
         print(f"Llama 3.2 1B shapes, random weights, {args.layers} layers, "
               f"{args.weights.upper()}_0 {model.weight_bytes() / 1e9:.2f} GB "
               f"(built in {time.perf_counter() - t0:.1f} s); prompt of {len(prompt_ids)} "
@@ -128,7 +137,7 @@ def main():
 
     results = []
 
-    def report(label, prompt_s, times, backend=None):
+    def report(label, prompt_s, times, backend=None, nbytes=wb):
         ms = np.median(times[1:] or times) * 1e3
         prompt_ms = prompt_s * 1e3 / len(prompt_ids)
         results.append(dict(backend=backend or label, ms_per_token=ms,
@@ -136,7 +145,7 @@ def main():
         pre = (f"prompt {prompt_ms:6.2f} ms/token ({1e3 / prompt_ms:6.1f} tokens/s), "
                if len(prompt_ids) > 1 else "")
         print(f"  {label:<22} {pre}decode {ms:7.2f} ms/token  {1e3 / ms:6.1f} tokens/s  "
-              f"{wb / (ms / 1e3) / 1e9:5.1f} GB/s of weights")
+              f"{nbytes / (ms / 1e3) / 1e9:5.1f} GB/s of weights")
 
     runs = {}
     for be in backends:
@@ -168,6 +177,21 @@ def main():
             same = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
                         min(len(toks), len(out)))
             print(f"  {be}: first {same} of {len(toks)} tokens match NumPy")
+
+    if use_torch:
+        if args.threads:
+            torch.set_num_threads(args.threads)
+        cache = model.torch_cache()
+        out, prompt_s, times = generate(lambda t, p: model.torch_step(cache, t, p), prompt_ids,
+                                        args.tokens, stop)
+        report(f"PyTorch, {torch.get_num_threads()} thr", prompt_s, times, "torch",
+               model.torch_weight_bytes())
+        if tok:
+            print("    " + repr(tok.decode(out)))
+        for be, toks in runs.items():
+            same = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
+                        min(len(toks), len(out)))
+            print(f"  {be}: first {same} of {len(toks)} tokens match PyTorch")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
