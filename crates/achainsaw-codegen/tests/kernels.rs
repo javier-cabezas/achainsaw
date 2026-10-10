@@ -655,3 +655,47 @@ fn check_q_gemv(name: &str, q4: bool) {
         }
     }
 }
+
+/// `quantize_q8` (standard library): the int8 values and, per 32-block, a 16-byte record of
+/// the scale (f32), the sums of values 0..15 and 16..31 (i32) and a zero, at every ISA level.
+#[test]
+fn quantize_q8_writes_block_records() {
+    let module = parse_and_validate("use quantize_q8\n").unwrap();
+    type Quantize = extern "C" fn(*const f32, *mut i8, *mut u8, i64);
+    let mut rng = Rng(77);
+    for (level, features) in host_levels() {
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.compile_module(&module).unwrap();
+        let f: Quantize = unsafe { std::mem::transmute(engine.get_fn_ptr("quantize_q8").unwrap()) };
+        for k in [32usize, 64, 4096] {
+            let mut x: Vec<f32> = (0..k).map(|_| rng.next() * 3.0).collect();
+            // A block of zeros (scale 0) and one of halfway cases.
+            x[..32].fill(0.0);
+            if k > 32 {
+                for (t, v) in x[32..64].iter_mut().enumerate() {
+                    *v = (t as f32 - 15.5) * 4.0;
+                }
+            }
+            let mut xq = vec![0x55i8; k];
+            let mut dx = vec![0xAAu8; k / 32 * 16];
+            f(x.as_ptr(), xq.as_mut_ptr(), dx.as_mut_ptr(), k as i64);
+            let (want_q, want_d) = q8_quantize(&x);
+            assert_eq!(xq, want_q, "values, k={k}, {level}");
+            for b in 0..k / 32 {
+                let rec = &dx[b * 16..b * 16 + 16];
+                let word = |i: usize| i32::from_le_bytes(rec[4 * i..4 * i + 4].try_into().unwrap());
+                let sum = |r: std::ops::Range<usize>| -> i32 {
+                    want_q[b * 32..][r].iter().map(|&v| v as i32).sum()
+                };
+                assert_eq!(
+                    f32::from_bits(word(0) as u32).to_bits(),
+                    want_d[b].to_bits(),
+                    "scale {b}, {level}"
+                );
+                assert_eq!(word(1), sum(0..16), "low sum {b}, k={k}, {level}");
+                assert_eq!(word(2), sum(16..32), "high sum {b}, k={k}, {level}");
+                assert_eq!(word(3), 0, "pad {b}, {level}");
+            }
+        }
+    }
+}

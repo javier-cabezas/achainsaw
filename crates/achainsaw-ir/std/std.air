@@ -4,7 +4,7 @@
 # Every function here is validated and tested; see crates/achainsaw-ir/src/stdlib.rs.
 
 # dst[0 .. 64] = rows 64c .. 64c + 64 of the quantized matrix `mat` times the int8
-# activations xq (scales dx per 32-block, from quantize_q8); k is the matrix's row length.
+# activations xq (block records dx, from quantize_q8); k is the matrix's row length.
 # `mat` points to 3 words: packed weights, f16 scales, format (0 Q8_0, 1 Q4_0, 2 Q6_K).
 # Weights come in chunks of 64 rows; per 32-block of a chunk, each group of 4 consecutive
 # values of a row fills one 32-bit lane, so `vdot` multiplies them by 4 activations:
@@ -46,7 +46,7 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     xb = add xq, xo
     sb_off = mul b, sc_blk
     sb = add sc, sb_off
-    d = ld dx[b]:f32
+    d = ld dx[b:v128]:f32
     jmp strips(0:i64)
   strips(j:i64):
     j_more = lt j, 64:i64
@@ -102,8 +102,8 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
   done:
     ret
 
-# qmat_chunk for 4 tokens at once: token t's int8 activations at xq + t * xs, its scales
-# at dx + t * xs / 8, its 64 results at dst + 256 t. Each weight vector is loaded and
+# qmat_chunk for 4 tokens at once: token t's int8 activations at xq + t * xs, its block
+# records at dx + t * xs / 2, its 64 results at dst + 256 t. Each weight vector is loaded and
 # unpacked once for the four tokens; every token goes through qmat_chunk's steps, so its
 # results are exactly qmat_chunk's.
 fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
@@ -117,7 +117,7 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     xq1 = add xq, xs
     xq2 = add xq1, xs
     xq3 = add xq2, xs
-    ds = udiv xs, 8:i64
+    ds = udiv xs, 2:i64
     dx1 = add dx, ds
     dx2 = add dx1, ds
     dx3 = add dx2, ds
@@ -145,10 +145,10 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     xb3 = add xq3, xo
     sb_off = mul b, sc_blk
     sb = add sc, sb_off
-    d0 = ld dx[b]:f32
-    d1 = ld dx1[b]:f32
-    d2 = ld dx2[b]:f32
-    d3 = ld dx3[b]:f32
+    d0 = ld dx[b:v128]:f32
+    d1 = ld dx1[b:v128]:f32
+    d2 = ld dx2[b:v128]:f32
+    d3 = ld dx3[b:v128]:f32
     jmp strips(0:i64)
   strips(j:i64):
     j_more = lt j, 64:i64
@@ -344,11 +344,11 @@ inline fn qmat_acc2(py:ptr, dl:vx, dh:vx, s:vx, s1:vx, d:f32)
     ret
 
 # dst[64t .. 64t + 64] = rows 64c .. 64c + 64 of `mat` times token t's int8 activations,
-# for n tokens xs bytes apart in xq (their scales xs / 8 bytes apart in dx): four at a time
+# for n tokens xs bytes apart in xq (their block records xs / 2 bytes apart in dx): four at a time
 # with qmat_chunk4, the rest with qmat_chunk, so every result is exactly qmat_chunk's.
 fn qmat_batch(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, n:i64, xs:i64)
   b0:
-    ds = udiv xs, 8:i64
+    ds = udiv xs, 2:i64
     jmp tiles(0:i64)
   tiles(t:i64):
     t4 = add t, 4:i64
@@ -380,15 +380,19 @@ fn qmat_batch(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, n:i64, xs:i64)
     ret
 
 # Q8_0 quantization of x[0 .. k] (k a multiple of 32), as llama.cpp's quantize_row_q8_0:
-# dx[b] = max|x in block b| / 127 and xq[32b + t] = round(x[32b + t] / dx[b]), halves away
+# scale d = max|x in block b| / 127 and xq[32b + t] = round(x[32b + t] / d), halves away
 # from zero. At full vector width: |x| with vabs, vround, then vftoi and two saturating
-# vnarrows down to i8.
+# vnarrows down to i8. Each block's 16-byte record at dx + 16b holds d (f32), the sums of
+# its quantized values 0..15 and 16..31 (i32, for dot products with unsigned weights), and
+# a zero i32.
 fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
   b0:
     w = vl f32
     nb = udiv k, 32:i64
     zf = cst 0.0:f32
     v_zero = splat zf:vx
+    v_zi = splat 0:i32:vx
+    v_one8 = splat 1:i8:vx
     jmp blocks(0:i64)
   blocks(b:i64):
     b_more = lt b, nb
@@ -413,7 +417,10 @@ fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
     pos = gt d, zf
     inv = div 1.0:f32, d
     id = select pos, inv, zf
-    st dx[b], d
+    ro = shl b, 4:i64
+    rec = add dx, ro
+    st rec, d
+    st rec[3], 0:i32
     v_id = splat id:vx
     jmp quant(0:i64)
   quant(s:i64):
@@ -433,6 +440,16 @@ fn quantize_q8(x:ptr, xq:ptr, dx:ptr, k:i64)
     s2 = add s, w
     jmp quant(s2)
   block_next:
+    # The block's two half sums: 4-byte sums by `vdot` with ones, over 16 bytes each.
+    lo = ldm xq[base]:vx, 16:i8
+    sl = vdot v_zi, lo, v_one8:i8
+    s_lo = vsum sl:i32
+    hb = add base, 16:i64
+    hi = ldm xq[hb]:vx, 16:i8
+    sh = vdot v_zi, hi, v_one8:i8
+    s_hi = vsum sh:i32
+    st rec[1], s_lo
+    st rec[2], s_hi
     b2 = add b, 1:i64
     jmp blocks(b2)
   done:

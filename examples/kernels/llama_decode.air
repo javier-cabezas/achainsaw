@@ -69,12 +69,12 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     qbuf = alloc qd4
     xq = alloc kmax
     nbmax = udiv kmax, 32:i64
-    nb4 = mul nbmax, 4:i64
-    dx = alloc nb4
+    nb16 = mul nbmax, 16:i64
+    dx = alloc nb16
     aq = alloc f
     nbf = udiv f, 32:i64
-    nbf4 = mul nbf, 4:i64
-    adx = alloc nbf4
+    nbf16 = mul nbf, 16:i64
+    adx = alloc nbf16
     half = udiv hd, 2:i64
     rope_row = mul half, 4:i64
     rope_off = mul pos, rope_row
@@ -322,7 +322,7 @@ fn attn_head(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, 
     xq_h = add xq, xq_off
     blocks = udiv hd, 32:i64
     dx_off0 = mul hq, blocks
-    dx_off = mul dx_off0, 4:i64
+    dx_off = mul dx_off0, 16:i64
     dx_h = add dx, dx_off
     call quantize_q8(out, xq_h, dx_h, hd)
     free out
@@ -367,7 +367,7 @@ fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
     call silu_mul(g, u, a, 64:i64)
     q_off = mul c, 64:i64
     aq_c = add aq, q_off
-    d_off = mul c, 8:i64
+    d_off = mul c, 32:i64
     adx_c = add adx, d_off
     call quantize_q8(a, aq_c, adx_c, 64:i64)
     free a
@@ -451,7 +451,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     xq_sz = mul n, xs
     xq = alloc xq_sz
     aq = alloc xq_sz
-    dx_sz = udiv xq_sz, 8:i64
+    dx_sz = udiv xq_sz, 2:i64
     dx = alloc dx_sz
     adx = alloc dx_sz
     kv_row = mul nkv, hd
@@ -509,7 +509,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     ret next
 
 # norm_quant for token s of a prefill: its residual stream row of hs, its xn row, and its
-# int8 activations xs bytes apart (scales xs / 8 apart).
+# int8 activations xs bytes apart (block records xs / 2 apart).
 fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i64)
   b0:
     d4 = mul d, 4:i64
@@ -518,7 +518,7 @@ fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i6
     xn_s = add xn, r_off
     q_off = mul s, xs
     xq_s = add xq, q_off
-    ds = udiv xs, 8:i64
+    ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
     call norm_quant(h_s, wt, xn_s, xq_s, dx_s, d, eps)
@@ -616,7 +616,7 @@ fn attn_head_n(hq:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64
   b0:
     qd = mul nh, hd
     qd4 = mul qd, 4:i64
-    ds = udiv xs, 8:i64
+    ds = udiv xs, 2:i64
     jmp toks(0:i64)
   toks(s:i64):
     s_more = lt s, n
@@ -685,9 +685,9 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
     cu = add cg, 1:i64
     call qmat_batch(cg, mat, xq, dx, g, k, n, xs)
     call qmat_batch(cu, mat, xq, dx, u, k, n, xs)
-    ds = udiv xs, 8:i64
+    ds = udiv xs, 2:i64
     q_off = mul c, 64:i64
-    d_off = mul c, 8:i64
+    d_off = mul c, 32:i64
     jmp toks(0:i64)
   toks(s:i64):
     s_more = lt s, n
