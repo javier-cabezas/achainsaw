@@ -2225,6 +2225,40 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.to_canon(m, vty)
     }
 
+    /// `vftoi` f32 -> i32, saturating with NaN to 0 (`llvm.fptosi.sat`). AArch64 has that
+    /// conversion (`fcvtzs`), but x86 lowers the intrinsic lane by lane, so x86 code zeroes
+    /// NaNs, clamps below, converts with `fptosi` (`cvttps2dq`) and selects the maximum for
+    /// values from 2^31 up.
+    fn vftoi(
+        &self,
+        x: BasicValueEnum<'ctx>,
+        rt: BasicTypeEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let arm = matches!(self.opts.vx, VxShape::Scalable { .. })
+            || self.opts.target_features.contains("+neon");
+        if arm {
+            return self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x]);
+        }
+        let x = x.into_vector_value();
+        let n = x.get_type().get_size();
+        let f32t = self.ctx.f32_type();
+        let fsplat = |v: f64| VectorType::const_vector(&vec![f32t.const_float(v); n as usize]);
+        let zero = x.get_type().const_zero();
+        let nan = b.build_float_compare(FloatPredicate::UNO, x, x, "")?;
+        let x = b.build_select(nan, zero, x, "")?.into_vector_value();
+        let min = fsplat(-2147483648.0);
+        let low = b.build_float_compare(FloatPredicate::OLT, x, min, "")?;
+        let clamped = b.build_select(low, min, x, "")?.into_vector_value();
+        let high = b.build_float_compare(FloatPredicate::OGE, x, fsplat(2147483648.0), "")?;
+        let clamped = b.build_select(high, zero, clamped, "")?.into_vector_value();
+        let r = b.build_float_to_signed_int(clamped, rt.into_vector_type(), "")?;
+        let i32t = self.i32();
+        let max =
+            VectorType::const_vector(&vec![i32t.const_int(i32::MAX as u64, false); n as usize]);
+        Ok(b.build_select(high, max, r, "")?)
+    }
+
     /// `VUnary` (conversions name the result lane type, as in `VUnaryOp::source_lane`).
     fn vunary(
         &self,
@@ -2240,10 +2274,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             VUnaryOp::Itof => {
                 b.build_cast(InstructionOpcode::SIToFP, x, self.lane_vec(vty, lane), "")?
             }
-            VUnaryOp::Ftoi => {
-                let rt = self.lane_vec(vty, lane);
-                self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
-            }
+            VUnaryOp::Ftoi => self.vftoi(x, self.lane_vec(vty, lane))?,
             VUnaryOp::Exp => self.vexp(x)?,
             VUnaryOp::Abs if lane.is_float() => self.intr("llvm.fabs", &[x.get_type()], &[x])?,
             // `false`: the minimum integer gives itself rather than poison.
