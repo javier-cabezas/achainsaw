@@ -59,6 +59,8 @@ pub struct MatrixUnits {
     pub amx_fp16: bool,
     /// Arm SME outer products into ZA (streaming mode).
     pub sme: bool,
+    /// x86 AVX512-BF16 `vdpbf16ps` (512-bit): bf16 `mm` with fast_math, where AMX is absent.
+    pub avx512_bf16: bool,
 }
 
 /// Int8 dot-product instructions `vdot` may use (SVE's `sdot` is always available with SVE).

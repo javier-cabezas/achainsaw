@@ -120,7 +120,7 @@ Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` 
 
 **Permutations** (`vziplo`/`vziphi`, `vunziplo`/`vunziphi`, `vrev`, `vdup`) are defined relative to the vector's own lane count, so vector-length-agnostic code can use them on `vx` at any width: on SVE each is a single instruction (`zip1`/`zip2`, `uzp1`/`uzp2`, `rev`, `dup`) at every vector length. There is deliberately no shuffle by an index list, since its indices would depend on a width that `vx` code does not know. Zips and unzips cover the common layouts: pairs such as interleaved RoPE's `(x[2i], x[2i+1])` deinterleave with `vunziplo`/`vunziphi` and go back with `vziplo`/`vziphi`, and repeated zips transpose small tiles.
 
-**Fast min/max:** float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`) propagate NaN and order -0.0 below +0.0 by default. Compiling with fast math (`--fast-math` on `run`, `bench` and `build`, `fast_math=True` in Python's `compile`, `fast_math` in MCP `air_run`, `JitEngine::set_fast_math` or `CodegenOptions` in Rust) lowers the same instructions to compare and select instead, `max(a, b) = a > b ? a : b` and `min(a, b) = a < b ? a : b`, so a NaN operand or two zeros give `b`. That skips the NaN and signed-zero handling, which costs several instructions per op on 128-bit Cranelift vectors, and results stay identical on every backend (they are what x86's `maxps`/`minps` compute). Softmax runs 17% faster on Cranelift and 13% faster on LLVM with it; the kernel benchmarks below use it. Fast math also lets bf16 `mm` use AMX (`tdpbf16ps`) and SME (`bfmopa`), which treat bf16 subnormal inputs as zero; by default bf16 `mm` uses exact vector FMAs on those CPUs, so it widens every bf16 value exactly on every backend (int8, f16 and f32 `mm` use the matrix engines either way).
+**Fast min/max:** float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`) propagate NaN and order -0.0 below +0.0 by default. Compiling with fast math (`--fast-math` on `run`, `bench` and `build`, `fast_math=True` in Python's `compile`, `fast_math` in MCP `air_run`, `JitEngine::set_fast_math` or `CodegenOptions` in Rust) lowers the same instructions to compare and select instead, `max(a, b) = a > b ? a : b` and `min(a, b) = a < b ? a : b`, so a NaN operand or two zeros give `b`. That skips the NaN and signed-zero handling, which costs several instructions per op on 128-bit Cranelift vectors, and results stay identical on every backend (they are what x86's `maxps`/`minps` compute). Softmax runs 17% faster on Cranelift and 13% faster on LLVM with it; the kernel benchmarks below use it. Fast math also lets bf16 `mm` use AMX (`tdpbf16ps`), SME (`bfmopa`) and AVX512-BF16 (`vdpbf16ps`), which treat bf16 subnormal inputs as zero; by default bf16 `mm` uses exact vector FMAs on those CPUs, so it widens every bf16 value exactly on every backend (int8, f16 and f32 `mm` use the matrix engines either way).
 
 Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
 ```air
@@ -172,9 +172,10 @@ On the LLVM backend, `mm` uses the best kernel the target has:
 |---|---|
 | x86 with AMX (Sapphire/Emerald Rapids: bf16, i8; Granite Rapids: also f16) | 16x16 AMX tiles (`tdpbf16ps`, `tdpbssd`, `tdpfp16ps`) |
 | AArch64 with SME (e.g. Apple M4) | ZA-tile outer products (`fmopa`, `bfmopa`, `smopa`) in streaming mode |
-| Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), 4 rows of C per B strip |
+| x86 with AVX512-BF16 (Zen 4/5, Cooper Lake), bf16 with fast math | `vdpbf16ps` (two products per f32 lane), tiles of 4 rows of C by 64 columns |
+| Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), tiles of 4 rows of C by 4 vectors (2 on 16-register targets); bf16, f16 and i8 rows of A are widened once per tile, so the inner loop broadcasts them from memory |
 
-On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 130 GFLOP/s for f32, 90 for bf16, 70 GOP/s for i8, and 29 for f16. Cranelift's 128-bit kernel reaches about 50, 32, 33 and 9. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
+On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 155 GFLOP/s for f32, 145 for bf16 (290 with fast math, on `vdpbf16ps`; PyTorch's oneDNN gets 282), 125 GOP/s for i8, and 140 for f16. Cranelift's 128-bit kernel reaches about 50, 30, 33 and 8. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
 
 **Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and running `mm` as 128-bit tiles (4 rows by 8 columns of C, with FMA where the CPU has it). The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
 
@@ -496,15 +497,15 @@ The parentheses give the speedup over NumPy:
 | Q4_0 GEMV 4096x4096, all cores | 5.69 ms (the same, from 4-bit values) | 117 µs (49x; int4 weight-only kernel, bf16 activations) | 210 µs (27x) | 45.2 µs (126x) |
 | Q8_0 GEMV 4096x4096, all cores | 5.82 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 142 µs (41x; int8 weight-only kernel, one scale per row, bf16 activations) | 216 µs (27x) | 60.7 µs (96x) |
 | RoPE, 32 heads x 128 | 7.5 µs | 9.9 µs (0.76x) | 1.9 µs (3.9x) | 0.76 µs (9.9x) |
+| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 24.4 µs (6.8x) |
 | Residual add + RMSNorm, n=4096 | 6.3 µs | 8.8 µs (0.71x) | 4.1 µs (1.5x) | 1.2 µs (5.3x) |
 | RMSNorm, n=4096 | 5.2 µs | 6.9 µs (0.76x) | 3.5 µs (1.5x) | 1.0 µs (5.1x) |
 | Cosine similarity, n=1024 | 2.1 µs | 5.5 µs (0.39x) | 0.64 µs (3.3x) | 0.47 µs (4.5x) |
 | Softmax, n=1000 | 2.6 µs | 1.2 µs (2.3x) | 1.7 µs (1.6x) | 0.76 µs (3.5x) |
 | Euclidean distance, n=1024 | 1.4 µs | 1.7 µs (0.81x) | 0.63 µs (2.2x) | 0.48 µs (2.8x) |
-| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 62.1 µs (2.7x) |
 | SwiGLU, n=14336 | 9.9 µs | 7.0 µs (1.4x) | 13.3 µs (0.74x) | 4.2 µs (2.3x) |
+| Flash attention decode, DeepSeek V4 Pro, all cores | 1.18 ms | 890 µs (1.3x; `scaled_dot_product_attention`, bf16 output) | 1.80 ms (0.65x) | 522 µs (2.3x) |
 | Greedy argmax, vocabulary 128256 | 6.0 µs | 49.9 µs (0.12x) | 15.7 µs (0.38x) | 4.6 µs (1.3x) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.18 ms | 890 µs (1.3x; `scaled_dot_product_attention`, bf16 output) | 1.80 ms (0.65x) | 911 µs (1.3x) |
 | GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 8.5 µs (0.61x) | 5.4 µs (0.96x) |
 | GEMV f32 512x1024, 1 core | 5.6 µs (all cores) | 25.6 µs (0.22x, all cores) | 33.2 µs (0.17x) | 19.3 µs (0.29x) |
 
@@ -512,10 +513,11 @@ The parentheses give the speedup over NumPy:
 
 Every pull request also runs a performance check in CI: [`benchmarks/perf_compare.py`](benchmarks/perf_compare.py) builds the PR's base and head on the same runner, runs each side's kernel benchmarks and a 4-layer decode alternately for 5 rounds, and fails if the best time of any kernel on either backend got more than 25% slower. Comparing best times from fresh processes keeps runner noise out; the job summary lists every ratio.
 
+LLVM is ahead of PyTorch on every kernel: 2.6x on Q4_0 and 2.3x on Q8_0 against its quantized kernels, 1.6x on bf16 GEMM and 1.7x on attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets), and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch.
+
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
 - **f32 GEMV against multithreaded BLAS.** On all cores LLVM and OpenBLAS are level (5.4 vs 5.2 µs; a `par` costs about 1 µs of dispatch at 16 threads). The single-core row compares one core with NumPy's 16 threads: OpenBLAS on one thread (`OPENBLAS_NUM_THREADS=1`) takes 21.6 µs, slightly slower than LLVM. PyTorch's x86 wheel calls MKL here, which runs this size on one thread and is slower on AMD CPUs.
-- **bf16 GEMM against PyTorch.** On CPUs with AVX512-BF16 but no AMX (like this Zen 4), `mm` widens bf16 to f32 FMAs, while PyTorch's oneDNN uses AVX512-BF16 dot products, with twice the multiplies per instruction, and rounds its output to bf16. It is the one kernel where PyTorch leads LLVM by a clear margin (1.6x); attention, which is half `mm`, ties. Elsewhere LLVM is ahead: 2.6x on Q4_0 and 2.3x on Q8_0 against PyTorch's quantized kernels, and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch.
 
 **Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is faster than Q8_0 on LLVM and as fast on Cranelift.
 

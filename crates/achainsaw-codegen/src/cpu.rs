@@ -570,6 +570,7 @@ impl CpuFeatures {
             amx_int8: amx && self.has(F::AmxInt8),
             amx_fp16: amx && self.has(F::AmxFp16),
             sme: self.arch == Arch::Aarch64 && self.has(F::Sme),
+            avx512_bf16: self.arch == Arch::X86_64 && self.has(F::Avx512bf16),
         }
     }
 
@@ -968,14 +969,22 @@ pub fn llvm_aot_target(
 }
 
 /// Features of named CPUs that Cranelift's presets do not model but LLVM lowering depends
-/// on: AMX (which `mm` kernel to use) and SVE/SME (`vx` shape and `mm` kernel).
+/// on: AMX and AVX512-BF16 (which `mm` kernel to use) and SVE/SME (`vx` shape and `mm`
+/// kernel).
 #[cfg(feature = "llvm")]
 fn llvm_cpu_extra_features(arch: Arch, cpu: &str) -> &'static [Feature] {
     match (arch, cpu.to_ascii_lowercase().as_str()) {
-        (Arch::X86_64, "sapphirerapids" | "emeraldrapids") => &[F::AmxTile, F::AmxBf16, F::AmxInt8],
-        (Arch::X86_64, "graniterapids" | "graniterapids-d" | "diamondrapids") => {
-            &[F::AmxTile, F::AmxBf16, F::AmxInt8, F::AmxFp16]
+        (Arch::X86_64, "cooperlake" | "znver4" | "znver5") => &[F::Avx512bf16],
+        (Arch::X86_64, "sapphirerapids" | "emeraldrapids") => {
+            &[F::Avx512bf16, F::AmxTile, F::AmxBf16, F::AmxInt8]
         }
+        (Arch::X86_64, "graniterapids" | "graniterapids-d" | "diamondrapids") => &[
+            F::Avx512bf16,
+            F::AmxTile,
+            F::AmxBf16,
+            F::AmxInt8,
+            F::AmxFp16,
+        ],
         (Arch::Aarch64, "a64fx" | "neoverse-v1") => &[F::Sve],
         (Arch::Aarch64, "neoverse-n2" | "neoverse-n3" | "neoverse-v2" | "neoverse-v3") => {
             &[F::Sve, F::Sve2]

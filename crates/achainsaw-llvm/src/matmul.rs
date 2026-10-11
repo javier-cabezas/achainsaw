@@ -6,13 +6,14 @@
 //! best kernel the target has:
 //! - **AMX** (x86 with `amx-bf16`, `amx-int8` or `amx-fp16`): 16x16 tile dot products.
 //! - **SME** (AArch64 with `sme`): ZA-tile outer products in streaming mode.
-//! - **Vector FMA** otherwise: each `vx`-wide strip of a C row accumulates
+//! - **AVX512-BF16** (x86, bf16 with `fast_math`): `vdpbf16ps`, two products per f32 lane.
+//! - **Vector FMA** otherwise: tiles of C rows by `vx`-wide strips accumulate
 //!   `broadcast(A[i][kk]) * B[kk][strip]` over `kk`, with masked tails.
 //!
 //! Float results agree with the scalar reference within rounding error (fused or widened
-//! products round differently); i8 results are exact. bf16 uses AMX or SME only with
-//! `LowerOptions::fast_math`: AMX's `tdpbf16ps` and SME's `bfmopa` (as BFDOT, without
-//! FEAT_EBF16's extended behavior) treat bf16 subnormal inputs as zero, while AIR widens every
+//! products round differently); i8 results are exact. bf16 uses AMX, SME or AVX512-BF16
+//! only with `LowerOptions::fast_math`: AMX's `tdpbf16ps`, SME's `bfmopa` (as BFDOT, without
+//! FEAT_EBF16's extended behavior) and `vdpbf16ps` treat bf16 subnormal inputs as zero, while AIR widens every
 //! bf16 value exactly. AMX-FP16, SME's widening f16 and f32 outer products, and the int8
 //! engines are exact, so they are always used.
 
@@ -22,8 +23,26 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MmKernel {
     Fma,
+    Bf16Dot,
     Sme,
     Amx,
+}
+
+/// Rows of C in one tile of the vector FMA and bf16 dot-product kernels.
+const TILE_ROWS: usize = 4;
+/// k values of A the vector FMA kernel widens at a time (a tile's rows on the stack).
+const FMA_KC: i64 = 256;
+/// 16-column strips per tile of the bf16 dot-product kernel (16 zmm accumulators).
+const DOT_STRIPS: usize = 4;
+
+/// The part of `mm` one vector FMA tile covers: rows `i .. i + rows`, products over `kk` in
+/// `k0 .. k0 + kc`, with A read from `packed` (`mm_pack_rows`) or in place.
+struct FmaTile<'ctx> {
+    i: IntValue<'ctx>,
+    rows: usize,
+    k0: IntValue<'ctx>,
+    kc: IntValue<'ctx>,
+    packed: Option<IntValue<'ctx>>,
 }
 
 impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
@@ -45,6 +64,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             MmKernel::Amx
         } else if units.sme && exact {
             MmKernel::Sme
+        } else if dtype == Type::BF16 && units.avx512_bf16 && self.opts.fast_math {
+            MmKernel::Bf16Dot
         } else {
             MmKernel::Fma
         }
@@ -64,6 +85,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let regs = [p(0), p(1), p(2), p(3), p(4), p(5)];
         match self.mm_kernel(dtype) {
             MmKernel::Fma => self.mm_fma(f, dtype, regs)?,
+            MmKernel::Bf16Dot => self.mm_bf16_dot(f, regs)?,
             MmKernel::Sme => self.mm_sme(f, dtype, regs)?,
             MmKernel::Amx => self.mm_amx(f, dtype, regs)?,
         }
@@ -186,6 +208,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     }
 
     /// Widens `mm` elements (scalar or lanes) to the accumulator type: f32, or i32 for i8.
+    /// f16 uses the hardware conversion where there is one: it differs from the integer
+    /// sequence only in NaN payloads, and a NaN input makes its products NaN either way.
     pub(super) fn mm_widen(
         &self,
         dtype: Type,
@@ -194,7 +218,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let b = &self.builder;
         Ok(match dtype {
             Type::BF16 => self.bf16_to_f32(v)?,
-            Type::F16 => self.f16_to_f32(v)?,
+            Type::F16 => self.f16_lanes_to_f32(v)?,
             Type::I8 => {
                 let t = self.shaped(self.i32().into(), Self::shape_of(v));
                 match v {
@@ -218,99 +242,436 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     // Vector FMA kernel (every target)
     // ---------------------------------------------------------------------------------
 
-    /// Vector FMA `mm`. Rows of C are processed `ROWS` at a time (then one at a time for the
-    /// remainder); for each `vx`-wide strip of columns, the block's accumulators start as C
-    /// and add `broadcast(A[r][kk]) * B[kk][strip]` for every `kk`, so each B strip is loaded
-    /// and widened once per row block. Per element the sum runs over `kk` in order, like the
-    /// scalar reference, but fused where the target has FMA. Masked loads/stores cover the
-    /// last strip.
+    /// Column strips (`vx` vectors) per vector FMA tile: `TILE_ROWS` x 4 accumulators where
+    /// there are 32 vector registers (AVX-512, SVE), x 2 with 16 (SSE, AVX2) or narrow
+    /// AArch64 vectors.
+    fn fma_strips(&self) -> usize {
+        match self.opts.vx {
+            VxShape::Fixed(bits) if bits < 512 => 2,
+            _ => 4,
+        }
+    }
+
+    /// `llvm.get.active.lane.mask` enabling the first `min(n - j, lanes)` lanes of `mask_ty`.
+    fn mm_edge_mask(
+        &self,
+        mask_ty: BasicTypeEnum<'ctx>,
+        n: IntValue<'ctx>,
+        j: IntValue<'ctx>,
+        lanes: IntValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let left = self.builder.build_int_sub(n, j, "")?;
+        let cnt = self
+            .intr(
+                "llvm.umin",
+                &[self.i64().into()],
+                &[left.into(), lanes.into()],
+            )?
+            .into_int_value();
+        self.intr(
+            "llvm.get.active.lane.mask",
+            &[mask_ty, self.i64().into()],
+            &[self.c64(0).into(), cnt.into()],
+        )
+    }
+
+    /// Vector load or store of the lanes `mask` enables (all of them for `None`).
+    fn mm_load(
+        &self,
+        ty: BasicTypeEnum<'ctx>,
+        addr: IntValue<'ctx>,
+        mask: Option<BasicValueEnum<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        match mask {
+            Some(mask) => self.masked_load(ty, addr, mask),
+            None => self.load(ty, addr),
+        }
+    }
+
+    fn mm_store(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        addr: IntValue<'ctx>,
+        mask: Option<BasicValueEnum<'ctx>>,
+    ) -> Result<()> {
+        match mask {
+            Some(mask) => self.masked_store(v, addr, mask),
+            None => self.store(v, addr),
+        }
+    }
+
+    /// Vector FMA `mm`, in tiles of `TILE_ROWS` rows of C by `fma_strips()` `vx`-wide
+    /// column strips, then single strips at the right edge (masked) and single rows at the
+    /// bottom. A tile's accumulators start as C and add `broadcast(A[r][kk]) * B[kk][strip]`
+    /// for every `kk`, so each B vector is loaded and widened once per tile and each A value
+    /// once per tile. Per element the sum runs over `kk` in order, like the scalar reference,
+    /// but fused where the target has FMA. For 16-bit and i8 inputs, the tile's rows of A are
+    /// first widened to the accumulator type, `FMA_KC` values at a time, into a buffer on the
+    /// stack, so the inner loop broadcasts them straight from memory: widening each A value
+    /// into a general register and moving it to a vector took as many instructions as the
+    /// multiply-adds.
     fn mm_fma(&self, f: FunctionValue<'ctx>, dtype: Type, regs: [IntValue<'ctx>; 6]) -> Result<()> {
-        const ROWS: i64 = 4;
         let b = &self.builder;
-        let [_, _, _, m, _, _] = regs;
-        let full = b.build_and(m, self.c64(!(ROWS - 1)), "m.blocks")?;
-        self.for_loop(
-            f,
-            "mm.i4",
-            (self.c64(0), full, self.c64(ROWS)),
-            &[],
-            |i, _| {
-                self.mm_fma_rows(f, dtype, regs, i, ROWS as usize)?;
+        let [_, _, _, m, n, k] = regs;
+        let rows = TILE_ROWS as i64;
+        let strips = self.fma_strips();
+        let vl = self.lanes_value(Type::Vx, Type::I32)?;
+        let tile_w = b.build_int_mul(vl, self.c64(strips as i64), "")?;
+        let full_m = b.build_and(m, self.c64(!(rows - 1)), "m.tiles")?;
+        let n_rem = b.build_int_unsigned_rem(n, tile_w, "")?;
+        let full_n = b.build_int_sub(n, n_rem, "n.tiles")?;
+        let (zero, one) = (self.c64(0), self.c64(1));
+        let packed = if dtype == Type::F32 {
+            None
+        } else {
+            let buf_ty = self.i32().array_type((TILE_ROWS as i64 * FMA_KC) as u32);
+            let buf = b.build_alloca(buf_ty, "mm.apack")?;
+            buf.as_instruction()
+                .unwrap()
+                .set_alignment(64)
+                .map_err(|e| anyhow!("{e}"))?;
+            Some(b.build_ptr_to_int(buf, self.i64(), "")?)
+        };
+        // Every column of the tile rows: full tiles, then single (masked) strips.
+        let columns = |tile: &FmaTile<'ctx>| -> Result<()> {
+            self.for_loop(f, "mm.j", (zero, full_n, tile_w), &[], |j, _| {
+                self.mm_fma_tile(f, dtype, regs, tile, j, strips, None)?;
                 Ok(vec![])
-            },
-        )?;
-        self.for_loop(f, "mm.i1", (full, m, self.c64(1)), &[], |i, _| {
-            self.mm_fma_rows(f, dtype, regs, i, 1)?;
+            })?;
+            self.for_loop(f, "mm.jt", (full_n, n, vl), &[], |j, _| {
+                let mask_ty = self.mask_vec(Type::Vx, Type::I32);
+                let mask = self.mm_edge_mask(mask_ty, n, j, vl)?;
+                self.mm_fma_tile(f, dtype, regs, tile, j, 1, Some(mask))?;
+                Ok(vec![])
+            })?;
+            Ok(())
+        };
+
+        self.for_loop(f, "mm.i", (zero, full_m, self.c64(rows)), &[], |i, _| {
+            self.for_loop(f, "mm.k0", (zero, k, self.c64(FMA_KC)), &[], |k0, _| {
+                let left = b.build_int_sub(k, k0, "")?;
+                let kc = self
+                    .intr(
+                        "llvm.umin",
+                        &[self.i64().into()],
+                        &[left.into(), self.c64(FMA_KC).into()],
+                    )?
+                    .into_int_value();
+                if let Some(buf) = packed {
+                    self.mm_pack_rows(f, dtype, regs, i, k0, kc, buf)?;
+                }
+                columns(&FmaTile {
+                    i,
+                    rows: TILE_ROWS,
+                    k0,
+                    kc,
+                    packed,
+                })?;
+                Ok(vec![])
+            })?;
+            Ok(vec![])
+        })?;
+        // Leftover rows, one at a time over all of k, reading A in place.
+        self.for_loop(f, "mm.i1", (full_m, m, one), &[], |i, _| {
+            columns(&FmaTile {
+                i,
+                rows: 1,
+                k0: zero,
+                kc: k,
+                packed: None,
+            })?;
             Ok(vec![])
         })?;
         Ok(())
     }
 
-    /// Rows `i..i + rows` of C for the vector FMA kernel.
-    fn mm_fma_rows(
+    /// Widens `A[i + r][k0 .. k0 + kc]` to the accumulator type into row `r` of `buf`
+    /// (`FMA_KC` values per row), for each of the tile's `TILE_ROWS` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_pack_rows(
         &self,
         f: FunctionValue<'ctx>,
         dtype: Type,
         regs: [IntValue<'ctx>; 6],
         i: IntValue<'ctx>,
-        rows: usize,
+        k0: IntValue<'ctx>,
+        kc: IntValue<'ctx>,
+        buf: IntValue<'ctx>,
+    ) -> Result<()> {
+        let b = &self.builder;
+        let [_, pa, _, _, _, k] = regs;
+        let esize = dtype.byte_size() as i64;
+        let vl = self.lanes_value(Type::Vx, Type::I32)?;
+        let elem_ty = self.vec_of(
+            self.mm_elem_type(dtype),
+            self.lanes_min(Type::Vx, Type::I32),
+            self.scalable(Type::Vx),
+        );
+        let mask_ty = self.mask_vec(Type::Vx, Type::I32);
+        for r in 0..TILE_ROWS {
+            let row = b.build_int_add(i, self.c64(r as i64), "")?;
+            self.for_loop(f, "mm.pack", (self.c64(0), kc, vl), &[], |c, _| {
+                let mask = self.mm_edge_mask(mask_ty, kc, c, vl)?;
+                let col = b.build_int_add(k0, c, "")?;
+                let src = self.elem_addr(pa, row, k, col, esize)?;
+                let v = self.masked_load(elem_ty, src, mask)?;
+                let wide = self.mm_widen(dtype, v)?;
+                let dst = self.elem_addr(buf, self.c64(r as i64), self.c64(FMA_KC), c, 4)?;
+                self.masked_store(wide, dst, mask)?;
+                Ok(vec![])
+            })?;
+        }
+        Ok(())
+    }
+
+    /// One tile of the vector FMA kernel: rows `tile.i ..` of C by `strips` `vx` vectors
+    /// from column `j`, adding the products over `kk` in `tile.k0 .. tile.k0 + tile.kc`.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_fma_tile(
+        &self,
+        f: FunctionValue<'ctx>,
+        dtype: Type,
+        regs: [IntValue<'ctx>; 6],
+        tile: &FmaTile<'ctx>,
+        j: IntValue<'ctx>,
+        strips: usize,
+        mask: Option<BasicValueEnum<'ctx>>,
     ) -> Result<()> {
         let b = &self.builder;
         let [pc, pa, pb, _, n, k] = regs;
         let is_int = dtype == Type::I8;
         let acc_lane = if is_int { Type::I32 } else { Type::F32 };
+        let acc_scalar = self.scalar_type(acc_lane);
         let esize = dtype.byte_size() as i64;
-        let lanes = self.lanes_min(Type::Vx, Type::I32);
-        let scalable = self.scalable(Type::Vx);
         let acc_ty = self.lane_vec(Type::Vx, acc_lane);
-        let elem_ty = self.vec_of(self.mm_elem_type(dtype), lanes, scalable);
-        let mask_ty = self.vec_of(self.i1().into(), lanes, scalable);
+        let elem_ty = self.vec_of(
+            self.mm_elem_type(dtype),
+            self.lanes_min(Type::Vx, Type::I32),
+            self.scalable(Type::Vx),
+        );
         let vl = self.lanes_value(Type::Vx, Type::I32)?;
-        let (zero, one) = (self.c64(0), self.c64(1));
-        let row = |r: usize| b.build_int_add(i, self.c64(r as i64), "");
+        let row = |r: usize| b.build_int_add(tile.i, self.c64(r as i64), "");
+        let col = |s: usize| -> Result<IntValue<'ctx>> {
+            let off = b.build_int_mul(vl, self.c64(s as i64), "")?;
+            Ok(b.build_int_add(j, off, "")?)
+        };
 
-        self.for_loop(f, "mm.j", (zero, n, vl), &[], |j, _| {
-            let left = b.build_int_sub(n, j, "")?;
-            let cnt = self
-                .intr("llvm.umin", &[self.i64().into()], &[left.into(), vl.into()])?
-                .into_int_value();
-            let mask = self.intr(
-                "llvm.get.active.lane.mask",
-                &[mask_ty, self.i64().into()],
-                &[zero.into(), cnt.into()],
-            )?;
-            let mut c_addrs = Vec::with_capacity(rows);
-            let mut init = Vec::with_capacity(rows);
-            for r in 0..rows {
-                let addr = self.elem_addr(pc, row(r)?, n, j, 4)?;
-                init.push(self.masked_load(acc_ty, addr, mask)?);
+        let mut c_addrs = Vec::with_capacity(tile.rows * strips);
+        let mut init = Vec::with_capacity(tile.rows * strips);
+        for r in 0..tile.rows {
+            for s in 0..strips {
+                let addr = self.elem_addr(pc, row(r)?, n, col(s)?, 4)?;
+                init.push(self.mm_load(acc_ty, addr, mask)?);
                 c_addrs.push(addr);
             }
-            let accs = self.for_loop(f, "mm.k", (zero, k, one), &init, |kk, accs| {
-                let b_addr = self.elem_addr(pb, kk, n, j, esize)?;
-                let bv = self.masked_load(elem_ty, b_addr, mask)?;
-                let bv = self.mm_widen(dtype, bv)?;
-                let mut next = Vec::with_capacity(rows);
-                for (r, acc) in accs.iter().enumerate() {
-                    let a_addr = self.elem_addr(pa, row(r)?, k, kk, esize)?;
-                    let a = self.load(self.mm_elem_type(dtype), a_addr)?;
-                    let a = self.splat(self.mm_widen(dtype, a)?, acc_lane, Type::Vx)?;
+        }
+        let one = self.c64(1);
+        let accs = self.for_loop(f, "mm.k", (self.c64(0), tile.kc, one), &init, |kk, accs| {
+            let ka = b.build_int_add(tile.k0, kk, "")?;
+            let bvs = (0..strips)
+                .map(|s| {
+                    let addr = self.elem_addr(pb, ka, n, col(s)?, esize)?;
+                    let v = self.mm_load(elem_ty, addr, mask)?;
+                    self.mm_widen(dtype, v)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut next = Vec::with_capacity(accs.len());
+            for r in 0..tile.rows {
+                let a = match tile.packed {
+                    Some(buf) => {
+                        let addr =
+                            self.elem_addr(buf, self.c64(r as i64), self.c64(FMA_KC), kk, 4)?;
+                        self.load(acc_scalar, addr)?
+                    }
+                    None => {
+                        let addr = self.elem_addr(pa, row(r)?, k, ka, esize)?;
+                        self.mm_widen(dtype, self.load(self.mm_elem_type(dtype), addr)?)?
+                    }
+                };
+                let a = self.splat(a, acc_lane, Type::Vx)?;
+                for (s, bv) in bvs.iter().enumerate() {
+                    let acc = accs[r * strips + s];
                     next.push(if is_int {
-                        let prod = vec2!(a, bv, |x, y| b.build_int_mul(x, y, "")?);
-                        vec2!(*acc, prod, |x, y| b.build_int_add(x, y, "")?)
+                        let prod = vec2!(a, *bv, |x, y| b.build_int_mul(x, y, "")?);
+                        vec2!(acc, prod, |x, y| b.build_int_add(x, y, "")?)
                     } else {
                         // Fused where the target has FMA, multiply + add elsewhere (a libcall
                         // per element otherwise); `mm` only promises rounding-level agreement.
-                        self.intr("llvm.fmuladd", &[acc_ty], &[a, bv, *acc])?
+                        self.intr("llvm.fmuladd", &[acc_ty], &[a, *bv, acc])?
                     });
                 }
-                Ok(next)
-            })?;
-            for (acc, addr) in accs.into_iter().zip(c_addrs) {
-                self.masked_store(acc, addr, mask)?;
             }
+            Ok(next)
+        })?;
+        for (acc, addr) in accs.into_iter().zip(c_addrs) {
+            self.mm_store(acc, addr, mask)?;
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // bf16 dot-product kernel (x86 AVX512-BF16, with fast_math)
+    // ---------------------------------------------------------------------------------
+
+    /// bf16 `mm` on `vdpbf16ps`, which adds `A[r][kk] * B[kk][j] + A[r][kk + 1] *
+    /// B[kk + 1][j]` to 16 f32 columns at once: twice the products of an FMA. Tiles of
+    /// `TILE_ROWS` rows by `DOT_STRIPS` 16-column strips, then single (masked) strips and
+    /// single rows at the edges. Per pair of k values, a tile interleaves the two rows of B
+    /// into the pairs the instruction expects (one permute per strip) and broadcasts each
+    /// row's two A values as one 32-bit load. An odd last `kk` pairs with zeros. Used only
+    /// with fast_math, since `vdpbf16ps` treats subnormal inputs as zero.
+    fn mm_bf16_dot(&self, f: FunctionValue<'ctx>, regs: [IntValue<'ctx>; 6]) -> Result<()> {
+        let b = &self.builder;
+        let [_, _, _, m, n, _] = regs;
+        let rows = TILE_ROWS as i64;
+        let lanes = self.c64(16);
+        let tile_w = self.c64(16 * DOT_STRIPS as i64);
+        let full_m = b.build_and(m, self.c64(!(rows - 1)), "m.tiles")?;
+        let n_rem = b.build_int_unsigned_rem(n, tile_w, "")?;
+        let full_n = b.build_int_sub(n, n_rem, "n.tiles")?;
+        let (zero, one) = (self.c64(0), self.c64(1));
+        let columns = |i: IntValue<'ctx>, tile_rows: usize| -> Result<()> {
+            self.for_loop(f, "mm.j", (zero, full_n, tile_w), &[], |j, _| {
+                self.mm_dot_tile(f, regs, i, tile_rows, j, DOT_STRIPS, None)?;
+                Ok(vec![])
+            })?;
+            self.for_loop(f, "mm.jt", (full_n, n, lanes), &[], |j, _| {
+                let c_mask = self.mm_edge_mask(self.i1().vec_type(16).into(), n, j, lanes)?;
+                let b_mask = self.mm_edge_mask(self.i1().vec_type(32).into(), n, j, lanes)?;
+                self.mm_dot_tile(f, regs, i, tile_rows, j, 1, Some((c_mask, b_mask)))?;
+                Ok(vec![])
+            })?;
+            Ok(())
+        };
+        self.for_loop(f, "mm.i", (zero, full_m, self.c64(rows)), &[], |i, _| {
+            columns(i, TILE_ROWS)?;
             Ok(vec![])
         })?;
+        self.for_loop(f, "mm.i1", (full_m, m, one), &[], |i, _| {
+            columns(i, 1)?;
+            Ok(vec![])
+        })?;
+        Ok(())
+    }
+
+    /// One tile of the bf16 dot-product kernel: `rows` rows of C from `i` by `strips`
+    /// 16-column strips from `j` (1 or an even number), over all of k. `edge` holds the masks
+    /// of a last, partial strip: its 16 f32 columns of C and the 32 i16 lanes of B loaded.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_dot_tile(
+        &self,
+        f: FunctionValue<'ctx>,
+        regs: [IntValue<'ctx>; 6],
+        i: IntValue<'ctx>,
+        rows: usize,
+        j: IntValue<'ctx>,
+        strips: usize,
+        edge: Option<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>)>,
+    ) -> Result<()> {
+        let b = &self.builder;
+        let [pc, pa, pb, _, n, k] = regs;
+        let acc_ty: BasicTypeEnum = self.ctx.f32_type().vec_type(16).into();
+        let row_ty: BasicTypeEnum = self.i16().vec_type(32).into();
+        let pair_ty = self.ctx.bf16_type().vec_type(32);
+        let dot = self.intrinsic("llvm.x86.avx512bf16.dpbf16ps.512", &[]);
+        // Two rows of B, 32 columns each, give the pairs of two strips: `vpermi2w` with
+        // `index(0)` puts column c (c < 16) of the first row in lane 2c and that of the second
+        // in lane 2c + 1; `index(1)` does the same for columns 16 + c. Every loaded lane is
+        // used: with 16-column loads, LLVM filled the unused upper halves with
+        // `vbroadcasti64x4`/`vinserti64x4`, which cost a quarter of the speed on Zen 4.
+        let index = |half: u64| -> BasicValueEnum<'ctx> {
+            VectorType::const_vector(
+                &(0..32u64)
+                    .map(|l| {
+                        self.i16()
+                            .const_int(16 * half + l / 2 + 32 * (l % 2), false)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into()
+        };
+        let indices = [index(0), index(1)];
+        let permute = self.intrinsic("llvm.x86.avx512.vpermi2var.hi.512", &[]);
+        let (c_mask, b_mask) = match edge {
+            Some((c, b)) => (Some(c), Some(b)),
+            None => (None, None),
+        };
+        let row = |r: usize| b.build_int_add(i, self.c64(r as i64), "");
+        let col = |s: usize| b.build_int_add(j, self.c64(16 * s as i64), "");
+        // The B pairs of every strip for rows `first` and `second` of B (zeros for `None`).
+        let b_pairs = |first: IntValue<'ctx>, second: Option<IntValue<'ctx>>| {
+            let load_row =
+                |kk, s| self.mm_load(row_ty, self.elem_addr(pb, kk, n, col(s)?, 2)?, b_mask);
+            let mut pairs = Vec::with_capacity(strips);
+            for s in (0..strips).step_by(2) {
+                let lo = load_row(first, s)?;
+                let hi = match second {
+                    Some(kk) => load_row(kk, s)?,
+                    None => row_ty.const_zero(),
+                };
+                for idx in indices.iter().take(strips - s) {
+                    let p = self.call1(permute, &[lo, *idx, hi])?;
+                    pairs.push(self.bitcast(p, pair_ty)?);
+                }
+            }
+            Ok::<_, anyhow::Error>(pairs)
+        };
+        let a_pair = |pair: BasicValueEnum<'ctx>| -> Result<BasicValueEnum<'ctx>> {
+            let v = self.splat(pair, Type::I32, Type::V512)?;
+            self.bitcast(v, pair_ty)
+        };
+        let step = |accs: &[BasicValueEnum<'ctx>],
+                    pairs: Vec<BasicValueEnum<'ctx>>,
+                    a_of: &dyn Fn(usize) -> Result<BasicValueEnum<'ctx>>|
+         -> Result<Vec<BasicValueEnum<'ctx>>> {
+            let mut next = Vec::with_capacity(accs.len());
+            for r in 0..rows {
+                let a = a_of(r)?;
+                for (s, bp) in pairs.iter().enumerate() {
+                    next.push(self.call1(dot, &[accs[r * strips + s], a, *bp])?);
+                }
+            }
+            Ok(next)
+        };
+
+        let mut c_addrs = Vec::with_capacity(rows * strips);
+        let mut init = Vec::with_capacity(rows * strips);
+        for r in 0..rows {
+            for s in 0..strips {
+                let addr = self.elem_addr(pc, row(r)?, n, col(s)?, 4)?;
+                init.push(self.mm_load(acc_ty, addr, c_mask)?);
+                c_addrs.push(addr);
+            }
+        }
+        let two = self.c64(2);
+        let pairs_end = b.build_and(k, self.c64(!1), "k.pairs")?;
+        let accs = self.for_loop(
+            f,
+            "mm.kp",
+            (self.c64(0), pairs_end, two),
+            &init,
+            |kk, accs| {
+                let kk1 = b.build_int_add(kk, self.c64(1), "")?;
+                let pairs = b_pairs(kk, Some(kk1))?;
+                step(accs, pairs, &|r| {
+                    let addr = self.elem_addr(pa, row(r)?, k, kk, 2)?;
+                    a_pair(self.load(self.i32().into(), addr)?)
+                })
+            },
+        )?;
+        // An odd k: the last value pairs with zeros (A's zero comes from widening its 16 bits,
+        // so nothing past the end of the row is read).
+        let accs = self.for_loop(f, "mm.kt", (pairs_end, k, two), &accs, |kk, accs| {
+            let pairs = b_pairs(kk, None)?;
+            step(accs, pairs, &|r| {
+                let addr = self.elem_addr(pa, row(r)?, k, kk, 2)?;
+                let h = self.load(self.i16().into(), addr)?.into_int_value();
+                a_pair(b.build_int_z_extend(h, self.i32(), "")?.into())
+            })
+        })?;
+        for (acc, addr) in accs.into_iter().zip(c_addrs) {
+            self.mm_store(acc, addr, c_mask)?;
+        }
         Ok(())
     }
 
