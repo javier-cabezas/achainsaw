@@ -647,6 +647,9 @@ fn mm_at_host_vector_length() {
     check_mm(vec![(level, features)]);
 }
 
+/// `mm` at each level, without and with fast_math (whose bf16 kernels may differ: AMX, SME
+/// or AVX512-BF16), against an f64 reference. The operands are normal numbers, which every
+/// kernel handles the same way.
 fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
     let shapes = [
         (1, 1, 1),
@@ -654,18 +657,26 @@ fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
         (4, 8, 16),
         (16, 16, 32),
         (7, 1, 33),
-        // Strip and tile edges for 128-2048-bit vectors, 16x16 AMX tiles and SME's ZA.
+        // Strip and tile edges for 128-2048-bit vectors, 16x16 AMX tiles, SME's ZA, and
+        // the 4-row tiles of 2-4 strips of the vector kernels (pieces of 256 k values).
         (5, 15, 9),
         (17, 17, 31),
         (3, 33, 64),
         (2, 65, 3),
         (33, 70, 67),
+        (9, 130, 300),
         (2, 9, 0),
         (0, 4, 4),
         (-1, 3, 3),
     ];
-    for (level, features) in levels {
-        let engine = jit(MM, &features);
+    let modes = levels
+        .into_iter()
+        .flat_map(|(level, features)| [false, true].map(|fast| (level, features, fast)));
+    for (level, features, fast) in modes {
+        let module = parse_and_validate(MM).unwrap();
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.set_fast_math(fast);
+        engine.compile_module(&module).unwrap();
         for dtype in [Type::BF16, Type::F16, Type::F32, Type::I8] {
             let f: MmFn =
                 unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
@@ -695,7 +706,8 @@ fn check_mm(levels: Vec<(IsaLevel, CpuFeatures)>) {
                             .collect();
                         let want = c0[idx] + terms.iter().sum::<f64>();
                         let raw: [u8; 4] = c[idx * 4..idx * 4 + 4].try_into().unwrap();
-                        let ctx = format!("{dtype} {m}x{n}x{k} C[{i},{j}] at {level}");
+                        let ctx =
+                            format!("{dtype} {m}x{n}x{k} C[{i},{j}] at {level}, fast_math={fast}");
                         if dtype == Type::I8 {
                             assert_eq!(i32::from_le_bytes(raw) as f64, want, "{ctx}");
                         } else {
@@ -761,7 +773,7 @@ fn mm_widens_every_half_value_exactly() {
 }
 
 /// `mm` reads and writes only its three matrices: each operand in turn ends exactly at a
-/// guard page, for shapes that end in every tile and tail case.
+/// guard page, for shapes that end in every tile and tail case, without and with fast_math.
 #[cfg(unix)]
 #[test]
 fn mm_stays_inside_its_matrices() {
@@ -785,24 +797,42 @@ fn mm_stays_inside_its_matrices() {
     };
     let (a_map, b_map, c_map) = (map(), map(), map());
     for (_, features) in host_levels() {
-        let engine = jit(MM, &features);
-        for dtype in [Type::BF16, Type::F16, Type::F32, Type::I8] {
-            let f: MmFn =
-                unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
-            let es = dtype.byte_size();
-            for (m, n, k) in [(1, 1, 1), (5, 13, 3), (4, 8, 2), (3, 12, 1), (9, 7, 4)] {
-                let end = |map: *mut u8, bytes: usize| unsafe { map.add(page - bytes) };
-                let a = end(a_map, m * k * es);
-                let b = end(b_map, k * n * es);
-                let c = end(c_map, m * n * 4);
-                // Zeroed pages: every value is +0, so C stays finite whatever the order.
-                f(c, a, b, m as i64, n as i64, k as i64);
-            }
+        for fast in [false, true] {
+            let module = parse_and_validate(MM).unwrap();
+            let mut engine = JitEngine::with_features(&features).unwrap();
+            engine.set_fast_math(fast);
+            engine.compile_module(&module).unwrap();
+            check_mm_bounds(&engine, page, [a_map, b_map, c_map]);
         }
     }
     unsafe {
         for map in [a_map, b_map, c_map] {
             libc::munmap(map.cast(), 2 * page);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn check_mm_bounds(engine: &JitEngine, page: usize, [a_map, b_map, c_map]: [*mut u8; 3]) {
+    for dtype in [Type::BF16, Type::F16, Type::F32, Type::I8] {
+        let f: MmFn =
+            unsafe { std::mem::transmute(engine.get_fn_ptr(&format!("mm_{dtype}")).unwrap()) };
+        let es = dtype.byte_size();
+        for (m, n, k) in [
+            (1, 1, 1),
+            (5, 13, 3),
+            (4, 8, 2),
+            (3, 12, 1),
+            (9, 7, 4),
+            (4, 64, 2),
+            (5, 70, 5),
+        ] {
+            let end = |map: *mut u8, bytes: usize| unsafe { map.add(page - bytes) };
+            let a = end(a_map, m * k * es);
+            let b = end(b_map, k * n * es);
+            let c = end(c_map, m * n * 4);
+            // Zeroed pages: every value is +0, so C stays finite whatever the order.
+            f(c, a, b, m as i64, n as i64, k as i64);
         }
     }
 }
@@ -902,8 +932,9 @@ fn new_ops_compile_for_every_llvm_target() {
 
 /// Each target gets the `mm` kernel its hardware supports, visible in the assembly: AMX on
 /// Sapphire/Granite Rapids (AMX-FP16 only on Granite Rapids), SME outer products on SME
-/// targets, and vector FMAs elsewhere; bf16 uses AMX's `tdpbf16ps` and SME's `bfmopa` only
-/// with fast_math, since they treat bf16 subnormal inputs as zero. AMX runs only when CI lands
+/// targets, AVX512-BF16's `vdpbf16ps` for bf16 without AMX, and vector FMAs elsewhere; bf16
+/// uses `tdpbf16ps`, `bfmopa` and `vdpbf16ps` only with fast_math, since they treat bf16
+/// subnormal inputs as zero. AMX runs only when CI lands
 /// on an AMX runner, so the assembly is its main check.
 #[cfg(feature = "llvm")]
 #[test]
@@ -960,6 +991,23 @@ fn mm_kernels_match_target_matrix_engines() {
             "",
             true,
             &["vfmadd", "zmm"],
+            &["tdpbf16ps", "vdpbf16ps"],
+        ),
+        (X86, "znver4", "", false, &["vfmadd", "zmm"], &["vdpbf16ps"]),
+        (
+            X86,
+            "znver4",
+            "",
+            true,
+            &["vdpbf16ps", "vfmadd"],
+            &["tdpbf16ps"],
+        ),
+        (
+            X86,
+            "x86-64-v4",
+            "+avx512bf16",
+            true,
+            &["vdpbf16ps"],
             &["tdpbf16ps"],
         ),
         (
