@@ -54,8 +54,9 @@ def run_side(root, workdir, tag, skipped):
     kernels = os.path.join(root, "benchmarks", "benchmark_kernels.py")
     out = os.path.join(workdir, f"{tag}-kernels.json")
     cmd = [sys.executable, kernels, "--json", out]
-    if supports(kernels, "--no-numpy", env):
-        cmd.append("--no-numpy")
+    for flag in ("--no-numpy", "--no-torch"):
+        if supports(kernels, flag, env):
+            cmd.append(flag)
     res = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=root)
     if res.returncode != 0:
         raise RuntimeError(f"{kernels} failed:\n{res.stdout[-3000:]}\n{res.stderr[-3000:]}")
@@ -73,6 +74,8 @@ def run_side(root, workdir, tag, skipped):
                "--no-numpy", "--json", out]
         if supports(decode, "--prompt-tokens", env):
             cmd += ["--prompt-tokens", "64"]
+        if supports(decode, "--no-torch", env):
+            cmd.append("--no-torch")
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=root)
         if res.returncode != 0:
             raise RuntimeError(f"{decode} failed:\n{res.stdout[-3000:]}\n{res.stderr[-3000:]}")

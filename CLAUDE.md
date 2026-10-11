@@ -9,7 +9,7 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 - `crates/achainsaw-cli`: `achainsaw` binary (`main.rs`) and the MCP stdio server (`mcp.rs`).
 - `crates/achainsaw-py`: PyO3 bindings; type stubs in `achainsaw.pyi`.
 - `examples/`: `.air` sources with matching `.airb` bytecode; `tests/`: Python e2e tests.
-- `benchmarks/`: NumPy comparisons of `examples/kernels/`; `gguf.py` (GGUF reader, dequantization, Llama 3 tokenizer) and `llama_model.py` (weight packing for `llama_decode.air`, GGUF conversion, NumPy reference) back `benchmark_decode.py`.
+- `benchmarks/`: NumPy and PyTorch comparisons of `examples/kernels/` (PyTorch is optional: each script skips it when it is not installed or with `--no-torch`, and every PyTorch baseline is checked against the case's reference); `gguf.py` (GGUF reader, dequantization, Llama 3 tokenizer) and `llama_model.py` (weight packing for `llama_decode.air`, GGUF conversion, NumPy reference, PyTorch forward pass on its weight-only int4/int8 kernels) back `benchmark_decode.py`.
 
 ## Commands
 - Build: `cargo build --workspace` (release CLI: `cargo build --release -p achainsaw`)

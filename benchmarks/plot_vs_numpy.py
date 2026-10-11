@@ -1,13 +1,15 @@
 """
 Draws the kernels' speedup over NumPy from `benchmark_kernels.py --json` results, as light
-and dark SVG figures for the README (selected with <picture> and prefers-color-scheme).
+and dark SVG figures for the README (selected with <picture> and prefers-color-scheme), with
+PyTorch's speedup over NumPy beside them when the results include it.
 
     python benchmarks/benchmark_kernels.py --json results.json
     python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy
 
-One row per kernel, sorted by the LLVM speedup; each backend is a bar growing from the 1x
-line (NumPy) on a log scale, left when slower and right when faster. Colors and chrome
-follow the data-viz reference palette (categorical slots 1-2, validated for both modes).
+One row per kernel, sorted by the LLVM speedup; PyTorch and each backend are a bar growing
+from the 1x line (NumPy) on a log scale, left when slower and right when faster. Colors and
+chrome follow the data-viz reference palette (categorical slots 1-2 for the backends,
+validated for both modes; PyTorch, a second baseline, in a neutral gray).
 """
 
 import json
@@ -34,12 +36,13 @@ SHORT = {
 THEMES = {
     "light": dict(surface="#fcfcfb", primary="#0b0b0b", secondary="#52514e",
                   muted="#898781", grid="#e1e0d9", baseline="#c3c2b7",
-                  series={"cranelift": "#2a78d6", "llvm": "#eb6834"}),
+                  series={"torch": "#8a8a85", "cranelift": "#2a78d6", "llvm": "#eb6834"}),
     "dark": dict(surface="#1a1a19", primary="#ffffff", secondary="#c3c2b7",
                  muted="#898781", grid="#2c2c2a", baseline="#383835",
-                 series={"cranelift": "#3987e5", "llvm": "#d95926"}),
+                 series={"torch": "#7a7a75", "cranelift": "#3987e5", "llvm": "#d95926"}),
 }
-NAMES = {"cranelift": "Cranelift (128-bit vectors)", "llvm": "LLVM (AVX-512)"}
+NAMES = {"torch": "PyTorch (eager)", "cranelift": "Cranelift (128-bit vectors)",
+         "llvm": "LLVM (AVX-512)"}
 FONT = 'system-ui, -apple-system, &quot;Segoe UI&quot;, sans-serif'
 
 
@@ -61,8 +64,8 @@ def render(rows, backends, theme):
     plot_w = 520
     width = left + plot_w + right
     height = top + len(rows) * (band + band_gap) + 54
-    lo, hi = 0.1, 50.0
-    ticks = [0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50]
+    lo, hi = 0.1, 200.0
+    ticks = [0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 200]
 
     def x(v):
         v = min(max(v, lo), hi)
@@ -73,7 +76,7 @@ def render(rows, backends, theme):
            f'<title>Speedup of the AIR kernels over NumPy</title>',
            f'<rect width="{width}" height="{height}" rx="8" fill="{t["surface"]}"/>',
            f'<text x="24" y="32" font-size="16" font-weight="600" fill="{t["primary"]}">'
-           f'Speedup over NumPy, same data types</text>',
+           f'Speedup over NumPy (computing with the kernels\' data types)</text>',
            f'<text x="24" y="52" font-size="12" fill="{t["secondary"]}">'
            f'Ryzen 7 8845HS (8 cores, 16 threads). Right of 1x: faster than NumPy; '
            f'log scale.</text>']
@@ -118,16 +121,20 @@ def render(rows, backends, theme):
 def main():
     results, prefix = sys.argv[1], sys.argv[2]
     data = json.load(open(results, encoding="utf-8"))
-    backends = [b for b in ("cranelift", "llvm") if b in data["backends"]]
+    series = [b for b in ("cranelift", "llvm") if b in data["backends"]]
+    if any(r.get("torch_us") for r in data["results"]):
+        series.insert(0, "torch")
     rows = []
     for r in data["results"]:
         speedup = {run["backend"]: r["numpy_us"] / run["us"] for run in r["runs"]
                    if run["isa"] == "host"}
+        if r.get("torch_us"):
+            speedup["torch"] = r["numpy_us"] / r["torch_us"]
         rows.append(dict(label=SHORT.get(r["kernel"], r["label"]), speedup=speedup))
-    rows.sort(key=lambda r: -r["speedup"].get("llvm", r["speedup"].get(backends[0], 0)))
+    rows.sort(key=lambda r: -r["speedup"].get("llvm", r["speedup"].get(series[-1], 0)))
     for theme in THEMES:
         with open(f"{prefix}-{theme}.svg", "w", encoding="utf-8") as f:
-            f.write(render(rows, backends, theme))
+            f.write(render(rows, series, theme))
 
 
 if __name__ == "__main__":

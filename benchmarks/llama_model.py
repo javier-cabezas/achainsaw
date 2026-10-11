@@ -1,7 +1,8 @@
 """
 Llama-style models for examples/kernels/llama_decode.air: Q8_0, Q4_0 and Q6_K weight matrices
 in the kernel's packed layout, a random model or one loaded from a GGUF file (benchmarks/gguf.py),
-the kernel's model table, and a NumPy forward pass with the kernel's data types.
+the kernel's model table, a NumPy forward pass with the kernel's data types, and a PyTorch
+forward pass on PyTorch's weight-only quantized kernels (see Mat.prepare_torch).
 
 GGUF tensors are converted as follows:
   Q4_0             -> Q4_0, bit for bit
@@ -17,6 +18,12 @@ uses.
 """
 
 import numpy as np
+
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
 
 from gguf import GGUF
 
@@ -162,6 +169,38 @@ class Mat:
         self.q_blocks = np.ascontiguousarray(v.transpose(1, 0, 2))
         self.s_blocks = np.ascontiguousarray(self.d.T)
 
+    def prepare_torch(self):
+        """PyTorch's weight-only kernels (torchao's CPU path), which take bf16 activations.
+        Q4_0 becomes int4 in the same 32-blocks (weight (q - 8) * scale, scales rounded to
+        bf16); Q8_0 and Q6_K are requantized to int8 with one scale per row, as PyTorch has
+        no per-block int8 kernel."""
+        if self.fmt == "q4":
+            v = np.concatenate([self.q & 15, self.q >> 4], axis=2).reshape(self.rows, self.k)
+            self.t_w = torch.ops.aten._convert_weight_to_int4pack_for_cpu(
+                torch.from_numpy(v.astype(np.int32)), 1)
+            s = torch.from_numpy(np.ascontiguousarray(self.d.T)).bfloat16()
+            self.t_sz = torch.stack([s, torch.zeros_like(s)], dim=-1).contiguous()
+            return
+        q = np.empty((self.rows, self.k), dtype=np.int8)
+        s = np.empty(self.rows, dtype=np.float32)
+        for r in range(0, self.rows, 4096):
+            n = min(4096, self.rows - r)
+            w = (self.q[r:r + n].reshape(n, -1, self.sub) * self.d[r:r + n, :, None])
+            w = w.reshape(n, self.k).astype(np.float32)
+            s[r:r + n] = np.abs(w).max(axis=1) / np.float32(127.0)
+            inv = np.where(s[r:r + n] > 0, 1.0 / np.maximum(s[r:r + n], 1e-30), 0.0)
+            q[r:r + n] = np.round(w * inv[:, None].astype(np.float32)).astype(np.int8)
+        self.t_w, self.t_s = torch.from_numpy(q), torch.from_numpy(s).bfloat16()
+
+    def torch_matvec(self, x):
+        """y = W x on PyTorch's kernels (see prepare_torch): x rounded to bf16, y in f32."""
+        xb = x.bfloat16()[None]
+        if self.fmt == "q4":
+            y = torch.ops.aten._weight_int4pack_mm_for_cpu(xb, self.t_w, 32, self.t_sz)
+        else:
+            y = torch.ops.aten._weight_int8pack_mm(xb, self.t_w, self.t_s)
+        return y[0].float()
+
     def matvec(self, x):
         """y = W x with the kernel's types: x quantized to int8 per 32-block, exact integer
         dots per scale group (a batched f32 matmul is exact: every dot is below 2^24), f32
@@ -207,7 +246,8 @@ def rope_tables(max_ctx, head_dim, base, freq_factors=None):
 
 
 class Model:
-    def __init__(self, cfg, embd, norm_out, lm, cos, sin, layers, eps, numpy=False):
+    def __init__(self, cfg, embd, norm_out, lm, cos, sin, layers, eps, numpy=False,
+                 use_torch=False):
         d, nl, nh, nkv, hd, f, vocab, max_ctx = cfg
         self.cfg = np.array(cfg, dtype=np.int64)
         self.d, self.nh, self.nkv, self.hd, self.f = d, nh, nkv, hd, f
@@ -219,6 +259,8 @@ class Model:
             m.pack()
             if numpy:
                 m.prepare_numpy()
+            if use_torch:
+                m.prepare_torch()
             m.q = None  # the packed copy is all the kernel needs
         words = []
 
@@ -239,7 +281,7 @@ class Model:
 
     @classmethod
     def random(cls, d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, fmt="q8",
-               numpy=False):
+               numpy=False, use_torch=False):
         rng = np.random.default_rng(0)
         ls = []
         for _ in range(layers):
@@ -255,10 +297,10 @@ class Model:
         return cls((d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx),
                    rng.standard_normal((vocab, d), dtype=np.float32),
                    rng.uniform(0.8, 1.2, d).astype(np.float32),
-                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy)
+                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy, use_torch)
 
     @classmethod
-    def from_gguf(cls, path, max_ctx, numpy=False):
+    def from_gguf(cls, path, max_ctx, numpy=False, use_torch=False):
         g = path if isinstance(path, GGUF) else GGUF(path)
         m, t = g.meta, g.tensors
         arch = m.get("general.architecture")
@@ -309,7 +351,7 @@ class Model:
             ))
         eps = m.get("llama.attention.layer_norm_rms_epsilon", 1e-5)
         model = cls((d, nl, nh, nkv, hd, f, vocab, max_ctx), embd, norm(
-            "output_norm.weight"), lm, cos, sin, layers, eps, numpy)
+            "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch)
         model.formats = {n: sorted({l[n].fmt for l in layers}) for n in ("qkv", "o", "gate_up",
                                                                            "down")}
         model.formats["lm"] = [lm.fmt]
@@ -319,6 +361,12 @@ class Model:
         """Bytes of packed matrices one token reads (embedding row and norms aside)."""
         mats = [self.lm] + [l[n] for l in self.layers for n in ("qkv", "o", "gate_up", "down")]
         return sum(m.packed_q.nbytes + m.packed_s.nbytes for m in mats)
+
+    def torch_weight_bytes(self):
+        """Bytes of PyTorch's matrices one token reads (see Mat.prepare_torch)."""
+        mats = [self.lm] + [l[n] for l in self.layers for n in ("qkv", "o", "gate_up", "down")]
+        return sum(t.nbytes for m in mats
+                   for t in ((m.t_w, m.t_sz) if m.fmt == "q4" else (m.t_w, m.t_s)))
 
     def new_cache(self):
         return np.zeros(len(self.layers) * 2 * self.max_ctx * self.nkv * self.hd, dtype=np.float32)
@@ -358,3 +406,39 @@ class Model:
         logits = self.lm.matvec(self.norm(h, self.norm_out))
         self.last_h, self.last_logits = h, logits  # what the kernel leaves in `h`, for tests
         return int(np.argmax(logits))
+
+    # PyTorch forward pass of the same model (needs use_torch=True at construction): the
+    # matrices on PyTorch's weight-only kernels (Mat.torch_matvec), everything else in f32.
+    def torch_cache(self):
+        return [(torch.zeros(self.max_ctx, self.nkv, self.hd), torch.zeros(self.max_ctx, self.nkv, self.hd))
+                for _ in self.layers]
+
+    def torch_rope(self, x, pos):
+        half = self.hd // 2
+        a, b = x[..., :half], x[..., half:]
+        c, s = torch.from_numpy(self.cos[pos]), torch.from_numpy(self.sin[pos])
+        return torch.cat([a * c - b * s, b * c + a * s], dim=-1)
+
+    @torch.inference_mode() if torch is not None else (lambda f: f)
+    def torch_step(self, cache, token, pos):
+        nh, nkv, hd, d, eps = self.nh, self.nkv, self.hd, self.d, float(self.eps)
+
+        def norm(h, w):
+            return F.rms_norm(h, (d,), torch.from_numpy(w), eps=eps)
+
+        h = torch.from_numpy(self.embd[token].copy())
+        for l, layer in enumerate(self.layers):
+            kc, vc = cache[l]
+            qkv = layer["qkv"].torch_matvec(norm(h, layer["attn_norm"]))
+            q = self.torch_rope(qkv[:nh * hd].view(nh, hd), pos)
+            kc[pos] = self.torch_rope(qkv[nh * hd:(nh + nkv) * hd].view(nkv, hd), pos)
+            vc[pos] = qkv[(nh + nkv) * hd:].view(nkv, hd)
+            keys = kc[:pos + 1].transpose(0, 1)[None]                 # [1, nkv, t, hd]
+            vals = vc[:pos + 1].transpose(0, 1)[None]
+            attn = F.scaled_dot_product_attention(q[None, :, None], keys, vals, enable_gqa=True)
+            h = h + layer["o"].torch_matvec(attn.reshape(-1))
+            gu = layer["gate_up"].torch_matvec(norm(h, layer["ffn_norm"])).view(-1, 2, 64)
+            g, u = gu[:, 0].reshape(-1), gu[:, 1].reshape(-1)
+            h = h + layer["down"].torch_matvec(F.silu(g) * u)
+        logits = self.lm.torch_matvec(norm(h, self.norm_out))
+        return int(torch.max(logits, 0).indices)
