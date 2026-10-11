@@ -81,6 +81,23 @@ fn par_matches_serial_sum() {
     }
 }
 
+/// Back-to-back `par`s of many sizes and thread caps, so helpers still busy with or waking
+/// up for one `par` meet the next: each must skip regions already closed without losing a
+/// result or delaying the next `par`.
+#[test]
+fn par_back_to_back() {
+    let mut e = engine(SQUARES, None, None);
+    for round in 0..5000 {
+        e.set_threads([None, Some(2), Some(5), Some(16)][round % 4]);
+        let n = (round % 37) as i64;
+        assert_eq!(
+            call_i64(&e, "squares", &[n]).unwrap(),
+            sum_squares(n),
+            "round {round}"
+        );
+    }
+}
+
 #[test]
 fn par_in_sandbox() {
     let e = engine(SQUARES, Some(1 << 20), None);
