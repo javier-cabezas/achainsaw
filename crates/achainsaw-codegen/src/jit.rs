@@ -10,7 +10,7 @@ use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use std::alloc::Layout;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::backend::Backend;
@@ -616,33 +616,51 @@ const PAR_FUEL_CHUNK: i64 = 1 << 16;
 /// headroom for the runtime and host frames.
 pub const EXECUTION_STACK_BYTES: usize = 8 << 20;
 
-/// State shared by the threads running one `par`.
+/// A value on cache lines of its own, so writes to it do not slow down threads reading its
+/// neighbours (128 bytes: x86 prefetches lines in pairs).
+#[repr(align(128))]
+struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Body arguments at most this many slots long are copied to the stack of each worker.
+const PAR_STACK_ARGS: usize = 32;
+
+/// State shared by the threads running one `par`, on the stack of its caller. Helpers reach
+/// it only after joining through `ParPool::joined`, and the caller returns only once every
+/// helper that joined has left.
 struct ParRegion {
     /// Scalar trampoline of the body, `void(u64 *args, u64 *ret)`.
     tramp: extern "C" fn(*const u64, *mut u64),
-    /// Body arguments; slot 0 is replaced by the index.
-    args: Vec<u64>,
+    /// Body arguments (`slots` values, the caller's; slot 0 is replaced by the index).
+    args: *const u64,
+    slots: usize,
     count: i64,
-    next: AtomicI64,
-    /// Helper threads that may join (the calling thread always works too).
-    helpers: usize,
-    /// Threads still between joining and leaving; the caller returns once it is 0.
-    inflight: AtomicUsize,
-    caller: std::thread::Thread,
-    /// Fuel budget left for workers to draw from (`UNLIMITED_FUEL` when there is none).
-    fuel: AtomicI64,
     /// Set by the first failure; workers stop taking indices and fuel.
     abort: AtomicBool,
     failure: Mutex<Option<ExecutionStatus>>,
     arena: *const Mutex<Arena>,
     sandboxed: bool,
-    /// Heap accounting for non-sandboxed code under a quota (see `rt_malloc`).
-    allocated: AtomicUsize,
     quota: usize,
+    /// Next index to run. Written by every worker, so it does not share a cache line with
+    /// the fields above, which every worker reads.
+    next: CachePadded<AtomicI64>,
+    /// Fuel budget left for workers to draw from (`UNLIMITED_FUEL` when there is none).
+    fuel: CachePadded<AtomicI64>,
+    /// No budget to share (`fuel` cannot run out): workers still refill their counters a
+    /// chunk at a time, so they notice `abort`, but leave `fuel` alone.
+    unlimited: bool,
+    /// Heap accounting for non-sandboxed code under a quota (see `rt_malloc`).
+    allocated: CachePadded<AtomicUsize>,
 }
 
-// `arena` is the caller's, alive while `inflight` is non-zero; threads that join later
-// find no index left and never use it.
+// `args` and `arena` are the caller's, alive while the caller waits in `rt_par_for`, which
+// outlasts every worker.
 unsafe impl Send for ParRegion {}
 unsafe impl Sync for ParRegion {}
 
@@ -651,6 +669,9 @@ impl ParRegion {
     fn draw(&self, want: i64) -> i64 {
         if want <= 0 || self.abort.load(Ordering::Relaxed) {
             return 0;
+        }
+        if self.unlimited {
+            return want;
         }
         let mut left = self.fuel.load(Ordering::Acquire);
         loop {
@@ -679,11 +700,9 @@ impl ParRegion {
         self.abort.store(true, Ordering::Release);
     }
 
-    /// Runs indices until they run out or a worker fails, and returns whether it ran any. A
-    /// thread counts as in flight from before its first index to after it has returned its
-    /// unused fuel, so the caller, which waits for none to be in flight, sees every result.
+    /// Runs indices until they run out or a worker fails, and returns whether it ran any.
+    /// Unused fuel goes back to the shared budget before it returns.
     fn participate(&self, is_caller: bool) -> bool {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
         let counter = Cell::new(0);
         let prev_fuel = ACTIVE_FUEL.with(|a| a.replace(&counter));
         let prev_region = PAR_REGION.with(|r| r.replace(self));
@@ -699,11 +718,23 @@ impl ParRegion {
         });
         reset_execution_status();
 
-        let mut args = self.args.clone();
+        // This thread's copy of the arguments, on the stack unless they are long.
+        let mut stack_args = [0u64; PAR_STACK_ARGS];
+        let mut heap_args = Vec::new();
+        // SAFETY: the caller's `slots` values, alive while it waits for the workers.
+        let src = unsafe { std::slice::from_raw_parts(self.args, self.slots) };
+        let args: &mut [u64] = if self.slots <= PAR_STACK_ARGS {
+            &mut stack_args[..self.slots]
+        } else {
+            heap_args.extend_from_slice(src);
+            &mut heap_args
+        };
+        args.copy_from_slice(src);
         let mut ret = 0u64;
         let mut worked = false;
         while !self.abort.load(Ordering::Relaxed) {
-            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            // Only claims the index: results reach the caller through `ParPool::joined`.
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
             if i >= self.count {
                 break;
             }
@@ -721,17 +752,15 @@ impl ParRegion {
             }
         }
 
-        // Unused fuel goes back to the budget the caller resumes with.
-        self.fuel.fetch_add(counter.get().max(0), Ordering::AcqRel);
+        if !self.unlimited {
+            self.fuel.fetch_add(counter.get().max(0), Ordering::AcqRel);
+        }
         reset_execution_status();
         ACTIVE_FUEL.with(|a| a.set(prev_fuel));
         PAR_REGION.with(|r| r.set(prev_region));
         ACTIVE_ARENA.with(|a| a.set(prev_arena));
         if let Some(limit) = prev_limit {
             STACK_LIMIT.with(|l| l.set(limit));
-        }
-        if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 && !is_caller {
-            self.caller.unpark();
         }
         worked
     }
@@ -756,12 +785,33 @@ pub fn in_par_worker() -> bool {
 /// with 200 us (2.7 ms run apart).
 const PAR_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 
-/// Helper threads that run `par` iterations next to the calling thread.
+/// `ParPool::announce`: the `par` number above these bits, the helpers it uses in them.
+const ANNOUNCE_USED_BITS: u32 = 16;
+/// `ParPool::joined`: the `par` number above these bits, then the closed bit, then the
+/// number of helpers in the region.
+const JOINED_COUNT_BITS: u32 = 16;
+const JOINED_CLOSED: u64 = 1 << JOINED_COUNT_BITS;
+const JOINED_COUNT_MASK: u64 = JOINED_CLOSED - 1;
+const JOINED_EPOCH_SHIFT: u32 = JOINED_COUNT_BITS + 1;
+
+/// Helper threads that run `par` iterations next to the calling thread. A `par` publishes
+/// its region and bumps `announce`; each helper it uses joins by incrementing the count in
+/// `joined` while the region is open, runs indices, and leaves by decrementing it. The
+/// caller closes the region once it has run out of indices and waits for the count to
+/// reach zero, so a helper that arrives late (still waking up) finds it closed, never
+/// touches it, and costs the caller nothing. No locks or allocations on this path.
 struct ParPool {
     helpers: Vec<Helper>,
-    /// Bumped for each `par`, together with `job`.
-    epoch: AtomicU64,
-    job: Mutex<(u64, Option<Arc<ParRegion>>)>,
+    /// The current `par`'s number and helper count (see `ANNOUNCE_USED_BITS`); helpers
+    /// spin on it.
+    announce: CachePadded<AtomicU64>,
+    /// The current `par`'s number, closed bit and joined helpers (see `JOINED_COUNT_BITS`).
+    joined: CachePadded<AtomicU64>,
+    /// The current `par`'s region, valid for a helper that has joined it.
+    region: AtomicPtr<ParRegion>,
+    /// The caller is parked waiting for helpers to leave; the last one to leave wakes it.
+    waiting: AtomicBool,
+    waiter: Mutex<Option<std::thread::Thread>>,
     /// Held by the thread running a `par` on the pool; others run theirs serially.
     busy: Mutex<()>,
 }
@@ -780,6 +830,8 @@ pub fn par_pool_threads() -> usize {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            // Helper counts fit the bit fields of `ParPool::announce` and `joined`.
+            .min(JOINED_COUNT_MASK as usize)
     })
 }
 
@@ -803,11 +855,86 @@ fn par_pool() -> &'static ParPool {
             .collect();
         ParPool {
             helpers,
-            epoch: AtomicU64::new(0),
-            job: Mutex::new((0, None)),
+            announce: CachePadded(AtomicU64::new(0)),
+            joined: CachePadded(AtomicU64::new(JOINED_CLOSED)),
+            region: AtomicPtr::new(std::ptr::null_mut()),
+            waiting: AtomicBool::new(false),
+            waiter: Mutex::new(None),
             busy: Mutex::new(()),
         }
     })
+}
+
+impl ParPool {
+    /// Joins `par` number `epoch` and runs its indices, unless its caller has closed it.
+    fn join(&self, epoch: u64) {
+        let seen = self.joined.fetch_add(1, Ordering::Acquire);
+        if seen >> JOINED_EPOCH_SHIFT != epoch || seen & JOINED_CLOSED != 0 {
+            // Closed, or already another `par`: take back the increment, whose caller waits
+            // for it like for a helper leaving.
+            self.leave();
+            return;
+        }
+        // SAFETY: published before `announce`, and alive until this helper leaves.
+        let region = unsafe { &*self.region.load(Ordering::Acquire) };
+        region.participate(false);
+        self.leave();
+    }
+
+    /// Leaves the current region (the caller may return as soon as this runs), waking the
+    /// caller if it is parked.
+    fn leave(&self) {
+        self.joined.fetch_sub(1, Ordering::SeqCst);
+        // Pairs with the caller's `waiting` store then count load.
+        if self.waiting.load(Ordering::SeqCst) {
+            if let Some(caller) = &*self.waiter.lock().unwrap_or_else(|e| e.into_inner()) {
+                caller.unpark();
+            }
+        }
+    }
+
+    /// Closes the current region to new helpers and waits until those inside have left.
+    fn close(&self) {
+        self.joined.fetch_or(JOINED_CLOSED, Ordering::AcqRel);
+        let inside = || self.joined.load(Ordering::SeqCst) & JOINED_COUNT_MASK != 0;
+        let mut spins = 0u32;
+        while inside() {
+            if spins < 1 << 14 {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+            *self.waiter.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
+            self.waiting.store(true, Ordering::SeqCst);
+            while inside() {
+                std::thread::park();
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Opens the region of `par` number `epoch`. Waits out late helpers still taking back
+    /// their increment of an earlier `par`, so none is lost.
+    fn open(&self, epoch: u64) {
+        let open = epoch << JOINED_EPOCH_SHIFT;
+        let mut current = self.joined.load(Ordering::Relaxed);
+        loop {
+            if current & JOINED_COUNT_MASK != 0 {
+                std::hint::spin_loop();
+                current = self.joined.load(Ordering::Relaxed);
+                continue;
+            }
+            match self.joined.compare_exchange_weak(
+                current,
+                open,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => current = now,
+            }
+        }
+    }
 }
 
 /// Waits for each new `par` (spinning, then parked) and joins it unless it is capped below
@@ -815,17 +942,18 @@ fn par_pool() -> &'static ParPool {
 fn helper_loop(index: usize) {
     let pool = par_pool();
     let me = &pool.helpers[index];
+    let epoch_of = |announce: u64| announce >> ANNOUNCE_USED_BITS;
     let mut seen = 0u64;
     let mut spin = PAR_SPIN;
     loop {
         let idle_since = std::time::Instant::now();
         let mut spins = 0u32;
-        while pool.epoch.load(Ordering::SeqCst) == seen {
+        while epoch_of(pool.announce.load(Ordering::SeqCst)) == seen {
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(1024) && idle_since.elapsed() >= spin {
-                // Pairs with the dispatcher's epoch store then `parked` load.
+                // Pairs with the dispatcher's `announce` store then `parked` load.
                 me.parked.store(true, Ordering::SeqCst);
-                if pool.epoch.load(Ordering::SeqCst) == seen {
+                if epoch_of(pool.announce.load(Ordering::SeqCst)) == seen {
                     std::thread::park();
                 }
                 me.parked.store(false, Ordering::SeqCst);
@@ -833,21 +961,15 @@ fn helper_loop(index: usize) {
                 std::hint::spin_loop();
             }
         }
-        let (epoch, job) = {
-            let slot = pool.job.lock().unwrap_or_else(|e| e.into_inner());
-            (slot.0, slot.1.clone())
-        };
-        seen = epoch;
+        let announce = pool.announce.load(Ordering::SeqCst);
+        seen = epoch_of(announce);
         // Helpers a `par` does not use (it has fewer tasks than threads, or a lower thread
         // cap) park at once, so they neither slow down busy threads sharing their core nor
         // need waking for loops of the same size; the others wait for the next `par`.
-        let used = job.is_some_and(|region| {
-            let used = index < region.helpers;
-            if used {
-                region.participate(false);
-            }
-            used
-        });
+        let used = index < (announce & ((1 << ANNOUNCE_USED_BITS) - 1)) as usize;
+        if used {
+            pool.join(seen);
+        }
         spin = if used {
             PAR_SPIN
         } else {
@@ -868,7 +990,7 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
     }
     // SAFETY: the JIT passes a trampoline address and `slots` initialized u64 values.
     let tramp: extern "C" fn(*const u64, *mut u64) = unsafe { std::mem::transmute(tramp) };
-    let mut args = unsafe { std::slice::from_raw_parts(args, slots as usize) }.to_vec();
+    let slots = slots as usize;
     let threads = match PAR_THREADS.with(|t| t.get()) {
         0 => par_pool_threads(),
         cap => cap.min(par_pool_threads()),
@@ -877,6 +999,8 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
     let busy = pool.and_then(|p| p.busy.try_lock().ok());
 
     let (Some(pool), Some(_busy)) = (pool, busy) else {
+        // SAFETY: as above.
+        let mut args = unsafe { std::slice::from_raw_parts(args, slots) }.to_vec();
         let mut ret = 0u64;
         for i in 0..n {
             let ok = with_active_fuel(|counter| charge(counter, 1)).unwrap_or(true);
@@ -896,47 +1020,44 @@ extern "C" fn rt_par_for(tramp: usize, args: *const u64, slots: i64, n: i64) -> 
     let caller_fuel = ACTIVE_FUEL.with(|a| a.get());
     // SAFETY: set by `call_typed` for the duration of the call that reached this hook.
     let caller_fuel = (!caller_fuel.is_null()).then(|| unsafe { &*caller_fuel });
-    let region = Arc::new(ParRegion {
+    let fuel = caller_fuel.map_or(UNLIMITED_FUEL, |c| c.get());
+    let region = ParRegion {
         tramp,
         args,
+        slots,
         count: n,
-        next: AtomicI64::new(0),
-        // At most one thread per index.
-        helpers: threads.min(n as usize) - 1,
-        inflight: AtomicUsize::new(0),
-        caller: std::thread::current(),
-        fuel: AtomicI64::new(caller_fuel.map_or(UNLIMITED_FUEL, |c| c.get())),
         abort: AtomicBool::new(false),
         failure: Mutex::new(None),
         arena: ACTIVE_ARENA.with(|a| a.get()),
         sandboxed: STACK_LIMIT.with(|l| l.get()) != 0,
-        allocated: AtomicUsize::new(MEMORY_ALLOCATED.with(|m| m.get())),
         quota: MEMORY_QUOTA.with(|q| q.get()),
-    });
-    {
-        let mut slot = pool.job.lock().unwrap_or_else(|e| e.into_inner());
-        slot.0 += 1;
-        slot.1 = Some(region.clone());
-        pool.epoch.store(slot.0, Ordering::SeqCst);
-    }
-    for helper in &pool.helpers[..region.helpers] {
+        next: CachePadded(AtomicI64::new(0)),
+        fuel: CachePadded(AtomicI64::new(fuel)),
+        // A limited budget is at most `i64::MAX` units, as is `UNLIMITED_FUEL`, but code
+        // that ran through half of that is not finishing anyway.
+        unlimited: fuel > UNLIMITED_FUEL / 2,
+        allocated: CachePadded(AtomicUsize::new(MEMORY_ALLOCATED.with(|m| m.get()))),
+    };
+    // At most one thread per index.
+    let used = threads.min(n as usize) - 1;
+    let epoch = (pool.announce.load(Ordering::Relaxed) >> ANNOUNCE_USED_BITS) + 1;
+    pool.region.store(
+        &region as *const ParRegion as *mut ParRegion,
+        Ordering::Release,
+    );
+    pool.open(epoch);
+    pool.announce.store(
+        (epoch << ANNOUNCE_USED_BITS) | used as u64,
+        Ordering::SeqCst,
+    );
+    for helper in &pool.helpers[..used] {
         if helper.parked.load(Ordering::SeqCst) {
             helper.thread.unpark();
         }
     }
 
     let _ = region.participate(true);
-    // Helpers still finishing an index unpark this thread when the last one leaves.
-    let mut spins = 0u32;
-    while region.inflight.load(Ordering::SeqCst) != 0 {
-        if spins < 1 << 14 {
-            spins += 1;
-            std::hint::spin_loop();
-        } else {
-            std::thread::park();
-        }
-    }
-    pool.job.lock().unwrap_or_else(|e| e.into_inner()).1 = None;
+    pool.close();
 
     if let Some(counter) = caller_fuel {
         counter.set(region.fuel.load(Ordering::Acquire));

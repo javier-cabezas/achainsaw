@@ -221,11 +221,11 @@ fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
 
 The rules:
 - **Write only your own memory.** Calls run concurrently and in any order. Each `i` writes its own memory; to reduce, store per-`i` partial results in an `alloc`'d array and sum them after the `par`.
-- **Give each `i` real work.** A row or a block of thousands of elements works well. Dispatching a `par` costs a few microseconds.
+- **Give each `i` real work.** A row or a block of thousands of elements works well. Dispatching a `par` costs about a microsecond on 16 threads.
 - **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
 
 How it runs:
-- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A `par` with fewer indices than threads uses only that many threads: the other helpers stay parked, so they neither slow down busy threads sharing their core nor need waking for later loops of the same size.
+- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. Starting and joining a `par` takes no locks or allocations, and helpers still waking up when the indices run out skip that `par` instead of delaying it. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A `par` with fewer indices than threads uses only that many threads: the other helpers stay parked, so they neither slow down busy threads sharing their core nor need waking for later loops of the same size.
 - **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
 - **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
 - **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
@@ -236,10 +236,10 @@ Speedup of `gemv_par`'s `bench` driver on a Ryzen 7 8845HS (8 cores, 16 threads)
 
 | Shape | Backend | 1 thread | 16 threads | Speedup |
 |---|---|---|---|---|
-| 4096x4096 (64 MB), 50 runs | Cranelift | 632 ms | 75 ms | 8.4x |
-| 4096x4096 (64 MB), 50 runs | LLVM (AVX-512) | 180 ms | 74 ms (8 threads) | 2.4x (memory-bound) |
-| 1024x512 (2 MB), 2000 runs | Cranelift | 685 ms | 83 ms | 8.3x |
-| 1024x512 (2 MB), 2000 runs | LLVM (AVX-512) | 81 ms | 27 ms | 3.1x (2000 `par` dispatches) |
+| 4096x4096 (64 MB), 50 runs | Cranelift | 193 ms | 77 ms | 2.5x (memory-bound) |
+| 4096x4096 (64 MB), 50 runs | LLVM (AVX-512) | 148 ms | 74 ms | 2.0x (memory-bound) |
+| 1024x512 (2 MB), 2000 runs | Cranelift | 90 ms | 17 ms | 5.3x |
+| 1024x512 (2 MB), 2000 runs | LLVM (AVX-512) | 43 ms | 9 ms | 4.8x (2000 `par` dispatches) |
 
 ---
 
@@ -493,19 +493,19 @@ The parentheses give the speedup over NumPy:
 
 | Kernel | NumPy | PyTorch | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|---|
-| Q4_0 GEMV 4096x4096, all cores | 5.69 ms (the same, from 4-bit values) | 117 µs (49x; int4 weight-only kernel, bf16 activations) | 219 µs (26x) | 53.1 µs (107x) |
-| Q8_0 GEMV 4096x4096, all cores | 5.82 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 142 µs (41x; int8 weight-only kernel, one scale per row, bf16 activations) | 216 µs (27x) | 73.3 µs (79x) |
+| Q4_0 GEMV 4096x4096, all cores | 5.69 ms (the same, from 4-bit values) | 117 µs (49x; int4 weight-only kernel, bf16 activations) | 210 µs (27x) | 45.2 µs (126x) |
+| Q8_0 GEMV 4096x4096, all cores | 5.82 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 142 µs (41x; int8 weight-only kernel, one scale per row, bf16 activations) | 216 µs (27x) | 60.7 µs (96x) |
 | RoPE, 32 heads x 128 | 7.5 µs | 9.9 µs (0.76x) | 1.9 µs (3.9x) | 0.76 µs (9.9x) |
 | Residual add + RMSNorm, n=4096 | 6.3 µs | 8.8 µs (0.71x) | 4.1 µs (1.5x) | 1.2 µs (5.3x) |
 | RMSNorm, n=4096 | 5.2 µs | 6.9 µs (0.76x) | 3.5 µs (1.5x) | 1.0 µs (5.1x) |
 | Cosine similarity, n=1024 | 2.1 µs | 5.5 µs (0.39x) | 0.64 µs (3.3x) | 0.47 µs (4.5x) |
 | Softmax, n=1000 | 2.6 µs | 1.2 µs (2.3x) | 1.7 µs (1.6x) | 0.76 µs (3.5x) |
 | Euclidean distance, n=1024 | 1.4 µs | 1.7 µs (0.81x) | 0.63 µs (2.2x) | 0.48 µs (2.8x) |
-| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 66.7 µs (2.5x) |
+| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 62.1 µs (2.7x) |
 | SwiGLU, n=14336 | 9.9 µs | 7.0 µs (1.4x) | 13.3 µs (0.74x) | 4.2 µs (2.3x) |
 | Greedy argmax, vocabulary 128256 | 6.0 µs | 49.9 µs (0.12x) | 15.7 µs (0.38x) | 4.6 µs (1.3x) |
 | Flash attention decode, DeepSeek V4 Pro, all cores | 1.18 ms | 890 µs (1.3x; `scaled_dot_product_attention`, bf16 output) | 1.80 ms (0.65x) | 911 µs (1.3x) |
-| GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 13.3 µs (0.39x) | 9.4 µs (0.56x) |
+| GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 8.5 µs (0.61x) | 5.4 µs (0.96x) |
 | GEMV f32 512x1024, 1 core | 5.6 µs (all cores) | 25.6 µs (0.22x, all cores) | 33.2 µs (0.17x) | 19.3 µs (0.29x) |
 
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
@@ -514,8 +514,8 @@ Every pull request also runs a performance check in CI: [`benchmarks/perf_compar
 
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
-- **f32 GEMV against multithreaded BLAS.** The 2 MB matrix is cache-resident across calls: OpenBLAS splits it statically, so each core finds its rows in its own L2, while `par` hands rows out dynamically (better under uneven work, worse for this cache reuse) and adds about 2.7 µs of dispatch at 16 threads. The single-core row compares one core with NumPy's 16 threads. PyTorch's x86 wheel calls MKL here, which runs this size on one thread and is slower on AMD CPUs.
-- **bf16 GEMM against PyTorch.** On CPUs with AVX512-BF16 but no AMX (like this Zen 4), `mm` widens bf16 to f32 FMAs, while PyTorch's oneDNN uses AVX512-BF16 dot products, with twice the multiplies per instruction, and rounds its output to bf16. It is the one kernel where PyTorch leads LLVM by a clear margin (1.7x); attention, which is half `mm`, ties. Elsewhere LLVM is ahead: 2.2x on Q4_0 and 1.9x on Q8_0 against PyTorch's quantized kernels, and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch.
+- **f32 GEMV against multithreaded BLAS.** On all cores LLVM and OpenBLAS are level (5.4 vs 5.2 µs; a `par` costs about 1 µs of dispatch at 16 threads). The single-core row compares one core with NumPy's 16 threads: OpenBLAS on one thread (`OPENBLAS_NUM_THREADS=1`) takes 21.6 µs, slightly slower than LLVM. PyTorch's x86 wheel calls MKL here, which runs this size on one thread and is slower on AMD CPUs.
+- **bf16 GEMM against PyTorch.** On CPUs with AVX512-BF16 but no AMX (like this Zen 4), `mm` widens bf16 to f32 FMAs, while PyTorch's oneDNN uses AVX512-BF16 dot products, with twice the multiplies per instruction, and rounds its output to bf16. It is the one kernel where PyTorch leads LLVM by a clear margin (1.6x); attention, which is half `mm`, ties. Elsewhere LLVM is ahead: 2.6x on Q4_0 and 2.3x on Q8_0 against PyTorch's quantized kernels, and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch.
 
 **Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is faster than Q8_0 on LLVM and as fast on Cranelift.
 
