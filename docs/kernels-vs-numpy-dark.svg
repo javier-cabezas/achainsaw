@@ -35,12 +35,12 @@
 <text x="415.5" y="820" font-size="11" fill="#898781">faster than NumPy →</text>
 <text x="238" y="125.0" font-size="12" text-anchor="end" fill="#ffffff">Q4_0 GEMV 4096x4096, all cores</text>
 <path d="M407.5,104.0 H669.5 Q673.5,104.0 673.5,108.0 V110.0 Q673.5,114.0 669.5,114.0 H407.5 Z" fill="#7a7a75"><title>Q4_0 GEMV 4096x4096, all cores, PyTorch (eager): 48.77x NumPy</title></path>
-<path d="M407.5,116.0 H626.3 Q630.3,116.0 630.3,120.0 V122.0 Q630.3,126.0 626.3,126.0 H407.5 Z" fill="#3987e5"><title>Q4_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 25.94x NumPy</title></path>
-<path d="M407.5,128.0 H723.3 Q727.3,128.0 727.3,132.0 V134.0 Q727.3,138.0 723.3,138.0 H407.5 Z" fill="#d95926"><title>Q4_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 107.07x NumPy</title></path>
+<path d="M407.5,116.0 H629.1 Q633.1,116.0 633.1,120.0 V122.0 Q633.1,126.0 629.1,126.0 H407.5 Z" fill="#3987e5"><title>Q4_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 27.03x NumPy</title></path>
+<path d="M407.5,128.0 H734.3 Q738.3,128.0 738.3,132.0 V134.0 Q738.3,138.0 734.3,138.0 H407.5 Z" fill="#d95926"><title>Q4_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 125.77x NumPy</title></path>
 <text x="238" y="173.0" font-size="12" text-anchor="end" fill="#ffffff">Q8_0 GEMV 4096x4096, all cores</text>
 <path d="M407.5,152.0 H657.6 Q661.6,152.0 661.6,156.0 V158.0 Q661.6,162.0 657.6,162.0 H407.5 Z" fill="#7a7a75"><title>Q8_0 GEMV 4096x4096, all cores, PyTorch (eager): 40.98x NumPy</title></path>
 <path d="M407.5,164.0 H628.8 Q632.8,164.0 632.8,168.0 V170.0 Q632.8,174.0 628.8,174.0 H407.5 Z" fill="#3987e5"><title>Q8_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 26.91x NumPy</title></path>
-<path d="M407.5,176.0 H702.7 Q706.7,176.0 706.7,180.0 V182.0 Q706.7,186.0 702.7,186.0 H407.5 Z" fill="#d95926"><title>Q8_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 79.34x NumPy</title></path>
+<path d="M407.5,176.0 H715.7 Q719.7,176.0 719.7,180.0 V182.0 Q719.7,186.0 715.7,186.0 H407.5 Z" fill="#d95926"><title>Q8_0 GEMV 4096x4096, all cores, LLVM (AVX-512): 95.91x NumPy</title></path>
 <text x="238" y="221.0" font-size="12" text-anchor="end" fill="#ffffff">RoPE, 32 heads x 128</text>
 <path d="M407.5,200.0 H393.0 Q389.0,200.0 389.0,204.0 V206.0 Q389.0,210.0 393.0,210.0 H407.5 Z" fill="#7a7a75"><title>RoPE, 32 heads x 128, PyTorch (eager): 0.76x NumPy</title></path>
 <path d="M407.5,212.0 H496.3 Q500.3,212.0 500.3,216.0 V218.0 Q500.3,222.0 496.3,222.0 H407.5 Z" fill="#3987e5"><title>RoPE, 32 heads x 128, Cranelift (128-bit vectors): 3.88x NumPy</title></path>
@@ -68,7 +68,7 @@
 <text x="238" y="509.0" font-size="12" text-anchor="end" fill="#ffffff">GEMM bf16 256³, all cores</text>
 <path d="M407.5,488.0 H503.7 Q507.7,488.0 507.7,492.0 V494.0 Q507.7,498.0 503.7,498.0 H407.5 Z" fill="#7a7a75"><title>GEMM bf16 256³, all cores, PyTorch (eager): 4.33x NumPy</title></path>
 <path d="M407.5,500.0 H404.1 Q400.7,500.0 400.7,503.4 V506.6 Q400.7,510.0 404.1,510.0 H407.5 Z" fill="#3987e5"><title>GEMM bf16 256³, all cores, Cranelift (128-bit vectors): 0.91x NumPy</title></path>
-<path d="M407.5,512.0 H465.8 Q469.8,512.0 469.8,516.0 V518.0 Q469.8,522.0 465.8,522.0 H407.5 Z" fill="#d95926"><title>GEMM bf16 256³, all cores, LLVM (AVX-512): 2.48x NumPy</title></path>
+<path d="M407.5,512.0 H470.7 Q474.7,512.0 474.7,516.0 V518.0 Q474.7,522.0 470.7,522.0 H407.5 Z" fill="#d95926"><title>GEMM bf16 256³, all cores, LLVM (AVX-512): 2.67x NumPy</title></path>
 <text x="238" y="557.0" font-size="12" text-anchor="end" fill="#ffffff">SwiGLU, n=14336</text>
 <path d="M407.5,536.0 H426.8 Q430.8,536.0 430.8,540.0 V542.0 Q430.8,546.0 426.8,546.0 H407.5 Z" fill="#7a7a75"><title>SwiGLU, n=14336, PyTorch (eager): 1.41x NumPy</title></path>
 <path d="M407.5,548.0 H391.3 Q387.3,548.0 387.3,552.0 V554.0 Q387.3,558.0 391.3,558.0 H407.5 Z" fill="#3987e5"><title>SwiGLU, n=14336, Cranelift (128-bit vectors): 0.74x NumPy</title></path>
@@ -83,8 +83,8 @@
 <path d="M407.5,656.0 H421.0 Q425.0,656.0 425.0,660.0 V662.0 Q425.0,666.0 421.0,666.0 H407.5 Z" fill="#d95926"><title>Flash attention decode, all cores, LLVM (AVX-512): 1.29x NumPy</title></path>
 <text x="238" y="701.0" font-size="12" text-anchor="end" fill="#ffffff">GEMV f32 512x1024, all cores</text>
 <path d="M407.5,680.0 H300.0 Q296.0,680.0 296.0,684.0 V686.0 Q296.0,690.0 300.0,690.0 H407.5 Z" fill="#7a7a75"><title>GEMV f32 512x1024, all cores, PyTorch (eager): 0.20x NumPy</title></path>
-<path d="M407.5,692.0 H347.9 Q343.9,692.0 343.9,696.0 V698.0 Q343.9,702.0 347.9,702.0 H407.5 Z" fill="#3987e5"><title>GEMV f32 512x1024, all cores, Cranelift (128-bit vectors): 0.39x NumPy</title></path>
-<path d="M407.5,704.0 H371.4 Q367.4,704.0 367.4,708.0 V710.0 Q367.4,714.0 371.4,714.0 H407.5 Z" fill="#d95926"><title>GEMV f32 512x1024, all cores, LLVM (AVX-512): 0.56x NumPy</title></path>
+<path d="M407.5,692.0 H378.2 Q374.2,692.0 374.2,696.0 V698.0 Q374.2,702.0 378.2,702.0 H407.5 Z" fill="#3987e5"><title>GEMV f32 512x1024, all cores, Cranelift (128-bit vectors): 0.61x NumPy</title></path>
+<path d="M407.5,704.0 H406.4 Q405.2,704.0 405.2,705.2 V712.8 Q405.2,714.0 406.4,714.0 H407.5 Z" fill="#d95926"><title>GEMV f32 512x1024, all cores, LLVM (AVX-512): 0.97x NumPy</title></path>
 <text x="238" y="749.0" font-size="12" text-anchor="end" fill="#ffffff">GEMV f32 512x1024, 1 core</text>
 <path d="M407.5,728.0 H308.0 Q304.0,728.0 304.0,732.0 V734.0 Q304.0,738.0 308.0,738.0 H407.5 Z" fill="#7a7a75"><title>GEMV f32 512x1024, 1 core, PyTorch (eager): 0.22x NumPy</title></path>
 <path d="M407.5,740.0 H290.4 Q286.4,740.0 286.4,744.0 V746.0 Q286.4,750.0 290.4,750.0 H407.5 Z" fill="#3987e5"><title>GEMV f32 512x1024, 1 core, Cranelift (128-bit vectors): 0.17x NumPy</title></path>
