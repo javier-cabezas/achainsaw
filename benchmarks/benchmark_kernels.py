@@ -1,6 +1,7 @@
 """
-Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/,
-including flash attention at DeepSeek V4 Pro's decode size.
+Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/: the
+operators of LLM inference (norms, activations, RoPE, attention for decode, quantized GEMV and
+prefill GEMM, argmax and top-k sampling) and a few BLAS-style ones.
 
 Every kernel is checked against NumPy, then timed on each available code generation
 backend (Cranelift, and LLVM when the build has it) and, with --isa all, at every ISA
@@ -12,9 +13,10 @@ fast_math=True (float min/max as compare and select; the tests cover both modes)
 NumPy and, when it is installed, PyTorch (eager, CPU) are timed on the same work as
 baselines. NumPy computes with the kernels' data types. PyTorch runs its own fastest CPU
 path for each kernel, and its results are checked too. Where its types differ, the case
-says so: bf16 outputs for GEMM and attention, and for the quantized GEMVs PyTorch's
-weight-only int4 and int8 kernels, which take bf16 activations instead of int8 ones (int8
-with one scale per row, since PyTorch has no per-block int8 kernel).
+says so: bf16 outputs for GEMM and attention (bf16 queries too for GQA attention), and for
+the quantized GEMVs and GEMM PyTorch's weight-only int4 and int8 kernels, which take bf16
+activations instead of int8 ones (int8 with one scale per row, since PyTorch has no
+per-block int8 kernel).
 
     python benchmarks/benchmark_kernels.py                  # host ISA, all backends
     python benchmarks/benchmark_kernels.py --isa all        # sweep ISA levels too
@@ -88,6 +90,17 @@ def np_q8_gemv(q_blocks, scales, x):
     nb = q_blocks.shape[0]
     dots = np.matmul(q_blocks.astype(np.float32), xq.reshape(nb, 32, 1))[:, :, 0]
     return ((dots * dx[:, None]) * scales).sum(axis=0)
+
+
+def np_q8_gemm(q_blocks, scales, xs):
+    """np_q8_gemv for n tokens xs [n x k]: one batched f32 matmul over the blocks for every
+    token (exact block dots), so the int8 weights are widened once per call."""
+    qs = [q8_quantize(x) for x in xs]
+    nb = q_blocks.shape[0]
+    xq = np.stack([q.reshape(nb, 32) for q, _ in qs], axis=2)          # [k/32 x 32 x n]
+    dx = np.stack([d for _, d in qs], axis=1)                          # [k/32 x n]
+    dots = np.matmul(q_blocks.astype(np.float32), xq)                  # [k/32 x m x n]
+    return ((dots * dx[:, None, :]) * scales[:, :, None]).sum(axis=0).T
 
 
 def rel_err(out, ref):
@@ -320,6 +333,50 @@ def make_cases():
         flops=2 * 2 * fh * fnk * fd,
     ))
 
+    # One decode step of grouped-query attention at Llama 3 8B's shapes: 32 query heads on 8
+    # KV heads of 128 dims, over 4096 positions of a bf16 KV cache (16 MB).
+    gh, gkv, ghd, gt = 32, 8, 128, 4096
+    ggrp = gh // gkv
+    gq = rng.standard_normal((gh, ghd)).astype(np.float32)
+    gkc = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
+    gvc = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
+    gout = np.zeros((gh, ghd), dtype=np.float32)
+    gscale = np.float32(1.0 / np.sqrt(ghd))
+    gk64, gv64 = bf16_values(gkc).astype(np.float64), bf16_values(gvc).astype(np.float64)
+    gsc = np.matmul(gq.astype(np.float64).reshape(gkv, ggrp, ghd), gk64.transpose(0, 2, 1))
+    gsc *= float(gscale)
+    gp = np.exp(gsc - gsc.max(axis=2, keepdims=True))
+    gqa_ref = (np.matmul(gp, gv64) / gp.sum(axis=2, keepdims=True)).reshape(gh, ghd)
+
+    def np_gqa():
+        # Same types as the kernel: the bf16 cache widened to f32 in the call.
+        k32, v32 = bf16_values(gkc), bf16_values(gvc)
+        s = np.matmul(gq.reshape(gkv, ggrp, ghd), k32.transpose(0, 2, 1)) * gscale
+        e = np.exp(s - s.max(axis=2, keepdims=True))
+        return (np.matmul(e, v32) / e.sum(axis=2, keepdims=True)).reshape(gh, ghd)
+
+    if torch is not None:
+        # bf16 throughout (its SDPA wants one dtype), bf16 output. Each group's query heads
+        # go in as that KV head's query positions: the same math, and PyTorch's fastest form
+        # (enable_gqa=True with one query position per head takes 18x as long).
+        t_gq = tt(gq).bfloat16().view(1, gkv, ggrp, ghd)
+        t_gk, t_gv = torch_bf16(gkc).view(1, gkv, gt, ghd), torch_bf16(gvc).view(1, gkv, gt, ghd)
+
+    def verify_gqa(k):
+        gout[:] = np.nan
+        k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt)
+        return rel_err(gout, gqa_ref)
+
+    cases.append(dict(
+        name="gqa_attention",
+        label=f"GQA decode attention, Llama 3 8B ({gh}/{gkv} heads x {ghd}, {gt} positions)",
+        run=lambda k: k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt),
+        verify=verify_gqa, tol=1e-5, numpy=np_gqa,
+        torch=lambda: F.scaled_dot_product_attention(t_gq, t_gk, t_gv),
+        torch_check=lambda out: rel_err(out, gqa_ref), torch_tol=1e-2,
+        flops=2 * 2 * gh * gt * ghd,
+    ))
+
     # Decode-step glue at Llama 3 8B sizes (d = 4096, MLP 14336, 32 heads of 128,
     # vocabulary 128256).
     sw_n = 14336
@@ -344,6 +401,29 @@ def make_cases():
         flops=8 * sw_n,
     ))
 
+    # GeGLU (Gemma): GELU with PyTorch's tanh approximation on the gate, times up.
+    gc = np.sqrt(2.0 / np.pi)
+    ginner = gc * (gd + 0.044715 * gd ** 3)
+    ge_ref = gd * up / (1.0 + np.exp(-2.0 * ginner))
+
+    def np_geglu():
+        g = gate
+        return np.float32(0.5) * g * (np.float32(1.0) + np.tanh(
+            np.float32(gc) * (g + np.float32(0.044715) * g * g * g))) * up
+
+    def verify_geglu(k):
+        k(gate, up, sw_out, sw_n)
+        return rel_err(sw_out, ge_ref)
+
+    cases.append(dict(
+        name="geglu", label=f"GeGLU, GELU-tanh via vectorized exp (n={sw_n})",
+        run=lambda k: k(gate, up, sw_out, sw_n),
+        verify=verify_geglu, tol=1e-6, numpy=np_geglu,
+        torch=lambda: F.gelu(t_gate, approximate="tanh") * t_up,
+        torch_check=lambda out: rel_err(out, ge_ref),
+        flops=11 * sw_n,
+    ))
+
     vocab = 128256
     logits = rng.standard_normal(vocab).astype(np.float32)
     am_ref = int(np.argmax(logits))
@@ -356,6 +436,31 @@ def make_cases():
         # torch.max along the dimension finds the index faster than torch.argmax.
         torch=lambda: torch.max(t_logits, 0),
         torch_check=lambda out: float(int(out.indices) != am_ref),
+        flops=vocab,
+    ))
+
+    # Top-k sampling's selection: the 40 largest logits, sorted, with their token ids.
+    tk = 40
+    tk_vals = np.zeros(tk, dtype=np.float32)
+    tk_idx = np.zeros(tk, dtype=np.int64)
+    tk_ref = np.argsort(-logits, kind="stable")[:tk]
+
+    def verify_topk(k):
+        tk_idx[:] = -1
+        k(logits, vocab, tk, tk_vals, tk_idx)
+        return float(not (np.array_equal(tk_idx, tk_ref)
+                          and np.array_equal(tk_vals, logits[tk_ref])))
+
+    def np_topk():
+        idx = np.argpartition(logits, -tk)[-tk:]
+        return idx[np.argsort(-logits[idx])]
+
+    cases.append(dict(
+        name="topk", label=f"Top-k, k={tk} (vocab={vocab})",
+        run=lambda k: k(logits, vocab, tk, tk_vals, tk_idx),
+        verify=verify_topk, tol=0.0, numpy=np_topk,
+        torch=lambda: torch.topk(t_logits, tk),
+        torch_check=lambda out: float(not np.array_equal(out.indices.numpy(), tk_ref)),
         flops=vocab,
     ))
 
@@ -425,6 +530,32 @@ def make_cases():
         torch=lambda: F.rms_norm(t_ares0 + t_ax, (an,), t_aw, eps=1e-5),
         torch_check=lambda out: float(np.max(np.abs(out.numpy() - an_ref))),
         flops=5 * an,
+    ))
+
+    ln_n = 4096
+    lx = (rng.standard_normal(ln_n) + 0.5).astype(np.float32)
+    lw = rng.uniform(0.8, 1.2, ln_n).astype(np.float32)
+    lb = (rng.standard_normal(ln_n) * 0.1).astype(np.float32)
+    lout = np.zeros(ln_n, dtype=np.float32)
+    lxd = lx.astype(np.float64)
+    ln_ref = (lxd - lxd.mean()) / np.sqrt(lxd.var() + 1e-5) * lw + lb
+    t_lx, t_lw, t_lb = tt(lx), tt(lw), tt(lb)
+
+    def verify_layernorm(k):
+        k(lx, lw, lb, lout, ln_n, 1e-5)
+        return float(np.max(np.abs(lout - ln_ref)))
+
+    def np_layernorm():
+        d = lx - lx.mean()
+        return d / np.sqrt(np.mean(d * d) + np.float32(1e-5)) * lw + lb
+
+    cases.append(dict(
+        name="layernorm", label=f"LayerNorm (n={ln_n})",
+        run=lambda k: k(lx, lw, lb, lout, ln_n, 1e-5),
+        verify=verify_layernorm, tol=1e-5, numpy=np_layernorm,
+        torch=lambda: F.layer_norm(t_lx, (ln_n,), t_lw, t_lb, eps=1e-5),
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - ln_ref))),
+        flops=8 * ln_n,
     ))
 
     qm, qk = 4096, 4096
@@ -507,6 +638,35 @@ def make_cases():
         torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tx_bf16[None], t_p4, 32, t_sz4),
         torch_check=lambda out: rel_err(out, q4_ref_t), torch_tol=1e-2,
         flops=2 * qm * qk,
+    ))
+
+    # Prefill: the same Q4_0 matrix on a batch of 32 tokens.
+    pn = 32
+    px = rng.standard_normal((pn, qk)).astype(np.float32)
+    p_out = np.zeros((pn, qm), dtype=np.float32)
+    pxq = [q8_quantize(x) for x in px]
+    pxq_ints = np.stack([q.reshape(qnb, 32) for q, _ in pxq], axis=2).astype(np.float64)
+    pdx = np.stack([d for _, d in pxq], axis=1).astype(np.float64)
+    pdots = np.matmul(q4_blocks.astype(np.float64), pxq_ints)        # [k/32 x m x n]
+    q4g_ref = ((pdots * pdx[:, None, :]) * q4s.astype(np.float64)[:, :, None]).sum(axis=0).T
+    if torch is not None:
+        tpx_bf16 = tt(px).bfloat16()
+        w4t = (q4_vals.astype(np.float64).reshape(qm, qnb, 32)
+               * t_s4.double().numpy().T[:, :, None]).reshape(qm, qk)
+        q4g_ref_t = tpx_bf16.double().numpy() @ w4t.T
+
+    def verify_q4_gemm(k):
+        p_out[:] = np.nan
+        k.run("q4_gemm", q4_packed, q4s_packed, px, p_out, qm, qk, pn)
+        return rel_err(p_out, q4g_ref)
+
+    cases.append(dict(
+        name="q4_gemm", label=f"Q4_0 GEMM, prefill of {pn} tokens, all cores ({qm}x{qk})",
+        run=lambda k: k.run("q4_gemm", q4_packed, q4s_packed, px, p_out, qm, qk, pn),
+        verify=verify_q4_gemm, tol=1e-5, numpy=lambda: np_q8_gemm(q4_blocks, q4s, px),
+        torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tpx_bf16, t_p4, 32, t_sz4),
+        torch_check=lambda out: rel_err(out, q4g_ref_t), torch_tol=1e-2,
+        flops=2 * qm * qk * pn,
     ))
     return cases
 

@@ -700,3 +700,243 @@ fn quantize_q8_writes_block_records() {
         }
     }
 }
+
+#[test]
+fn layernorm_matches_reference() {
+    type LayerNorm = extern "C" fn(*const f32, *const f32, *const f32, *mut f32, i64, f32) -> f32;
+    for (level, engine) in engines("layernorm") {
+        let k: LayerNorm = unsafe { std::mem::transmute(engine.get_fn_ptr("layernorm").unwrap()) };
+        let mut rng = Rng(13);
+        for n in LENGTHS {
+            // A mean far from zero next to the spread: mean(x^2) - mean^2 would lose it.
+            let x: Vec<f32> = rng.vec(n).iter().map(|v| v + 30.0).collect();
+            let (w, b) = (rng.vec(n), rng.vec(n));
+            let eps = 1e-5f32;
+            let mut out = vec![7.0f32; n + 16];
+            let inv = k(
+                x.as_ptr(),
+                w.as_ptr(),
+                b.as_ptr(),
+                out.as_mut_ptr(),
+                n as i64,
+                eps,
+            ) as f64;
+            let mean = x.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
+            let var = x.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+            let want_inv = 1.0 / (var + eps as f64).sqrt();
+            // The f32 mean is off by about 30 * 2^-24 per value; relative to the spread.
+            let tol = 2e-4 * want_inv.max(1.0);
+            assert!(
+                (inv - want_inv).abs() <= tol * want_inv,
+                "layernorm scale n={n} at {level}: got {inv}, want {want_inv}"
+            );
+            for i in 0..n {
+                let want = (x[i] as f64 - mean) * want_inv * w[i] as f64 + b[i] as f64;
+                assert!(
+                    (out[i] as f64 - want).abs() <= tol,
+                    "layernorm[{i}] n={n} at {level}: got {}, want {want}",
+                    out[i]
+                );
+            }
+            assert!(
+                out[n..].iter().all(|&v| v == 7.0),
+                "layernorm wrote past n={n} at {level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn geglu_matches_reference() {
+    type Geglu = extern "C" fn(*const f32, *const f32, *mut f32, i64);
+    let specials = [
+        -100.0f32, -20.0, -9.0, -5.0, -1e-3, 0.0, 1e-3, 5.0, 20.0, 100.0,
+    ];
+    for (level, engine) in engines("geglu") {
+        let k: Geglu = unsafe { std::mem::transmute(engine.get_fn_ptr("geglu").unwrap()) };
+        let mut rng = Rng(37);
+        for n in LENGTHS.iter().copied().chain([specials.len()]) {
+            let gate: Vec<f32> = if n == specials.len() {
+                specials.to_vec()
+            } else {
+                rng.vec(n).iter().map(|v| v * 3.0).collect()
+            };
+            let up = rng.vec(n);
+            let mut out = vec![f32::NAN; n];
+            k(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), n as i64);
+            for i in 0..n {
+                let (g, u) = (gate[i] as f64, up[i] as f64);
+                let inner = (2.0 / std::f64::consts::PI).sqrt() * (g + 0.044715 * g.powi(3));
+                // 0.5 (1 + tanh(inner)), in the form that keeps its tiny values for very
+                // negative g (tanh rounds to -1 there).
+                let want = g * u / (1.0 + (-2.0 * inner).exp());
+                // exp's argument, -2 * inner, is rounded to f32 first.
+                // vexp clamps at 88: a very negative g gives g u / e^88 rather than 0.
+                let tol = (2e-6 + 2e-7 * (2.0 * inner).abs()) * want.abs() + 1e-30;
+                let got = out[i] as f64;
+                assert!(
+                    (got - want).abs() <= tol,
+                    "geglu n={n} [{i}] g={g} u={u} at {level}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn topk_matches_reference() {
+    type TopK = extern "C" fn(*const f32, i64, i64, *mut f32, *mut i64);
+    for (level, engine) in engines("topk") {
+        let kern: TopK = unsafe { std::mem::transmute(engine.get_fn_ptr("topk").unwrap()) };
+        let mut rng = Rng(53);
+        for n in LENGTHS.iter().copied().chain([4096, 128256]) {
+            let random = rng.vec(n);
+            // Few distinct values: ties everywhere, which must keep index order.
+            let ties: Vec<f32> = random.iter().map(|v| (v * 2.0).round()).collect();
+            let mut rising = random.clone();
+            rising.sort_by(f32::total_cmp);
+            let falling: Vec<f32> = rising.iter().rev().cloned().collect();
+            for (name, x) in [
+                ("random", &random),
+                ("ties", &ties),
+                ("rising", &rising),
+                ("falling", &falling),
+            ] {
+                let mut order: Vec<usize> = (0..n).collect();
+                // IEEE order, as the kernel compares: -0.0 and +0.0 are equal.
+                order.sort_by(|&a, &b| x[b].partial_cmp(&x[a]).unwrap().then(a.cmp(&b)));
+                // k = n sorts everything by insertion: quadratic, so not at vocabulary size.
+                let all = if n <= 4096 { n } else { 1 };
+                for k in [1, 3, 40, all].into_iter().filter(|&k| k <= n) {
+                    let mut vals = vec![f32::NAN; k + 4];
+                    let mut idx = vec![-1i64; k + 4];
+                    kern(
+                        x.as_ptr(),
+                        n as i64,
+                        k as i64,
+                        vals.as_mut_ptr(),
+                        idx.as_mut_ptr(),
+                    );
+                    let want: Vec<i64> = order[..k].iter().map(|&i| i as i64).collect();
+                    assert_eq!(&idx[..k], &want[..], "topk {name} n={n} k={k} at {level}");
+                    for j in 0..k {
+                        assert_eq!(vals[j], x[want[j] as usize], "topk {name} n={n} k={k}");
+                    }
+                    assert!(
+                        idx[k..].iter().all(|&i| i == -1),
+                        "topk wrote past k={k} n={n} at {level}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gqa_attention_matches_reference() {
+    type Gqa = extern "C" fn(*const f32, *const u16, *const u16, *mut f32, i64, i64, i64, i64, i64);
+    let bf = |v: f32| half::bf16::from_f32(v);
+    for (level, engine) in engines("gqa_attention") {
+        let kern: Gqa = unsafe { std::mem::transmute(engine.get_fn_ptr("gqa_attention").unwrap()) };
+        let mut rng = Rng(61);
+        // (q heads, KV heads, head dim, positions, cache length): one position, partial
+        // splits, a head dim that is no multiple of any vector, and Llama 3 8B's heads.
+        for (nh, nkv, hd, t_len, max_ctx) in [
+            (4, 1, 8, 1, 4),
+            (8, 2, 64, 300, 320),
+            (6, 3, 40, 513, 600),
+            (7, 7, 16, 256, 256),
+            (32, 8, 128, 260, 300),
+        ] {
+            let q = rng.vec(nh * hd);
+            let cache = |rng: &mut Rng| -> Vec<half::bf16> {
+                rng.vec(nkv * max_ctx * hd).iter().map(|&v| bf(v)).collect()
+            };
+            let (kc, vc) = (cache(&mut rng), cache(&mut rng));
+            let mut out = vec![f32::NAN; nh * hd];
+            kern(
+                q.as_ptr(),
+                kc.as_ptr().cast(),
+                vc.as_ptr().cast(),
+                out.as_mut_ptr(),
+                nh as i64,
+                nkv as i64,
+                hd as i64,
+                t_len as i64,
+                max_ctx as i64,
+            );
+            let scale = 1.0 / (hd as f64).sqrt();
+            for h in 0..nh {
+                let g = h / (nh / nkv);
+                let row =
+                    |c: &[half::bf16], t: usize, d: usize| c[(g * max_ctx + t) * hd + d].to_f64();
+                let scores: Vec<f64> = (0..t_len)
+                    .map(|t| {
+                        (0..hd)
+                            .map(|d| q[h * hd + d] as f64 * row(&kc, t, d))
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let p: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let total: f64 = p.iter().sum();
+                for d in 0..hd {
+                    let want: f64 = (0..t_len).map(|t| p[t] * row(&vc, t, d)).sum::<f64>() / total;
+                    let got = out[h * hd + d] as f64;
+                    assert!(
+                        (got - want).abs() <= 1e-4,
+                        "gqa {nh}/{nkv}x{hd} t={t_len} out[{h}][{d}] at {level}: got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `q4_gemm` gives every token exactly `q4_gemv`'s results (same quantization, same int8
+/// dots, 4 tokens per weight load).
+#[test]
+fn q4_gemm_matches_q4_gemv() {
+    type Gemm = extern "C" fn(*const u8, *const u16, *const f32, *mut f32, i64, i64, i64);
+    type Gemv = extern "C" fn(*const u8, *const u16, *const f32, *mut f32, i64, i64);
+    for ((level, gemm), (_, gemv)) in engines("q4_gemm").into_iter().zip(engines("q4_gemv")) {
+        let kgemm: Gemm = unsafe { std::mem::transmute(gemm.get_fn_ptr("q4_gemm").unwrap()) };
+        let kgemv: Gemv = unsafe { std::mem::transmute(gemv.get_fn_ptr("q4_gemv").unwrap()) };
+        let mut rng = Rng(83);
+        for (m, k) in [(64, 32), (128, 96), (192, 256)] {
+            let (wq, sc, _, _) = q_pack(&mut rng, m, k, true);
+            for n in [1, 3, 4, 5, 9] {
+                let x = rng.vec(n * k);
+                let mut y = vec![f32::NAN; n * m];
+                kgemm(
+                    wq.as_ptr(),
+                    sc.as_ptr(),
+                    x.as_ptr(),
+                    y.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                );
+                for t in 0..n {
+                    let mut want = vec![f32::NAN; m];
+                    kgemv(
+                        wq.as_ptr(),
+                        sc.as_ptr(),
+                        x[t * k..].as_ptr(),
+                        want.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                    );
+                    for i in 0..m {
+                        assert_eq!(
+                            y[t * m + i].to_bits(),
+                            want[i].to_bits(),
+                            "q4_gemm {m}x{k} n={n} y[{t}][{i}] at {level}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,37 @@
+# GeGLU gate of Gemma's MLPs (and GELU-tanh activations in GPT-2/BERT-style models):
+#   out_i = gelu(gate_i) * up_i,  gelu(g) = 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3)))
+# PyTorch's gelu(approximate="tanh"). Since 0.5 (1 + tanh(u)) = 1 / (1 + exp(-2u)), this is
+#   out_i = gate_i * up_i / (1 + exp(-2 sqrt(2/pi) (g + 0.044715 g^3)))
+# one `vexp` per vector, as in swiglu.air (no tanh, no libm call). vexp clamps its argument
+# at 88, so a very negative g gives g u / e^88 (about 1e-38 g u) instead of 0.
+fn geglu(gate:ptr, up:ptr, out:ptr, n:i64)
+  b0:
+    w = vl f32
+    one = cst 1.0:f32
+    v_one = splat one:vx
+    # -2 sqrt(2/pi), and -2 sqrt(2/pi) 0.044715
+    c1 = cst -1.5957691216057308:f32
+    v_c1 = splat c1:vx
+    c3 = cst -0.0713548162726:f32
+    v_c3 = splat c3:vx
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    g = ldm gate[i]:vx, rest:f32
+    u = ldm up[i]:vx, rest:f32
+    g2 = vmul g, g:f32
+    # -2u = g (c1 + c3 g^2)
+    poly = vfma v_c3, g2, v_c1:f32
+    arg = vmul g, poly:f32
+    e = vexp arg:f32
+    den = vadd e, v_one:f32
+    gu = vmul g, u:f32
+    y = vdiv gu, den:f32
+    stm out[i], y, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  done:
+    ret

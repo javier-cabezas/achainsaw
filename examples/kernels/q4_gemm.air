@@ -1,0 +1,77 @@
+# Quantized matrix product for prefill on all cores: n tokens' activations x (f32 [n x k])
+# times a Q4_0 weight matrix W (m x k, packed as in q4_gemv.air), y = x W^T (f32 [n x m]).
+# Each token is quantized to int8 per 32-block (quantize_q8, one task per token); then one
+# task per 64-row chunk of W runs qmat_batch, which loads and unpacks each weight vector
+# once for 4 tokens, so W is read once per 4 tokens instead of once per token as n q4_gemv
+# calls would. Each token's results are exactly q4_gemv's.
+
+use quantize_q8, qmat_batch
+
+fn q4_gemm(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64, n:i64)
+  b0:
+    # int8 activations, k bytes per token; block records, k / 2 bytes per token
+    xq_bytes = mul n, k
+    xq = alloc xq_bytes
+    dx_bytes = udiv xq_bytes, 2:i64
+    dx = alloc dx_bytes
+    par n, quant_token(x, xq, dx, k)
+    # The matrix as qmat_batch takes it: weights, scales, format (1: Q4_0).
+    mat = alloc 24:i64
+    st mat, wq
+    st mat[1], scales
+    st mat[2], 1:i64
+    chunks = udiv m, 64:i64
+    par chunks, q4_gemm_chunk(mat, xq, dx, y, m, k, n)
+    free mat
+    free dx
+    free xq
+    ret
+
+# Token t's int8 activations and block records.
+fn quant_token(t:i64, x:ptr, xq:ptr, dx:ptr, k:i64)
+  b0:
+    k4 = mul k, 4:i64
+    x_off = mul t, k4
+    xt = add x, x_off
+    q_off = mul t, k
+    xqt = add xq, q_off
+    d_off = udiv q_off, 2:i64
+    dxt = add dx, d_off
+    call quantize_q8(xt, xqt, dxt, k)
+    ret
+
+# Rows 64c .. 64c + 64 of every token's output.
+fn q4_gemm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, m:i64, k:i64, n:i64)
+  b0:
+    w = vl f32
+    tmp_bytes = mul n, 256:i64
+    tmp = alloc tmp_bytes
+    call qmat_batch(c, mat, xq, dx, tmp, k, n, k)
+    m4 = mul m, 4:i64
+    c_off = mul c, 256:i64
+    jmp toks(0:i64)
+  toks(t:i64):
+    t_more = lt t, n
+    br t_more, tok_start, done
+  tok_start:
+    y_row = mul t, m4
+    y_t0 = add y, y_row
+    y_t = add y_t0, c_off
+    tmp_off = mul t, 256:i64
+    tmp_t = add tmp, tmp_off
+    jmp copy(0:i64)
+  copy(j:i64):
+    more = lt j, 64:i64
+    br more, copy_body, tok_next
+  copy_body:
+    rest = sub 64:i64, j
+    v = ldm tmp_t[j]:vx, rest:f32
+    stm y_t[j], v, rest:f32
+    j2 = add j, w
+    jmp copy(j2)
+  tok_next:
+    t2 = add t, 1:i64
+    jmp toks(t2)
+  done:
+    free tmp
+    ret

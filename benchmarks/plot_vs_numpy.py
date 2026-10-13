@@ -31,6 +31,11 @@ SHORT = {
     "add_rmsnorm": "Residual add + RMSNorm, n=4096",
     "q8_gemv": "Q8_0 GEMV 4096x4096, all cores",
     "q4_gemv": "Q4_0 GEMV 4096x4096, all cores",
+    "q4_gemm": "Q4_0 GEMM, 32 tokens, all cores",
+    "gqa_attention": "GQA attention decode, all cores",
+    "layernorm": "LayerNorm, n=4096",
+    "geglu": "GeGLU, n=14336",
+    "topk": "Top-k (k=40), 128256 logits",
 }
 
 THEMES = {

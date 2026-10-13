@@ -1,0 +1,98 @@
+# Top-k of n f32 logits, the selection step of top-k sampling (then a softmax over the k):
+# the k largest values in descending order at vals[0 .. k] with their indices (i64) at
+# idx[0 .. k], the first index first among equal values; 1 <= k <= n, no NaN.
+#
+# One pass at full vector width over groups of 4 vectors: a group's maximum (vmax, then
+# vmaxr) is compared with the current k-th best, and only a group that beats it (or any group
+# while the list is filling) is looked at further: each of its vectors that beats it is scanned
+# value by value, inserting into the sorted list. With logits in random order the list soon
+# holds large values and almost every group is skipped: about k ln(n / k) insertions in all.
+fn topk(x:ptr, n:i64, k:i64, vals:ptr, idx:ptr)
+  b0:
+    w = vl f32
+    w4 = mul w, 4:i64
+    km1 = sub k, 1:i64
+    low = cst -340282346638528859811704183484516925440.0:f32
+    jmp groups(0:i64, 0:i64, low)
+
+  # Whole groups of 4 vectors; cnt values are in the list, thr is its last one once full.
+  groups(i:i64, cnt:i64, thr:f32):
+    g_end = add i, w4
+    g_full = le g_end, n
+    br g_full, group_body, scan(i, n, 1:i32, 0:i64, cnt, thr)
+  group_body:
+    a = ld x[i:f32]:vx
+    i1 = add i, w
+    b = ld x[i1:f32]:vx
+    i2 = add i1, w
+    c = ld x[i2:f32]:vx
+    i3 = add i2, w
+    d = ld x[i3:f32]:vx
+    ab = vmax a, b:f32
+    cd = vmax c, d:f32
+    m = vmax ab, cd:f32
+    mr = vmaxr m:f32
+    beats = gt mr, thr
+    filling = lt cnt, k
+    take = or beats, filling
+    br take, vecs(i, 0:i64, cnt, thr), groups(g_end, cnt, thr)
+
+  # Vector q of the group at vi: scanned if it beats the current k-th best.
+  vecs(vi:i64, q:i64, vc:i64, vthr:f32):
+    q_more = lt q, 4:i64
+    br q_more, vec_body, groups(vi, vc, vthr)
+  vec_body:
+    vv = ld x[vi:f32]:vx
+    vmr = vmaxr vv:f32
+    v_beats = gt vmr, vthr
+    v_fill = lt vc, k
+    v_take = or v_beats, v_fill
+    v_end = add vi, w
+    q2 = add q, 1:i64
+    br v_take, scan(vi, v_end, 0:i32, q, vc, vthr), vecs(v_end, q2, vc, vthr)
+
+  # Values t .. end one at a time; `last` marks the final stretch of x, else they are
+  # vector sq of a group.
+  scan(t:i64, end:i64, last:i32, sq:i64, sc:i64, sthr:f32):
+    t_more = lt t, end
+    br t_more, scan_body, scan_done
+  scan_body:
+    v = ld x[t]:f32
+    s_beats = gt v, sthr
+    s_fill = lt sc, k
+    s_take = or s_beats, s_fill
+    t1 = add t, 1:i64
+    br s_take, insert, scan(t1, end, last, sq, sc, sthr)
+  # Insert v: from the end of the list (its last entry, dropped, once full), move smaller
+  # entries down one place.
+  insert:
+    full_now = ge sc, k
+    start = select full_now, km1, sc
+    jmp shift(start)
+  shift(j:i64):
+    j_pos = gt j, 0:i64
+    br j_pos, shift_cmp, place(j)
+  shift_cmp:
+    jm1 = sub j, 1:i64
+    pv = ld vals[jm1]:f32
+    smaller = lt pv, v
+    br smaller, shift_move, place(j)
+  shift_move:
+    st vals[j], pv
+    pi = ld idx[jm1]:i64
+    st idx[j], pi
+    jmp shift(jm1)
+  place(pj:i64):
+    st vals[pj], v
+    st idx[pj], t
+    sc1 = add sc, 1:i64
+    sc2 = min sc1, k
+    is_full = ge sc2, k
+    kth = ld vals[km1]:f32
+    nthr = select is_full, kth, sthr
+    jmp scan(t1, end, last, sq, sc2, nthr)
+  scan_done:
+    sq2 = add sq, 1:i64
+    br last, done, vecs(t, sq2, sc, sthr)
+  done:
+    ret
