@@ -1,0 +1,75 @@
+# LayerNorm over n f32 values with a weight and a bias, as in GPT-2, BERT, Whisper and ViT:
+#   out_i = (x_i - mean) / sqrt(var + eps) * w_i + b_i,   var = mean((x - mean)^2)
+# Three passes: the mean, the squared deviations from it (accurate even when |mean| is large
+# next to the spread, unlike mean(x^2) - mean^2), then the normalization. Vector-length
+# agnostic: masked tails for the mean and the normalization; the variance takes whole vectors,
+# then the last few values one at a time, so unused lanes stay out of it. Returns
+# 1 / sqrt(var + eps).
+fn layernorm(x:ptr, w:ptr, b:ptr, out:ptr, n:i64, eps:f32)->f32
+  b0:
+    z = cst 0.0:f32
+    zero = splat z:vx
+    lanes = vl f32
+    jmp sum(0:i64, zero)
+  sum(i:i64, acc:vx):
+    more = lt i, n
+    br more, sum_body, mean
+  sum_body:
+    rest = sub n, i
+    xv = ldm x[i]:vx, rest:f32
+    acc2 = vadd acc, xv:f32
+    i2 = add i, lanes
+    jmp sum(i2, acc2)
+  mean:
+    s = vsum acc:f32
+    nf = itof n:f32
+    mu = div s, nf
+    vmu = splat mu:vx
+    jmp dev(0:i64, zero)
+
+  # Squared deviations: whole vectors, then the partial one with its unused lanes zeroed.
+  dev(j:i64, acc_d:vx):
+    j_end = add j, lanes
+    full = le j_end, n
+    br full, dev_body, dev_tail
+  dev_body:
+    xd = ld x[j:f32]:vx
+    d = vsub xd, vmu:f32
+    acc_d2 = vfma d, d, acc_d:f32
+    jmp dev(j_end, acc_d2)
+  dev_tail:
+    sv = vsum acc_d:f32
+    jmp dev_rest(j, sv)
+  dev_rest(r:i64, ss:f32):
+    r_more = lt r, n
+    br r_more, dev_rest_body, variance
+  dev_rest_body:
+    xr = ld x[r]:f32
+    dr = sub xr, mu
+    ss2 = fma dr, dr, ss
+    r2 = add r, 1:i64
+    jmp dev_rest(r2, ss2)
+  variance:
+    var = div ss, nf
+    var_eps = add var, eps
+    sd = sqrt var_eps
+    inv = div 1.0:f32, sd
+    vinv = splat inv:vx
+    jmp norm(0:i64)
+
+  norm(k:i64):
+    more_k = lt k, n
+    br more_k, norm_body, done
+  norm_body:
+    rest_k = sub n, k
+    xk = ldm x[k]:vx, rest_k:f32
+    wk = ldm w[k]:vx, rest_k:f32
+    bk = ldm b[k]:vx, rest_k:f32
+    dk = vsub xk, vmu:f32
+    nk = vmul dk, vinv:f32
+    y = vfma nk, wk, bk:f32
+    stm out[k], y, rest_k:f32
+    k2 = add k, lanes
+    jmp norm(k2)
+  done:
+    ret inv
