@@ -31,6 +31,15 @@ little from the kernel's.
     python benchmarks/benchmark_decode.py --weights q8 --layers 4 --tokens 16 --no-numpy
     python benchmarks/benchmark_decode.py --prompt-tokens 512 --tokens 1 --no-numpy  # prefill
 
+    # Against llama.cpp on the same file (build llama-bench from github.com/ggml-org/llama.cpp):
+    python benchmarks/benchmark_decode.py --gguf model.gguf --threads 8 --prompt-tokens 512 \\
+        --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
+
+llama.cpp runs its own `llama-bench` (3 repetitions) with the same thread count: prefill of a
+prompt of the same length, then the same number of generated tokens after a context of that
+length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is f32) and has its own kernels and rounding, so
+only its speed is compared.
+
 NumPy and PyTorch run the prompt one token at a time. The prompt speed is the prefill time per prompt
 token; the decode speed covers the generated tokens only.
 """
@@ -38,6 +47,7 @@ token; the decode speed covers the generated tokens only.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -83,6 +93,19 @@ def generate(step, prompt_ids, n_new, stop, prefill=None):
     return out, prompt_s, times
 
 
+def llama_bench(path, gguf, prompt_tokens, gen_tokens, threads):
+    """llama.cpp's own benchmark on the same GGUF file: prefill of `prompt_tokens` tokens,
+    then `gen_tokens` generated after a context of that length (its --n-depth), as the AIR
+    kernel decodes after the prompt. Returns (prompt tokens/s, decode tokens/s, commit)."""
+    def run(*extra):
+        cmd = [path, "-m", gguf, "-t", str(threads), "-r", "3", "-o", "json", *extra]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        return json.loads(out)[0]
+    pp = run("-p", str(prompt_tokens), "-n", "0") if prompt_tokens > 1 else None
+    tg = run("-p", "0", "-n", str(gen_tokens), "-d", str(prompt_tokens))
+    return pp and pp["avg_ts"], tg["avg_ts"], tg["build_commit"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--gguf", metavar="PATH", help="Llama GGUF checkpoint (default: random)")
@@ -93,25 +116,40 @@ def main():
     parser.add_argument("--weights", choices=["q4", "q8"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
-    parser.add_argument("--prompt-tokens", type=int, default=16,
-                        help="random model: prompt length in random tokens (default: 16)")
+    parser.add_argument("--prompt-tokens", type=int,
+                        help="prompt length in random tokens (default: 16 for the random model; "
+                             "with --gguf it replaces --prompt, and generation ignores "
+                             "end-of-text tokens, as llama-bench does)")
     parser.add_argument("--backends", default="all")
     parser.add_argument("--threads", type=int,
                         help="threads for the kernel's par loops (default: all logical cores)")
     parser.add_argument("--no-numpy", action="store_true", help="skip the NumPy baseline")
     parser.add_argument("--no-torch", action="store_true",
                         help="skip the PyTorch baseline (skipped anyway without PyTorch)")
+    parser.add_argument("--llama-bench", metavar="PATH",
+                        help="with --gguf: also run llama.cpp's llama-bench on the same file, "
+                             "threads, prompt length and token count")
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args = parser.parse_args()
     use_torch = torch is not None and not args.no_torch
+    if args.llama_bench and not args.gguf:
+        parser.error("--llama-bench needs --gguf")
 
     t0 = time.perf_counter()
     if args.gguf:
         g = GGUF(args.gguf)
         tok = Tokenizer(g)
-        prompt = chat_prompt(args.prompt) if args.chat else args.prompt
-        prompt_ids = tok.encode(prompt)
-        stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>") if t in tok.ids}
+        if args.prompt_tokens:
+            # Random ordinary tokens (below the special ones), as llama-bench uses; no stop
+            # tokens, so every run generates exactly --tokens.
+            prompt_ids = [int(t) for t in np.random.default_rng(1).integers(
+                0, 128000, args.prompt_tokens)]
+            stop = set()
+        else:
+            prompt = chat_prompt(args.prompt) if args.chat else args.prompt
+            prompt_ids = tok.encode(prompt)
+            stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>")
+                    if t in tok.ids}
         model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
                                 numpy=not args.no_numpy, use_torch=use_torch)
         name = g.meta.get("general.name", os.path.basename(args.gguf))
@@ -122,7 +160,7 @@ def main():
     else:
         tok, stop = None, set()
         prompt_ids = [int(t) for t in np.random.default_rng(1).integers(
-            0, 128256, max(args.prompt_tokens, 1))]
+            0, 128256, max(args.prompt_tokens or 16, 1))]
         model = Model.random(d=2048, layers=args.layers, heads=32, kv_heads=8, head_dim=64,
                              ffn=8192, vocab=128256, max_ctx=len(prompt_ids) + args.tokens + 1,
                              fmt=args.weights, numpy=not args.no_numpy, use_torch=use_torch)
@@ -165,7 +203,7 @@ def main():
         out, prompt_s, times = generate(step, prompt_ids, args.tokens, stop, prefill)
         runs[be] = out
         report(f"AIR {be}, {kernel.threads} thr", prompt_s, times, be)
-        if tok:
+        if tok and not args.prompt_tokens:
             print("    " + repr(tok.decode(out)))
 
     if not args.no_numpy:
@@ -192,6 +230,15 @@ def main():
             same = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
                         min(len(toks), len(out)))
             print(f"  {be}: first {same} of {len(toks)} tokens match PyTorch")
+
+    if args.llama_bench:
+        threads = args.threads or os.cpu_count()
+        pp_ts, tg_ts, commit = llama_bench(args.llama_bench, args.gguf, len(prompt_ids),
+                                           args.tokens, threads)
+        # Its own prefill and decode rates, as the AIR rows report theirs.
+        prompt_s = len(prompt_ids) / pp_ts if pp_ts else 0.0
+        report(f"llama.cpp, {threads} thr", prompt_s, [1.0 / tg_ts], "llama.cpp")
+        print(f"    llama-bench build {commit}")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
