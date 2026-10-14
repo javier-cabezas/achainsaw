@@ -562,7 +562,7 @@ Llama 3.2 1B Instruct in Q4_0 (Q4_0 layers, two Q4_1 down projections, a Q6_K em
 
 | | ms/token | tokens/s | weights read per token |
 |---|---|---|---|
-| llama.cpp (CPU, `llama-bench -n 64 -t 8`) | 15.4 | 64.8 | 765 MB at 50 GB/s |
+| llama.cpp (CPU, build 6868a52, `llama-bench -n 64 -t 8`) | 15.1 | 66.3 | 765 MB at 51 GB/s |
 | AIR on LLVM, one call per token | 14.6 | 68.4 | 794 MB at 54 GB/s |
 | AIR on Cranelift, one call per token | 21.4 | 46.8 | 794 MB at 37 GB/s |
 | PyTorch 2.14, weight-only int4/int8 kernels | 29.7 | 33.7 | 884 MB at 30 GB/s |
@@ -572,12 +572,26 @@ The kernel prints the same text as llama.cpp (`llama-simple`, greedy), and its t
 
 PyTorch runs the same model eagerly on its weight-only quantized kernels (`benchmark_decode.py` uses them when PyTorch is installed; `--no-torch` skips it). Q4_0 matrices become int4 with the same 32-blocks; the Q8_0 down projections and the Q6_K LM head become int8 with one scale per row. Its tokens match too. Its int4 kernel streams weights at about half the rate of LLVM's `vdotu` loop, and it reads the int8 LM head instead of 6.5-bit Q6_K.
 
-Prefill of a 542-token prompt (`--prompt` with a long text), against the decode steps that follow it in the same run (one `llama_decode` call per token, the cost of feeding a prompt without prefill):
+**Against llama.cpp, by context length.** `benchmark_decode.py --llama-bench PATH` runs llama.cpp's own `llama-bench` on the same file, thread count, prompt length and number of generated tokens, and prints it as one more row (`--prompt-tokens N` makes the prompt N random tokens, as llama-bench's are):
 
-| | `llama_prefill`, ms/token | tokens/s | `llama_decode`, ms/token |
-|---|---|---|---|
-| AIR on LLVM | 2.32 | 432 | 16.3 |
-| AIR on Cranelift | 11.8 | 85 | 28.0 |
+```bash
+python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 \
+    --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
+```
+
+Prefill of the prompt (one `llama_prefill` call; llama-bench's `-p`), then 64 tokens generated after it (`llama_decode`; llama-bench's `-n 64 -d <prompt>`), 8 threads, llama.cpp build 6868a52 with its default f16 KV cache:
+
+| Context | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
+|---|---|---|---|---|
+| 64 tokens | 806 tokens/s (1.24 ms/token) | 434 tokens/s (2.30 ms/token) | 65.9 tokens/s (15.2 ms/token) | 67.4 tokens/s (14.9 ms/token) |
+| 512 tokens | 605 tokens/s (1.65 ms/token) | 437 tokens/s (2.29 ms/token) | 62.0 tokens/s (16.1 ms/token) | 60.5 tokens/s (16.5 ms/token) |
+| 2048 tokens | 299 tokens/s (3.34 ms/token) | 392 tokens/s (2.55 ms/token) | 47.5 tokens/s (21.0 ms/token) | 48.6 tokens/s (20.6 ms/token) |
+
+- **Short prompts prefill up to 1.9x faster than llama.cpp.** `llama_prefill` loads and unpacks each weight vector once per 4 tokens and runs the int8 dots on `vdotu`.
+- **Decode is level.** Both stream the weights at about the memory's bandwidth; run to run, each varies by about ±3%.
+- **Long contexts are llama.cpp's.** The kernel's attention takes one query head at a time over an f32 KV cache, and in prefill one token at a time, so its cost grows with the square of the prompt. At 2048 tokens llama.cpp prefills 1.3x faster and decodes 2% faster. [`gqa_attention.air`](examples/kernels/gqa_attention.air)'s approach (a group's query heads together over a bf16 cache, positions split across cores) is the fix.
+- With 16 threads (two per core) at 512 tokens, AIR prefills 609 tokens/s and decodes 55.3 tokens/s; llama.cpp 533 and 53.2. Both decode faster on 8.
+- Cranelift prefills 118, 112 and 71 tokens/s and decodes 40.8, 38.2 and 25.9 tokens/s at the three lengths.
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
