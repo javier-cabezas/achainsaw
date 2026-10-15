@@ -274,11 +274,21 @@ class TestGGUFDecode(unittest.TestCase):
             cache, h = m.new_cache(), np.zeros(m.d, dtype=np.float32)
             np_cache = m.numpy_cache()
             token, checked = 1, 0
+            planes = cache.reshape(len(m.layers), 2, m.nkv, m.max_ctx, m.hd)
             for pos in range(8):
                 got = k.run("llama_decode", m.table, m.cfg, cache, token, pos, h, float(m.eps))
                 want = m.numpy_step(np_cache, token, pos)
+                # The KV cache holds bf16 values; NumPy's f32 K and V can round to the
+                # neighboring bf16 value where they sit at a rounding boundary.
+                for l, (kc, vc) in enumerate(np_cache):
+                    for kv, ref in enumerate((kc[pos], vc[pos])):
+                        bits = planes[l, kv, :, pos, :].astype(np.uint32) << 16
+                        np.testing.assert_allclose(bits.view(np.float32), ref, rtol=2.0 ** -7,
+                                                   err_msg=f"{be} cache l={l} pos {pos}")
+                # Such a step can flip an int8 quantization of a later attention output,
+                # which moves the hidden state by up to about 0.5% of its scale.
                 scale = np.abs(m.last_h).max()
-                np.testing.assert_allclose(h, m.last_h, atol=2e-3 * scale,
+                np.testing.assert_allclose(h, m.last_h, atol=1e-2 * scale,
                                            err_msg=f"{be} pos {pos}")
                 top = np.sort(m.last_logits)[-2:]
                 if top[1] - top[0] > 1e-3 * np.abs(m.last_logits).max():

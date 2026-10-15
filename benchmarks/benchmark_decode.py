@@ -7,14 +7,15 @@ The AIR kernel runs the whole prompt in one llama_prefill call (4 tokens per wei
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
 Q4_0 or Q8_0 weights with f32 block scales, activations quantized to int8 per 32-block on
-the fly, exact integer block dots, f32 for everything else (embedding, norms, RoPE, KV cache,
-attention). They share the same weights (NumPy reads them block-major), so they should
+the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
+RoPE, attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights
 to f32 in each call and runs the block dots as a batched f32 BLAS matmul (exact here).
 The kernel compiles with fast_math=True (float min/max as compare and select).
 
 PyTorch (eager, CPU) runs the same model on its weight-only quantized kernels, the path
-torchao uses on CPU, with bf16 activations into each matrix and f32 elsewhere. Q4_0
+torchao uses on CPU, with bf16 activations into each matrix, bf16 attention on a bf16 KV
+cache, and f32 elsewhere. Q4_0
 matrices keep their 4-bit values and 32-blocks; Q8_0 and Q6_K ones are requantized to int8
 with one scale per row, as PyTorch has no per-block int8 kernel, so its tokens can differ a
 little from the kernel's.
@@ -37,8 +38,8 @@ little from the kernel's.
 
 llama.cpp runs its own `llama-bench` (3 repetitions) with the same thread count: prefill of a
 prompt of the same length, then the same number of generated tokens after a context of that
-length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is f32) and has its own kernels and rounding, so
-only its speed is compared.
+length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is bf16) and has its own
+kernels and rounding, so only its speed is compared.
 
 NumPy and PyTorch run the prompt one token at a time. The prompt speed is the prefill time per prompt
 token; the decode speed covers the generated tokens only.

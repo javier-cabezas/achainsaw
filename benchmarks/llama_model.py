@@ -231,6 +231,13 @@ def _q6_k_values(b):
     return q.reshape(rows, nsb * 8, 32), scales.reshape(rows, nsb * 16)
 
 
+def bf16_round(x):
+    """x rounded to bfloat16 (nearest even), as f32: the values the kernel's KV cache holds."""
+    b = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    r = ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) << 16
+    return r.astype(np.uint32).view(np.float32).reshape(np.shape(x))
+
+
 def rope_tables(max_ctx, head_dim, base, freq_factors=None):
     """cos and sin [max_ctx x head_dim/2] as llama.cpp computes them: theta_i = pos *
     base^(-2i/head_dim), by repeated f32 multiplication, divided by the frequency factor."""
@@ -369,7 +376,9 @@ class Model:
                    for t in ((m.t_w, m.t_sz) if m.fmt == "q4" else (m.t_w, m.t_s)))
 
     def new_cache(self):
-        return np.zeros(len(self.layers) * 2 * self.max_ctx * self.nkv * self.hd, dtype=np.float32)
+        """The kernel's KV cache: per layer, K then V, each bf16 [nkv x max_ctx x hd] (raw
+        u16 bits)."""
+        return np.zeros(len(self.layers) * 2 * self.nkv * self.max_ctx * self.hd, dtype=np.uint16)
 
     # NumPy forward pass of the same model (needs numpy=True at construction).
     def norm(self, h, w):
@@ -382,6 +391,7 @@ class Model:
         return np.concatenate([a * c - b * s, b * c + a * s], axis=-1)
 
     def numpy_cache(self):
+        # f32 arrays holding bf16 values, as the kernel's cache does.
         return [(np.zeros((self.max_ctx, self.nkv, self.hd), np.float32),
                  np.zeros((self.max_ctx, self.nkv, self.hd), np.float32)) for _ in self.layers]
 
@@ -392,8 +402,8 @@ class Model:
             kc, vc = cache[l]
             qkv = layer["qkv"].matvec(self.norm(h, layer["attn_norm"]))
             q = self.rope(qkv[:nh * hd].reshape(nh, hd), pos)
-            kc[pos] = self.rope(qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), pos)
-            vc[pos] = qkv[(nh + nkv) * hd:].reshape(nkv, hd)
+            kc[pos] = bf16_round(self.rope(qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), pos))
+            vc[pos] = bf16_round(qkv[(nh + nkv) * hd:].reshape(nkv, hd))
             keys = np.repeat(kc[:pos + 1], nh // nkv, axis=1)       # [t, nh, hd]
             vals = np.repeat(vc[:pos + 1], nh // nkv, axis=1)
             scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(hd))
@@ -410,8 +420,9 @@ class Model:
     # PyTorch forward pass of the same model (needs use_torch=True at construction): the
     # matrices on PyTorch's weight-only kernels (Mat.torch_matvec), everything else in f32.
     def torch_cache(self):
-        return [(torch.zeros(self.max_ctx, self.nkv, self.hd), torch.zeros(self.max_ctx, self.nkv, self.hd))
-                for _ in self.layers]
+        # bf16 [nkv x max_ctx x hd], as the kernel's.
+        return [tuple(torch.zeros(self.nkv, self.max_ctx, self.hd, dtype=torch.bfloat16)
+                      for _ in range(2)) for _ in self.layers]
 
     def torch_rope(self, x, pos):
         half = self.hd // 2
@@ -431,11 +442,13 @@ class Model:
             kc, vc = cache[l]
             qkv = layer["qkv"].torch_matvec(norm(h, layer["attn_norm"]))
             q = self.torch_rope(qkv[:nh * hd].view(nh, hd), pos)
-            kc[pos] = self.torch_rope(qkv[nh * hd:(nh + nkv) * hd].view(nkv, hd), pos)
-            vc[pos] = qkv[(nh + nkv) * hd:].view(nkv, hd)
-            keys = kc[:pos + 1].transpose(0, 1)[None]                 # [1, nkv, t, hd]
-            vals = vc[:pos + 1].transpose(0, 1)[None]
-            attn = F.scaled_dot_product_attention(q[None, :, None], keys, vals, enable_gqa=True)
+            kc[:, pos] = self.torch_rope(qkv[nh * hd:(nh + nkv) * hd].view(nkv, hd), pos)
+            vc[:, pos] = qkv[(nh + nkv) * hd:].view(nkv, hd)
+            keys, vals = kc[None, :, :pos + 1], vc[None, :, :pos + 1]  # [1, nkv, t, hd]
+            # Each KV head's query heads as its query positions: the same math as
+            # enable_gqa=True with one position per head, which leaves SDPA's fast path.
+            qg = q.view(1, nkv, nh // nkv, hd).bfloat16()
+            attn = F.scaled_dot_product_attention(qg, keys, vals).float()
             h = h + layer["o"].torch_matvec(attn.reshape(-1))
             gu = layer["gate_up"].torch_matvec(norm(h, layer["ffn_norm"])).view(-1, 2, 64)
             g, u = gu[:, 0].reshape(-1), gu[:, 1].reshape(-1)
