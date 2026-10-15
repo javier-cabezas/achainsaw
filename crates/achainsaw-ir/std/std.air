@@ -566,3 +566,346 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
     jmp loop(i2)
   done:
     ret
+
+# Attention of `group` query heads (f32 rows of hd at qg) over nt >= 1 positions of one KV
+# head, whose K and V rows (hd bf16 values each) start at kb and vb: one split of
+# flash-decoding. For head r it writes at pg + r * head_b the max m of its scores (dot
+# products times `scale`), the sum of exp(score - m), and the hd outputs sum_t
+# exp(score_t - m) V[t], unnormalized; attn_merge combines splits. Heads go 4 at a time with
+# their dot products, then their outputs, in registers, so each K and V vector is widened
+# from bf16 once for 4 heads (then one head at a time for the rest of the group).
+fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f32, head_b:i64)
+  b0:
+    w16 = vl bf16
+    w32 = vl f32
+    zero = splat 0.0:f32:vx
+    low = cst -340282346638528859811704183484516925440.0:f32
+    v_low = splat low:vx
+    row2 = mul hd, 2:i64
+    hd4 = mul hd, 4:i64
+    # scores [group x nt]
+    ntb = mul nt, 4:i64
+    sc_bytes = mul group, ntb
+    sc = alloc sc_bytes
+    quads_end0 = udiv group, 4:i64
+    quads_end = mul quads_end0, 4:i64
+    jmp score(0:i64)
+
+  # Scores of position t: 4 heads at a time, each K vector widened once for the 4.
+  score(t:i64):
+    t_more = lt t, nt
+    br t_more, score_start, softmax(0:i64)
+  score_start:
+    k_off = mul t, row2
+    kt = add kb, k_off
+    jmp sq_heads(0:i64)
+  sq_heads(r:i64):
+    r_more = lt r, quads_end
+    br r_more, sq_start, ss_heads(r)
+  sq_start:
+    qr_off = mul r, hd4
+    q0 = add qg, qr_off
+    q1 = add q0, hd4
+    q2 = add q1, hd4
+    q3 = add q2, hd4
+    jmp sq_dot(0:i64, zero, zero, zero, zero)
+  sq_dot(j:i64, a0:vx, a1:vx, a2:vx, a3:vx):
+    j_more = lt j, hd
+    br j_more, sq_dot_body, sq_store
+  sq_dot_body:
+    rest = sub hd, j
+    kv = ldm kt[j]:vx, rest:bf16
+    klo = vfwidenlo kv:bf16
+    khi = vfwidenhi kv:bf16
+    rest_hi0 = sub rest, w32
+    rest_hi = max rest_hi0, 0:i64
+    j_hi = add j, w32
+    x0l = ldm q0[j]:vx, rest:f32
+    x0h = ldm q0[j_hi]:vx, rest_hi:f32
+    b0l = vfma klo, x0l, a0:f32
+    b0h = vfma khi, x0h, b0l:f32
+    x1l = ldm q1[j]:vx, rest:f32
+    x1h = ldm q1[j_hi]:vx, rest_hi:f32
+    b1l = vfma klo, x1l, a1:f32
+    b1h = vfma khi, x1h, b1l:f32
+    x2l = ldm q2[j]:vx, rest:f32
+    x2h = ldm q2[j_hi]:vx, rest_hi:f32
+    b2l = vfma klo, x2l, a2:f32
+    b2h = vfma khi, x2h, b2l:f32
+    x3l = ldm q3[j]:vx, rest:f32
+    x3h = ldm q3[j_hi]:vx, rest_hi:f32
+    b3l = vfma klo, x3l, a3:f32
+    b3h = vfma khi, x3h, b3l:f32
+    j2 = add j, w16
+    jmp sq_dot(j2, b0h, b1h, b2h, b3h)
+  sq_store:
+    si0 = mul r, nt
+    si = add si0, t
+    e0 = vsum a0:f32
+    f0 = mul e0, scale
+    st sc[si], f0
+    si1 = add si, nt
+    e1 = vsum a1:f32
+    f1 = mul e1, scale
+    st sc[si1], f1
+    si2 = add si1, nt
+    e2 = vsum a2:f32
+    f2 = mul e2, scale
+    st sc[si2], f2
+    si3 = add si2, nt
+    e3 = vsum a3:f32
+    f3 = mul e3, scale
+    st sc[si3], f3
+    r4 = add r, 4:i64
+    jmp sq_heads(r4)
+  # The rest of the group, one head at a time.
+  ss_heads(u:i64):
+    u_more = lt u, group
+    br u_more, ss_start, score_next
+  ss_start:
+    qu_off = mul u, hd4
+    qu = add qg, qu_off
+    jmp ss_dot(0:i64, zero)
+  ss_dot(sj:i64, acc:vx):
+    sj_more = lt sj, hd
+    br sj_more, ss_dot_body, ss_store
+  ss_dot_body:
+    srest = sub hd, sj
+    skv = ldm kt[sj]:vx, srest:bf16
+    sklo = vfwidenlo skv:bf16
+    skhi = vfwidenhi skv:bf16
+    srest_hi0 = sub srest, w32
+    srest_hi = max srest_hi0, 0:i64
+    sj_hi = add sj, w32
+    sxl = ldm qu[sj]:vx, srest:f32
+    sxh = ldm qu[sj_hi]:vx, srest_hi:f32
+    acc1 = vfma sklo, sxl, acc:f32
+    acc2 = vfma skhi, sxh, acc1:f32
+    sj2 = add sj, w16
+    jmp ss_dot(sj2, acc2)
+  ss_store:
+    su0 = mul u, nt
+    su = add su0, t
+    ev = vsum acc:f32
+    fv = mul ev, scale
+    st sc[su], fv
+    u2 = add u, 1:i64
+    jmp ss_heads(u2)
+  score_next:
+    t2 = add t, 1:i64
+    jmp score(t2)
+
+  # Per head: the split's max (whole vectors, then the rest one by one), then the
+  # exponentials in place and their sum.
+  softmax(h:i64):
+    h_more = lt h, group
+    br h_more, sm_head, pv(0:i64)
+  sm_head:
+    srow0 = mul h, ntb
+    srow = add sc, srow0
+    jmp sm_vmax(0:i64, v_low)
+  sm_vmax(um:i64, mv:vx):
+    u_end = add um, w32
+    u_full = le u_end, nt
+    br u_full, sm_vmax_body, sm_reduce
+  sm_vmax_body:
+    sv = ld srow[um:f32]:vx
+    mv2 = vmax mv, sv:f32
+    jmp sm_vmax(u_end, mv2)
+  sm_reduce:
+    mr = vmaxr mv:f32
+    jmp sm_smax(um, mr)
+  sm_smax(uu:i64, mx:f32):
+    uu_more = lt uu, nt
+    br uu_more, sm_smax_body, sm_exp
+  sm_smax_body:
+    s1 = ld srow[uu]:f32
+    mx2 = max mx, s1
+    uu2 = add uu, 1:i64
+    jmp sm_smax(uu2, mx2)
+  sm_exp:
+    total = call exp_shift(srow, nt, mx)
+    pr_off = mul h, head_b
+    prow = add pg, pr_off
+    st prow, mx
+    st prow[1], total
+    h2 = add h, 1:i64
+    jmp softmax(h2)
+
+  # o[r] = sum_t p[r][t] V[t], one vector of V's columns at a time (outer loop), so the 4
+  # heads' sums for it stay in registers over all positions of the split.
+  pv(c:i64):
+    c_more = lt c, hd
+    br c_more, pv_cols, done
+  pv_cols:
+    c_rest = sub hd, c
+    c_rest_hi0 = sub c_rest, w32
+    c_rest_hi = max c_rest_hi0, 0:i64
+    c_hi = add c, w32
+    jmp pq_heads(0:i64)
+  pq_heads(pr:i64):
+    pr_more = lt pr, quads_end
+    br pr_more, pq_start, ps_heads(pr)
+  pq_start:
+    p0 = mul pr, ntb
+    pp0 = add sc, p0
+    pp1 = add pp0, ntb
+    pp2 = add pp1, ntb
+    pp3 = add pp2, ntb
+    jmp pq_pos(0:i64, zero, zero, zero, zero, zero, zero, zero, zero)
+  pq_pos(pt:i64, o0l:vx, o0h:vx, o1l:vx, o1h:vx, o2l:vx, o2h:vx, o3l:vx, o3h:vx):
+    pt_more = lt pt, nt
+    br pt_more, pq_pos_body, pq_store
+  pq_pos_body:
+    v_off = mul pt, row2
+    vt = add vb, v_off
+    vv = ldm vt[c]:vx, c_rest:bf16
+    vlo = vfwidenlo vv:bf16
+    vhi = vfwidenhi vv:bf16
+    y0 = ld pp0[pt]:f32
+    vy0 = splat y0:vx
+    n0l = vfma vlo, vy0, o0l:f32
+    n0h = vfma vhi, vy0, o0h:f32
+    y1 = ld pp1[pt]:f32
+    vy1 = splat y1:vx
+    n1l = vfma vlo, vy1, o1l:f32
+    n1h = vfma vhi, vy1, o1h:f32
+    y2 = ld pp2[pt]:f32
+    vy2 = splat y2:vx
+    n2l = vfma vlo, vy2, o2l:f32
+    n2h = vfma vhi, vy2, o2h:f32
+    y3 = ld pp3[pt]:f32
+    vy3 = splat y3:vx
+    n3l = vfma vlo, vy3, o3l:f32
+    n3h = vfma vhi, vy3, o3h:f32
+    pt2 = add pt, 1:i64
+    jmp pq_pos(pt2, n0l, n0h, n1l, n1h, n2l, n2h, n3l, n3h)
+  pq_store:
+    po_off = mul pr, head_b
+    or0 = add pg, po_off
+    od0 = add or0, 8:i64
+    stm od0[c], o0l, c_rest:f32
+    stm od0[c_hi], o0h, c_rest_hi:f32
+    od1 = add od0, head_b
+    stm od1[c], o1l, c_rest:f32
+    stm od1[c_hi], o1h, c_rest_hi:f32
+    od2 = add od1, head_b
+    stm od2[c], o2l, c_rest:f32
+    stm od2[c_hi], o2h, c_rest_hi:f32
+    od3 = add od2, head_b
+    stm od3[c], o3l, c_rest:f32
+    stm od3[c_hi], o3h, c_rest_hi:f32
+    pr4 = add pr, 4:i64
+    jmp pq_heads(pr4)
+  ps_heads(ph:i64):
+    ph_more = lt ph, group
+    br ph_more, ps_start, pv_next
+  ps_start:
+    ps0 = mul ph, ntb
+    pps = add sc, ps0
+    jmp ps_pos(0:i64, zero, zero)
+  ps_pos(st_:i64, osl:vx, osh:vx):
+    st_more = lt st_, nt
+    br st_more, ps_pos_body, ps_store
+  ps_pos_body:
+    sv_off = mul st_, row2
+    svt = add vb, sv_off
+    svv = ldm svt[c]:vx, c_rest:bf16
+    svlo = vfwidenlo svv:bf16
+    svhi = vfwidenhi svv:bf16
+    ys = ld pps[st_]:f32
+    vys = splat ys:vx
+    nsl = vfma svlo, vys, osl:f32
+    nsh = vfma svhi, vys, osh:f32
+    st2 = add st_, 1:i64
+    jmp ps_pos(st2, nsl, nsh)
+  ps_store:
+    pso_off = mul ph, head_b
+    psr = add pg, pso_off
+    psd = add psr, 8:i64
+    stm psd[c], osl, c_rest:f32
+    stm psd[c_hi], osh, c_rest_hi:f32
+    ph2 = add ph, 1:i64
+    jmp ps_heads(ph2)
+  pv_next:
+    c2 = add c, w16
+    jmp pv(c2)
+  done:
+    free sc
+    ret
+
+# Merges `splits` flash-decoding splits of one query head (attn_split's records: max, sum,
+# hd outputs; rowb bytes apart from hp) into out[0 .. hd]: each split's outputs and sum are
+# rescaled by exp(m_split - m) for the overall max m, added in split order, and the outputs
+# divided by the total.
+fn attn_merge(hp:ptr, splits:i64, rowb:i64, hd:i64, oh:ptr)
+  b0:
+    w = vl f32
+    z = cst 0.0:f32
+    zero = splat z:vx
+    m0 = ld hp:f32
+    jmp mmax(1:i64, m0)
+  mmax(s:i64, mx:f32):
+    s_more = lt s, splits
+    br s_more, mmax_body, zero_out(0:i64)
+  mmax_body:
+    ps_off = mul s, rowb
+    ps = add hp, ps_off
+    ms = ld ps:f32
+    mx2 = max mx, ms
+    s2 = add s, 1:i64
+    jmp mmax(s2, mx2)
+  zero_out(zo:i64):
+    zo_more = lt zo, hd
+    br zo_more, zero_out_body, splits_loop(0:i64, z)
+  zero_out_body:
+    zo_rest = sub hd, zo
+    stm oh[zo], zero, zo_rest:f32
+    zo2 = add zo, w
+    jmp zero_out(zo2)
+  # out += exp(m_s - m) o_s, total += exp(m_s - m) l_s
+  splits_loop(sp:i64, tot:f32):
+    sp_more = lt sp, splits
+    br sp_more, split_start, finish
+  split_start:
+    sp_off = mul sp, rowb
+    sp_row = add hp, sp_off
+    m_s = ld sp_row:f32
+    l_s = ld sp_row[1]:f32
+    dm = sub m_s, mx
+    vdm = splat dm:vx
+    ve = vexp vdm:f32
+    e = extlane ve, 0:f32
+    tot2 = fma l_s, e, tot
+    o_s = add sp_row, 8:i64
+    jmp acc_cols(0:i64)
+  acc_cols(c:i64):
+    c_more = lt c, hd
+    br c_more, acc_body, split_next
+  acc_body:
+    c_rest = sub hd, c
+    ov = ldm o_s[c]:vx, c_rest:f32
+    cur = ldm oh[c]:vx, c_rest:f32
+    nv = vfma ov, ve, cur:f32
+    stm oh[c], nv, c_rest:f32
+    c2 = add c, w
+    jmp acc_cols(c2)
+  split_next:
+    sp2 = add sp, 1:i64
+    jmp splits_loop(sp2, tot2)
+  finish:
+    inv = div 1.0:f32, tot
+    vinv = splat inv:vx
+    jmp scale_cols(0:i64)
+  scale_cols(f:i64):
+    f_more = lt f, hd
+    br f_more, scale_body, done
+  scale_body:
+    f_rest = sub hd, f
+    fv = ldm oh[f]:vx, f_rest:f32
+    fv2 = vmul fv, vinv:f32
+    stm oh[f], fv2, f_rest:f32
+    f2 = add f, w
+    jmp scale_cols(f2)
+  done:
+    ret

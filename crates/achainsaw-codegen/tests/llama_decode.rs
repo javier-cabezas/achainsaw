@@ -163,6 +163,11 @@ impl Mat {
     }
 }
 
+/// Rounds to bf16 (nearest even), as the kernel stores its KV cache.
+fn bf16_round(v: f64) -> f64 {
+    half::bf16::from_f32(v as f32).to_f64()
+}
+
 /// x quantized per 32-block as the kernel's `quantize_q8` does (f32 arithmetic).
 fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
     let mut xq = vec![0i8; x.len()];
@@ -300,8 +305,8 @@ impl Model {
         }
     }
 
-    /// One decode step; `cache[l]` is (K, V), each [max_ctx][nkv][hd]. Returns the hidden
-    /// state and the logits.
+    /// One decode step; `cache[l]` is (K, V), each [max_ctx][nkv][hd] holding bf16 values.
+    /// Returns the hidden state and the logits.
     fn step(
         &self,
         cache: &mut [(Vec<f64>, Vec<f64>)],
@@ -324,8 +329,10 @@ impl Model {
                 self.rope(&mut k, pos);
                 let v = &qkv[(nh + nkv + g) * hd..(nh + nkv + g + 1) * hd];
                 let at = (pos * nkv + g) * hd;
-                kc[at..at + hd].copy_from_slice(&k);
-                vc[at..at + hd].copy_from_slice(v);
+                for j in 0..hd {
+                    kc[at + j] = bf16_round(k[j]);
+                    vc[at + j] = bf16_round(v[j]);
+                }
             }
             let mut attn = vec![0f32; nh * hd];
             for hq in 0..nh {
@@ -394,7 +401,7 @@ impl Model {
     }
 }
 
-type Decode = extern "C" fn(*const usize, *const i64, *mut f32, i64, i64, *mut f32, f32) -> i64;
+type Decode = extern "C" fn(*const usize, *const i64, *mut u16, i64, i64, *mut f32, f32) -> i64;
 
 fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
     let host = CpuFeatures::host();
@@ -445,7 +452,8 @@ fn check_decode(mixed: bool) {
         );
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
-        let mut cache = vec![0f32; model.layers.len() * 2 * plane];
+        // bf16 bits, per layer K then V, each [nkv][max_ctx][hd].
+        let mut cache = vec![0u16; model.layers.len() * 2 * plane];
         let mut ref_cache = vec![(vec![0f64; plane], vec![0f64; plane]); model.layers.len()];
         let mut token = 7usize;
         let mut checked_tokens = 0;
@@ -468,10 +476,12 @@ fn check_decode(mixed: bool) {
                     "h[{i}] at pos {pos}, {level}: got {got}, want {want} (scale {scale})"
                 );
             }
+            let bf = |b: u16| half::bf16::from_bits(b).to_f64();
             for (l, (kr, vr)) in ref_cache.iter().enumerate() {
-                let base = l * 2 * plane + pos * model.nkv * model.hd;
                 for j in 0..model.nkv * model.hd {
-                    let (k, v) = (cache[base + j] as f64, cache[base + plane + j] as f64);
+                    let (g, e) = (j / model.hd, j % model.hd);
+                    let at = l * 2 * plane + (g * model.max_ctx + pos) * model.hd + e;
+                    let (k, v) = (bf(cache[at]), bf(cache[at + plane]));
                     let (kw, vw) = (
                         kr[pos * model.nkv * model.hd + j],
                         vr[pos * model.nkv * model.hd + j],
@@ -505,7 +515,7 @@ fn check_decode(mixed: bool) {
 }
 
 type Prefill =
-    extern "C" fn(*const usize, *const i64, *mut f32, *const i64, i64, i64, *mut f32, f32) -> i64;
+    extern "C" fn(*const usize, *const i64, *mut u16, *const i64, i64, i64, *mut f32, f32) -> i64;
 
 /// `llama_prefill` over a prompt gives exactly what `llama_decode` gives token by token:
 /// the same KV cache bits, final hidden state bits and next token, whether the prompt goes
@@ -518,9 +528,22 @@ fn llama_prefill_matches_decode_exactly() {
     ))
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
-    let prompt: [i64; 6] = [7, 300, 42, 511, 0, 99];
-    for mixed in [false, true] {
-        let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
+    // A short prompt, and one past two 256-position attention splits; each also in pieces.
+    let mut rng = Rng(11);
+    let long: Vec<i64> = (0..530)
+        .map(|_| (rng.next().abs() * 511.0) as i64)
+        .collect();
+    let short = vec![7, 300, 42, 511, 0, 99];
+    // (mixed formats, prompt, context length, ways to split the prompt into prefill calls)
+    type Case<'a> = (bool, &'a [i64], usize, &'a [&'a [usize]]);
+    let cases: [Case; 4] = [
+        (false, &short, 8, &[&[6], &[1, 5]]),
+        (true, &short, 8, &[&[6], &[1, 5]]),
+        (false, &long, 530, &[&[530], &[255, 2, 273]]),
+        (true, &long, 530, &[&[300, 230]]),
+    ];
+    for &(mixed, prompt, max_ctx, all_pieces) in &cases {
+        let model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         let (table, cfg) = model.tables();
         let cache_len = model.layers.len() * 2 * model.max_ctx * model.nkv * model.hd;
         for (level, features) in host_levels() {
@@ -532,7 +555,7 @@ fn llama_prefill_matches_decode_exactly() {
                 unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
             let ctx = format!("{level}{}", if mixed { " mixed Q4/Q8/Q6" } else { "" });
 
-            let mut cache = vec![0f32; cache_len];
+            let mut cache = vec![0u16; cache_len];
             let mut h = vec![f32::NAN; model.d];
             let mut next = 0;
             for (pos, &tok) in prompt.iter().enumerate() {
@@ -547,8 +570,8 @@ fn llama_prefill_matches_decode_exactly() {
                 );
             }
 
-            for pieces in [&[6usize][..], &[1, 5]] {
-                let mut p_cache = vec![0f32; cache_len];
+            for &pieces in all_pieces {
+                let mut p_cache = vec![0u16; cache_len];
                 let mut p_h = vec![f32::NAN; model.d];
                 let mut p_next = -1;
                 let mut pos = 0;
@@ -572,12 +595,79 @@ fn llama_prefill_matches_decode_exactly() {
                     bits(&h),
                     "hidden state, pieces {pieces:?}, {ctx}"
                 );
-                assert_eq!(
-                    bits(&p_cache),
-                    bits(&cache),
-                    "KV cache, pieces {pieces:?}, {ctx}"
-                );
+                assert!(p_cache == cache, "KV cache, pieces {pieces:?}, {ctx}");
             }
         }
+    }
+}
+
+/// A 520-token prompt through `llama_prefill`, then one `llama_decode` step, against the f64
+/// reference: attention over three 256-position splits, merged. The kernel rounds f32 K and
+/// V values to bf16 and the reference f64 ones, so a value at a rounding boundary can land a
+/// bf16 step apart (a few in the first 64 positions); that can flip an int8 quantization of
+/// the attention output, and the flip carries into the next layer's K and V. Such flips
+/// move the hidden state by up to about 0.5% of its scale, against whole units for a wrong
+/// split; `gqa_attention`'s test checks the splits' arithmetic itself to 1e-4.
+#[test]
+fn llama_long_context_matches_reference() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/kernels/llama_decode.air"
+    ))
+    .unwrap();
+    let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
+    let model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
+    let (table, cfg) = model.tables();
+    let plane = model.max_ctx * model.nkv * model.hd;
+    let mut rng = Rng(23);
+    let prompt: Vec<i64> = (0..520)
+        .map(|_| (rng.next().abs() * 511.0) as i64)
+        .collect();
+    let mut ref_cache = vec![(vec![0f64; plane], vec![0f64; plane]); model.layers.len()];
+    let mut ref_h = Vec::new();
+    for (pos, &tok) in prompt.iter().enumerate() {
+        ref_h = model.step(&mut ref_cache, tok as usize, pos).0;
+    }
+    let close = |got: &[f32], want: &[f64], what: &str| {
+        let scale = want.iter().fold(0f64, |a, v| a.max(v.abs()));
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g as f64 - w).abs() <= 1e-2 * scale,
+                "{what} h[{i}]: got {g}, want {w} (scale {scale})"
+            );
+        }
+    };
+    for (level, features) in host_levels() {
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.compile_module(&module).unwrap();
+        let decode: Decode =
+            unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
+        let prefill: Prefill =
+            unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
+        let mut cache = vec![0u16; model.layers.len() * 2 * plane];
+        let mut h = vec![f32::NAN; model.d];
+        let next = prefill(
+            table.as_ptr(),
+            cfg.as_ptr(),
+            cache.as_mut_ptr(),
+            prompt.as_ptr(),
+            prompt.len() as i64,
+            0,
+            h.as_mut_ptr(),
+            model.eps,
+        );
+        close(&h, &ref_h, &format!("after the prompt, {level}"));
+        decode(
+            table.as_ptr(),
+            cfg.as_ptr(),
+            cache.as_mut_ptr(),
+            next,
+            prompt.len() as i64,
+            h.as_mut_ptr(),
+            model.eps,
+        );
+        let mut rc = ref_cache.clone();
+        let (want, _) = model.step(&mut rc, next as usize, prompt.len());
+        close(&h, &want, &format!("decode at position 520, {level}"));
     }
 }
