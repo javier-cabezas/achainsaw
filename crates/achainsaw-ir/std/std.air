@@ -328,8 +328,7 @@ inline fn qmat_w4(wb:ptr, g:i64)->(vx, vx)
 
 # Q6_K weights of groups g and g + 4, unsigned (value + 32): Q4_0's nibbles with their high
 # 2 bits from the second plane (group g % 2, bit pairs g / 2 and g / 2 + 2), each pair moved
-# to bits 4..5 with one shift. The shifts run on 16-bit lanes (x86 has no 8-bit ones), which
-# is exact here: bits 4..5 of each byte come from bits of the same byte.
+# to bits 4..5 with one shift and a mask.
 inline fn qmat_w6(wb:ptr, g:i64)->(vx, vx)
   b0:
     o = shl g, 8:i64
@@ -345,16 +344,16 @@ inline fn qmat_w6(wb:ptr, g:i64)->(vx, vx)
     pair = ushr g, 1:i64
     sh = shl pair, 1:i64
     up = sub 4:i64, sh
-    bl0 = vshl hp, up:i16
+    bl0 = vshl hp, up:i8
     bl = vand bl0, top2:i8
     wl = vor l4, bl:i8
-    bh0 = vushr hp, sh:i16
+    bh0 = vushr hp, sh:i8
     bh = vand bh0, top2:i8
     wh = vor h4, bh:i8
     ret wl, wh
 
 # Q5_K weights of groups g and g + 4, values 0..31: Q4_0's nibbles with their top bits from
-# the second plane (bits g and 4 + g, moved to bit 4 by 16-bit lane shifts, as in qmat_w6).
+# the second plane (bits g and 4 + g, each moved to bit 4 with one shift and a mask).
 inline fn qmat_w5(wb:ptr, g:i64)->(vx, vx)
   b0:
     o = shl g, 8:i64
@@ -365,10 +364,10 @@ inline fn qmat_w5(wb:ptr, g:i64)->(vx, vx)
     h4 = vushr nv, 4:i8
     hp = ld wb[1024:i8]:vx
     up = sub 4:i64, g
-    bl0 = vshl hp, up:i16
+    bl0 = vshl hp, up:i8
     bl = vand bl0, sixteen:i8
     wl = vor l4, bl:i8
-    bh0 = vushr hp, g:i16
+    bh0 = vushr hp, g:i8
     bh = vand bh0, sixteen:i8
     wh = vor h4, bh:i8
     ret wl, wh
