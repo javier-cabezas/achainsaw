@@ -1,6 +1,6 @@
 """
-Llama-style models for examples/kernels/llama_decode.air: Q8_0, Q4_0 and Q6_K weight matrices
-in the kernel's packed layout, a random model or one loaded from a GGUF file (benchmarks/gguf.py),
+Llama-style models for examples/kernels/llama_decode.air: Q8_0, Q4_0, Q6_K, Q4_K and Q5_K weight
+matrices in the kernel's packed layout, a random model or one loaded from a GGUF file (benchmarks/gguf.py),
 the kernel's model table, a NumPy forward pass with the kernel's data types, and a PyTorch
 forward pass on PyTorch's weight-only quantized kernels (see Mat.prepare_torch).
 
@@ -9,10 +9,15 @@ GGUF tensors are converted as follows:
   Q8_0             -> Q8_0, bit for bit
   Q6_K             -> 6-bit values bit for bit, with one f16 scale per 16 values: the f16
                       rounding of Q6_K's super-block scale times its int8 sub-block scale
+  Q4_K, Q5_K       -> 4- or 5-bit values bit for bit, with an f16 scale and min per 32
+                      values: the f16 roundings of the super-block scale times the 6-bit
+                      sub-block scale, and of the super-block min times the 6-bit min
   anything else    -> dequantized to f32, then Q8_0 as llama.cpp quantizes it (e.g. Q4_1,
                       F16, BF16)
-A fused matrix (QKV, gate/up) keeps its parts' format if they share one; otherwise all
-parts become Q8_0 (exactly for Q4_0 parts: int8 q - 8 with the same scale). Q and K rows are un-permuted from
+A fused QKV matrix keeps each part's format (Parts: Q4_K_M files store V as Q6_K in some
+layers and Q, K as Q4_K). Gate/up rows interleave by chunk, so they keep their format if
+gate and up share one; otherwise both become Q8_0 (exactly for Q4_0: int8 q - 8 with the
+same scale). Q and K rows are un-permuted from
 llama.cpp's interleaved RoPE order back to Hugging Face's half-split order, which the kernel
 uses.
 """
@@ -25,7 +30,7 @@ try:
 except ImportError:
     torch = None
 
-from gguf import GGUF
+from gguf import GGUF, k_quant_values
 
 
 def quantize(x):
@@ -56,37 +61,55 @@ def quantize_rows(w, chunk=4096):
     return q, d
 
 
+def f16_round(x):
+    return np.asarray(x, dtype=np.float32).astype(np.float16).astype(np.float32)
+
+
 class Mat:
     """A weight matrix of `rows` x `k`, in blocks of 32 along k, with f16 scales `d` (held as
     f32) per `sub` values of a row: [rows x k/sub].
       Q8_0: q int8 [rows x k/32 x 32], sub = 32
       Q4_0: q uint8 [rows x k/32 x 16], llama.cpp's nibble bytes: value t of a block is
             (byte t & 15) - 8 and value t + 16 is (byte t >> 4) - 8; sub = 32
-      Q6_K: q int8 [rows x k/32 x 32] in -32..31, sub = 16"""
+      Q6_K: q int8 [rows x k/32 x 32] in -32..31, sub = 16
+      Q4_K, Q5_K: q uint8 [rows x k/32 x 32] in 0..15 or 0..31, sub = 32, and f16 mins `m`
+            [rows x k/32]: weight d * q - m"""
 
-    FORMATS = {"q8": 0, "q4": 1, "q6": 2}
+    FORMATS = {"q8": 0, "q4": 1, "q6": 2, "q4k": 3, "q5k": 4}
 
-    def __init__(self, fmt, q, d):
-        self.fmt, self.q, self.d = fmt, q, d
+    def __init__(self, fmt, q, d, m=None):
+        self.fmt, self.q, self.d, self.m = fmt, q, d, m
         self.rows, self.k = q.shape[0], q.shape[1] * 32
         self.sub = 16 if fmt == "q6" else 32
+
+    @property
+    def has_min(self):
+        return self.fmt in ("q4k", "q5k")
 
     @classmethod
     def random(cls, rng, rows, k, fmt):
         nb = k // 32
+        m = None
         if fmt == "q4":
             q = rng.integers(0, 256, size=(rows, nb, 16), dtype=np.uint8)
             scale = 4.6
         elif fmt == "q6":
             q = rng.integers(-32, 32, size=(rows, nb, 32), dtype=np.int8)
             scale = 18.5
+        elif fmt in ("q4k", "q5k"):
+            top = 16 if fmt == "q4k" else 32
+            q = rng.integers(0, top, size=(rows, nb, 32), dtype=np.uint8)
+            scale = 4.6 if fmt == "q4k" else 9.2
         else:
             q = rng.integers(-127, 128, size=(rows, nb, 32), dtype=np.int8)
             scale = 73.0
         # Entries of roughly unit variance times 1/sqrt(k), as in a trained layer.
         n_scales = k // (16 if fmt == "q6" else 32)
-        d = rng.uniform(0.75, 1.0, size=(rows, n_scales)) / (scale * np.sqrt(k))
-        return cls(fmt, q, d.astype(np.float16).astype(np.float32))
+        d = f16_round(rng.uniform(0.75, 1.0, size=(rows, n_scales)) / (scale * np.sqrt(k)))
+        if fmt in ("q4k", "q5k"):
+            # Mins near the middle of the values' range, so the weights center on zero.
+            m = f16_round(d * (top / 2) * rng.uniform(0.8, 1.2, size=d.shape))
+        return cls(fmt, q, d, m)
 
     @classmethod
     def from_tensor(cls, t):
@@ -98,6 +121,12 @@ class Mat:
             return cls("q8", np.ascontiguousarray(b[:, :, 2:34]).view(np.int8), d)
         if t.type_name == "Q6_K":
             return cls("q6", *_q6_k_values(t.blocks()))
+        if t.type_name in ("Q4_K", "Q5_K"):
+            b = t.blocks()
+            q, sc, mn = k_quant_values(b.reshape(-1, b.shape[2]), 4 if t.type_name == "Q4_K" else 5)
+            nb = t.cols // 32
+            return cls("q4k" if t.type_name == "Q4_K" else "q5k", q.reshape(t.rows, nb, 32),
+                       f16_round(sc).reshape(t.rows, nb), f16_round(mn).reshape(t.rows, nb))
         q = np.empty((t.rows, t.cols // 32, 32), dtype=np.int8)
         d = np.empty((t.rows, t.cols // 32), dtype=np.float32)
         step = 8192
@@ -105,41 +134,61 @@ class Mat:
             q[r:r + step], d[r:r + step] = quantize_rows(t.dequantize(slice(r, r + step)))
         return cls("q8", q, d)
 
+    def dequantize(self):
+        """f32 [rows x k]."""
+        if self.fmt == "q4":
+            return self.to_q8().dequantize()
+        w = self.q.reshape(self.rows, -1, self.sub) * self.d[:, :, None]
+        if self.has_min:
+            w = w - self.m[:, :, None]
+        return w.reshape(self.rows, self.k).astype(np.float32)
+
     def to_q8(self):
         if self.fmt == "q8":
             return self
-        if self.fmt == "q6":
-            w = self.q.reshape(self.rows, -1, 16) * self.d[:, :, None]
-            return Mat("q8", *quantize_rows(w.reshape(self.rows, self.k).astype(np.float32)))
-        q = np.concatenate([self.q & 15, self.q >> 4], axis=2).astype(np.int8) - np.int8(8)
-        return Mat("q8", q, self.d)
+        if self.fmt == "q4":
+            q = np.concatenate([self.q & 15, self.q >> 4], axis=2).astype(np.int8) - np.int8(8)
+            return Mat("q8", q, self.d)
+        return Mat("q8", *quantize_rows(self.dequantize()))
 
     def take(self, rows):
-        return Mat(self.fmt, self.q[rows], self.d[rows])
+        return Mat(self.fmt, self.q[rows], self.d[rows], None if self.m is None else self.m[rows])
 
     @staticmethod
     def concat(mats):
+        """The rows of `mats` in one matrix: in their format if they share one, else Q8_0."""
         if len({m.fmt for m in mats}) > 1:
             mats = [m.to_q8() for m in mats]
-        return Mat(mats[0].fmt, np.concatenate([m.q for m in mats]),
-                   np.concatenate([m.d for m in mats]))
+        m = None if mats[0].m is None else np.concatenate([x.m for x in mats])
+        return Mat(mats[0].fmt, np.concatenate([x.q for x in mats]),
+                   np.concatenate([x.d for x in mats]), m)
 
     def values(self):
-        """int8 [rows x k/32 x 32]: the integer weights (q - 8 for Q4_0)."""
+        """int8 [rows x k/32 x 32]: the integer weights (q - 8 for Q4_0; unsigned for Q4_K
+        and Q5_K, whose mins matvec applies)."""
         if self.fmt == "q4":
             return self.to_q8().q
         return self.q
 
     def nbytes(self):
-        return self.q.nbytes + self.d.nbytes
+        return self.q.nbytes + self.d.nbytes + (0 if self.m is None else self.m.nbytes)
+
+    def parts(self):
+        return [self]
+
+    def packed_nbytes(self):
+        return self.packed_q.nbytes + self.packed_s.nbytes
 
     def pack(self):
         """The kernel's layout (see qmat_chunk in the AIR standard library): 64-row chunks;
         per chunk and 32-block, groups of 4 consecutive bytes of a row form one 32-bit lane,
         byte (g * 64 + j) * 4 + q holding row j's byte 4g + q: its int8 values plus 128 for Q8_0, its
-        nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q); for Q6_K the low 4 bits as
-        Q4_0's nibbles, then a 512-byte plane whose byte (g * 64 + j) * 4 + q holds the high
-        2 bits of values 8p + 4g + q in bit pair p. Then the f16 scales [k/sub x 64]."""
+        nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q) and Q4_K (the same, from its
+        values); for Q6_K the low 4 bits as Q4_0's nibbles, then a 512-byte plane whose byte
+        (g * 64 + j) * 4 + q holds the high 2 bits of values 8p + 4g + q in bit pair p; for
+        Q5_K the low 4 bits as nibbles, then a 256-byte plane whose byte j * 4 + q holds the
+        top bits of values 4g + q (bit g) and 16 + 4g + q (bit 4 + g). Then the f16 scales
+        [k/sub x 64]; for Q4_K and Q5_K, scale then min per block."""
         c, nb = self.rows // 64, self.k // 32
 
         def lanes(v, n):
@@ -148,6 +197,16 @@ class Mat:
 
         if self.fmt == "q4":
             q = lanes(self.q, 16)
+        elif self.has_min:
+            u = self.q.reshape(c, 64, nb, 32)
+            lo = u & 15
+            q = lanes(lo[..., :16] | (lo[..., 16:] << 4), 16)
+            if self.fmt == "q5k":
+                hi = (u >> 4).reshape(c, 64, nb, 2, 4, 4)       # [.., half, g, q]
+                top = np.zeros((c, 64, nb, 4), dtype=np.uint8)
+                for g in range(4):
+                    top |= (hi[..., 0, g, :] << g) | (hi[..., 1, g, :] << (4 + g))
+                q = np.concatenate([q, lanes(top, 4)], axis=2)
         elif self.fmt == "q6":
             u = (self.q.astype(np.int16) + 32).astype(np.uint8).reshape(c, 64, nb, 32)
             lo, hi = u & 15, u >> 4
@@ -160,33 +219,45 @@ class Mat:
             q = lanes(self.q.view(np.uint8) ^ np.uint8(0x80), 32)
         self.packed_q = np.ascontiguousarray(q)
         per = 32 // self.sub
-        self.packed_s = np.ascontiguousarray(
-            self.d.reshape(c, 64, nb * per).transpose(0, 2, 1).astype(np.float16))
+        sc = self.d.reshape(c, 64, nb * per)
+        if self.has_min:
+            sc = np.stack([self.d, self.m], axis=2).reshape(c, 64, nb * 2)
+        self.packed_s = np.ascontiguousarray(sc.transpose(0, 2, 1).astype(np.float16))
+
+    def words(self):
+        """The part's 4 words for qmat_chunk: weights, scales, format, chunks."""
+        return [self.packed_q.ctypes.data, self.packed_s.ctypes.data, Mat.FORMATS[self.fmt],
+                self.rows // 64]
 
     def prepare_numpy(self):
         # Integer weights by scale group for np.matmul: [k/sub x rows x sub].
         v = self.values().reshape(self.rows, -1, self.sub)
         self.q_blocks = np.ascontiguousarray(v.transpose(1, 0, 2))
         self.s_blocks = np.ascontiguousarray(self.d.T)
+        self.m_blocks = None if self.m is None else np.ascontiguousarray(self.m.T)
 
     def prepare_torch(self):
         """PyTorch's weight-only kernels (torchao's CPU path), which take bf16 activations.
-        Q4_0 becomes int4 in the same 32-blocks (weight (q - 8) * scale, scales rounded to
-        bf16); Q8_0 and Q6_K are requantized to int8 with one scale per row, as PyTorch has
-        no per-block int8 kernel."""
-        if self.fmt == "q4":
-            v = np.concatenate([self.q & 15, self.q >> 4], axis=2).reshape(self.rows, self.k)
+        Q4_0 and Q4_K become int4 in the same 32-blocks (weight (q - 8) * scale + zero, with
+        zero 0 for Q4_0 and 8 scale - min for Q4_K, rounded to bf16); Q8_0, Q6_K and Q5_K are
+        requantized to int8 with one scale per row, as PyTorch has no per-block int8 kernel."""
+        if self.fmt in ("q4", "q4k"):
+            if self.fmt == "q4":
+                v = np.concatenate([self.q & 15, self.q >> 4], axis=2)
+            else:
+                v = self.q
             self.t_w = torch.ops.aten._convert_weight_to_int4pack_for_cpu(
-                torch.from_numpy(v.astype(np.int32)), 1)
-            s = torch.from_numpy(np.ascontiguousarray(self.d.T)).bfloat16()
-            self.t_sz = torch.stack([s, torch.zeros_like(s)], dim=-1).contiguous()
+                torch.from_numpy(v.reshape(self.rows, self.k).astype(np.int32)), 1)
+            s = torch.from_numpy(np.ascontiguousarray(self.d.T))
+            z = torch.zeros_like(s) if self.m is None else \
+                8 * s - torch.from_numpy(np.ascontiguousarray(self.m.T))
+            self.t_sz = torch.stack([s, z], dim=-1).bfloat16().contiguous()
             return
         q = np.empty((self.rows, self.k), dtype=np.int8)
         s = np.empty(self.rows, dtype=np.float32)
         for r in range(0, self.rows, 4096):
             n = min(4096, self.rows - r)
-            w = (self.q[r:r + n].reshape(n, -1, self.sub) * self.d[r:r + n, :, None])
-            w = w.reshape(n, self.k).astype(np.float32)
+            w = self.take(slice(r, r + n)).dequantize()
             s[r:r + n] = np.abs(w).max(axis=1) / np.float32(127.0)
             inv = np.where(s[r:r + n] > 0, 1.0 / np.maximum(s[r:r + n], 1e-30), 0.0)
             q[r:r + n] = np.round(w * inv[:, None].astype(np.float32)).astype(np.int8)
@@ -195,7 +266,7 @@ class Mat:
     def torch_matvec(self, x):
         """y = W x on PyTorch's kernels (see prepare_torch): x rounded to bf16, y in f32."""
         xb = x.bfloat16()[None]
-        if self.fmt == "q4":
+        if self.fmt in ("q4", "q4k"):
             y = torch.ops.aten._weight_int4pack_mm_for_cpu(xb, self.t_w, 32, self.t_sz)
         else:
             y = torch.ops.aten._weight_int8pack_mm(xb, self.t_w, self.t_s)
@@ -209,7 +280,62 @@ class Mat:
         ng = self.q_blocks.shape[0]
         dots = np.matmul(self.q_blocks.astype(np.float32), xq.reshape(ng, self.sub, 1))[:, :, 0]
         dxg = np.repeat(dx, 32 // self.sub)
-        return ((dots * dxg[:, None]) * self.s_blocks).sum(axis=0)
+        y = (dots * dxg[:, None]) * self.s_blocks
+        if self.m_blocks is not None:
+            # Q4_K, Q5_K: minus min * the block's activation sum.
+            y -= (xq.reshape(ng, 32).sum(axis=1) * dx)[:, None] * self.m_blocks
+        return y.sum(axis=0)
+
+
+class Parts:
+    """A matrix stacked by rows from parts of whole 64-row chunks in their own formats (a
+    fused QKV matrix whose Q, K and V differ): qmat_chunk walks its parts' words."""
+
+    def __init__(self, mats):
+        self._parts = mats
+        self.rows, self.k = sum(m.rows for m in mats), mats[0].k
+        self.fmt = "+".join(m.fmt for m in mats)
+
+    @staticmethod
+    def of(mats):
+        """`mats` stacked: one Mat if they share a format, else Parts."""
+        return Mat.concat(mats) if len({m.fmt for m in mats}) == 1 else Parts(mats)
+
+    def parts(self):
+        return self._parts
+
+    def pack(self):
+        for m in self._parts:
+            m.pack()
+
+    def words(self):
+        return [w for m in self._parts for w in m.words()]
+
+    def packed_nbytes(self):
+        return sum(m.packed_nbytes() for m in self._parts)
+
+    def prepare_numpy(self):
+        for m in self._parts:
+            m.prepare_numpy()
+
+    def prepare_torch(self):
+        for m in self._parts:
+            m.prepare_torch()
+
+    def matvec(self, x):
+        return np.concatenate([m.matvec(x) for m in self._parts])
+
+    def torch_matvec(self, x):
+        return torch.cat([m.torch_matvec(x) for m in self._parts])
+
+    @property
+    def q(self):
+        return None
+
+    @q.setter
+    def q(self, value):
+        for m in self._parts:
+            m.q = value
 
 
 def _q6_k_values(b):
@@ -269,21 +395,18 @@ class Model:
             if use_torch:
                 m.prepare_torch()
             m.q = None  # the packed copy is all the kernel needs
-        words = []
+        # Each matrix's part list (4 words per part), which the table points to.
+        self.part_lists = {}
 
         def mat(m):
-            words.extend([m.packed_q.ctypes.data, m.packed_s.ctypes.data, Mat.FORMATS[m.fmt]])
+            self.part_lists[id(m)] = a = np.array(m.words(), dtype=np.uint64)
+            return a.ctypes.data
 
-        words += [embd.ctypes.data, norm_out.ctypes.data]
-        mat(lm)
-        words += [cos.ctypes.data, sin.ctypes.data]
+        words = [embd.ctypes.data, norm_out.ctypes.data, mat(lm), cos.ctypes.data,
+                 sin.ctypes.data]
         for l in layers:
-            words.append(l["attn_norm"].ctypes.data)
-            mat(l["qkv"])
-            mat(l["o"])
-            words.append(l["ffn_norm"].ctypes.data)
-            mat(l["gate_up"])
-            mat(l["down"])
+            words += [l["attn_norm"].ctypes.data, mat(l["qkv"]), mat(l["o"]),
+                      l["ffn_norm"].ctypes.data, mat(l["gate_up"]), mat(l["down"])]
         self.table = np.array(words, dtype=np.uint64)
 
     @classmethod
@@ -350,7 +473,7 @@ class Model:
             gu_rows = np.arange(2 * f).reshape(2, f // 64, 64).transpose(1, 0, 2).reshape(-1)
             layers.append(dict(
                 attn_norm=norm(p + "attn_norm.weight"),
-                qkv=Mat.concat([q, k, v]),
+                qkv=Parts.of([q, k, v]),
                 o=Mat.from_tensor(t[p + "attn_output.weight"]),
                 ffn_norm=norm(p + "ffn_norm.weight"),
                 gate_up=Mat.concat([gate, up]).take(gu_rows),
@@ -367,13 +490,13 @@ class Model:
     def weight_bytes(self):
         """Bytes of packed matrices one token reads (embedding row and norms aside)."""
         mats = [self.lm] + [l[n] for l in self.layers for n in ("qkv", "o", "gate_up", "down")]
-        return sum(m.packed_q.nbytes + m.packed_s.nbytes for m in mats)
+        return sum(m.packed_nbytes() for m in mats)
 
     def torch_weight_bytes(self):
         """Bytes of PyTorch's matrices one token reads (see Mat.prepare_torch)."""
         mats = [self.lm] + [l[n] for l in self.layers for n in ("qkv", "o", "gate_up", "down")]
-        return sum(t.nbytes for m in mats
-                   for t in ((m.t_w, m.t_sz) if m.fmt == "q4" else (m.t_w, m.t_s)))
+        return sum(t.nbytes for m in mats for p in m.parts()
+                   for t in ((p.t_w, p.t_sz) if p.fmt in ("q4", "q4k") else (p.t_w, p.t_s)))
 
     def new_cache(self):
         """The kernel's KV cache: per layer, K then V, each bf16 [nkv x max_ctx x hd] (raw

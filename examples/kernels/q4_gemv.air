@@ -25,14 +25,13 @@ fn q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)
     nb16 = mul nb, 16:i64
     dx = alloc nb16
     call quantize_q8(x, xq, dx, k)
-    # The matrix as qmat_chunk takes it: weights, scales, format (1).
-    mat = alloc 24:i64
-    st mat, wq
-    mat1 = add mat, 8:i64
-    st mat1, scales
-    mat2 = add mat, 16:i64
-    st mat2, 1:i64
+    # The matrix as qmat_chunk takes it, one part: weights, scales, format (1), chunks.
     chunks = udiv m, 64:i64
+    mat = alloc 32:i64
+    st mat, wq
+    st mat[1], scales
+    st mat[2], 1:i64
+    st mat[3], chunks
     par chunks, q4_gemv_chunk(mat, xq, dx, y, k)
     free mat
     free dx

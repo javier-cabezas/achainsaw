@@ -5,7 +5,10 @@
 
 # dst[0 .. 64] = rows 64c .. 64c + 64 of the quantized matrix `mat` times the int8
 # activations xq (block records dx, from quantize_q8); k is the matrix's row length.
-# `mat` points to 3 words: packed weights, f16 scales, format (0 Q8_0, 1 Q4_0, 2 Q6_K).
+# `mat` is a list of parts of 4 words each: packed weights, f16 scales, format (0 Q8_0,
+# 1 Q4_0, 2 Q6_K, 3 Q4_K, 4 Q5_K) and the part's number of 64-row chunks; chunk c is in the
+# first part whose chunks reach past it, so the parts of a fused matrix (Q, K and V) keep
+# their own formats.
 # Weights come in chunks of 64 rows, stored unsigned (value + bias); per 32-block of a chunk,
 # each group of 4 consecutive values of a row fills one 32-bit lane, so one `vdotu` (x86
 # vpdpbusd, Arm usdot) multiplies them by 4 activations:
@@ -17,17 +20,22 @@
 #   Q6_K (format 2): 1536 bytes: the low 4 bits of the values offset by 32, as Q4_0's
 #                    nibbles, then 512 bytes whose byte (g * 64 + j) * 4 + q (g < 2) holds
 #                    the high 2 bits of row j's value 8p + 4g + q in bit pair p (p < 4).
+#   Q4_K (format 3): 1024 bytes: the values 0..15 as Q4_0's nibbles (no offset).
+#   Q5_K (format 4): 1280 bytes: the low 4 bits of the values 0..31 as Q4_0's nibbles, then
+#                    256 bytes whose byte j * 4 + q holds the top bits of row j's values
+#                    4g + q in bit g and 16 + 4g + q in bit 4 + g (g < 4).
 # Scales are f16 [64] vectors per block: one for Q8_0 and Q4_0, two for Q6_K (one per 16
-# values). Blocks are the outer loop, so each block's bytes are read in one pass; for each
-# strip of `vl i32` rows, two exact int32 dot chains (values 0..15 and 16..31, Q6_K's two
-# scale groups) lose bias * sum(x) (the sums from quantize_q8's block records), then are
-# converted and added as scale * d * dot into dst. The steps are the inline functions below,
-# shared with qmat_chunk4, so both give the same bits per token.
+# values), and for Q4_K and Q5_K a scale s and a min m, the weight being s * value - m.
+# Blocks are the outer loop, so each block's bytes are read in one pass; for each strip of
+# `vl i32` rows, two exact int32 dot chains (values 0..15 and 16..31, Q6_K's two scale
+# groups) lose bias * sum(x) (the sums from quantize_q8's block records), then are converted
+# and added as scale * d * dot into dst; Q4_K and Q5_K, which have no bias, instead subtract
+# m * d * sum(x) after. The steps are the inline functions below, shared with qmat_chunk4,
+# so both give the same bits per token.
 fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
   b0:
     wb0_, sc, nb, blk, sc_blk, fmt, bias = call qmat_layout(c, mat, k)
-    is_q4 = eq fmt, 1:i64
-    is_q6 = eq fmt, 2:i64
+    is_q4, is_q5, is_q6, two = call qmat_kind(fmt)
     w = vl i32
     zf = splat 0.0:f32:vx
     zi = splat 0:i32:vx
@@ -59,7 +67,9 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     wb = add wb0, j4
     br is_q4, q4(0:i64, zi, zi), not_q4
   not_q4:
-    br is_q6, q6(0:i64, zi, zi), q8(0:i64, zi, zi)
+    br is_q6, q6(0:i64, zi, zi), not_q6
+  not_q6:
+    br is_q5, q5(0:i64, zi, zi), q8(0:i64, zi, zi)
   q8(g8:i64, a8l:vx, a8h:vx):
     m8 = lt g8, 4:i64
     br m8, q8_body, scale(a8l, a8h)
@@ -84,21 +94,35 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     d6l, d6h = call qmat_dot(xb, g6, w6l, w6h, a6l, a6h)
     g6n = add g6, 1:i64
     jmp q6(g6n, d6l, d6h)
+  q5(g5:i64, a5l:vx, a5h:vx):
+    m5 = lt g5, 4:i64
+    br m5, q5_body, scale(a5l, a5h)
+  q5_body:
+    w5l, w5h = call qmat_w5(wb, g5)
+    d5l, d5h = call qmat_dot(xb, g5, w5l, w5h, a5l, a5h)
+    g5n = add g5, 1:i64
+    jmp q5(g5n, d5l, d5h)
   scale(sl:vx, sh:vx):
     rest = sub 64:i64, j
     s = call qmat_scale(sb, j, rest)
     py = add dst, j4
-    br is_q6, scale6, scale4
+    br two, scale2, scale4
   scale4:
     call qmat_acc1(py, sl, sh, s, d, c_lo, c_hi)
     j2 = add j, w
     jmp strips(j2)
-  scale6:
+  scale2:
     jh = add j, 64:i64
     s1 = call qmat_scale(sb, jh, rest)
+    br is_q6, scale6, scalek
+  scale6:
     call qmat_acc2(py, sl, sh, s, s1, d, c_lo, c_hi)
     j3 = add j, w
     jmp strips(j3)
+  scalek:
+    call qmat_accm(py, sl, sh, s, s1, d, c_lo, c_hi)
+    j4k = add j, w
+    jmp strips(j4k)
   block_next:
     b2 = add b, 1:i64
     jmp blocks(b2)
@@ -112,8 +136,7 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
 fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
   b0:
     wb0_, sc, nb, blk, sc_blk, fmt, bias = call qmat_layout(c, mat, k)
-    is_q4 = eq fmt, 1:i64
-    is_q6 = eq fmt, 2:i64
+    is_q4, is_q5, is_q6, two = call qmat_kind(fmt)
     w = vl i32
     zf = splat 0.0:f32:vx
     zi = splat 0:i32:vx
@@ -161,7 +184,9 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     wb = add wb0, j4
     br is_q4, q4(0:i64, zi, zi, zi, zi, zi, zi, zi, zi), not_q4
   not_q4:
-    br is_q6, q6(0:i64, zi, zi, zi, zi, zi, zi, zi, zi), q8(0:i64, zi, zi, zi, zi, zi, zi, zi, zi)
+    br is_q6, q6(0:i64, zi, zi, zi, zi, zi, zi, zi, zi), not_q6
+  not_q6:
+    br is_q5, q5(0:i64, zi, zi, zi, zi, zi, zi, zi, zi), q8(0:i64, zi, zi, zi, zi, zi, zi, zi, zi)
   q8(g8:i64, a0l:vx, a0h:vx, a1l:vx, a1h:vx, a2l:vx, a2h:vx, a3l:vx, a3h:vx):
     m8 = lt g8, 4:i64
     br m8, q8_body, scale(a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h)
@@ -195,6 +220,17 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     h3l, h3h = call qmat_dot(xb3, g6, w6l, w6h, c3l, c3h)
     g6n = add g6, 1:i64
     jmp q6(g6n, h0l, h0h, h1l, h1h, h2l, h2h, h3l, h3h)
+  q5(g5:i64, e0l_:vx, e0h_:vx, e1l_:vx, e1h_:vx, e2l_:vx, e2h_:vx, e3l_:vx, e3h_:vx):
+    m5 = lt g5, 4:i64
+    br m5, q5_body, scale(e0l_, e0h_, e1l_, e1h_, e2l_, e2h_, e3l_, e3h_)
+  q5_body:
+    w5l, w5h = call qmat_w5(wb, g5)
+    k0l, k0h = call qmat_dot(xb0, g5, w5l, w5h, e0l_, e0h_)
+    k1l, k1h = call qmat_dot(xb1, g5, w5l, w5h, e1l_, e1h_)
+    k2l, k2h = call qmat_dot(xb2, g5, w5l, w5h, e2l_, e2h_)
+    k3l, k3h = call qmat_dot(xb3, g5, w5l, w5h, e3l_, e3h_)
+    g5n = add g5, 1:i64
+    jmp q5(g5n, k0l, k0h, k1l, k1h, k2l, k2h, k3l, k3h)
   scale(s0l:vx, s0h:vx, s1l:vx, s1h:vx, s2l:vx, s2h:vx, s3l:vx, s3h:vx):
     rest = sub 64:i64, j
     s = call qmat_scale(sb, j, rest)
@@ -202,7 +238,7 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     py1 = add dst1, j4
     py2 = add dst2, j4
     py3 = add dst3, j4
-    br is_q6, scale6, scale4
+    br two, scale2, scale4
   scale4:
     call qmat_acc1(py0, s0l, s0h, s, d0, l0, h0)
     call qmat_acc1(py1, s1l, s1h, s, d1, l1, h1)
@@ -210,15 +246,24 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     call qmat_acc1(py3, s3l, s3h, s, d3, l3, h3)
     j2 = add j, w
     jmp strips(j2)
-  scale6:
+  scale2:
     jh = add j, 64:i64
     s1 = call qmat_scale(sb, jh, rest)
+    br is_q6, scale6, scalek
+  scale6:
     call qmat_acc2(py0, s0l, s0h, s, s1, d0, l0, h0)
     call qmat_acc2(py1, s1l, s1h, s, s1, d1, l1, h1)
     call qmat_acc2(py2, s2l, s2h, s, s1, d2, l2, h2)
     call qmat_acc2(py3, s3l, s3h, s, s1, d3, l3, h3)
     j3 = add j, w
     jmp strips(j3)
+  scalek:
+    call qmat_accm(py0, s0l, s0h, s, s1, d0, l0, h0)
+    call qmat_accm(py1, s1l, s1h, s, s1, d1, l1, h1)
+    call qmat_accm(py2, s2l, s2h, s, s1, d2, l2, h2)
+    call qmat_accm(py3, s3l, s3h, s, s1, d3, l3, h3)
+    j4k = add j, w
+    jmp strips(j4k)
   block_next:
     b2 = add b, 1:i64
     jmp blocks(b2)
@@ -227,28 +272,59 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
 
 # Chunk c of `mat` (see qmat_chunk): its weights, its scales, the number of 32-blocks of a
 # row, the bytes per block of weights and of scales, the format, and the bias of its unsigned
-# weights (128 for Q8_0, 8 for Q4_0, 32 for Q6_K).
+# weights (128 for Q8_0, 8 for Q4_0, 32 for Q6_K; 1 for Q4_K and Q5_K, whose weights have no
+# offset, so that qmat_block's corrections are the activation sums their mins multiply).
 inline fn qmat_layout(c:i64, mat:ptr, k:i64)->(ptr, ptr, i64, i64, i64, i64, i32)
   b0:
-    wq = ld mat:ptr
-    scales = ld mat[1]:ptr
-    fmt = ld mat[2]:i64
-    is_q4 = eq fmt, 1:i64
+    jmp find(mat, c)
+  find(part:ptr, pc:i64):
+    part_chunks = ld part[3]:i64
+    past = uge pc, part_chunks
+    br past, next_part, found
+  next_part:
+    pc2 = sub pc, part_chunks
+    part2 = add part, 32:i64
+    jmp find(part2, pc2)
+  found:
+    wq = ld part:ptr
+    scales = ld part[1]:ptr
+    fmt = ld part[2]:i64
     is_q6 = eq fmt, 2:i64
+    is_k = uge fmt, 3:i64
+    is_q5 = eq fmt, 4:i64
+    nibbles = and fmt, 1:i64
+    is_n = eq nibbles, 1:i64
     nb = udiv k, 32:i64
-    blk_a = select is_q4, 1024:i64, 2048:i64
-    blk = select is_q6, 1536:i64, blk_a
-    nsub = select is_q6, 2:i64, 1:i64
+    # Q4_0 and Q4_K (odd formats) 1024 bytes, Q8_0 2048, Q6_K 1536, Q5_K 1280.
+    blk_a = select is_n, 1024:i64, 2048:i64
+    blk_b = select is_q6, 1536:i64, blk_a
+    blk = select is_q5, 1280:i64, blk_b
+    two = or is_q6, is_k
+    nsub = select two, 2:i64, 1:i64
     sc_blk = shl nsub, 7:i64
     chunk_w = mul nb, blk
-    w_off = mul c, chunk_w
+    w_off = mul pc, chunk_w
     wc = add wq, w_off
     chunk_s = mul nb, sc_blk
-    s_off = mul c, chunk_s
+    s_off = mul pc, chunk_s
     sc = add scales, s_off
-    bias_a = select is_q4, 8:i32, 128:i32
-    bias = select is_q6, 32:i32, bias_a
+    bias_a = select is_n, 8:i32, 128:i32
+    bias_b = select is_q6, 32:i32, bias_a
+    bias = select is_k, 1:i32, bias_b
     ret wc, sc, nb, blk, sc_blk, fmt, bias
+
+# A format's kind (see qmat_chunk): whether its weights unpack as nibbles (Q4_0, Q4_K), as
+# Q5_K or as Q6_K, and whether it has two scale vectors per block (Q6_K, Q4_K, Q5_K).
+inline fn qmat_kind(fmt:i64)->(i32, i32, i32, i32)
+  b0:
+    is_q4a = eq fmt, 1:i64
+    is_q4k = eq fmt, 3:i64
+    is_q4 = or is_q4a, is_q4k
+    is_q5 = eq fmt, 4:i64
+    is_q6 = eq fmt, 2:i64
+    is_k = uge fmt, 3:i64
+    two = or is_q6, is_k
+    ret is_q4, is_q5, is_q6, two
 
 # Q8_0 weights of groups g and g + 4 for the strip of rows at wb, unsigned (value + 128).
 inline fn qmat_w8(wb:ptr, g:i64)->(vx, vx)
@@ -271,13 +347,15 @@ inline fn qmat_w4(wb:ptr, g:i64)->(vx, vx)
     ret wl, wh
 
 # Q6_K weights of groups g and g + 4, unsigned (value + 32): Q4_0's nibbles with their high
-# 2 bits from the second plane (group g % 2, bit pairs g / 2 and g / 2 + 2).
+# 2 bits from the second plane (group g % 2, bit pairs g / 2 and g / 2 + 2), each pair moved
+# to bits 4..5 with one shift. The shifts run on 16-bit lanes (x86 has no 8-bit ones), which
+# is exact here: bits 4..5 of each byte come from bits of the same byte.
 inline fn qmat_w6(wb:ptr, g:i64)->(vx, vx)
   b0:
     o = shl g, 8:i64
     nv = ld wb[o:i8]:vx
     mask = splat 15:i8:vx
-    three = splat 3:i8:vx
+    top2 = splat 48:i8:vx
     l4 = vand nv, mask:i8
     h4 = vushr nv, 4:i8
     gp = and g, 1:i64
@@ -285,16 +363,34 @@ inline fn qmat_w6(wb:ptr, g:i64)->(vx, vx)
     ho = add po, 1024:i64
     hp = ld wb[ho:i8]:vx
     pair = ushr g, 1:i64
-    shl_lo = shl pair, 1:i64
-    shl_hi = add shl_lo, 4:i64
-    bl0 = vushr hp, shl_lo:i8
-    bl = vand bl0, three:i8
-    bl4 = vshl bl, 4:i8
-    wl = vor l4, bl4:i8
-    bh0 = vushr hp, shl_hi:i8
-    bh = vand bh0, three:i8
-    bh4 = vshl bh, 4:i8
-    wh = vor h4, bh4:i8
+    sh = shl pair, 1:i64
+    up = sub 4:i64, sh
+    bl0 = vshl hp, up:i16
+    bl = vand bl0, top2:i8
+    wl = vor l4, bl:i8
+    bh0 = vushr hp, sh:i16
+    bh = vand bh0, top2:i8
+    wh = vor h4, bh:i8
+    ret wl, wh
+
+# Q5_K weights of groups g and g + 4, values 0..31: Q4_0's nibbles with their top bits from
+# the second plane (bits g and 4 + g, moved to bit 4 by 16-bit lane shifts, as in qmat_w6).
+inline fn qmat_w5(wb:ptr, g:i64)->(vx, vx)
+  b0:
+    o = shl g, 8:i64
+    nv = ld wb[o:i8]:vx
+    mask = splat 15:i8:vx
+    sixteen = splat 16:i8:vx
+    l4 = vand nv, mask:i8
+    h4 = vushr nv, 4:i8
+    hp = ld wb[1024:i8]:vx
+    up = sub 4:i64, g
+    bl0 = vshl hp, up:i16
+    bl = vand bl0, sixteen:i8
+    wl = vor l4, bl:i8
+    bh0 = vushr hp, g:i16
+    bh = vand bh0, sixteen:i8
+    wh = vor h4, bh:i8
     ret wl, wh
 
 # One token's dots for groups g and g + 4: dl += wl . x[4g .. 4g + 4] and dh += wh .
@@ -312,7 +408,7 @@ inline fn qmat_dot(xb:ptr, g:i64, wl:vx, wh:vx, dl:vx, dh:vx)->(vx, vx)
     ret dl2, dh2
 
 # f16 scales sb[i ..] of a strip's rows (at most n of them), widened to f32: scale group
-# 0 of rows j .. at sb[j], Q6_K's group 1 at sb[j + 64].
+# 0 of rows j .. at sb[j], Q6_K's group 1 (the mins of Q4_K and Q5_K) at sb[j + 64].
 inline fn qmat_scale(sb:ptr, i:i64, n:i64)->vx
   b0:
     h = ldm sb[i]:vx, n:f16
@@ -352,6 +448,26 @@ inline fn qmat_acc2(py:ptr, dl:vx, dh:vx, s:vx, s1:vx, d:f32, c_lo:i32, c_hi:i32
     pfh = vitof dhc:f32
     acch = vfma pfh, ds1, accl:f32
     st py, acch
+    ret
+
+# A token's f32 sums at py += s * d * (dl + dh), then -= m * d * (c_lo + c_hi): Q4_K and
+# Q5_K, whose weights s * value - m have a scale s and a min m per block (qmat_layout's bias
+# 1 makes c_lo + c_hi the activations' sum).
+inline fn qmat_accm(py:ptr, dl:vx, dh:vx, s:vx, m:vx, d:f32, c_lo:i32, c_hi:i32)
+  b0:
+    acc = ld py:vx
+    vd = splat d:vx
+    ds = vmul s, vd:f32
+    raw = vadd dl, dh:i32
+    pf = vitof raw:f32
+    acc1 = vfma pf, ds, acc:f32
+    sum = add c_lo, c_hi
+    sumf = itof sum:f32
+    dsum = mul d, sumf
+    ndsum = neg dsum
+    vn = splat ndsum:vx
+    acc2 = vfma m, vn, acc1:f32
+    st py, acc2
     ret
 
 # Block b's activation record (from quantize_q8) at dx: its scale, and the corrections for

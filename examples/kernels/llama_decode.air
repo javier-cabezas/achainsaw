@@ -18,10 +18,12 @@
 # once per 4 tokens rather than once per token, and attention, norms and epilogues run per
 # token. Its results are exactly those of n llama_decode calls.
 #
-# Each weight matrix is Q8_0, Q4_0 or Q6_K, chosen per matrix: 8-, 4- or 6-bit weights with
-# f16 scales per 32 (Q6_K: 16) values of a row, packed in chunks of 64 output rows;
-# activations are quantized to int8 per 32-block on the fly and the int8 dots run on `vdotu`
-# (weights stored unsigned; the activation sums of quantize_q8 remove their offset).
+# Each weight matrix is Q8_0, Q4_0, Q6_K, Q4_K or Q5_K, chosen per matrix (and per part of a
+# fused matrix: Q, K and V may differ): 8-, 4-, 6- or 5-bit weights with f16 scales per 32
+# (Q6_K: 16) values of a row, plus a min per 32 for Q4_K and Q5_K, packed in chunks of 64
+# output rows; activations are quantized to int8 per 32-block on the fly and the int8 dots
+# run on `vdotu` (weights stored unsigned; the activation sums of quantize_q8 remove their
+# offset or apply the mins).
 # The matrix chunks (qmat_chunk), the quantization, RoPE, softmax's exp (vexp, no libm call)
 # and SwiGLU's gating come from the AIR standard library (`use`).
 #
@@ -29,12 +31,12 @@
 # kv_heads (grouped-query attention); pos < max_ctx.
 #
 # cfg (i64[8]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx
-# model (table of 8-byte words): a matrix takes 3 words, its packed weights, its scales and
-# its format (0: Q8_0, 1: Q4_0, 2: Q6_K), and functions receive a pointer to those words.
-#   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]
-#   [2..4] LM head [vocab x d]
-#   [5] RoPE cos f32 [max_ctx x head_dim/2]   [6] RoPE sin (same shape)
-#   then 14 per layer, at 7 + 14 * l:
+# model (table of 8-byte words): a matrix is a pointer to its parts, 4 words each: packed
+# weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K) and number of
+# 64-row chunks (see qmat_chunk in the standard library).
+#   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]   [2] LM head
+#   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape)
+#   then 6 per layer, at 5 + 6 * l:
 #   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
 #   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
 #   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn]
@@ -796,29 +798,29 @@ inline fn load_cfg(cfg:ptr)->(i64, i64, i64, i64, i64, i64, i64, i64)
     max_ctx = ld cfg[7]:i64
     ret d, nl, nh, nkv, hd, f, vocab, max_ctx
 
-# The model table's global entries: embedding, final norm, the LM head's 3 words, RoPE
-# cos and sin tables.
+# The model table's global entries: embedding, final norm, LM head, RoPE cos and sin
+# tables.
 inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
   b0:
     embd = ld model[0]:ptr
     norm_out = ld model[1]:ptr
-    lm = add model, 16:i64
-    cos_t = ld model[5]:ptr
-    sin_t = ld model[6]:ptr
+    lm = ld model[2]:ptr
+    cos_t = ld model[3]:ptr
+    sin_t = ld model[4]:ptr
     ret embd, norm_out, lm, cos_t, sin_t
 
-# Layer l's entries (14 words at 7 + 14 l): its two norm weights, and pointers to the
-# 3-word entries of its QKV, O, gate/up and down matrices.
+# Layer l's entries (6 words at 5 + 6 l): its two norm weights and its QKV, O, gate/up and
+# down matrices.
 inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr)
   b0:
-    slot0 = mul l, 14:i64
-    slot = add slot0, 7:i64
+    slot0 = mul l, 6:i64
+    slot = add slot0, 5:i64
     lp_off = shl slot, 3:i64
     lp = add model, lp_off
     attn_norm = ld lp[0]:ptr
-    m_qkv = add lp, 8:i64
-    m_o = add lp, 32:i64
-    ffn_norm = ld lp[7]:ptr
-    m_gu = add lp, 64:i64
-    m_dn = add lp, 88:i64
+    m_qkv = ld lp[1]:ptr
+    m_o = ld lp[2]:ptr
+    ffn_norm = ld lp[3]:ptr
+    m_gu = ld lp[4]:ptr
+    m_dn = ld lp[5]:ptr
     ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn

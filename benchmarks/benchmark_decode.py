@@ -6,8 +6,8 @@ math and, when PyTorch is installed, a PyTorch one.
 The AIR kernel runs the whole prompt in one llama_prefill call (4 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
-Q4_0 or Q8_0 weights with f32 block scales, activations quantized to int8 per 32-block on
-the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
+Q4_0, Q8_0, Q6_K, Q4_K or Q5_K weights with f16 block scales (and mins for Q4_K and Q5_K),
+activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
 RoPE, attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights
 to f32 in each call and runs the block dots as a batched f32 BLAS matmul (exact here).
@@ -16,12 +16,14 @@ The kernel compiles with fast_math=True (float min/max as compare and select).
 PyTorch (eager, CPU) runs the same model on its weight-only quantized kernels, the path
 torchao uses on CPU, with bf16 activations into each matrix, bf16 attention on a bf16 KV
 cache, and f32 elsewhere. Q4_0
-matrices keep their 4-bit values and 32-blocks; Q8_0 and Q6_K ones are requantized to int8
-with one scale per row, as PyTorch has no per-block int8 kernel, so its tokens can differ a
-little from the kernel's.
+and Q4_K matrices keep their 4-bit values and 32-blocks (Q4_K's min becomes the int4 kernel's
+zero point, rounded to bf16); Q8_0, Q6_K and Q5_K ones are requantized to int8 with one scale
+per row, as PyTorch has no per-block int8 kernel, so its tokens can differ a little from the
+kernel's.
 
     # Llama 3.2 1B Instruct, Q4_0 (773 MB):
     # https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
+    # (or -Q4_K_M.gguf, 808 MB, and -Q5_K_M.gguf, 912 MB: Q4_K/Q5_K with some Q6_K matrices)
     python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf \\
         --prompt "The capital of France is" --tokens 32
     python benchmarks/benchmark_decode.py --gguf model.gguf --chat --prompt "Explain SSA form"
@@ -114,7 +116,7 @@ def main():
                         help="prompt for --gguf (default: %(default)r)")
     parser.add_argument("--chat", action="store_true", help="wrap the prompt in the chat format")
     parser.add_argument("--layers", type=int, default=16, help="random model layers")
-    parser.add_argument("--weights", choices=["q4", "q8"], default="q4",
+    parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
     parser.add_argument("--prompt-tokens", type=int,

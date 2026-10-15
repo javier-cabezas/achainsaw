@@ -27,15 +27,19 @@ impl Rng {
     }
 }
 
-/// Weight formats of `mat_chunk_into`, by their number in the model table.
-#[derive(Clone, Copy, PartialEq)]
+/// Weight formats of `qmat_chunk`, by their number in a matrix part.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Fmt {
     Q8 = 0,
     Q4 = 1,
     Q6 = 2,
+    Q4K = 3,
+    Q5K = 4,
 }
 
 impl Fmt {
+    const ALL: [Fmt; 5] = [Fmt::Q4, Fmt::Q8, Fmt::Q6, Fmt::Q4K, Fmt::Q5K];
+
     /// Values per scale.
     fn group(self) -> usize {
         if self == Fmt::Q6 {
@@ -44,22 +48,31 @@ impl Fmt {
             32
         }
     }
+
+    /// Q4_K and Q5_K: unsigned values, a scale and a min per 32-block.
+    fn has_min(self) -> bool {
+        matches!(self, Fmt::Q4K | Fmt::Q5K)
+    }
 }
 
-/// A Q8_0, Q4_0 or Q6_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0, -32..=31 for
-/// Q6_K) and f16 scales `s` [k/group x rows], plus the kernel's packed layout (see
-/// `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of 4 consecutive
-/// elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row r's element
-/// 4g + q plus 128 for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and 16 + 4g + q (high
-/// nibble), offset by 8; for Q6_K those nibbles of the low 4 bits of the values offset by
-/// 32, then 512 bytes whose byte (g * 64 + r) * 4 + q (g < 2) holds the high 2 bits of
-/// element 8p + 4g + q in bit pair p.
+/// A Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0,
+/// -32..=31 for Q6_K, 0..=15 for Q4_K, 0..=31 for Q5_K), f16 scales `s` [k/group x rows]
+/// and, for Q4_K and Q5_K, f16 mins `m` [k/32 x rows] (weight s * q - m), plus the kernel's
+/// packed layout (see `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of
+/// 4 consecutive elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row
+/// r's element 4g + q plus 128 for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and
+/// 16 + 4g + q (high nibble), offset by 8 (Q4_K: not offset); for Q6_K those nibbles of the
+/// low 4 bits of the values offset by 32, then 512 bytes whose byte (g * 64 + r) * 4 + q
+/// (g < 2) holds the high 2 bits of element 8p + 4g + q in bit pair p; for Q5_K the nibbles
+/// of the low 4 bits, then 256 bytes whose byte r * 4 + q holds the top bit of element 4g + q
+/// in bit g and of element 16 + 4g + q in bit 4 + g.
 struct Mat {
     rows: usize,
     k: usize,
     fmt: Fmt,
     q: Vec<i8>,
     s: Vec<f32>,
+    m: Vec<f32>,
     packed_q: Vec<u8>,
     packed_s: Vec<u16>,
 }
@@ -72,10 +85,14 @@ impl Mat {
             Fmt::Q8 => (127.0, 73.0),
             Fmt::Q4 => (8.0, 4.6),
             Fmt::Q6 => (32.0, 18.5),
+            Fmt::Q4K => (8.0, 4.6),
+            Fmt::Q5K => (16.0, 9.2),
         };
         let q: Vec<i8> = (0..rows * k)
             .map(|_| {
-                ((rng.next() * qmax).floor() as i32).clamp(-qmax as i32, qmax as i32 - 1) as i8
+                let v = ((rng.next() * qmax).floor() as i32).clamp(-qmax as i32, qmax as i32 - 1);
+                // Q4_K and Q5_K values are unsigned: 0 .. 2 qmax.
+                (if fmt.has_min() { v + qmax as i32 } else { v }) as i8
             })
             .collect();
         // Entries of roughly unit variance times 1/sqrt(k), as in a trained layer; f16 scales
@@ -83,7 +100,7 @@ impl Mat {
         let s: Vec<f32> = (0..k / g * rows)
             .map(|_| {
                 let v = (0.75 + 0.25 * rng.next()) / (smax * (k as f32).sqrt());
-                let v = if fmt != Fmt::Q8 && rng.next() < 0.0 {
+                let v = if matches!(fmt, Fmt::Q4 | Fmt::Q6) && rng.next() < 0.0 {
                     -v
                 } else {
                     v
@@ -91,13 +108,25 @@ impl Mat {
                 half::f16::from_f32(v).to_f32()
             })
             .collect();
+        // Mins near the middle of the values' range times the scale, so the weights center
+        // on zero.
+        let m: Vec<f32> = if fmt.has_min() {
+            s.iter()
+                .map(|&sv| half::f16::from_f32(sv * qmax * (1.0 + 0.2 * rng.next())).to_f32())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let block_bytes = match fmt {
             Fmt::Q8 => 2048,
-            Fmt::Q4 => 1024,
+            Fmt::Q4 | Fmt::Q4K => 1024,
             Fmt::Q6 => 1536,
+            Fmt::Q5K => 1280,
         };
+        // Scale vectors per block: Q6_K's two scale groups, or Q4_K's and Q5_K's scale and min.
+        let per_block = if fmt.has_min() { 2 } else { 32 / g };
         let mut packed_q = vec![0u8; rows / 64 * nb * block_bytes];
-        let mut packed_s = vec![0u16; k / g * rows];
+        let mut packed_s = vec![0u16; nb * per_block * rows];
         for c in 0..rows / 64 {
             for kk in 0..k {
                 let (b, t) = (kk / 32, kk % 32);
@@ -110,6 +139,13 @@ impl Mat {
                     match fmt {
                         Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8 ^ 0x80,
                         Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
+                        Fmt::Q4K => packed_q[at(n / 4, n % 4)] |= (v as u8) << (4 * (t / 16)),
+                        Fmt::Q5K => {
+                            let u = v as u8;
+                            packed_q[at(n / 4, n % 4)] |= (u & 15) << (4 * (t / 16));
+                            packed_q[blk + 1024 + r * 4 + n % 4] |=
+                                (u >> 4) << (4 * (t / 16) + n / 4);
+                        }
                         Fmt::Q6 => {
                             let u = (v + 32) as u8;
                             packed_q[at(n / 4, n % 4)] |= (u & 15) << (4 * (t / 16));
@@ -119,10 +155,16 @@ impl Mat {
                     }
                 }
             }
-            for gi in 0..k / g {
+            for vi in 0..nb * per_block {
+                // Scale vector vi of the chunk: Q4_K's and Q5_K's alternate scale and min.
+                let (src, gi) = if fmt.has_min() {
+                    (if vi % 2 == 0 { &s } else { &m }, vi / 2)
+                } else {
+                    (&s, vi)
+                };
                 for r in 0..64 {
-                    packed_s[(c * (k / g) + gi) * 64 + r] =
-                        half::f16::from_f32(s[gi * rows + c * 64 + r]).to_bits();
+                    packed_s[(c * nb * per_block + vi) * 64 + r] =
+                        half::f16::from_f32(src[gi * rows + c * 64 + r]).to_bits();
                 }
             }
         }
@@ -132,18 +174,10 @@ impl Mat {
             fmt,
             q,
             s,
+            m,
             packed_q,
             packed_s,
         }
-    }
-
-    /// The matrix's 3 words in the kernel's model table.
-    fn words(&self) -> [usize; 3] {
-        [
-            self.packed_q.as_ptr() as usize,
-            self.packed_s.as_ptr() as usize,
-            self.fmt as usize,
-        ]
     }
 
     fn matvec(&self, (xq, dx): &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
@@ -152,14 +186,55 @@ impl Mat {
             .map(|i| {
                 (0..self.k / g)
                     .map(|gi| {
+                        let x = &xq[gi * g..gi * g + g];
                         let dot: i64 = (0..g)
-                            .map(|t| self.q[i * self.k + gi * g + t] as i64 * xq[gi * g + t] as i64)
+                            .map(|t| self.q[i * self.k + gi * g + t] as i64 * x[t] as i64)
                             .sum();
-                        self.s[gi * self.rows + i] as f64 * dx[gi * g / 32] as f64 * dot as f64
+                        let mut v = self.s[gi * self.rows + i] as f64 * dot as f64;
+                        if self.fmt.has_min() {
+                            let sum: i64 = x.iter().map(|&v| v as i64).sum();
+                            v -= self.m[gi * self.rows + i] as f64 * sum as f64;
+                        }
+                        v * dx[gi * g / 32] as f64
                     })
                     .sum()
             })
             .collect()
+    }
+}
+
+/// A weight matrix as the kernel takes it: parts of whole 64-row chunks stacked by rows,
+/// each in its own format (a fused QKV matrix whose Q, K and V differ).
+struct Matrix(Vec<Mat>);
+
+impl Matrix {
+    fn random(rng: &mut Rng, rows: &[usize], k: usize, fmts: &[Fmt]) -> Self {
+        Self(
+            rows.iter()
+                .zip(fmts)
+                .map(|(&r, &f)| Mat::random(rng, r, k, f))
+                .collect(),
+        )
+    }
+
+    /// The parts' 4 words each (weights, scales, format, chunks), which the model table
+    /// points to.
+    fn words(&self) -> Vec<usize> {
+        self.0
+            .iter()
+            .flat_map(|p| {
+                [
+                    p.packed_q.as_ptr() as usize,
+                    p.packed_s.as_ptr() as usize,
+                    p.fmt as usize,
+                    p.rows / 64,
+                ]
+            })
+            .collect()
+    }
+
+    fn matvec(&self, x: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
+        self.0.iter().flat_map(|p| p.matvec(x)).collect()
     }
 }
 
@@ -188,11 +263,11 @@ fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
 
 struct Layer {
     attn_norm: Vec<f32>,
-    qkv: Mat,
-    o: Mat,
+    qkv: Matrix,
+    o: Matrix,
     ffn_norm: Vec<f32>,
-    gate_up: Mat,
-    down: Mat,
+    gate_up: Matrix,
+    down: Matrix,
 }
 
 struct Model {
@@ -206,7 +281,7 @@ struct Model {
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
-    lm: Mat,
+    lm: Matrix,
     cos: Vec<f32>,
     sin: Vec<f32>,
     layers: Vec<Layer>,
@@ -240,26 +315,32 @@ impl Model {
                 sin.push(a.sin() as f32);
             }
         }
-        // `mixed`: Q4_0, Q8_0 and Q6_K rotate across the matrices of a layer and across
-        // layers, and the LM head is Q6_K.
+        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K and Q5_K rotate across the matrices of a layer
+        // (Q, K and V each in its own) and across layers, and the LM head is Q6_K.
         let layers = attn_norms
             .into_iter()
             .zip(ffn_norms)
             .enumerate()
             .map(|(l, (attn_norm, ffn_norm))| {
-                let fmt = |i: usize| match (mixed, (i + l) % 3) {
-                    (false, _) => Fmt::Q8,
-                    (true, 0) => Fmt::Q4,
-                    (true, 1) => Fmt::Q8,
-                    _ => Fmt::Q6,
+                let fmt = |i: usize| {
+                    if mixed {
+                        Fmt::ALL[(i + 3 * l) % Fmt::ALL.len()]
+                    } else {
+                        Fmt::Q8
+                    }
                 };
                 Layer {
                     attn_norm,
-                    qkv: Mat::random(&mut rng, (nh + 2 * nkv) * hd, d, fmt(0)),
-                    o: Mat::random(&mut rng, d, nh * hd, fmt(1)),
+                    qkv: Matrix::random(
+                        &mut rng,
+                        &[nh * hd, nkv * hd, nkv * hd],
+                        d,
+                        &[fmt(0), fmt(1), fmt(2)],
+                    ),
+                    o: Matrix::random(&mut rng, &[d], nh * hd, &[fmt(3)]),
                     ffn_norm,
-                    gate_up: Mat::random(&mut rng, 2 * f, d, fmt(2)),
-                    down: Mat::random(&mut rng, d, f, fmt(3)),
+                    gate_up: Matrix::random(&mut rng, &[2 * f], d, &[fmt(4)]),
+                    down: Matrix::random(&mut rng, &[d], f, &[fmt(5)]),
                 }
             })
             .collect();
@@ -274,7 +355,12 @@ impl Model {
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
-            lm: Mat::random(&mut rng, vocab, d, if mixed { Fmt::Q6 } else { Fmt::Q8 }),
+            lm: Matrix::random(
+                &mut rng,
+                &[vocab],
+                d,
+                &[if mixed { Fmt::Q6 } else { Fmt::Q8 }],
+            ),
             cos,
             sin,
             layers,
@@ -371,19 +457,26 @@ impl Model {
         (h, logits)
     }
 
-    /// The kernel's `model` pointer table and `cfg`.
-    fn tables(&self) -> (Vec<usize>, Vec<i64>) {
+    /// The kernel's `model` pointer table and `cfg`, and the matrices' part lists the table
+    /// points to (to keep alive while it is used).
+    fn tables(&self) -> (Vec<usize>, Vec<i64>, Vec<Vec<usize>>) {
         let p = |v: &[f32]| v.as_ptr() as usize;
-        let mut t = vec![p(&self.embd), p(&self.norm_out)];
-        t.extend(self.lm.words());
-        t.extend([p(&self.cos), p(&self.sin)]);
+        let mut parts = vec![self.lm.words()];
         for l in &self.layers {
-            t.push(p(&l.attn_norm));
-            t.extend(l.qkv.words());
-            t.extend(l.o.words());
-            t.push(p(&l.ffn_norm));
-            t.extend(l.gate_up.words());
-            t.extend(l.down.words());
+            parts.extend([&l.qkv, &l.o, &l.gate_up, &l.down].map(Matrix::words));
+        }
+        let mp = |i: usize| parts[i].as_ptr() as usize;
+        let mut t = vec![
+            p(&self.embd),
+            p(&self.norm_out),
+            mp(0),
+            p(&self.cos),
+            p(&self.sin),
+        ];
+        for (i, l) in self.layers.iter().enumerate() {
+            let m = 1 + 4 * i;
+            t.extend([p(&l.attn_norm), mp(m), mp(m + 1)]);
+            t.extend([p(&l.ffn_norm), mp(m + 2), mp(m + 3)]);
         }
         let cfg = [
             self.d,
@@ -397,7 +490,7 @@ impl Model {
         ]
         .map(|v| v as i64)
         .to_vec();
-        (t, cfg)
+        (t, cfg, parts)
     }
 }
 
@@ -421,7 +514,8 @@ fn llama_decode_matches_reference() {
     check_decode(false);
 }
 
-/// Q4_0, Q8_0 and Q6_K matrices mixed within and across layers, and a Q6_K LM head.
+/// Q4_0, Q8_0, Q6_K, Q4_K and Q5_K matrices mixed within and across layers (Q, K and V in
+/// different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {
     check_decode(true);
@@ -436,7 +530,7 @@ fn check_decode(mixed: bool) {
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     // d=128, 2 layers, 4 q heads over 2 KV heads of 64, MLP 256, vocab 512, context 8.
     let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
-    let (table, cfg) = model.tables();
+    let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
     let modes = host_levels()
         .into_iter()
@@ -448,7 +542,7 @@ fn check_decode(mixed: bool) {
         let level = format!(
             "{level}{}{}",
             if fast { " fast_math" } else { "" },
-            if mixed { " mixed Q4/Q8/Q6" } else { "" }
+            if mixed { " mixed formats" } else { "" }
         );
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
@@ -544,7 +638,7 @@ fn llama_prefill_matches_decode_exactly() {
     ];
     for &(mixed, prompt, max_ctx, all_pieces) in &cases {
         let model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
-        let (table, cfg) = model.tables();
+        let (table, cfg, _parts) = model.tables();
         let cache_len = model.layers.len() * 2 * model.max_ctx * model.nkv * model.hd;
         for (level, features) in host_levels() {
             let mut engine = JitEngine::with_features(&features).unwrap();
@@ -553,7 +647,7 @@ fn llama_prefill_matches_decode_exactly() {
                 unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
             let prefill: Prefill =
                 unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
-            let ctx = format!("{level}{}", if mixed { " mixed Q4/Q8/Q6" } else { "" });
+            let ctx = format!("{level}{}", if mixed { " mixed formats" } else { "" });
 
             let mut cache = vec![0u16; cache_len];
             let mut h = vec![f32::NAN; model.d];
@@ -617,7 +711,7 @@ fn llama_long_context_matches_reference() {
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     let model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
-    let (table, cfg) = model.tables();
+    let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
     let mut rng = Rng(23);
     let prompt: Vec<i64> = (0..520)

@@ -1,10 +1,11 @@
 """
 End-to-end test of the GGUF path: writes a tiny Llama GGUF with every tensor type the loader
-handles (Q4_0, Q8_0, Q6_K natively; Q4_1 and F16 re-quantized to Q8_0), loads it with
+handles (Q4_0, Q8_0, Q6_K, Q4_K and Q5_K natively; Q4_1 and F16 re-quantized to Q8_0),
+loads it with
 benchmarks/gguf.py and benchmarks/llama_model.py, and checks
   - the dequantizers against the values the file was written from,
   - the loader's conversions (bit for bit where promised; Q and K rows back in Hugging Face
-    order; fused matrices),
+    order; fused matrices, including a QKV matrix whose parts keep different formats),
   - the BPE tokenizer on a small vocabulary,
   - examples/kernels/llama_decode.air against the NumPy forward pass of the loaded model, on
     every available backend.
@@ -26,7 +27,7 @@ import achainsaw  # noqa: E402
 from gguf import GGUF, Tokenizer, _bytes_to_unicode  # noqa: E402
 from llama_model import Model  # noqa: E402
 
-D, LAYERS, HEADS, KV_HEADS, HEAD_DIM, FFN, VOCAB = 256, 2, 4, 2, 64, 512, 384
+D, LAYERS, HEADS, KV_HEADS, HEAD_DIM, FFN, VOCAB = 256, 3, 4, 2, 64, 512, 384
 F16 = np.float16
 
 
@@ -76,6 +77,38 @@ def enc_q6_k(rng, rows, k):
     return raw.reshape(rows, -1), vals.reshape(rows, k)
 
 
+def enc_k(bits):
+    """Q4_K (bits 4) or Q5_K (5): 256-value blocks of 8 sub-blocks, each with a 6-bit scale
+    and min under the block's f16 d and dmin; also returns the codes [rows x k]."""
+    def enc(rng, rows, k):
+        n = rows * k // 256
+        q = rng.integers(0, 1 << bits, size=(n, 256), dtype=np.uint8)
+        s6 = rng.integers(0, 64, size=(n, 8), dtype=np.uint8)
+        m6 = rng.integers(0, 64, size=(n, 8), dtype=np.uint8)
+        d = (rng.uniform(0.5, 1.0, size=n) / (4.6 * (1 << (bits - 4)) * 48 * np.sqrt(k))).astype(F16)
+        dmin = (d.astype(np.float32) * 8 * (1 << (bits - 4)) * 48 / 32).astype(F16)
+        # llama.cpp's packing of the 6-bit scales and mins into 12 bytes.
+        sc = np.zeros((n, 12), np.uint8)
+        sc[:, 0:4] = s6[:, 0:4] | ((s6[:, 4:8] >> 4) << 6)
+        sc[:, 4:8] = m6[:, 0:4] | ((m6[:, 4:8] >> 4) << 6)
+        sc[:, 8:12] = (s6[:, 4:8] & 15) | ((m6[:, 4:8] & 15) << 4)
+        lo = q & 15
+        qs = np.concatenate([lo[:, 64 * p:64 * p + 32] | (lo[:, 64 * p + 32:64 * p + 64] << 4)
+                             for p in range(4)], axis=1)
+        head = [d[:, None].view(np.uint8), dmin[:, None].view(np.uint8), sc]
+        if bits == 5:
+            qh = np.zeros((n, 32), np.uint8)
+            for j in range(8):
+                qh |= (q[:, 32 * j:32 * j + 32] >> 4) << j
+            head.append(qh)
+        raw = np.concatenate(head + [qs], axis=1)
+        ds = d.astype(np.float32)[:, None] * s6.astype(np.float32)        # [n x 8]
+        dm = dmin.astype(np.float32)[:, None] * m6.astype(np.float32)
+        vals = q.reshape(n, 8, 32).astype(np.float32) * ds[:, :, None] - dm[:, :, None]
+        return raw.reshape(rows, -1), vals.reshape(rows, k), q.reshape(rows, k)
+    return enc
+
+
 def enc_f16(rng, rows, k):
     v = (rng.standard_normal((rows, k)) / np.sqrt(k)).astype(F16)
     return v.view(np.uint8).reshape(rows, -1), v.astype(np.float32)
@@ -86,13 +119,16 @@ def enc_f32(rng, rows, k, values=None):
     return v.view(np.uint8).reshape(rows, -1), v
 
 
-ENCODERS = {2: enc_q4_0, 8: enc_q8_0, 3: enc_q4_1, 14: enc_q6_k, 1: enc_f16, 0: enc_f32}
+ENCODERS = {2: enc_q4_0, 8: enc_q8_0, 3: enc_q4_1, 14: enc_q6_k, 12: enc_k(4), 13: enc_k(5),
+            1: enc_f16, 0: enc_f32}
 
 # Per layer, the type of each weight: layer 0 is all Q4_0 but a Q4_1 down projection;
-# layer 1 mixes formats inside the fused QKV and gate/up matrices.
+# layer 1 mixes formats inside the fused QKV and gate/up matrices; layer 2 is laid out like
+# a Q4_K_M file's (Q and K Q4_K, V Q6_K), with Q5_K O and down projections.
 LAYER_TYPES = [
     dict(attn_q=2, attn_k=2, attn_v=2, attn_output=2, ffn_gate=2, ffn_up=2, ffn_down=3),
     dict(attn_q=8, attn_k=2, attn_v=2, attn_output=14, ffn_gate=1, ffn_up=2, ffn_down=2),
+    dict(attn_q=12, attn_k=12, attn_v=14, attn_output=13, ffn_gate=12, ffn_up=12, ffn_down=13),
 ]
 SHAPES = dict(attn_q=(HEADS * HEAD_DIM, D), attn_k=(KV_HEADS * HEAD_DIM, D),
               attn_v=(KV_HEADS * HEAD_DIM, D), attn_output=(D, HEADS * HEAD_DIM),
@@ -174,12 +210,14 @@ class TestGGUFDecode(unittest.TestCase):
             "tokenizer.ggml.bos_token_id": (4, tokens.index("<|begin_of_text|>")),
             "tokenizer.ggml.eos_token_id": (4, tokens.index("<|eot_id|>")),
         }
-        cls.expected = {}
+        cls.expected, cls.k_codes = {}, {}
         tensors = []
 
         def add(name, t, rows, k, **kw):
-            raw, vals = ENCODERS[t](rng, rows, k, **kw)
+            raw, vals, *codes = ENCODERS[t](rng, rows, k, **kw)
             cls.expected[name] = vals.reshape(rows, k)
+            if codes:
+                cls.k_codes[name] = codes[0]
             dims = [k] if rows == 1 else [k, rows]
             tensors.append((name, dims, t, raw))
 
@@ -213,21 +251,52 @@ class TestGGUFDecode(unittest.TestCase):
         m = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
 
         def weights(mat):
-            # The loaded matrix as f32 [rows x k], from its integer values and scales.
-            v = mat.q_blocks * mat.s_blocks[:, :, None]                   # [groups, rows, sub]
-            return v.transpose(1, 0, 2).reshape(mat.rows, -1)
+            # The loaded matrix as f32 [rows x k], from its integer values, scales and mins.
+            out = []
+            for p in mat.parts():
+                v = p.q_blocks * p.s_blocks[:, :, None]                   # [groups, rows, sub]
+                if p.m_blocks is not None:
+                    v = v - p.m_blocks[:, :, None]
+                out.append(v.transpose(1, 0, 2).reshape(p.rows, -1))
+            return np.concatenate(out)
 
         e = self.expected
-        l0, l1 = m.layers
+        l0, l1, l2 = m.layers
         self.assertEqual((l0["qkv"].fmt, l0["o"].fmt, l0["gate_up"].fmt, l0["down"].fmt),
                          ("q4", "q4", "q4", "q8"))
         self.assertEqual((l1["qkv"].fmt, l1["o"].fmt, l1["gate_up"].fmt, l1["down"].fmt),
-                         ("q8", "q6", "q8", "q4"))
+                         ("q8+q4+q4", "q6", "q8", "q4"))
+        self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, l2["gate_up"].fmt, l2["down"].fmt),
+                         ("q4k+q4k+q6", "q5k", "q4k", "q5k"))
         self.assertEqual(m.lm.fmt, "q6")
+        # Q4_K and Q5_K: values exact, scales and mins rounded to f16.
+        for name in ("attn_output", "ffn_down"):
+            mat = l2["o" if name == "attn_output" else "down"]
+            codes = mat.q_blocks.transpose(1, 0, 2).reshape(mat.rows, -1)
+            np.testing.assert_array_equal(codes, self.k_codes[f"blk.2.{name}.weight"])
         for i, layer in enumerate(m.layers):
+            if i == 2:
+                # Each part of QKV keeps its format. The f16 roundings of the scales and mins
+                # (2^-11 relative, Q6_K's too) move a weight by at most 2^-11 (|s q| + |m|),
+                # and |s q| + |m| <= 3 max|w| (m is minus the weight at q = 0).
+                p = "blk.2."
+                hf_q = np.empty_like(e[p + "attn_q.weight"])
+                hf_q[gguf_order(HEADS)] = e[p + "attn_q.weight"]
+                hf_k = np.empty_like(e[p + "attn_k.weight"])
+                hf_k[gguf_order(KV_HEADS)] = e[p + "attn_k.weight"]
+                want = {"qkv": np.concatenate([hf_q, hf_k, e[p + "attn_v.weight"]]),
+                        "o": e[p + "attn_output.weight"], "down": e[p + "ffn_down.weight"]}
+                gate, up = e[p + "ffn_gate.weight"], e[p + "ffn_up.weight"]
+                want["gate_up"] = np.stack([gate.reshape(-1, 64, D), up.reshape(-1, 64, D)],
+                                           1).reshape(-1, D)
+                for n, w in want.items():
+                    np.testing.assert_allclose(weights(layer[n]), w,
+                                               atol=3 * 2 ** -11 * np.abs(w).max(),
+                                               err_msg=f"{p}{n}")
+                continue
             p = f"blk.{i}."
-            # Q and K rows back in Hugging Face order; exact for Q4_0 and Q8_0 (fused into
-            # Q8_0 too, in layer 1).
+            # Q and K rows back in Hugging Face order; exact for Q4_0 and Q8_0 (layer 1's
+            # QKV in parts of each format; its gate/up re-quantized to Q8_0, see below).
             hf_q = np.empty_like(e[p + "attn_q.weight"])
             hf_q[gguf_order(HEADS)] = e[p + "attn_q.weight"]
             hf_k = np.empty_like(e[p + "attn_k.weight"])

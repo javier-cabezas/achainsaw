@@ -120,7 +120,39 @@ def _deq_q6_k(b):
     return y
 
 
-_DEQUANT = {"Q4_0": _deq_q4_0, "Q4_1": _deq_q4_1, "Q8_0": _deq_q8_0, "Q6_K": _deq_q6_k}
+def k_quant_values(b, bits):
+    """Q4_K (bits 4) or Q5_K (bits 5) blocks [n x 144 or 176] -> (values uint8 [n x 256],
+    0..15 or 0..31; scales and mins f32 [n x 8], one per 32 values: the f16 super-block
+    scale d times the 6-bit sub-block scale, and dmin times the 6-bit min, as llama.cpp
+    computes them). Value t of sub-block j is scale[j] * q - min[j]."""
+    d, dmin = _f16(b[:, 0:2]), _f16(b[:, 2:4])
+    sc = b[:, 4:16].astype(np.uint8)
+    # llama.cpp's get_scale_min_k4: 6-bit scales and mins, the last four split into nibbles
+    # and the top bits of the first eight bytes.
+    s6 = np.concatenate([sc[:, 0:4] & 63, (sc[:, 8:12] & 15) | ((sc[:, 0:4] >> 6) << 4)], axis=1)
+    m6 = np.concatenate([sc[:, 4:8] & 63, (sc[:, 8:12] >> 4) | ((sc[:, 4:8] >> 6) << 4)], axis=1)
+    qh = b[:, 16:48] if bits == 5 else None
+    qs = b[:, 48:176] if bits == 5 else b[:, 16:144]
+    q = np.empty((b.shape[0], 256), dtype=np.uint8)
+    for j in range(8):
+        v = qs[:, 32 * (j // 2):32 * (j // 2) + 32]
+        v = (v & 15) if j % 2 == 0 else (v >> 4)
+        if qh is not None:
+            v = v | (((qh >> j) & 1) << 4)
+        q[:, 32 * j:32 * j + 32] = v
+    return q, d * s6.astype(np.float32), dmin * m6.astype(np.float32)
+
+
+def _deq_k(bits):
+    def deq(b):
+        q, s, m = k_quant_values(b, bits)
+        y = q.reshape(-1, 8, 32).astype(np.float32) * s[:, :, None] - m[:, :, None]
+        return y.reshape(-1, 256)
+    return deq
+
+
+_DEQUANT = {"Q4_0": _deq_q4_0, "Q4_1": _deq_q4_1, "Q8_0": _deq_q8_0, "Q4_K": _deq_k(4),
+            "Q5_K": _deq_k(5), "Q6_K": _deq_q6_k}
 
 
 class GGUF:

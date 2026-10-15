@@ -162,7 +162,7 @@ fn gemv_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     ret
 ```
 
-It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0 or Q6_K matrix), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
+It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
 
 **Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
 
@@ -535,7 +535,7 @@ Fuel checks are inline (a decrement and a compare per branch, on a counter kept 
 
 #### Single-call decode (deep fusion)
 
-[`examples/kernels/llama_decode.air`](examples/kernels/llama_decode.air) runs a whole decode step of a Llama-style model (RMSNorm, grouped-query attention with RoPE and a bf16 KV cache, SwiGLU MLP, Q4_0/Q8_0/Q6_K weights) in one call: the token id goes in, the greedy next token comes out. Like GPU megakernels ([Hazy Research's Llama-1B megakernel](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles), [AutoMegaKernel](https://arxiv.org/pdf/2606.09682)), it removes the boundaries between the ~100 small kernels of a forward pass; on a CPU that means each elementwise op runs inside the pass that produces or consumes its data:
+[`examples/kernels/llama_decode.air`](examples/kernels/llama_decode.air) runs a whole decode step of a Llama-style model (RMSNorm, grouped-query attention with RoPE and a bf16 KV cache, SwiGLU MLP, Q4_0/Q8_0/Q6_K/Q4_K/Q5_K weights) in one call: the token id goes in, the greedy next token comes out. Like GPU megakernels ([Hazy Research's Llama-1B megakernel](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles), [AutoMegaKernel](https://arxiv.org/pdf/2606.09682)), it removes the boundaries between the ~100 small kernels of a forward pass; on a CPU that means each elementwise op runs inside the pass that produces or consumes its data:
 
 | Pass | Fused into it |
 |---|---|
@@ -547,11 +547,11 @@ Fuel checks are inline (a decrement and a compare per branch, on a counter kept 
 | Gate and up projections (`par`, 64 rows per task) | SwiGLU, Q8 quantization |
 | LM head (`par`, 64 rows per task) | argmax: each task keeps only its best logit, so the logits are never written |
 
-That is 2 serial norms and 6 `par` regions per layer. The KV cache is bf16 and head-major (`[kv_heads x max_ctx x head_dim]` per layer for K and for V), so a KV head's positions are contiguous, and attention is flash-decoding: positions split across cores even for one sequence, with the standard library's `attn_split` and `attn_merge` (also behind [`gqa_attention.air`](examples/kernels/gqa_attention.air)). Each weight matrix has its own format, Q8_0, Q4_0 or Q6_K, in the chunked layout of `q8_gemv` and `q4_gemv` (Q6_K adds a plane of high bits and a scale per 16 values), so every task owns its output rows and applies its epilogue without a cross-task reduction. `crates/achainsaw-codegen/tests/llama_decode.rs` checks it against an f64 reference model, with all three formats mixed, over several positions, at every ISA level on both backends.
+That is 2 serial norms and 6 `par` regions per layer. The KV cache is bf16 and head-major (`[kv_heads x max_ctx x head_dim]` per layer for K and for V), so a KV head's positions are contiguous, and attention is flash-decoding: positions split across cores even for one sequence, with the standard library's `attn_split` and `attn_merge` (also behind [`gqa_attention.air`](examples/kernels/gqa_attention.air)). Each weight matrix has its own format, Q8_0, Q4_0, Q6_K, Q4_K or Q5_K, in the chunked layout of `q8_gemv` and `q4_gemv` (Q6_K adds a plane of high bits and a scale per 16 values; Q4_K and Q5_K, a min per 32 values that the activation sums apply, and Q5_K a plane of top bits), so every task owns its output rows and applies its epilogue without a cross-task reduction. A matrix is a list of parts, so the fused QKV matrix keeps the formats of Q, K and V when they differ. `crates/achainsaw-codegen/tests/llama_decode.rs` checks it against an f64 reference model, with all five formats mixed within and across matrices, over several positions, at every ISA level on both backends.
 
 **Prefill.** `llama_prefill` runs a whole prompt of n tokens through the same passes in one call. Every projection task applies its rows to 4 tokens per weight load (`qmat_batch`, which runs the standard library's `qmat_chunk4` on tiles of 4 tokens and `qmat_chunk` on the rest), so the weights are read once per 4 tokens instead of once per token, and the work turns from memory-bound into compute-bound. Norms, RoPE and epilogues run per token, and attention runs one task per token and KV head, over the cache up to the token's own position with `llama_decode`'s splits and merges. Each token's operations are exactly those of `llama_decode`, so a prefill leaves the same KV cache, hidden state and next token bit for bit as decoding the prompt token by token (`llama_prefill_matches_decode_exactly`, in one call or in pieces).
 
-**A real model.** [`benchmarks/gguf.py`](benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, Q8_0, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
+**A real model.** [`benchmarks/gguf.py`](benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, Q4_K and Q5_K values bit for bit with each 32-value scale and min rounded to f16, anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
 
 ```bash
 curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -595,6 +595,19 @@ Prefill of the prompt (one `llama_prefill` call; llama-bench's `-p`), then 64 to
 - With 16 threads (two per core) at 512 tokens, AIR prefills 796 tokens/s and decodes 60.2 tokens/s; llama.cpp 585 and 58.8. Both decode faster on 8.
 - Cranelift prefills 157, 133, 112 and 66 tokens/s and decodes 44.9, 42.5, 38.4 and 26.4 tokens/s at the four lengths.
 
+**K-quants.** Most GGUF downloads are Q4_K_M or Q5_K_M files: Q4_K or Q5_K matrices (256-value super-blocks whose 32-value sub-blocks each have a 6-bit scale and a 6-bit min, so a weight is `scale * q - min`), with the V and down projections of half the layers, and the embedding, in Q6_K. The loader keeps the values bit for bit and rounds each sub-block's scale and min (the super-block's f16 factor times the 6-bit one) to f16, so a Q4_K weight takes 5 bits instead of 4.5; the kernel subtracts each min times the block's activation sum, which `quantize_q8` already computes. The fused QKV matrix is stored in parts, keeping Q and K in Q4_K and V in Q6_K. The same comparison at 512 tokens, the three files measured together:
+
+| File | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
+|---|---|---|---|---|
+| Q4_0 (773 MB) | 730 tokens/s | 438 tokens/s | 67.3 tokens/s | 59.5 tokens/s |
+| Q4_K_M (808 MB) | 672 tokens/s | 500 tokens/s | 61.1 tokens/s | 58.0 tokens/s |
+| Q5_K_M (912 MB) | 589 tokens/s | 789 tokens/s | 55.6 tokens/s | 52.4 tokens/s |
+
+- **Decode stays ahead** by 5–6% on the K-quant files, both bound by memory bandwidth, although the kernel reads 8% more bytes per token (0.87 and 0.98 GB of packed weights).
+- **Prefill is ahead on Q4_K_M and behind on Q5_K_M**, where llama.cpp is 1.3x faster (and faster than on its own Q4_K_M). Prefill is compute-bound, and Q5_K's and Q6_K's top bits take extra shifts and masks to unpack for every 4 tokens.
+- Cranelift prefills 105 and 103 tokens/s and decodes 36 and 31 tokens/s on the two files.
+- The kernel's tokens match NumPy's (`--prompt "The capital of France is"`: 24 of 24 on both files); on random prompts they part only at near-ties, as on Q4_0. PyTorch runs Q4_K on its int4 kernel with the min as its zero point (rounded to bf16) and Q5_K requantized to int8 per row; it decodes Q4_K_M at 30–33 tokens/s.
+
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
 | Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |
@@ -603,6 +616,18 @@ Prefill of the prompt (one `llama_prefill` call; llama-bench's `-p`), then 64 to
 | Q4_0, 0.70 GB | 13.2 ms/token (76 tokens/s, 53 GB/s) | 18.5 ms/token | 27.3 ms/token (int4) | 661 ms/token |
 
 On LLVM decode streams the weights at close to the memory's bandwidth (run to run, about ±5%), so Q4_0 is about 2x faster than Q8_0. On Cranelift, `vdot` and in-register unpacking make the int8 dots cheap enough that Q4_0's half-size weights pay off too. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. PyTorch's int4 and int8 kernels read the weights at 28–33 GB/s.
+
+Every format on the same random model (`--weights q8|q6|q5k|q4k|q4`), prefill of 512 tokens then decode, 8 threads, best of two runs:
+
+| Weights | Prefill, LLVM | Decode, LLVM | Prefill, Cranelift | Decode, Cranelift |
+|---|---|---|---|---|
+| Q8_0, 1.31 GB | 757 tokens/s | 40.7 tokens/s (53 GB/s) | 125 tokens/s | 36.2 tokens/s |
+| Q6_K, 1.08 GB | 555 tokens/s | 49.2 tokens/s (53 GB/s) | 107 tokens/s | 31.1 tokens/s |
+| Q5_K, 0.93 GB | 593 tokens/s | 59.0 tokens/s (55 GB/s) | 99 tokens/s | 31.6 tokens/s |
+| Q4_K, 0.77 GB | 692 tokens/s | 70.2 tokens/s (54 GB/s) | 106 tokens/s | 41.1 tokens/s |
+| Q4_0, 0.70 GB | 749 tokens/s | 76.5 tokens/s (53 GB/s) | 115 tokens/s | 43.8 tokens/s |
+
+Decode on LLVM follows the bytes per weight. Prefill follows the unpacking work: Q8_0 needs none, Q4_0 a mask and a shift, Q4_K adds a min, and Q5_K and Q6_K merge a plane of top bits. Those planes are unpacked with 16-bit lane shifts (x86 has no 8-bit vector shifts, and masking keeps each byte's own bits), which made Q5_K's prefill 11% faster and Q6_K's 5–20%.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
