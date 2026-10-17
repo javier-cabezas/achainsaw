@@ -29,35 +29,40 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import TypeAlias
+
+# (benchmark, backend) -> best time in µs
+Times: TypeAlias = dict[tuple[str, str], float]
 
 
-def side_env(root):
-    paths = [root, os.path.join(root, "benchmarks"), os.environ.get("PYTHONPATH", "")]
+def side_env(root: str) -> dict[str, str]:
+    paths: list[str] = [root, os.path.join(root, "benchmarks"), os.environ.get("PYTHONPATH", "")]
     return dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in paths if p))
 
 
-def supports(script, flag, env):
+def supports(script: str, flag: str, env: dict[str, str]) -> bool:
     """Whether `script --help` (run as the benchmarks run) lists `flag`; a script that
     cannot even print its help is an error, not a missing option."""
-    out = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True,
-                         env=env)
+    out: subprocess.CompletedProcess[str] = subprocess.run(
+        [sys.executable, script, "--help"], capture_output=True, text=True, env=env)
     if out.returncode != 0:
         raise RuntimeError(f"{script} --help failed:\n{out.stderr[-3000:]}")
     return flag in out.stdout
 
 
-def run_side(root, workdir, tag, skipped):
+def run_side(root: str, workdir: str, tag: str, skipped: set[str]) -> Times:
     """One round of benchmarks for the checkout at `root`: {(benchmark, backend): us}.
     Benchmarks this side's scripts cannot run are added to `skipped`."""
-    env = side_env(root)
-    times = {}
-    kernels = os.path.join(root, "benchmarks", "benchmark_kernels.py")
-    out = os.path.join(workdir, f"{tag}-kernels.json")
-    cmd = [sys.executable, kernels, "--json", out]
+    env: dict[str, str] = side_env(root)
+    times: Times = {}
+    kernels: str = os.path.join(root, "benchmarks", "benchmark_kernels.py")
+    out: str = os.path.join(workdir, f"{tag}-kernels.json")
+    cmd: list[str] = [sys.executable, kernels, "--json", out]
     for flag in ("--no-numpy", "--no-torch"):
         if supports(kernels, flag, env):
             cmd.append(flag)
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=root)
+    res: subprocess.CompletedProcess[str] = subprocess.run(cmd, env=env, capture_output=True,
+                                                           text=True, cwd=root)
     if res.returncode != 0:
         raise RuntimeError(f"{kernels} failed:\n{res.stdout[-3000:]}\n{res.stderr[-3000:]}")
     for r in json.load(open(out, encoding="utf-8"))["results"]:
@@ -65,7 +70,7 @@ def run_side(root, workdir, tag, skipped):
             if run["isa"] == "host":
                 times[(r["kernel"], run["backend"])] = run["us"]
 
-    decode = os.path.join(root, "benchmarks", "benchmark_decode.py")
+    decode: str = os.path.join(root, "benchmarks", "benchmark_decode.py")
     if not (os.path.exists(decode) and supports(decode, "--json", env)):
         skipped.add(f"{tag}: llama_decode (benchmark_decode.py has no --json)")
     else:
@@ -82,19 +87,21 @@ def run_side(root, workdir, tag, skipped):
         for r in json.load(open(out, encoding="utf-8"))["results"]:
             times[("llama_decode (4 layers, Q4_0)", r["backend"])] = r["ms_per_token"] * 1e3
             if r.get("prompt_tokens", 1) > 1:
-                key = f"llama_prefill (4 layers, Q4_0, {r['prompt_tokens']} tokens, per token)"
+                key: str = (f"llama_prefill (4 layers, Q4_0, {r['prompt_tokens']} tokens, "
+                            "per token)")
                 times[(key, r["backend"])] = r["prompt_ms_per_token"] * 1e3
     return times
 
 
-def fmt_us(us):
+def fmt_us(us: float) -> str:
     if us >= 1000:
         return f"{us / 1000:.2f} ms"
     return f"{us:.2f} µs" if us < 10 else f"{us:.1f} µs"
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def main() -> None:
+    assert __doc__ is not None
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("base")
     ap.add_argument("head")
     ap.add_argument("--rounds", type=int, default=5)
@@ -105,23 +112,25 @@ def main():
     ap.add_argument("--summary", help="append a Markdown report (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--allow-regressions", action="store_true",
                     help="report regressions without failing")
-    args = ap.parse_args()
+    args: argparse.Namespace = ap.parse_args()
 
-    sides = {"base": os.path.abspath(args.base), "head": os.path.abspath(args.head)}
-    best = {"base": {}, "head": {}}
-    skipped = set()
+    sides: dict[str, str] = {"base": os.path.abspath(args.base),
+                             "head": os.path.abspath(args.head)}
+    best: dict[str, Times] = {"base": {}, "head": {}}
+    skipped: set[str] = set()
     with tempfile.TemporaryDirectory() as workdir:
         for rnd in range(args.rounds):
-            order = ["base", "head"] if rnd % 2 == 0 else ["head", "base"]
+            order: list[str] = ["base", "head"] if rnd % 2 == 0 else ["head", "base"]
             for side in order:
-                t0 = time.perf_counter()
+                t0: float = time.perf_counter()
                 try:
-                    times = run_side(sides[side], workdir, side, skipped)
+                    times: Times = run_side(sides[side], workdir, side, skipped)
                 except RuntimeError as e:
                     print(f"[{side}] {e}", file=sys.stderr)
                     if side == "head":
                         sys.exit(2)
-                    note = f"The base's benchmarks failed, so nothing was compared:\n```\n{e}\n```\n"
+                    note: str = ("The base's benchmarks failed, so nothing was compared:\n"
+                                 f"```\n{e}\n```\n")
                     print(note)
                     if args.summary:
                         with open(args.summary, "a", encoding="utf-8") as f:
@@ -132,14 +141,17 @@ def main():
                 print(f"round {rnd + 1}/{args.rounds} {side}: {len(times)} results "
                       f"in {time.perf_counter() - t0:.0f} s", flush=True)
 
-    rows, regressions = [], []
+    # (key, base µs, head µs, head / base, status)
+    rows: list[tuple[tuple[str, str], float | None, float | None, float | None, str]] = []
+    regressions: list[tuple[str, str]] = []
     for key in sorted(set(best["base"]) | set(best["head"])):
-        b, h = best["base"].get(key), best["head"].get(key)
+        b: float | None = best["base"].get(key)
+        h: float | None = best["head"].get(key)
         if b is None or h is None:
             rows.append((key, b, h, None, "only in " + ("head" if b is None else "base")))
             continue
-        ratio = h / b
-        status = ""
+        ratio: float = h / b
+        status: str = ""
         if ratio > 1 + args.threshold and h - b > args.min_us:
             status = "slower"
             regressions.append(key)
@@ -148,21 +160,21 @@ def main():
         rows.append((key, b, h, ratio, status))
     rows.sort(key=lambda r: -(r[3] or 0))
 
-    lines = [f"### Performance: head vs base (best of {args.rounds} runs each)", "",
-             "| Benchmark | Backend | Base | Head | Head / base | |",
-             "|---|---|---|---|---|---|"]
-    for (name, backend), b, h, ratio, status in rows:
-        mark = {"slower": "**slower**", "faster": "faster"}.get(status, status)
+    lines: list[str] = [f"### Performance: head vs base (best of {args.rounds} runs each)", "",
+                        "| Benchmark | Backend | Base | Head | Head / base | |",
+                        "|---|---|---|---|---|---|"]
+    for (name, backend), b, h, rel, status in rows:
+        mark: str = {"slower": "**slower**", "faster": "faster"}.get(status, status)
         lines.append(f"| {name} | {backend} | {fmt_us(b) if b else '-'} | "
-                     f"{fmt_us(h) if h else '-'} | {f'{ratio:.2f}' if ratio else '-'} | {mark} |")
-    verdict = (f"{len(regressions)} benchmark(s) slower by more than "
-               f"{args.threshold:.0%}" if regressions else
-               f"No benchmark slower by more than {args.threshold:.0%}.")
+                     f"{fmt_us(h) if h else '-'} | {f'{rel:.2f}' if rel else '-'} | {mark} |")
+    verdict: str = (f"{len(regressions)} benchmark(s) slower by more than "
+                    f"{args.threshold:.0%}" if regressions else
+                    f"No benchmark slower by more than {args.threshold:.0%}.")
     if regressions and args.allow_regressions:
         verdict += " Allowed by the `perf-regression-ok` label."
     lines += ["", verdict]
     lines += [f"Skipped: {s}." for s in sorted(skipped)]
-    report = "\n".join(lines) + "\n"
+    report: str = "\n".join(lines) + "\n"
     print(report)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:

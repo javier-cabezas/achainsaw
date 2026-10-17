@@ -27,3 +27,14 @@ classifiers = [
 manifest-path = "crates/achainsaw-py/Cargo.toml"
 module-name = "achainsaw"
 features = ["pyo3/extension-module"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "crates/achainsaw-py:benchmarks"
+files = ["benchmarks", "examples", "tests", "tools"]
+
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*", "matplotlib", "matplotlib.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
