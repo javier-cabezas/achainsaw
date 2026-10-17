@@ -3,7 +3,7 @@ Single-call LLM inference: examples/kernels/llama_decode.air on a real Llama GGU
 or on a random model with Llama 3.2 1B's shapes, against a NumPy implementation of the same
 math and, when PyTorch is installed, a PyTorch one.
 
-The AIR kernel runs the whole prompt in one llama_prefill call (4 tokens per weight load),
+The AIR kernel runs the whole prompt in one llama_prefill call (8 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
 Q4_0, Q8_0, Q6_K, Q4_K or Q5_K weights with f16 block scales (and mins for Q4_K and Q5_K),
@@ -44,7 +44,8 @@ length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is bf16) and ha
 kernels and rounding, so only its speed is compared.
 
 NumPy and PyTorch run the prompt one token at a time. The prompt speed is the prefill time per prompt
-token; the decode speed covers the generated tokens only.
+token (for the AIR kernel, the mean of 3 more llama_prefill calls after the one that starts the
+generation); the decode speed covers the generated tokens only.
 """
 
 import argparse
@@ -60,6 +61,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import achainsaw  # noqa: E402
 from gguf import GGUF, Tokenizer  # noqa: E402
 from llama_model import Model, torch  # noqa: E402
+
+# Timed prefills after the first, whose mean is the AIR kernel's prompt speed (llama-bench
+# averages 3 repetitions too).
+PREFILL_REPS = 3
 
 KERNEL = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels",
                                       "llama_decode.air"))
@@ -204,6 +209,15 @@ def main():
                               h, float(model.eps))
 
         out, prompt_s, times = generate(step, prompt_ids, args.tokens, stop, prefill)
+        if len(prompt_ids) > 1:
+            # As llama-bench: the mean of 3 prefills after the first (warm-up) one, each
+            # rewriting the cache from position 0.
+            reps = []
+            for _ in range(PREFILL_REPS):
+                t = time.perf_counter()
+                prefill(prompt_ids)
+                reps.append(time.perf_counter() - t)
+            prompt_s = float(np.mean(reps))
         runs[be] = out
         report(f"AIR {be}, {kernel.threads} thr", prompt_s, times, be)
         if tok and not args.prompt_tokens:

@@ -263,6 +263,189 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
   done:
     ret
 
+# qmat_chunk4 for 8 tokens: each weight vector is loaded and unpacked once for eight. Strips
+# of rows are the outer loop and blocks the inner one here, so the 8 tokens' sums of a strip
+# stay in registers (the chunk's weights stay in L2 cache across the tiles of a prefill),
+# and a token's dots for values 0..15 and 16..31 go into one int32 chain (one scale, except
+# in Q6_K, which runs its halves one after the other): 8 int32 and 8 f32 accumulators. The
+# first strip copies, per block, the 8 tokens' activations and records into one row of a
+# table (qmat_prep8), so that one pointer reaches them all. Each token's int32 sums equal
+# qmat_chunk's and its float operations are qmat_chunk's in the same order, so its results
+# are exactly qmat_chunk's.
+fn qmat_chunk8(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
+  b0:
+    wb0, sc, nb, blk, sc_blk, fmt, bias = call qmat_layout(c, mat, k)
+    w = vl i32
+    xq1 = add xq, xs
+    xq2 = add xq1, xs
+    xq3 = add xq2, xs
+    xq4 = add xq3, xs
+    xq5 = add xq4, xs
+    xq6 = add xq5, xs
+    xq7 = add xq6, xs
+    ds = udiv xs, 2:i64
+    dx1 = add dx, ds
+    dx2 = add dx1, ds
+    dx3 = add dx2, ds
+    dx4 = add dx3, ds
+    dx5 = add dx4, ds
+    dx6 = add dx5, ds
+    dx7 = add dx6, ds
+    is_q6 = eq fmt, 2:i64
+    tab_sz = mul nb, 384:i64
+    tab = alloc tab_sz
+    zf = splat 0.0:f32:vx
+    # One strip loop per format, chosen once per chunk.
+    odd = and fmt, 1:i64
+    is_n = eq odd, 1:i64
+    br is_n, nib, wide
+  nib:
+    is_k4 = eq fmt, 3:i64
+    br is_k4, k4(0:i64), q4(0:i64)
+  wide:
+    is_q8 = eq fmt, 0:i64
+    br is_q8, q8(0:i64), wide2
+  wide2:
+    br is_q6, q6(0:i64), k5(0:i64)
+  q8(jq8:i64):
+    more_q8 = lt jq8, 64:i64
+    br more_q8, q8_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done
+  q8_blocks(bq8:i64, f0q8:vx, f1q8:vx, f2q8:vx, f3q8:vx, f4q8:vx, f5q8:vx, f6q8:vx, f7q8:vx):
+    bmore_q8 = lt bq8, nb
+    br bmore_q8, q8_next, q8_end
+  q8_next:
+    # The first strip fills the tile's row for the block; the others read it.
+    first_q8 = eq jq8, 0:i64
+    br first_q8, q8_prep, q8_body
+  q8_prep:
+    call qmat_prep8(tab, bq8, xq, xq1, xq2, xq3, xq4, xq5, xq6, xq7, dx, dx1, dx2, dx3, dx4, dx5, dx6, dx7, bias, is_q6)
+    jmp q8_body
+  q8_body:
+    wbb_q8, sb_q8, xr_q8, e_q8 = call qmat_tile8(wb0, sc, tab, bq8, blk, sc_blk)
+    wb_q8, s_q8, unused_q8 = call qmat_strip(wbb_q8, sb_q8, dst, jq8)
+    r0q8, r1q8, r2q8, r3q8, r4q8, r5q8, r6q8, r7q8 = call qmat_dots8x8(wb_q8, xr_q8)
+    g0q8, g1q8, g2q8, g3q8, g4q8, g5q8, g6q8, g7q8 = call qmat_acc8(e_q8, 0:i32, s_q8, f0q8, f1q8, f2q8, f3q8, f4q8, f5q8, f6q8, f7q8, r0q8, r1q8, r2q8, r3q8, r4q8, r5q8, r6q8, r7q8)
+    bq82 = add bq8, 1:i64
+    jmp q8_blocks(bq82, g0q8, g1q8, g2q8, g3q8, g4q8, g5q8, g6q8, g7q8)
+  q8_end:
+    out_q8 = shl jq8, 2:i64
+    py_q8 = add dst, out_q8
+    call qmat_st8(py_q8, f0q8, f1q8, f2q8, f3q8, f4q8, f5q8, f6q8, f7q8)
+    jq82 = add jq8, w
+    jmp q8(jq82)
+  q4(jq4:i64):
+    more_q4 = lt jq4, 64:i64
+    br more_q4, q4_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done
+  q4_blocks(bq4:i64, f0q4:vx, f1q4:vx, f2q4:vx, f3q4:vx, f4q4:vx, f5q4:vx, f6q4:vx, f7q4:vx):
+    bmore_q4 = lt bq4, nb
+    br bmore_q4, q4_next, q4_end
+  q4_next:
+    # The first strip fills the tile's row for the block; the others read it.
+    first_q4 = eq jq4, 0:i64
+    br first_q4, q4_prep, q4_body
+  q4_prep:
+    call qmat_prep8(tab, bq4, xq, xq1, xq2, xq3, xq4, xq5, xq6, xq7, dx, dx1, dx2, dx3, dx4, dx5, dx6, dx7, bias, is_q6)
+    jmp q4_body
+  q4_body:
+    wbb_q4, sb_q4, xr_q4, e_q4 = call qmat_tile8(wb0, sc, tab, bq4, blk, sc_blk)
+    wb_q4, s_q4, unused_q4 = call qmat_strip(wbb_q4, sb_q4, dst, jq4)
+    r0q4, r1q4, r2q4, r3q4, r4q4, r5q4, r6q4, r7q4 = call qmat_dots4x8(wb_q4, xr_q4)
+    g0q4, g1q4, g2q4, g3q4, g4q4, g5q4, g6q4, g7q4 = call qmat_acc8(e_q4, 0:i32, s_q4, f0q4, f1q4, f2q4, f3q4, f4q4, f5q4, f6q4, f7q4, r0q4, r1q4, r2q4, r3q4, r4q4, r5q4, r6q4, r7q4)
+    bq42 = add bq4, 1:i64
+    jmp q4_blocks(bq42, g0q4, g1q4, g2q4, g3q4, g4q4, g5q4, g6q4, g7q4)
+  q4_end:
+    out_q4 = shl jq4, 2:i64
+    py_q4 = add dst, out_q4
+    call qmat_st8(py_q4, f0q4, f1q4, f2q4, f3q4, f4q4, f5q4, f6q4, f7q4)
+    jq42 = add jq4, w
+    jmp q4(jq42)
+  q6(jq6:i64):
+    more_q6 = lt jq6, 64:i64
+    br more_q6, q6_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done
+  q6_blocks(bq6:i64, f0q6:vx, f1q6:vx, f2q6:vx, f3q6:vx, f4q6:vx, f5q6:vx, f6q6:vx, f7q6:vx):
+    bmore_q6 = lt bq6, nb
+    br bmore_q6, q6_next, q6_end
+  q6_next:
+    # The first strip fills the tile's row for the block; the others read it.
+    first_q6 = eq jq6, 0:i64
+    br first_q6, q6_prep, q6_body
+  q6_prep:
+    call qmat_prep8(tab, bq6, xq, xq1, xq2, xq3, xq4, xq5, xq6, xq7, dx, dx1, dx2, dx3, dx4, dx5, dx6, dx7, bias, is_q6)
+    jmp q6_body
+  q6_body:
+    wbb_q6, sb_q6, xr_q6, e_q6 = call qmat_tile8(wb0, sc, tab, bq6, blk, sc_blk)
+    wb_q6, s_q6, unused_q6 = call qmat_strip(wbb_q6, sb_q6, dst, jq6)
+    r0q6, r1q6, r2q6, r3q6, r4q6, r5q6, r6q6, r7q6 = call qmat_dots6lox8(wb_q6, xr_q6)
+    u0q6, u1q6, u2q6, u3q6, u4q6, u5q6, u6q6, u7q6 = call qmat_acc8(e_q6, 0:i32, s_q6, f0q6, f1q6, f2q6, f3q6, f4q6, f5q6, f6q6, f7q6, r0q6, r1q6, r2q6, r3q6, r4q6, r5q6, r6q6, r7q6)
+    h0q6, h1q6, h2q6, h3q6, h4q6, h5q6, h6q6, h7q6 = call qmat_dots6hix8(wb_q6, xr_q6)
+    s1_q6 = call qmat_scale1(sb_q6, jq6)
+    g0q6, g1q6, g2q6, g3q6, g4q6, g5q6, g6q6, g7q6 = call qmat_acc8(e_q6, 1:i32, s1_q6, u0q6, u1q6, u2q6, u3q6, u4q6, u5q6, u6q6, u7q6, h0q6, h1q6, h2q6, h3q6, h4q6, h5q6, h6q6, h7q6)
+    bq62 = add bq6, 1:i64
+    jmp q6_blocks(bq62, g0q6, g1q6, g2q6, g3q6, g4q6, g5q6, g6q6, g7q6)
+  q6_end:
+    out_q6 = shl jq6, 2:i64
+    py_q6 = add dst, out_q6
+    call qmat_st8(py_q6, f0q6, f1q6, f2q6, f3q6, f4q6, f5q6, f6q6, f7q6)
+    jq62 = add jq6, w
+    jmp q6(jq62)
+  k4(jk4:i64):
+    more_k4 = lt jk4, 64:i64
+    br more_k4, k4_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done
+  k4_blocks(bk4:i64, f0k4:vx, f1k4:vx, f2k4:vx, f3k4:vx, f4k4:vx, f5k4:vx, f6k4:vx, f7k4:vx):
+    bmore_k4 = lt bk4, nb
+    br bmore_k4, k4_next, k4_end
+  k4_next:
+    # The first strip fills the tile's row for the block; the others read it.
+    first_k4 = eq jk4, 0:i64
+    br first_k4, k4_prep, k4_body
+  k4_prep:
+    call qmat_prep8(tab, bk4, xq, xq1, xq2, xq3, xq4, xq5, xq6, xq7, dx, dx1, dx2, dx3, dx4, dx5, dx6, dx7, bias, is_q6)
+    jmp k4_body
+  k4_body:
+    wbb_k4, sb_k4, xr_k4, e_k4 = call qmat_tile8(wb0, sc, tab, bk4, blk, sc_blk)
+    wb_k4, s_k4, unused_k4 = call qmat_strip(wbb_k4, sb_k4, dst, jk4)
+    r0k4, r1k4, r2k4, r3k4, r4k4, r5k4, r6k4, r7k4 = call qmat_dots4x8(wb_k4, xr_k4)
+    s1_k4 = call qmat_scale1(sb_k4, jk4)
+    g0k4, g1k4, g2k4, g3k4, g4k4, g5k4, g6k4, g7k4 = call qmat_accm8(e_k4, s_k4, s1_k4, f0k4, f1k4, f2k4, f3k4, f4k4, f5k4, f6k4, f7k4, r0k4, r1k4, r2k4, r3k4, r4k4, r5k4, r6k4, r7k4)
+    bk42 = add bk4, 1:i64
+    jmp k4_blocks(bk42, g0k4, g1k4, g2k4, g3k4, g4k4, g5k4, g6k4, g7k4)
+  k4_end:
+    out_k4 = shl jk4, 2:i64
+    py_k4 = add dst, out_k4
+    call qmat_st8(py_k4, f0k4, f1k4, f2k4, f3k4, f4k4, f5k4, f6k4, f7k4)
+    jk42 = add jk4, w
+    jmp k4(jk42)
+  k5(jk5:i64):
+    more_k5 = lt jk5, 64:i64
+    br more_k5, k5_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done
+  k5_blocks(bk5:i64, f0k5:vx, f1k5:vx, f2k5:vx, f3k5:vx, f4k5:vx, f5k5:vx, f6k5:vx, f7k5:vx):
+    bmore_k5 = lt bk5, nb
+    br bmore_k5, k5_next, k5_end
+  k5_next:
+    # The first strip fills the tile's row for the block; the others read it.
+    first_k5 = eq jk5, 0:i64
+    br first_k5, k5_prep, k5_body
+  k5_prep:
+    call qmat_prep8(tab, bk5, xq, xq1, xq2, xq3, xq4, xq5, xq6, xq7, dx, dx1, dx2, dx3, dx4, dx5, dx6, dx7, bias, is_q6)
+    jmp k5_body
+  k5_body:
+    wbb_k5, sb_k5, xr_k5, e_k5 = call qmat_tile8(wb0, sc, tab, bk5, blk, sc_blk)
+    wb_k5, s_k5, unused_k5 = call qmat_strip(wbb_k5, sb_k5, dst, jk5)
+    r0k5, r1k5, r2k5, r3k5, r4k5, r5k5, r6k5, r7k5 = call qmat_dots5x8(wb_k5, xr_k5)
+    s1_k5 = call qmat_scale1(sb_k5, jk5)
+    g0k5, g1k5, g2k5, g3k5, g4k5, g5k5, g6k5, g7k5 = call qmat_accm8(e_k5, s_k5, s1_k5, f0k5, f1k5, f2k5, f3k5, f4k5, f5k5, f6k5, f7k5, r0k5, r1k5, r2k5, r3k5, r4k5, r5k5, r6k5, r7k5)
+    bk52 = add bk5, 1:i64
+    jmp k5_blocks(bk52, g0k5, g1k5, g2k5, g3k5, g4k5, g5k5, g6k5, g7k5)
+  k5_end:
+    out_k5 = shl jk5, 2:i64
+    py_k5 = add dst, out_k5
+    call qmat_st8(py_k5, f0k5, f1k5, f2k5, f3k5, f4k5, f5k5, f6k5, f7k5)
+    jk52 = add jk5, w
+    jmp k5(jk52)
+  done:
+    free tab
+    ret
+
 # Chunk c of `mat` (see qmat_chunk): its weights, its scales, the number of 32-blocks of a
 # row, the bytes per block of weights and of scales, the format, and the bias of its unsigned
 # weights (128 for Q8_0, 8 for Q4_0, 32 for Q6_K; 1 for Q4_K and Q5_K, whose weights have no
@@ -386,6 +569,45 @@ inline fn qmat_dot(xb:ptr, g:i64, wl:vx, wh:vx, dl:vx, dh:vx)->(vx, vx)
     dh2 = vdotu dh, wh, vxh:i8
     ret dl2, dh2
 
+# qmat_dot for 4 tokens with the same weights.
+inline fn qmat_dot4(xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr, g:i64, wl:vx, wh:vx, a0l:vx, a0h:vx, a1l:vx, a1h:vx, a2l:vx, a2h:vx, a3l:vx, a3h:vx)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    b0l, b0h = call qmat_dot(xb0, g, wl, wh, a0l, a0h)
+    b1l, b1h = call qmat_dot(xb1, g, wl, wh, a1l, a1h)
+    b2l, b2h = call qmat_dot(xb2, g, wl, wh, a2l, a2h)
+    b3l, b3h = call qmat_dot(xb3, g, wl, wh, a3l, a3h)
+    ret b0l, b0h, b1l, b1h, b2l, b2h, b3l, b3h
+
+# a + w . x[4gi .. 4gi + 4] in every 32-bit lane, x being a token's 32-value block at xb and
+# w unsigned weights (one vpdpbusd or usdot): qmat_chunk8's step, one chain per token;
+# qmat_accr removes their bias.
+inline fn qmat_dot1(xb:ptr, gi:i64, w:vx, a:vx)->vx
+  b0:
+    xv = ld xb[gi]:i32
+    vxv = splat xv:vx
+    r = vdotu a, w, vxv:i8
+    ret r
+
+# qmat_dot1 for the 8 tokens of a qmat_chunk8 row at xr (their blocks 32 bytes apart).
+inline fn qmat_dot8(xr:ptr, g:i64, w:vx, a0:vx, a1:vx, a2:vx, a3:vx, a4:vx, a5:vx, a6:vx, a7:vx)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    r0 = call qmat_dot1(xr, g, w, a0)
+    x1 = add xr, 32:i64
+    r1 = call qmat_dot1(x1, g, w, a1)
+    x2 = add xr, 64:i64
+    r2 = call qmat_dot1(x2, g, w, a2)
+    x3 = add xr, 96:i64
+    r3 = call qmat_dot1(x3, g, w, a3)
+    x4 = add xr, 128:i64
+    r4 = call qmat_dot1(x4, g, w, a4)
+    x5 = add xr, 160:i64
+    r5 = call qmat_dot1(x5, g, w, a5)
+    x6 = add xr, 192:i64
+    r6 = call qmat_dot1(x6, g, w, a6)
+    x7 = add xr, 224:i64
+    r7 = call qmat_dot1(x7, g, w, a7)
+    ret r0, r1, r2, r3, r4, r5, r6, r7
+
 # The strip of rows j .. of a block (weights at wb0, scales at sb): its weights, its scale
 # group 0 widened to f32, and its outputs at dst + 4j.
 inline fn qmat_strip(wb0:ptr, sb:ptr, dst:ptr, j:i64)->(ptr, vx, ptr)
@@ -434,6 +656,25 @@ inline fn qmat_dots8x4(wb:ptr, xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr)->(vx, vx, vx,
     a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h = call qmat_dot4(xb0, xb1, xb2, xb3, 3:i64, w3l, w3h, a2_0l, a2_0h, a2_1l, a2_1h, a2_2l, a2_2h, a2_3l, a2_3h)
     ret a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h
 
+# qmat_dots8 for the 8 tokens of a qmat_chunk8 row at xr, each weight vector unpacked once,
+# one int32 chain per token: the sums of all 32 values.
+inline fn qmat_dots8x8(wb:ptr, xr:ptr)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    z = splat 0:i32:vx
+    w0l, w0h = call qmat_w8(wb, 0:i64)
+    a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l = call qmat_dot8(xr, 0:i64, w0l, z, z, z, z, z, z, z, z)
+    a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7 = call qmat_dot8(xr, 4:i64, w0h, a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l)
+    w1l, w1h = call qmat_w8(wb, 1:i64)
+    a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l = call qmat_dot8(xr, 1:i64, w1l, a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7)
+    a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7 = call qmat_dot8(xr, 5:i64, w1h, a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l)
+    w2l, w2h = call qmat_w8(wb, 2:i64)
+    a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l = call qmat_dot8(xr, 2:i64, w2l, a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7)
+    a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7 = call qmat_dot8(xr, 6:i64, w2h, a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l)
+    w3l, w3h = call qmat_w8(wb, 3:i64)
+    a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l = call qmat_dot8(xr, 3:i64, w3l, a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7)
+    a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7 = call qmat_dot8(xr, 7:i64, w3h, a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l)
+    ret a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7
+
 # One token's dots for a strip of Q4_0 and Q4_K weights at wb, groups 0..3 unrolled (see
 # qmat_dot): the int32 sums of values 0..15 and of values 16..31.
 inline fn qmat_dots4(wb:ptr, xb:ptr)->(vx, vx)
@@ -462,6 +703,25 @@ inline fn qmat_dots4x4(wb:ptr, xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr)->(vx, vx, vx,
     w3l, w3h = call qmat_w4(wb, 3:i64)
     a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h = call qmat_dot4(xb0, xb1, xb2, xb3, 3:i64, w3l, w3h, a2_0l, a2_0h, a2_1l, a2_1h, a2_2l, a2_2h, a2_3l, a2_3h)
     ret a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h
+
+# qmat_dots4 for the 8 tokens of a qmat_chunk8 row at xr, each weight vector unpacked once,
+# one int32 chain per token: the sums of all 32 values.
+inline fn qmat_dots4x8(wb:ptr, xr:ptr)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    z = splat 0:i32:vx
+    w0l, w0h = call qmat_w4(wb, 0:i64)
+    a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l = call qmat_dot8(xr, 0:i64, w0l, z, z, z, z, z, z, z, z)
+    a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7 = call qmat_dot8(xr, 4:i64, w0h, a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l)
+    w1l, w1h = call qmat_w4(wb, 1:i64)
+    a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l = call qmat_dot8(xr, 1:i64, w1l, a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7)
+    a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7 = call qmat_dot8(xr, 5:i64, w1h, a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l)
+    w2l, w2h = call qmat_w4(wb, 2:i64)
+    a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l = call qmat_dot8(xr, 2:i64, w2l, a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7)
+    a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7 = call qmat_dot8(xr, 6:i64, w2h, a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l)
+    w3l, w3h = call qmat_w4(wb, 3:i64)
+    a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l = call qmat_dot8(xr, 3:i64, w3l, a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7)
+    a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7 = call qmat_dot8(xr, 7:i64, w3h, a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l)
+    ret a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7
 
 # One token's dots for a strip of Q5_K weights at wb, groups 0..3 unrolled (see
 # qmat_dot): the int32 sums of values 0..15 and of values 16..31.
@@ -492,6 +752,25 @@ inline fn qmat_dots5x4(wb:ptr, xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr)->(vx, vx, vx,
     a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h = call qmat_dot4(xb0, xb1, xb2, xb3, 3:i64, w3l, w3h, a2_0l, a2_0h, a2_1l, a2_1h, a2_2l, a2_2h, a2_3l, a2_3h)
     ret a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h
 
+# qmat_dots5 for the 8 tokens of a qmat_chunk8 row at xr, each weight vector unpacked once,
+# one int32 chain per token: the sums of all 32 values.
+inline fn qmat_dots5x8(wb:ptr, xr:ptr)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    z = splat 0:i32:vx
+    w0l, w0h = call qmat_w5(wb, 0:i64)
+    a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l = call qmat_dot8(xr, 0:i64, w0l, z, z, z, z, z, z, z, z)
+    a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7 = call qmat_dot8(xr, 4:i64, w0h, a0_0l, a0_1l, a0_2l, a0_3l, a0_4l, a0_5l, a0_6l, a0_7l)
+    w1l, w1h = call qmat_w5(wb, 1:i64)
+    a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l = call qmat_dot8(xr, 1:i64, w1l, a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7)
+    a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7 = call qmat_dot8(xr, 5:i64, w1h, a1_0l, a1_1l, a1_2l, a1_3l, a1_4l, a1_5l, a1_6l, a1_7l)
+    w2l, w2h = call qmat_w5(wb, 2:i64)
+    a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l = call qmat_dot8(xr, 2:i64, w2l, a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7)
+    a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7 = call qmat_dot8(xr, 6:i64, w2h, a2_0l, a2_1l, a2_2l, a2_3l, a2_4l, a2_5l, a2_6l, a2_7l)
+    w3l, w3h = call qmat_w5(wb, 3:i64)
+    a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l = call qmat_dot8(xr, 3:i64, w3l, a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7)
+    a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7 = call qmat_dot8(xr, 7:i64, w3h, a3_0l, a3_1l, a3_2l, a3_3l, a3_4l, a3_5l, a3_6l, a3_7l)
+    ret a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7
+
 # One token's dots for a strip of Q6_K weights at wb, groups 0..3 unrolled (see
 # qmat_dot): the int32 sums of values 0..15 and of values 16..31.
 inline fn qmat_dots6(wb:ptr, xb:ptr)->(vx, vx)
@@ -521,14 +800,184 @@ inline fn qmat_dots6x4(wb:ptr, xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr)->(vx, vx, vx,
     a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h = call qmat_dot4(xb0, xb1, xb2, xb3, 3:i64, w3l, w3h, a2_0l, a2_0h, a2_1l, a2_1h, a2_2l, a2_2h, a2_3l, a2_3h)
     ret a3_0l, a3_0h, a3_1l, a3_1h, a3_2l, a3_2h, a3_3l, a3_3h
 
-# qmat_dot for 4 tokens with the same weights.
-inline fn qmat_dot4(xb0:ptr, xb1:ptr, xb2:ptr, xb3:ptr, g:i64, wl:vx, wh:vx, a0l:vx, a0h:vx, a1l:vx, a1h:vx, a2l:vx, a2h:vx, a3l:vx, a3h:vx)->(vx, vx, vx, vx, vx, vx, vx, vx)
+# qmat_dots6's sums of values 0..15 for the 8 tokens of a qmat_chunk8 row at xr.
+inline fn qmat_dots6lox8(wb:ptr, xr:ptr)->(vx, vx, vx, vx, vx, vx, vx, vx)
   b0:
-    b0l, b0h = call qmat_dot(xb0, g, wl, wh, a0l, a0h)
-    b1l, b1h = call qmat_dot(xb1, g, wl, wh, a1l, a1h)
-    b2l, b2h = call qmat_dot(xb2, g, wl, wh, a2l, a2h)
-    b3l, b3h = call qmat_dot(xb3, g, wl, wh, a3l, a3h)
-    ret b0l, b0h, b1l, b1h, b2l, b2h, b3l, b3h
+    z = splat 0:i32:vx
+    w0, w0h = call qmat_w6(wb, 0:i64)
+    a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7 = call qmat_dot8(xr, 0:i64, w0, z, z, z, z, z, z, z, z)
+    w1, w1h = call qmat_w6(wb, 1:i64)
+    a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7 = call qmat_dot8(xr, 1:i64, w1, a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7)
+    w2, w2h = call qmat_w6(wb, 2:i64)
+    a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7 = call qmat_dot8(xr, 2:i64, w2, a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7)
+    w3, w3h = call qmat_w6(wb, 3:i64)
+    a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7 = call qmat_dot8(xr, 3:i64, w3, a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7)
+    ret a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7
+
+# qmat_dots6's sums of values 16..31 for the 8 tokens of a qmat_chunk8 row at xr.
+inline fn qmat_dots6hix8(wb:ptr, xr:ptr)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    z = splat 0:i32:vx
+    w0l, w0 = call qmat_w6(wb, 0:i64)
+    a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7 = call qmat_dot8(xr, 4:i64, w0, z, z, z, z, z, z, z, z)
+    w1l, w1 = call qmat_w6(wb, 1:i64)
+    a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7 = call qmat_dot8(xr, 5:i64, w1, a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7)
+    w2l, w2 = call qmat_w6(wb, 2:i64)
+    a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7 = call qmat_dot8(xr, 6:i64, w2, a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7)
+    w3l, w3 = call qmat_w6(wb, 3:i64)
+    a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7 = call qmat_dot8(xr, 7:i64, w3, a2_0, a2_1, a2_2, a2_3, a2_4, a2_5, a2_6, a2_7)
+    ret a3_0, a3_1, a3_2, a3_3, a3_4, a3_5, a3_6, a3_7
+
+# Block b of a qmat_chunk8 tile: its weights and scales, and the tile's row for it (384 bytes
+# per block: the 8 tokens' 32 activations, then their 16-byte records from qmat_rec).
+inline fn qmat_tile8(wb0:ptr, sc:ptr, tab:ptr, b:i64, blk:i64, sc_blk:i64)->(ptr, ptr, ptr, ptr)
+  b0:
+    bo = mul b, blk
+    wb = add wb0, bo
+    so = mul b, sc_blk
+    sb = add sc, so
+    eo = mul b, 384:i64
+    xr = add tab, eo
+    e = add xr, 256:i64
+    ret wb, sb, xr, e
+
+# Block b's row of a qmat_chunk8 tile at tab (see qmat_tile8): the 8 tokens' activations
+# (from xq0 .. xq7) and records (qmat_rec, from dx0 .. dx7).
+inline fn qmat_prep8(tab:ptr, b:i64, xq0:ptr, xq1:ptr, xq2:ptr, xq3:ptr, xq4:ptr, xq5:ptr, xq6:ptr, xq7:ptr, dx0:ptr, dx1:ptr, dx2:ptr, dx3:ptr, dx4:ptr, dx5:ptr, dx6:ptr, dx7:ptr, bias:i32, is_q6:i32)
+  b0:
+    eo = mul b, 384:i64
+    pe = add tab, eo
+    pr = add pe, 256:i64
+    px = shl b, 5:i64
+    px0 = add xq0, px
+    call qmat_copyx(pe, 0:i64, px0)
+    px1 = add xq1, px
+    call qmat_copyx(pe, 1:i64, px1)
+    px2 = add xq2, px
+    call qmat_copyx(pe, 2:i64, px2)
+    px3 = add xq3, px
+    call qmat_copyx(pe, 3:i64, px3)
+    px4 = add xq4, px
+    call qmat_copyx(pe, 4:i64, px4)
+    px5 = add xq5, px
+    call qmat_copyx(pe, 5:i64, px5)
+    px6 = add xq6, px
+    call qmat_copyx(pe, 6:i64, px6)
+    px7 = add xq7, px
+    call qmat_copyx(pe, 7:i64, px7)
+    call qmat_rec(pr, 0:i64, dx0, b, bias, is_q6)
+    call qmat_rec(pr, 1:i64, dx1, b, bias, is_q6)
+    call qmat_rec(pr, 2:i64, dx2, b, bias, is_q6)
+    call qmat_rec(pr, 3:i64, dx3, b, bias, is_q6)
+    call qmat_rec(pr, 4:i64, dx4, b, bias, is_q6)
+    call qmat_rec(pr, 5:i64, dx5, b, bias, is_q6)
+    call qmat_rec(pr, 6:i64, dx6, b, bias, is_q6)
+    call qmat_rec(pr, 7:i64, dx7, b, bias, is_q6)
+    ret
+
+# Token t's 32 activations of a block (at xb) into their place in a qmat_chunk8 row at pe.
+inline fn qmat_copyx(pe:ptr, t:i64, xb:ptr)
+  b0:
+    o = shl t, 5:i64
+    q = add pe, o
+    lo = ld xb:v128
+    hi = ld xb[16:i8]:v128
+    st q, lo
+    st q[16:i8], hi
+    ret
+
+# Token t's 16-byte entry in the row of block b at pe: from its activation record (qmat_block),
+# the scale d, the correction c of qmat_accr (c_lo for Q6_K's first half, c_lo + c_hi
+# otherwise), Q6_K's c_hi, and -d * (c_lo + c_hi) for the mins of Q4_K and Q5_K (qmat_accm's).
+inline fn qmat_rec(pe:ptr, t:i64, dx:ptr, b:i64, bias:i32, is_q6:i32)
+  b0:
+    d, c_lo, c_hi = call qmat_block(dx, b, bias)
+    c_all = add c_lo, c_hi
+    c = select is_q6, c_lo, c_all
+    nd = call qmat_negsum(d, c_all)
+    eo = shl t, 4:i64
+    e = add pe, eo
+    st e, d
+    st e[1], c
+    st e[2], c_hi
+    st e[3], nd
+    ret
+
+# Token t's entry (qmat_rec) in a block's row of records at e.
+inline fn qmat_rec_ld(e:ptr, t:i64)->(f32, i32, i32, f32)
+  b0:
+    eo = shl t, 4:i64
+    p = add e, eo
+    d = ld p:f32
+    c = ld p[1]:i32
+    h = ld p[2]:i32
+    nd = ld p[3]:f32
+    ret d, c, h, nd
+
+# qmat_accr for the 8 tokens of a strip, with their records at e (qmat_rec): c removes
+# the bias of the whole block (Q8_0, Q4_0) or of Q6_K's first half, or with half = 1 of
+# Q6_K's second.
+inline fn qmat_acc8(e:ptr, half:i32, s:vx, f0:vx, f1:vx, f2:vx, f3:vx, f4:vx, f5:vx, f6:vx, f7:vx, r0:vx, r1:vx, r2:vx, r3:vx, r4:vx, r5:vx, r6:vx, r7:vx)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    d0, c0, h0, n0 = call qmat_rec_ld(e, 0:i64)
+    k0 = select half, h0, c0
+    g0 = call qmat_accr(f0, r0, s, d0, k0)
+    d1, c1, h1, n1 = call qmat_rec_ld(e, 1:i64)
+    k1 = select half, h1, c1
+    g1 = call qmat_accr(f1, r1, s, d1, k1)
+    d2, c2, h2, n2 = call qmat_rec_ld(e, 2:i64)
+    k2 = select half, h2, c2
+    g2 = call qmat_accr(f2, r2, s, d2, k2)
+    d3, c3, h3, n3 = call qmat_rec_ld(e, 3:i64)
+    k3 = select half, h3, c3
+    g3 = call qmat_accr(f3, r3, s, d3, k3)
+    d4, c4, h4, n4 = call qmat_rec_ld(e, 4:i64)
+    k4 = select half, h4, c4
+    g4 = call qmat_accr(f4, r4, s, d4, k4)
+    d5, c5, h5, n5 = call qmat_rec_ld(e, 5:i64)
+    k5 = select half, h5, c5
+    g5 = call qmat_accr(f5, r5, s, d5, k5)
+    d6, c6, h6, n6 = call qmat_rec_ld(e, 6:i64)
+    k6 = select half, h6, c6
+    g6 = call qmat_accr(f6, r6, s, d6, k6)
+    d7, c7, h7, n7 = call qmat_rec_ld(e, 7:i64)
+    k7 = select half, h7, c7
+    g7 = call qmat_accr(f7, r7, s, d7, k7)
+    ret g0, g1, g2, g3, g4, g5, g6, g7
+
+# qmat_accmr for the 8 tokens of a strip (Q4_K and Q5_K), with their records at e.
+inline fn qmat_accm8(e:ptr, s:vx, m:vx, f0:vx, f1:vx, f2:vx, f3:vx, f4:vx, f5:vx, f6:vx, f7:vx, r0:vx, r1:vx, r2:vx, r3:vx, r4:vx, r5:vx, r6:vx, r7:vx)->(vx, vx, vx, vx, vx, vx, vx, vx)
+  b0:
+    d0, c0, h0, n0 = call qmat_rec_ld(e, 0:i64)
+    g0 = call qmat_accmr(f0, r0, s, m, d0, n0)
+    d1, c1, h1, n1 = call qmat_rec_ld(e, 1:i64)
+    g1 = call qmat_accmr(f1, r1, s, m, d1, n1)
+    d2, c2, h2, n2 = call qmat_rec_ld(e, 2:i64)
+    g2 = call qmat_accmr(f2, r2, s, m, d2, n2)
+    d3, c3, h3, n3 = call qmat_rec_ld(e, 3:i64)
+    g3 = call qmat_accmr(f3, r3, s, m, d3, n3)
+    d4, c4, h4, n4 = call qmat_rec_ld(e, 4:i64)
+    g4 = call qmat_accmr(f4, r4, s, m, d4, n4)
+    d5, c5, h5, n5 = call qmat_rec_ld(e, 5:i64)
+    g5 = call qmat_accmr(f5, r5, s, m, d5, n5)
+    d6, c6, h6, n6 = call qmat_rec_ld(e, 6:i64)
+    g6 = call qmat_accmr(f6, r6, s, m, d6, n6)
+    d7, c7, h7, n7 = call qmat_rec_ld(e, 7:i64)
+    g7 = call qmat_accmr(f7, r7, s, m, d7, n7)
+    ret g0, g1, g2, g3, g4, g5, g6, g7
+
+# The 8 tokens' sums of a strip, 64 floats (one token's results) apart from py.
+inline fn qmat_st8(py:ptr, f0:vx, f1:vx, f2:vx, f3:vx, f4:vx, f5:vx, f6:vx, f7:vx)
+  b0:
+    st py, f0
+    st py[64:f32], f1
+    st py[128:f32], f2
+    st py[192:f32], f3
+    st py[256:f32], f4
+    st py[320:f32], f5
+    st py[384:f32], f6
+    st py[448:f32], f7
+    ret
 
 # f16 scales sb[i ..] of a strip's rows (at most n of them), widened to f32: scale group
 # 0 of rows j .. at sb[j], Q6_K's group 1 (the mins of Q4_K and Q5_K) at sb[j + 64].
@@ -543,14 +992,9 @@ inline fn qmat_scale(sb:ptr, i:i64, n:i64)->vx
 inline fn qmat_acc1(py:ptr, dl:vx, dh:vx, s:vx, d:f32, c_lo:i32, c_hi:i32)
   b0:
     acc = ld py:vx
-    vd = splat d:vx
-    ds = vmul s, vd:f32
-    c = add c_lo, c_hi
-    vc = splat c:vx
     raw = vadd dl, dh:i32
-    dsum = vsub raw, vc:i32
-    pf = vitof dsum:f32
-    acc2 = vfma pf, ds, acc:f32
+    c = add c_lo, c_hi
+    acc2 = call qmat_accr(acc, raw, s, d, c)
     st py, acc2
     ret
 
@@ -559,19 +1003,22 @@ inline fn qmat_acc1(py:ptr, dl:vx, dh:vx, s:vx, d:f32, c_lo:i32, c_hi:i32)
 inline fn qmat_acc2(py:ptr, dl:vx, dh:vx, s:vx, s1:vx, d:f32, c_lo:i32, c_hi:i32)
   b0:
     acc = ld py:vx
-    vd = splat d:vx
-    ds = vmul s, vd:f32
-    vcl = splat c_lo:vx
-    vch = splat c_hi:vx
-    dlc = vsub dl, vcl:i32
-    dhc = vsub dh, vch:i32
-    pfl = vitof dlc:f32
-    accl = vfma pfl, ds, acc:f32
-    ds1 = vmul s1, vd:f32
-    pfh = vitof dhc:f32
-    acch = vfma pfh, ds1, accl:f32
+    accl = call qmat_accr(acc, dl, s, d, c_lo)
+    acch = call qmat_accr(accl, dh, s1, d, c_hi)
     st py, acch
     ret
+
+# acc + s * d * (dot - c), the step of qmat_acc1 and qmat_acc2 (and of qmat_chunk8, whose sums
+# stay in registers).
+inline fn qmat_accr(acc:vx, dot:vx, s:vx, d:f32, c:i32)->vx
+  b0:
+    vd = splat d:vx
+    ds = vmul s, vd:f32
+    vc = splat c:vx
+    dc = vsub dot, vc:i32
+    pf = vitof dc:f32
+    acc2 = vfma pf, ds, acc:f32
+    ret acc2
 
 # A token's f32 sums at py += s * d * (dl + dh), then -= m * d * (c_lo + c_hi): Q4_K and
 # Q5_K, whose weights s * value - m have a scale s and a min m per block (qmat_layout's bias
@@ -579,19 +1026,31 @@ inline fn qmat_acc2(py:ptr, dl:vx, dh:vx, s:vx, s1:vx, d:f32, c_lo:i32, c_hi:i32
 inline fn qmat_accm(py:ptr, dl:vx, dh:vx, s:vx, m:vx, d:f32, c_lo:i32, c_hi:i32)
   b0:
     acc = ld py:vx
-    vd = splat d:vx
-    ds = vmul s, vd:f32
     raw = vadd dl, dh:i32
-    pf = vitof raw:f32
-    acc1 = vfma pf, ds, acc:f32
     sum = add c_lo, c_hi
-    sumf = itof sum:f32
-    dsum = mul d, sumf
-    ndsum = neg dsum
-    vn = splat ndsum:vx
-    acc2 = vfma m, vn, acc1:f32
+    nd = call qmat_negsum(d, sum)
+    acc2 = call qmat_accmr(acc, raw, s, m, d, nd)
     st py, acc2
     ret
+
+# -d * sum, the factor of a block's mins in qmat_accmr.
+inline fn qmat_negsum(d:f32, sum:i32)->f32
+  b0:
+    sumf = itof sum:f32
+    dsum = mul d, sumf
+    nd = neg dsum
+    ret nd
+
+# (acc + s * d * dot) + m * nd, nd being -d * sum (qmat_negsum).
+inline fn qmat_accmr(acc:vx, dot:vx, s:vx, m:vx, d:f32, nd:f32)->vx
+  b0:
+    vd = splat d:vx
+    ds = vmul s, vd:f32
+    pf = vitof dot:f32
+    acc1 = vfma pf, ds, acc:f32
+    vn = splat nd:vx
+    acc2 = vfma m, vn, acc1:f32
+    ret acc2
 
 # Block b's activation record (from quantize_q8) at dx: its scale, and the corrections for
 # weights stored with `bias` added: bias times the sums of values 0..15 and 16..31.
@@ -607,40 +1066,54 @@ inline fn qmat_block(dx:ptr, b:i64, bias:i32)->(f32, i32, i32)
     ret d, c_lo, c_hi
 
 # dst[64t .. 64t + 64] = rows 64c .. 64c + 64 of `mat` times token t's int8 activations,
-# for n tokens xs bytes apart in xq (their block records xs / 2 bytes apart in dx): four at a time
-# with qmat_chunk4, the rest with qmat_chunk, so every result is exactly qmat_chunk's.
+# for n tokens xs bytes apart in xq (their block records xs / 2 bytes apart in dx): eight at a
+# time with qmat_chunk8 when vectors are 256 bits or wider, then four at a time with
+# qmat_chunk4, the rest with qmat_chunk, so every result is exactly qmat_chunk's.
 fn qmat_batch(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, n:i64, xs:i64)
   b0:
     ds = udiv xs, 2:i64
-    jmp tiles(0:i64)
+    # Tiles of 8 need 16 vector registers for their sums and weights: only with 256-bit
+    # vectors or wider (x86 AVX2 and AVX-512, SVE), not 128-bit ones (Cranelift, NEON).
+    w = vl i32
+    wide = uge w, 8:i64
+    br wide, tiles(0:i64), quad(0:i64)
   tiles(t:i64):
-    t4 = add t, 4:i64
-    full = le t4, n
-    br full, tile_body, rest(t)
+    t8 = add t, 8:i64
+    full = le t8, n
+    br full, tile_body, quad(t)
   tile_body:
-    xo = mul t, xs
-    pxq = add xq, xo
-    dofs = mul t, ds
-    pdx = add dx, dofs
-    oo = mul t, 256:i64
-    po = add dst, oo
-    call qmat_chunk4(c, mat, pxq, pdx, po, k, xs)
-    jmp tiles(t4)
+    po, pxq, pdx = call qmat_tok(t, xq, dx, dst, xs, ds)
+    call qmat_chunk8(c, mat, pxq, pdx, po, k, xs)
+    jmp tiles(t8)
+  quad(q:i64):
+    q4 = add q, 4:i64
+    four = le q4, n
+    br four, quad_body, rest(q)
+  quad_body:
+    qo, qxq, qdx = call qmat_tok(q, xq, dx, dst, xs, ds)
+    call qmat_chunk4(c, mat, qxq, qdx, qo, k, xs)
+    jmp quad(q4)
   rest(r:i64):
     r_more = lt r, n
     br r_more, rest_body, done
   rest_body:
-    rxo = mul r, xs
-    rxq = add xq, rxo
-    rdo = mul r, ds
-    rdx = add dx, rdo
-    roo = mul r, 256:i64
-    ro = add dst, roo
+    ro, rxq, rdx = call qmat_tok(r, xq, dx, dst, xs, ds)
     call qmat_chunk(c, mat, rxq, rdx, ro, k)
     r2 = add r, 1:i64
     jmp rest(r2)
   done:
     ret
+
+# Token t's results, int8 activations and block records for qmat_batch.
+inline fn qmat_tok(t:i64, xq:ptr, dx:ptr, dst:ptr, xs:i64, ds:i64)->(ptr, ptr, ptr)
+  b0:
+    oo = mul t, 256:i64
+    po = add dst, oo
+    xo = mul t, xs
+    pxq = add xq, xo
+    dofs = mul t, ds
+    pdx = add dx, dofs
+    ret po, pxq, pdx
 
 # Q8_0 quantization of x[0 .. k] (k a multiple of 32), as llama.cpp's quantize_row_q8_0:
 # scale d = max|x in block b| / 127 and xq[32b + t] = round(x[32b + t] / d), halves away

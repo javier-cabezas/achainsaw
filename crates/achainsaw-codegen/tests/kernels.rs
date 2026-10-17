@@ -895,7 +895,7 @@ fn gqa_attention_matches_reference() {
 }
 
 /// `q4_gemm` gives every token exactly `q4_gemv`'s results (same quantization, same int8
-/// dots, 4 tokens per weight load).
+/// dots, 8 or 4 tokens per weight load): token counts cover tiles of 8, 4 and single tokens.
 #[test]
 fn q4_gemm_matches_q4_gemv() {
     type Gemm = extern "C" fn(*const u8, *const u16, *const f32, *mut f32, i64, i64, i64);
@@ -906,7 +906,7 @@ fn q4_gemm_matches_q4_gemv() {
         let mut rng = Rng(83);
         for (m, k) in [(64, 32), (128, 96), (192, 256)] {
             let (wq, sc, _, _) = q_pack(&mut rng, m, k, true);
-            for n in [1, 3, 4, 5, 9] {
+            for n in [1, 3, 4, 5, 8, 9, 13, 16] {
                 let x = rng.vec(n * k);
                 let mut y = vec![f32::NAN; n * m];
                 kgemm(
@@ -935,6 +935,120 @@ fn q4_gemm_matches_q4_gemv() {
                             "q4_gemm {m}x{k} n={n} y[{t}][{i}] at {level}"
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The standard library's token tiles, `qmat_chunk8` and `qmat_chunk4`, give every token
+/// exactly `qmat_chunk`'s results, for each weight format and for a matrix of five parts in
+/// different formats, at every level with and without `fast_math`. They are called directly:
+/// `qmat_batch` runs `qmat_chunk8` only with vectors of 256 bits or more.
+#[test]
+fn qmat_tiles_match_single_tokens() {
+    let module =
+        parse_and_validate("use quantize_q8, qmat_chunk, qmat_chunk4, qmat_chunk8\n").unwrap();
+    type Quantize = extern "C" fn(*const f32, *mut i8, *mut u8, i64);
+    type One = extern "C" fn(i64, *const u64, *const i8, *const u8, *mut f32, i64);
+    type Tile = extern "C" fn(i64, *const u64, *const i8, *const u8, *mut f32, i64, i64);
+    // Bytes of weights per 32-block of a chunk, and f16 scale vectors per block, by format.
+    const BLOCK: [usize; 5] = [2048, 1024, 1536, 1024, 1280];
+    const SCALES: [usize; 5] = [1, 1, 2, 2, 2];
+    let (k, n) = (96usize, 8usize);
+    let nb = k / 32;
+    let mut rng = Rng(91);
+    let matrices: Vec<Vec<i64>> = (0..5)
+        .map(|f| vec![f])
+        .chain([vec![3, 2, 4, 0, 1]])
+        .collect();
+    // Every byte is a valid weight in every format, so the weights are random bytes.
+    let parts: Vec<Vec<(Vec<u8>, Vec<u16>)>> = matrices
+        .iter()
+        .map(|fmts| {
+            fmts.iter()
+                .map(|&f| {
+                    let f = f as usize;
+                    let w = (0..nb * BLOCK[f])
+                        .map(|_| (rng.next() * 1000.0) as u8)
+                        .collect();
+                    let s = (0..nb * 64 * SCALES[f])
+                        .map(|_| half::f16::from_f32(0.01 * rng.next()).to_bits())
+                        .collect();
+                    (w, s)
+                })
+                .collect()
+        })
+        .collect();
+    let x = rng.vec(n * k);
+    for (level, features) in host_levels() {
+        for fast in [false, true] {
+            let mut engine = JitEngine::with_features(&features).unwrap();
+            engine.set_fast_math(fast);
+            engine.compile_module(&module).unwrap();
+            let ptr = |name| engine.get_fn_ptr(name).unwrap();
+            let quantize: Quantize = unsafe { std::mem::transmute(ptr("quantize_q8")) };
+            let one: One = unsafe { std::mem::transmute(ptr("qmat_chunk")) };
+            let tile4: Tile = unsafe { std::mem::transmute(ptr("qmat_chunk4")) };
+            let tile8: Tile = unsafe { std::mem::transmute(ptr("qmat_chunk8")) };
+            let mut xq = vec![0i8; n * k];
+            let mut dx = vec![0u8; n * k / 2];
+            for t in 0..n {
+                quantize(
+                    x[t * k..].as_ptr(),
+                    xq[t * k..].as_mut_ptr(),
+                    dx[t * k / 2..].as_mut_ptr(),
+                    k as i64,
+                );
+            }
+            for (fmts, data) in matrices.iter().zip(&parts) {
+                // The part list: weights, scales, format, one 64-row chunk each.
+                let mat: Vec<u64> = fmts
+                    .iter()
+                    .zip(data)
+                    .flat_map(|(&f, (w, s))| [w.as_ptr() as u64, s.as_ptr() as u64, f as u64, 1])
+                    .collect();
+                for c in 0..fmts.len() {
+                    let mut want = vec![f32::NAN; n * 64];
+                    for t in 0..n {
+                        let (xt, dt) = (xq[t * k..].as_ptr(), dx[t * k / 2..].as_ptr());
+                        one(
+                            c as i64,
+                            mat.as_ptr(),
+                            xt,
+                            dt,
+                            want[t * 64..].as_mut_ptr(),
+                            k as i64,
+                        );
+                    }
+                    let mut got8 = vec![f32::NAN; n * 64];
+                    tile8(
+                        c as i64,
+                        mat.as_ptr(),
+                        xq.as_ptr(),
+                        dx.as_ptr(),
+                        got8.as_mut_ptr(),
+                        k as i64,
+                        k as i64,
+                    );
+                    let mut got4 = vec![f32::NAN; n * 64];
+                    for t in [0, 4] {
+                        let (xt, dt) = (xq[t * k..].as_ptr(), dx[t * k / 2..].as_ptr());
+                        tile4(
+                            c as i64,
+                            mat.as_ptr(),
+                            xt,
+                            dt,
+                            got4[t * 64..].as_mut_ptr(),
+                            k as i64,
+                            k as i64,
+                        );
+                    }
+                    let ctx = format!("formats {fmts:?} chunk {c} at {level} fast_math={fast}");
+                    assert!(want.iter().all(|v| v.is_finite()), "{ctx}");
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got8), bits(&want), "qmat_chunk8, {ctx}");
+                    assert_eq!(bits(&got4), bits(&want), "qmat_chunk4, {ctx}");
                 }
             }
         }
