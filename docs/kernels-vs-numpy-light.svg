@@ -36,7 +36,7 @@
 <text x="238" y="125.0" font-size="12" text-anchor="end" fill="#0b0b0b">Q4_0 GEMM, 32 tokens, all cores</text>
 <path d="M407.5,104.0 H652.0 Q656.0,104.0 656.0,108.0 V110.0 Q656.0,114.0 652.0,114.0 H407.5 Z" fill="#8a8a85"><title>Q4_0 GEMM, 32 tokens, all cores, PyTorch (eager): 37.80x NumPy</title></path>
 <path d="M407.5,116.0 H624.9 Q628.9,116.0 628.9,120.0 V122.0 Q628.9,126.0 624.9,126.0 H407.5 Z" fill="#2a78d6"><title>Q4_0 GEMM, 32 tokens, all cores, Cranelift (128-bit vectors): 25.44x NumPy</title></path>
-<path d="M407.5,128.0 H746.5 Q750.5,128.0 750.5,132.0 V134.0 Q750.5,138.0 746.5,138.0 H407.5 Z" fill="#eb6834"><title>Q4_0 GEMM, 32 tokens, all cores, LLVM (AVX-512): 150.34x NumPy</title></path>
+<path d="M407.5,128.0 H760.4 Q764.4,128.0 764.4,132.0 V134.0 Q764.4,138.0 760.4,138.0 H407.5 Z" fill="#eb6834"><title>Q4_0 GEMM, 32 tokens, all cores, LLVM (AVX-512): 184.30x NumPy</title></path>
 <text x="238" y="173.0" font-size="12" text-anchor="end" fill="#0b0b0b">Q4_0 GEMV 4096x4096, all cores</text>
 <path d="M407.5,152.0 H672.8 Q676.8,152.0 676.8,156.0 V158.0 Q676.8,162.0 672.8,162.0 H407.5 Z" fill="#8a8a85"><title>Q4_0 GEMV 4096x4096, all cores, PyTorch (eager): 51.19x NumPy</title></path>
 <path d="M407.5,164.0 H654.2 Q658.2,164.0 658.2,168.0 V170.0 Q658.2,174.0 654.2,174.0 H407.5 Z" fill="#2a78d6"><title>Q4_0 GEMV 4096x4096, all cores, Cranelift (128-bit vectors): 39.02x NumPy</title></path>

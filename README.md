@@ -500,7 +500,7 @@ The parentheses give the speedup over NumPy:
 | Kernel | NumPy | PyTorch | Cranelift (128-bit) | LLVM (512-bit) |
 |---|---|---|---|---|
 | Q4_0 GEMV 4096x4096, all cores | 5.58 ms (the same, from 4-bit values) | 109 µs (51x; int4 weight-only kernel, bf16 activations) | 143 µs (39x) | 39.4 µs (142x) |
-| Q4_0 GEMM 4096x4096 on 32 tokens (prefill), all cores | 66.9 ms (int widened to f32 per call) | 1.77 ms (38x; int4 weight-only kernel, bf16 activations) | 2.63 ms (25x) | 445 µs (150x) |
+| Q4_0 GEMM 4096x4096 on 32 tokens (prefill), all cores | 66.9 ms (int widened to f32 per call) | 1.77 ms (38x; int4 weight-only kernel, bf16 activations) | 2.63 ms (25x) | 363 µs (184x) |
 | Q8_0 GEMV 4096x4096, all cores | 5.62 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 111 µs (51x; int8 weight-only kernel, one scale per row, bf16 activations) | 157 µs (36x) | 55.5 µs (101x) |
 | Top-k, k=40 of 128256 logits | 755 µs (`argpartition`, then `argsort` of the 40) | 160 µs (4.7x; `topk`) | 24.7 µs (31x) | 15.1 µs (50x) |
 | GQA decode attention, Llama 3 8B: 32 query / 8 KV heads x 128, 4096 positions of a bf16 cache, all cores | 4.72 ms (the cache widened to f32 per call) | 473 µs (10x; `scaled_dot_product_attention` with each group's heads as query positions, bf16) | 923 µs (5.1x) | 209 µs (23x) |
@@ -523,7 +523,7 @@ The parentheses give the speedup over NumPy:
 
 Every pull request also runs a performance check in CI: [`benchmarks/perf_compare.py`](benchmarks/perf_compare.py) builds the PR's base and head on the same runner, runs each side's kernel benchmarks and a 4-layer decode alternately for 5 rounds, and fails if the best time of any kernel on either backend got more than 25% slower. Comparing best times from fresh processes keeps runner noise out; the job summary lists every ratio.
 
-LLVM is ahead of PyTorch on every kernel: 2.8x on Q4_0 and 2.0x on Q8_0 GEMV and 4.0x on the Q4_0 prefill GEMM against its quantized kernels; 1.6x on bf16 GEMM and 1.7x on DeepSeek's attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets); 2.3x on GQA attention; and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch. PyTorch's GQA time is its best form: with `enable_gqa=True` and one query position per head, `scaled_dot_product_attention` leaves its fast path and takes 18x as long.
+LLVM is ahead of PyTorch on every kernel: 2.8x on Q4_0 and 2.0x on Q8_0 GEMV and 4.9x on the Q4_0 prefill GEMM against its quantized kernels; 1.6x on bf16 GEMM and 1.7x on DeepSeek's attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets); 2.3x on GQA attention; and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch. PyTorch's GQA time is its best form: with `enable_gqa=True` and one query position per head, `scaled_dot_product_attention` leaves its fast path and takes 18x as long.
 
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
@@ -580,32 +580,33 @@ python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --t
     --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
 ```
 
-Prefill of the prompt (one `llama_prefill` call; llama-bench's `-p`), then 64 tokens generated after it (`llama_decode`; llama-bench's `-n 64 -d <prompt>`), 8 threads, llama.cpp build 6868a52 with its default f16 KV cache:
+Prefill of the prompt (one `llama_prefill` call, the mean of 3 after a first one, as llama-bench's `-p` averages 3), then 64 tokens generated after it (`llama_decode`; llama-bench's `-n 64 -d <prompt>`), 8 threads, llama.cpp build 6868a52 with its default f16 KV cache:
 
 | Context | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
 |---|---|---|---|---|
-| 64 tokens | 989 tokens/s (1.01 ms/token) | 433 tokens/s (2.31 ms/token) | 69.6 tokens/s (14.4 ms/token) | 67.4 tokens/s (14.8 ms/token) |
-| 512 tokens | 824 tokens/s (1.21 ms/token) | 445 tokens/s (2.25 ms/token) | 67.7 tokens/s (14.8 ms/token) | 61.8 tokens/s (16.2 ms/token) |
-| 2048 tokens | 659 tokens/s (1.52 ms/token) | 402 tokens/s (2.49 ms/token) | 63.6 tokens/s (15.7 ms/token) | 49.9 tokens/s (20.1 ms/token) |
-| 8192 tokens | 293 tokens/s (3.41 ms/token) | 286 tokens/s (3.49 ms/token) | 50.4 tokens/s (19.8 ms/token) | 27.3 tokens/s (36.7 ms/token) |
+| 64 tokens | 826 tokens/s (1.21 ms/token) | 407 tokens/s (2.46 ms/token) | 68.1 tokens/s (14.7 ms/token) | 64.0 tokens/s (15.6 ms/token) |
+| 512 tokens | 952 tokens/s (1.05 ms/token) | 439 tokens/s (2.28 ms/token) | 64.4 tokens/s (15.5 ms/token) | 59.7 tokens/s (16.8 ms/token) |
+| 2048 tokens | 644 tokens/s (1.55 ms/token) | 394 tokens/s (2.54 ms/token) | 62.0 tokens/s (16.1 ms/token) | 48.0 tokens/s (20.8 ms/token) |
+| 8192 tokens | 293 tokens/s (3.41 ms/token) | 276 tokens/s (3.62 ms/token) | 48.7 tokens/s (20.5 ms/token) | 26.9 tokens/s (37.2 ms/token) |
 
-- **Prefill is 1.6–2.3x faster than llama.cpp up to 2048 tokens, and level at 8192.** `llama_prefill` loads and unpacks each weight vector once per 8 tokens and runs the int8 dots on `vdotu`. Its attention runs `llama_decode`'s for every token (so a prefill stays bit-identical to decoding), which at long prompts costs more than llama.cpp's attention on matrix products.
+- **Prefill is 1.6–2.2x faster than llama.cpp up to 2048 tokens, and level at 8192.** `llama_prefill` loads and unpacks each weight vector once per 8 tokens and runs the int8 dots on `vdotu`. Its attention runs `llama_decode`'s for every token (so a prefill stays bit-identical to decoding), which at long prompts costs more than llama.cpp's attention on matrix products.
 - **Decode is level on short contexts and pulls ahead on long ones**: 1.3x at 2048 tokens, 1.8x at 8192. Both caches take 2 bytes per value; the kernel reads each KV head's positions once for its group's query heads and splits them across cores. Run to run, decode varies by about ±3% and prefill by up to ±10% (this laptop's clocks).
 - Before the bf16 cache and split attention, the kernel's attention took one query head at a time over an f32 cache, and at 2048 and 8192 tokens it prefilled 287 and 46 tokens/s and decoded 45.6 and 17.5 tokens/s.
-- With 16 threads (two per core) at 512 tokens, AIR prefills 1028 tokens/s and decodes 60.7 tokens/s; llama.cpp 557 and 58.2. Both decode faster on 8.
-- Cranelift prefills 194, 172, 129 and 73 tokens/s and decodes 60.6, 58.4, 49.6 and 31.6 tokens/s at the four lengths.
+- With 16 threads (two per core) at 512 tokens, AIR prefills 1044 tokens/s and decodes 60.3 tokens/s; llama.cpp 483 and 41.4. Both decode faster on 8.
+- Cranelift prefills 159, 163, 130 and 71 tokens/s and decodes 61.6, 55.1, 49.3 and 30.8 tokens/s at the four lengths.
+- Prefill loads and unpacks each weight vector once per 8 tokens on LLVM (once per 4 before, and still on Cranelift's 128-bit vectors), with the 8 tokens' sums kept in registers across blocks. Measured against the previous kernel the same way, alternating the two, that made 512-token prefill 6% faster on Q4_0, 9% on Q4_K_M and 12% on Q5_K_M. Earlier versions of these tables timed one cold `llama_prefill` call, which came out up to 10% faster or slower than this mean of warm ones.
 
-**K-quants.** Most GGUF downloads are Q4_K_M or Q5_K_M files: Q4_K or Q5_K matrices (256-value super-blocks whose 32-value sub-blocks each have a 6-bit scale and a 6-bit min, so a weight is `scale * q - min`), with the V and down projections of half the layers, and the embedding, in Q6_K. The loader keeps the values bit for bit and rounds each sub-block's scale and min (the super-block's f16 factor times the 6-bit one) to f16, so a Q4_K weight takes 5 bits instead of 4.5; the kernel subtracts each min times the block's activation sum, which `quantize_q8` already computes. The fused QKV matrix is stored in parts, keeping Q and K in Q4_K and V in Q6_K. The same comparison at 512 tokens, the three files measured together (the mean of two runs):
+**K-quants.** Most GGUF downloads are Q4_K_M or Q5_K_M files: Q4_K or Q5_K matrices (256-value super-blocks whose 32-value sub-blocks each have a 6-bit scale and a 6-bit min, so a weight is `scale * q - min`), with the V and down projections of half the layers, and the embedding, in Q6_K. The loader keeps the values bit for bit and rounds each sub-block's scale and min (the super-block's f16 factor times the 6-bit one) to f16, so a Q4_K weight takes 5 bits instead of 4.5; the kernel subtracts each min times the block's activation sum, which `quantize_q8` already computes. The fused QKV matrix is stored in parts, keeping Q and K in Q4_K and V in Q6_K. The same comparison at 512 tokens, the three files measured together (the mean of two runs, each started on an idle machine):
 
 | File | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
 |---|---|---|---|---|
-| Q4_0 (773 MB) | 916 tokens/s | 451 tokens/s | 67.1 tokens/s | 62.0 tokens/s |
-| Q4_K_M (808 MB) | 903 tokens/s | 509 tokens/s | 61.6 tokens/s | 58.8 tokens/s |
-| Q5_K_M (912 MB) | 729 tokens/s | 850 tokens/s | 55.4 tokens/s | 53.4 tokens/s |
+| Q4_0 (773 MB) | 952 tokens/s | 439 tokens/s | 64.4 tokens/s | 59.7 tokens/s |
+| Q4_K_M (808 MB) | 846 tokens/s | 497 tokens/s | 59.8 tokens/s | 56.1 tokens/s |
+| Q5_K_M (912 MB) | 873 tokens/s | 800 tokens/s | 54.6 tokens/s | 50.4 tokens/s |
 
-- **Decode stays ahead** by 4–5% on the K-quant files, both bound by memory bandwidth, although the kernel reads 8% more bytes per token (0.87 and 0.98 GB of packed weights).
-- **Prefill is 1.8x faster on Q4_K_M and 1.2x slower on Q5_K_M**, where llama.cpp is faster than on its own Q4_K_M. Prefill is compute-bound, and Q5_K's and Q6_K's top bits take extra shifts and masks to unpack for every 4 tokens.
-- Cranelift prefills 139 and 123 tokens/s and decodes 47 and 39 tokens/s on the two files.
+- **Decode stays ahead** by 7–8% on the K-quant files, both bound by memory bandwidth, although the kernel reads 8% more bytes per token (0.87 and 0.98 GB of packed weights).
+- **Prefill is 1.7x faster on Q4_K_M and 1.1x faster on Q5_K_M**, where llama.cpp is faster than on its own Q4_K_M. Prefill is compute-bound: the int8 dots take half of the inner loop, and scaling each block's sums for every token much of the rest, while unpacking Q5_K's top bits for 8 tokens at a time costs little.
+- Cranelift prefills 139 and 119 tokens/s and decodes 44.5 and 41.9 tokens/s on the two files.
 - The kernel's tokens match NumPy's (`--prompt "The capital of France is"`: 24 of 24 on both files); on random prompts they part only at near-ties, as on Q4_0. PyTorch runs Q4_K on its int4 kernel with the min as its zero point (rounded to bf16) and Q5_K requantized to int8 per row; it decodes Q4_K_M at 30–33 tokens/s.
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
@@ -621,13 +622,13 @@ Every format on the same random model (`--weights q8|q6|q5k|q4k|q4`), prefill of
 
 | Weights | Prefill, LLVM | Decode, LLVM | Prefill, Cranelift | Decode, Cranelift |
 |---|---|---|---|---|
-| Q8_0, 1.31 GB | 1018 tokens/s | 41.4 tokens/s (54 GB/s) | 177 tokens/s | 35.7 tokens/s |
-| Q6_K, 1.08 GB | 741 tokens/s | 49.6 tokens/s (54 GB/s) | 117 tokens/s | 39.7 tokens/s |
-| Q5_K, 0.93 GB | 826 tokens/s | 58.9 tokens/s (55 GB/s) | 121 tokens/s | 43.0 tokens/s |
-| Q4_K, 0.77 GB | 900 tokens/s | 69.9 tokens/s (54 GB/s) | 147 tokens/s | 48.2 tokens/s |
-| Q4_0, 0.70 GB | 989 tokens/s | 76.7 tokens/s (53 GB/s) | 178 tokens/s | 66.3 tokens/s |
+| Q8_0, 1.31 GB | 1013 tokens/s | 40.8 tokens/s (54 GB/s) | 161 tokens/s | 34.3 tokens/s |
+| Q6_K, 1.08 GB | 838 tokens/s | 49.5 tokens/s (54 GB/s) | 119 tokens/s | 39.9 tokens/s |
+| Q5_K, 0.93 GB | 896 tokens/s | 57.6 tokens/s (53 GB/s) | 124 tokens/s | 43.3 tokens/s |
+| Q4_K, 0.77 GB | 996 tokens/s | 70.1 tokens/s (54 GB/s) | 152 tokens/s | 54.7 tokens/s |
+| Q4_0, 0.70 GB | 1014 tokens/s | 75.9 tokens/s (53 GB/s) | 168 tokens/s | 66.9 tokens/s |
 
-Decode on LLVM follows the bytes per weight. Prefill follows the unpacking work: Q8_0 needs none, Q4_0 a mask and a shift, Q4_K adds a min, and Q5_K and Q6_K merge a plane of top bits. `qmat_chunk` chooses the format once per block, for a strip loop of its own, and unrolls each strip's 4 groups: a branch on the format in every strip, which Cranelift cannot hoist out of the loop, had made its quantized GEMVs up to 28% slower; choosing per block made prefill 20–25% faster on LLVM and decode 30–50% faster on Cranelift.
+Decode on LLVM follows the bytes per weight. Prefill follows the unpacking and scaling work: Q8_0 needs no unpacking, Q4_0 a mask and a shift, Q4_K adds a min, and Q5_K and Q6_K merge a plane of top bits; Q6_K also scales its two halves separately. With 8 tokens per weight load on LLVM, the slowest format (Q6_K) prefills at 83% of the speed of the fastest (73% with 4). `qmat_chunk` chooses the format once per block, for a strip loop of its own, and unrolls each strip's 4 groups: a branch on the format in every strip, which Cranelift cannot hoist out of the loop, had made its quantized GEMVs up to 28% slower; choosing per block made prefill 20–25% faster on LLVM and decode 30–50% faster on Cranelift.
 
 ### 10. Choosing a Backend (`--backend`)
 Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
