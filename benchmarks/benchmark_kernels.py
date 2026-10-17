@@ -27,13 +27,18 @@ per-block int8 kernel).
 Exits non-zero if any kernel, or a PyTorch baseline, disagrees with the reference.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 import time
+from collections.abc import Callable
+from typing import Any, NotRequired, TypeAlias, TypedDict
 
 import numpy as np
+import numpy.typing as npt
 
 try:
     import torch
@@ -45,115 +50,142 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import achainsaw
 
-KERNELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels"))
+F32: TypeAlias = npt.NDArray[np.float32]
+F64: TypeAlias = npt.NDArray[np.float64]
+U16: TypeAlias = npt.NDArray[np.uint16]
+# Arithmetic results whose dtype NumPy's stubs widen (float32 by a scalar to float64).
+Floats: TypeAlias = npt.NDArray[np.floating[Any]]
 
-ISA_ORDER = {
+
+class Case(TypedDict):
+    """A kernel to verify and time (see make_cases)."""
+    name: str
+    label: str
+    run: Callable[[achainsaw.Kernel], object]
+    verify: Callable[[achainsaw.Kernel], float]
+    tol: float
+    numpy: Callable[[], object]
+    torch: Callable[[], Any]
+    torch_check: Callable[[Any], float]
+    torch_tol: NotRequired[float]
+    flops: int
+
+
+KERNELS_DIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples",
+                                                "kernels"))
+
+ISA_ORDER: dict[str, list[str]] = {
     "x86_64": ["sse", "avx", "avx2", "avx512", "amx"],
     "aarch64": ["neon", "sve", "sve2", "sme"],
 }
 
 
-def source(name):
+def source(name: str) -> str:
     with open(os.path.join(KERNELS_DIR, name + ".air"), "r", encoding="utf-8") as f:
         return f.read()
 
 
-def bf16_bits(x):
+def bf16_bits(x: npt.ArrayLike) -> U16:
     """Round f32 values to bfloat16 (nearest-even) and return the raw u16 bits."""
-    b = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    b: npt.NDArray[np.uint32] = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
     return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16).astype(np.uint16)
 
 
-def bf16_values(bits):
+def bf16_values(bits: U16) -> F32:
     return (bits.astype(np.uint32) << 16).view(np.float32)
 
 
-def q8_quantize(x):
+def q8_quantize(x: F32) -> tuple[F32, Floats]:
     """Q8_0 activations exactly as the kernels' quantize_q8: per 32-block scale
     max|x| / 127 and values rounded half away from zero, in f32. Returns the integer values
     (as f32) and the scales."""
-    blocks = x.reshape(-1, 32).astype(np.float32)
-    d = np.abs(blocks).max(axis=1) / np.float32(127.0)
+    blocks: F32 = x.reshape(-1, 32).astype(np.float32)
+    d: Floats = np.abs(blocks).max(axis=1) / np.float32(127.0)
     with np.errstate(divide="ignore"):
-        inv = np.where(d > 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
-    v = blocks * inv[:, None]
-    t = np.trunc(v)
+        inv: F32 = np.where(d > 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
+    v: F32 = blocks * inv[:, None]
+    t: F32 = np.trunc(v)
     # Halves away from zero, exactly (C's roundf): every step is exact in f32.
-    return (t + np.where(np.abs(v - t) >= np.float32(0.5), np.sign(v), np.float32(0.0))).reshape(-1), d
+    q: F32 = t + np.where(np.abs(v - t) >= np.float32(0.5), np.sign(v), np.float32(0.0))
+    return q.reshape(-1), d
 
 
-def np_q8_gemv(q_blocks, scales, x):
+def np_q8_gemv(q_blocks: npt.NDArray[np.int8], scales: F32, x: F32) -> Floats:
     """NumPy Q8_0 GEMV with the kernel's data types: int8 weights q_blocks [k/32 x m x 32],
     f32 scales [k/32 x m], int8-quantized activations, exact integer block dots (computed as a
     batched f32 matmul, exact because every block dot is below 2^24), f32 accumulation."""
     xq, dx = q8_quantize(x)
-    nb = q_blocks.shape[0]
-    dots = np.matmul(q_blocks.astype(np.float32), xq.reshape(nb, 32, 1))[:, :, 0]
+    nb: int = q_blocks.shape[0]
+    dots: F32 = np.matmul(q_blocks.astype(np.float32), xq.reshape(nb, 32, 1))[:, :, 0]
     return ((dots * dx[:, None]) * scales).sum(axis=0)
 
 
-def np_q8_gemm(q_blocks, scales, xs):
+def np_q8_gemm(q_blocks: npt.NDArray[np.int8], scales: F32, xs: F32) -> Floats:
     """np_q8_gemv for n tokens xs [n x k]: one batched f32 matmul over the blocks for every
     token (exact block dots), so the int8 weights are widened once per call."""
-    qs = [q8_quantize(x) for x in xs]
-    nb = q_blocks.shape[0]
-    xq = np.stack([q.reshape(nb, 32) for q, _ in qs], axis=2)          # [k/32 x 32 x n]
-    dx = np.stack([d for _, d in qs], axis=1)                          # [k/32 x n]
-    dots = np.matmul(q_blocks.astype(np.float32), xq)                  # [k/32 x m x n]
+    qs: list[tuple[F32, Floats]] = [q8_quantize(x) for x in xs]
+    nb: int = q_blocks.shape[0]
+    xq: F32 = np.stack([q.reshape(nb, 32) for q, _ in qs], axis=2)     # [k/32 x 32 x n]
+    dx: Floats = np.stack([d for _, d in qs], axis=1)                  # [k/32 x n]
+    dots: F32 = np.matmul(q_blocks.astype(np.float32), xq)             # [k/32 x m x n]
     return ((dots * dx[:, None, :]) * scales[:, :, None]).sum(axis=0).T
 
 
-def rel_err(out, ref):
+def rel_err(out: Any, ref: npt.ArrayLike) -> float:
     """max |out - ref| / max |ref|, for a PyTorch result against the case's f64 reference."""
-    out = np.asarray(out.float() if torch is not None and isinstance(out, torch.Tensor) else out,
-                     dtype=np.float64)
-    ref = np.asarray(ref, dtype=np.float64)
-    return float(np.max(np.abs(out.reshape(ref.shape) - ref)) / np.max(np.abs(ref)))
+    o: F64 = np.asarray(
+        out.float() if torch is not None and isinstance(out, torch.Tensor) else out,
+        dtype=np.float64)
+    r: F64 = np.asarray(ref, dtype=np.float64)
+    return float(np.max(np.abs(o.reshape(r.shape) - r)) / np.max(np.abs(r)))
 
 
-def torch_bf16(bits):
+def torch_bf16(bits: U16) -> torch.Tensor:
     """A PyTorch bf16 tensor over raw bf16 bits (zero copy)."""
     return torch.from_numpy(np.ascontiguousarray(bits).view(np.int16)).view(torch.bfloat16)
 
 
-def time_call(func, budget_s, min_iters=5, chunks=5):
+def time_call(func: Callable[[], object], budget_s: float, min_iters: int = 5,
+              chunks: int = 5) -> float:
     """Seconds per call after a short warm-up: the run of about `budget_s` is split into
     `chunks` and the fastest chunk's average is returned, so a transient stall (another
     process, a migrated thread) does not count against the kernel."""
     for _ in range(3):
         func()
-    best = float("inf")
+    best: float = float("inf")
     for _ in range(chunks):
-        iters, t0 = 0, time.perf_counter()
+        iters: int = 0
+        t0: float = time.perf_counter()
         while True:
             func()
             iters += 1
-            elapsed = time.perf_counter() - t0
+            elapsed: float = time.perf_counter() - t0
             if iters >= min_iters and elapsed >= budget_s / chunks:
                 break
         best = min(best, elapsed / iters)
     return best
 
 
-def tt(x):
+def tt(x: npt.NDArray[Any]) -> Any:
     """A PyTorch tensor sharing x's memory, or None without PyTorch (its cases' torch
     callables are then never called)."""
     return torch.from_numpy(x) if torch is not None else None
 
 
-def make_cases():
+def make_cases() -> list[Case]:
     """Each case: name, label, kernel source, args builder, verify(kernel) -> max error,
     tolerance, NumPy baseline, PyTorch baseline with its check(result) -> error (and its own
     tolerance where its types differ), and the work per call (for GFLOP/s)."""
-    rng = np.random.default_rng(42)
-    cases = []
+    rng: np.random.Generator = np.random.default_rng(42)
+    cases: list[Case] = []
 
-    dim = 1024  # embedding size of common text-embedding models
-    a = rng.standard_normal(dim).astype(np.float32)
-    b = rng.standard_normal(dim).astype(np.float32)
-    ta, tb = tt(a), tt(b)
-    cos_ref = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
-    cases.append(dict(
+    dim: int = 1024  # embedding size of common text-embedding models
+    a: F32 = rng.standard_normal(dim).astype(np.float32)
+    b: F32 = rng.standard_normal(dim).astype(np.float32)
+    ta: torch.Tensor = tt(a)
+    tb: torch.Tensor = tt(b)
+    cos_ref: float = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+    cases.append(Case(
         name="cosine_similarity", label=f"Cosine similarity (n={dim})",
         run=lambda k: k(a, b, dim),
         verify=lambda k: abs(k(a, b, dim) - cos_ref), tol=1e-5,
@@ -163,8 +195,8 @@ def make_cases():
         flops=6 * dim,
     ))
 
-    l2_ref = float(np.linalg.norm(a - b))
-    cases.append(dict(
+    l2_ref: float = float(np.linalg.norm(a - b))
+    cases.append(Case(
         name="euclidean_distance", label=f"Euclidean distance (n={dim})",
         run=lambda k: k(a, b, dim),
         verify=lambda k: abs(k(a, b, dim) - l2_ref) / l2_ref, tol=1e-5,
@@ -174,22 +206,23 @@ def make_cases():
         flops=3 * dim,
     ))
 
-    sm_n = 1000
-    x_sm = (rng.standard_normal(sm_n) * 4.0).astype(np.float32)
-    out_sm = np.zeros(sm_n, dtype=np.float32)
-    t_sm = tt(x_sm)
-    e = np.exp(x_sm.astype(np.float64) - x_sm.max())
-    sm_ref = e / e.sum()
+    sm_n: int = 1000
+    x_sm: F32 = (rng.standard_normal(sm_n) * 4.0).astype(np.float32)
+    out_sm: F32 = np.zeros(sm_n, dtype=np.float32)
+    t_sm: torch.Tensor = tt(x_sm)
+    e: F64 = np.exp(x_sm.astype(np.float64) - np.max(x_sm))
+    sm_ref: F64 = e / e.sum()
 
-    def verify_softmax(k):
+    def verify_softmax(k: achainsaw.Kernel) -> float:
         k(x_sm, out_sm, sm_n)
         return float(np.max(np.abs(out_sm - sm_ref)))
 
-    def np_softmax():
-        z = np.exp(x_sm - x_sm.max())
-        return z / z.sum()
+    def np_softmax() -> F32:
+        z: F32 = np.exp(x_sm - np.max(x_sm))
+        p: F32 = z / z.sum()
+        return p
 
-    cases.append(dict(
+    cases.append(Case(
         name="softmax", label=f"Softmax (n={sm_n})",
         run=lambda k: k(x_sm, out_sm, sm_n),
         verify=verify_softmax, tol=1e-6, numpy=np_softmax,
@@ -198,19 +231,20 @@ def make_cases():
         flops=4 * sm_n,
     ))
 
-    rms_n = 4096
-    x_r = rng.standard_normal(rms_n).astype(np.float32)
-    w_r = rng.uniform(0.8, 1.2, rms_n).astype(np.float32)
-    out_r = np.zeros(rms_n, dtype=np.float32)
-    t_xr, t_wr = tt(x_r), tt(w_r)
-    xd = x_r.astype(np.float64)
-    rms_ref = xd / np.sqrt(np.mean(xd * xd) + 1e-6) * w_r
+    rms_n: int = 4096
+    x_r: F32 = rng.standard_normal(rms_n).astype(np.float32)
+    w_r: F32 = rng.uniform(0.8, 1.2, rms_n).astype(np.float32)
+    out_r: F32 = np.zeros(rms_n, dtype=np.float32)
+    t_xr: torch.Tensor = tt(x_r)
+    t_wr: torch.Tensor = tt(w_r)
+    xd: F64 = x_r.astype(np.float64)
+    rms_ref: F64 = xd / np.sqrt(np.mean(xd * xd) + 1e-6) * w_r
 
-    def verify_rms(k):
+    def verify_rms(k: achainsaw.Kernel) -> float:
         k(x_r, w_r, out_r, rms_n)
         return float(np.max(np.abs(out_r - rms_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="rmsnorm", label=f"RMSNorm (n={rms_n})",
         run=lambda k: k(x_r, w_r, out_r, rms_n),
         verify=verify_rms, tol=1e-5,
@@ -220,18 +254,20 @@ def make_cases():
         flops=4 * rms_n,
     ))
 
-    gm, gk = 512, 1024
-    A = rng.standard_normal((gm, gk)).astype(np.float32)
-    xg = rng.standard_normal(gk).astype(np.float32)
-    yg = np.zeros(gm, dtype=np.float32)
-    tA, txg = tt(A), tt(xg)
-    gemv_ref = A.astype(np.float64) @ xg.astype(np.float64)
+    gm: int = 512
+    gk: int = 1024
+    A: F32 = rng.standard_normal((gm, gk)).astype(np.float32)
+    xg: F32 = rng.standard_normal(gk).astype(np.float32)
+    yg: F32 = np.zeros(gm, dtype=np.float32)
+    tA: torch.Tensor = tt(A)
+    txg: torch.Tensor = tt(xg)
+    gemv_ref: F64 = A.astype(np.float64) @ xg.astype(np.float64)
 
-    def verify_gemv(k):
+    def verify_gemv(k: achainsaw.Kernel) -> float:
         k(A, xg, yg, gm, gk)
         return float(np.max(np.abs(yg - gemv_ref)) / np.max(np.abs(gemv_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="gemv_f32", label=f"GEMV f32 ({gm}x{gk})",
         run=lambda k: k(A, xg, yg, gm, gk),
         verify=verify_gemv, tol=1e-5, numpy=lambda: A @ xg,
@@ -239,12 +275,12 @@ def make_cases():
         flops=2 * gm * gk,
     ))
 
-    def verify_gemv_par(k):
+    def verify_gemv_par(k: achainsaw.Kernel) -> float:
         yg[:] = np.nan
         k.run("gemv_par", A, xg, yg, gm, gk)
         return float(np.max(np.abs(yg - gemv_ref)) / np.max(np.abs(gemv_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="gemv_par", label=f"GEMV f32, all cores via par ({gm}x{gk})",
         run=lambda k: k.run("gemv_par", A, xg, yg, gm, gk),
         verify=verify_gemv_par, tol=1e-5, numpy=lambda: A @ xg,
@@ -252,21 +288,23 @@ def make_cases():
         flops=2 * gm * gk,
     ))
 
-    n = 256
-    Ab = bf16_bits(rng.standard_normal((n, n)))
-    Bb = bf16_bits(rng.standard_normal((n, n)))
-    Af, Bf = bf16_values(Ab), bf16_values(Bb)
-    C = np.zeros((n, n), dtype=np.float32)
+    n: int = 256
+    Ab: U16 = bf16_bits(rng.standard_normal((n, n)))
+    Bb: U16 = bf16_bits(rng.standard_normal((n, n)))
+    Af: F32 = bf16_values(Ab)
+    Bf: F32 = bf16_values(Bb)
+    C: F32 = np.zeros((n, n), dtype=np.float32)
     if torch is not None:
-        tAb, tBb = torch_bf16(Ab), torch_bf16(Bb)
-    gemm_ref = Af.astype(np.float64) @ Bf.astype(np.float64)
+        tAb: torch.Tensor = torch_bf16(Ab)
+        tBb: torch.Tensor = torch_bf16(Bb)
+    gemm_ref: F64 = Af.astype(np.float64) @ Bf.astype(np.float64)
 
-    def verify_gemm(k):
+    def verify_gemm(k: achainsaw.Kernel) -> float:
         C[:] = 0.0
         k.run("gemm_bf16", C, Ab, Bb, n, n, n)
         return float(np.max(np.abs(C - gemm_ref)) / np.max(np.abs(gemm_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="gemm_bf16", label=f"GEMM bf16->f32 ({n}x{n}x{n})",
         run=lambda k: k.run("gemm_bf16", C, Ab, Bb, n, n, n),
         verify=verify_gemm, tol=1e-4,
@@ -280,53 +318,60 @@ def make_cases():
     # One decode step of DeepSeek V4 Pro's sparse attention: 128 query heads share one
     # 512-dim KV head (K = V) and attend to 1152 selected cache entries (sliding window 128
     # plus the indexer's top-1024), with a per-head attention sink.
-    fh, fd, fcache, fnk = 128, 512, 4096, 1152
-    fq = bf16_bits(rng.standard_normal((fh, fd)))
-    fkv = bf16_bits(rng.standard_normal((fcache, fd)))
-    fidx = rng.choice(fcache, size=fnk, replace=False).astype(np.int32)
-    fsink = rng.standard_normal(fh).astype(np.float32)
-    fout = np.zeros((fh, fd), dtype=np.float32)
-    fscale = np.float32(1.0 / np.sqrt(fd))
-    qf, kvf = bf16_values(fq).astype(np.float64), bf16_values(fkv).astype(np.float64)
-    sel = kvf[fidx]
-    scores = (qf @ sel.T) * float(fscale)
-    mx = scores.max(axis=1, keepdims=True)
-    pr = np.exp(scores - mx)
-    den = pr.sum(axis=1, keepdims=True) + np.exp(fsink[:, None].astype(np.float64) - mx)
-    flash_ref = (pr @ sel) / den
+    fh: int = 128
+    fd: int = 512
+    fcache: int = 4096
+    fnk: int = 1152
+    fq: U16 = bf16_bits(rng.standard_normal((fh, fd)))
+    fkv: U16 = bf16_bits(rng.standard_normal((fcache, fd)))
+    fidx: npt.NDArray[np.int32] = rng.choice(fcache, size=fnk, replace=False).astype(np.int32)
+    fsink: F32 = rng.standard_normal(fh).astype(np.float32)
+    fout: F32 = np.zeros((fh, fd), dtype=np.float32)
+    fscale: np.float32 = np.float32(1.0 / np.sqrt(fd))
+    qf: F64 = bf16_values(fq).astype(np.float64)
+    kvf: F64 = bf16_values(fkv).astype(np.float64)
+    sel: F64 = kvf[fidx]
+    scores: F64 = (qf @ sel.T) * float(fscale)
+    mx: F64 = scores.max(axis=1, keepdims=True)
+    pr: F64 = np.exp(scores - mx)
+    den: F64 = pr.sum(axis=1, keepdims=True) + np.exp(fsink[:, None].astype(np.float64) - mx)
+    flash_ref: F64 = (pr @ sel) / den
 
-    def verify_flash(k):
+    def verify_flash(k: achainsaw.Kernel) -> float:
         k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale)
         return float(np.max(np.abs(fout - flash_ref)) / np.max(np.abs(flash_ref)))
 
-    def np_flash():
+    def np_flash() -> Floats:
         # Same types as the kernel: bf16 q and kv (widened to f32 here), f32 scores and
         # softmax, probabilities rounded to bf16 for the product with V. The -1 entries are
         # all valid here, so no masking is needed.
-        q32, sel32 = bf16_values(fq), bf16_values(fkv[fidx])
-        s = (q32 @ sel32.T) * fscale
-        m = s.max(axis=1, keepdims=True)
-        e = np.exp(s - m)
-        p = bf16_values(bf16_bits(e))
+        q32: F32 = bf16_values(fq)
+        sel32: F32 = bf16_values(fkv[fidx])
+        s: F32 = (q32 @ sel32.T) * fscale
+        m: F32 = s.max(axis=1, keepdims=True)
+        e: F32 = np.exp(s - m)
+        p: F32 = bf16_values(bf16_bits(e))
         return (p @ sel32) / (e.sum(axis=1, keepdims=True) + np.exp(fsink[:, None] - m))
 
     if torch is not None:
         # PyTorch's scaled_dot_product_attention in bf16 (f32 softmax inside, bf16 output),
         # all heads as the queries of one KV head. The sink is one more key: a zero row
         # appended to the cache (score 0) plus a mask of the sink logit on its column.
-        t_q = torch_bf16(fq).view(1, 1, fh, fd)
-        t_kv = torch.cat([torch_bf16(fkv), torch.zeros(1, fd, dtype=torch.bfloat16)])
-        t_idx = torch.from_numpy(np.append(fidx, fcache).astype(np.int64))
-        t_mask = torch.zeros(1, 1, fh, fnk + 1, dtype=torch.bfloat16)
+        t_q: torch.Tensor = torch_bf16(fq).view(1, 1, fh, fd)
+        t_kv: torch.Tensor = torch.cat([torch_bf16(fkv),
+                                        torch.zeros(1, fd, dtype=torch.bfloat16)])
+        t_idx: torch.Tensor = torch.from_numpy(np.append(fidx, fcache).astype(np.int64))
+        t_mask: torch.Tensor = torch.zeros(1, 1, fh, fnk + 1, dtype=torch.bfloat16)
         t_mask[..., -1] = tt(fsink)
 
-    def torch_flash():
-        sel = t_kv[t_idx].view(1, 1, fnk + 1, fd)
-        return F.scaled_dot_product_attention(t_q, sel, sel, attn_mask=t_mask,
+    def torch_flash() -> torch.Tensor:
+        t_sel: torch.Tensor = t_kv[t_idx].view(1, 1, fnk + 1, fd)
+        return F.scaled_dot_product_attention(t_q, t_sel, t_sel, attn_mask=t_mask,
                                               scale=float(fscale))
 
-    cases.append(dict(
-        name="flash_attention", label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
+    cases.append(Case(
+        name="flash_attention",
+        label=f"Flash attention decode, DeepSeek V4 Pro ({fh}x{fd}, {fnk} keys)",
         run=lambda k: k.run("flash_attention", fq, fkv, fidx, fsink, fout, fh, fd, fnk, fscale),
         verify=verify_flash, tol=1e-2, numpy=np_flash,
         torch=torch_flash, torch_check=lambda out: rel_err(out, flash_ref),
@@ -335,39 +380,46 @@ def make_cases():
 
     # One decode step of grouped-query attention at Llama 3 8B's shapes: 32 query heads on 8
     # KV heads of 128 dims, over 4096 positions of a bf16 KV cache (16 MB).
-    gh, gkv, ghd, gt = 32, 8, 128, 4096
-    ggrp = gh // gkv
-    gq = rng.standard_normal((gh, ghd)).astype(np.float32)
-    gkc = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
-    gvc = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
-    gout = np.zeros((gh, ghd), dtype=np.float32)
-    gscale = np.float32(1.0 / np.sqrt(ghd))
-    gk64, gv64 = bf16_values(gkc).astype(np.float64), bf16_values(gvc).astype(np.float64)
-    gsc = np.matmul(gq.astype(np.float64).reshape(gkv, ggrp, ghd), gk64.transpose(0, 2, 1))
+    gh: int = 32
+    gkv: int = 8
+    ghd: int = 128
+    gt: int = 4096
+    ggrp: int = gh // gkv
+    gq: F32 = rng.standard_normal((gh, ghd)).astype(np.float32)
+    gkc: U16 = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
+    gvc: U16 = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
+    gout: F32 = np.zeros((gh, ghd), dtype=np.float32)
+    gscale: np.float32 = np.float32(1.0 / np.sqrt(ghd))
+    gk64: F64 = bf16_values(gkc).astype(np.float64)
+    gv64: F64 = bf16_values(gvc).astype(np.float64)
+    gsc: F64 = np.matmul(gq.astype(np.float64).reshape(gkv, ggrp, ghd), gk64.transpose(0, 2, 1))
     gsc *= float(gscale)
-    gp = np.exp(gsc - gsc.max(axis=2, keepdims=True))
-    gqa_ref = (np.matmul(gp, gv64) / gp.sum(axis=2, keepdims=True)).reshape(gh, ghd)
+    gp: F64 = np.exp(gsc - gsc.max(axis=2, keepdims=True))
+    gqa_ref: F64 = (np.matmul(gp, gv64) / gp.sum(axis=2, keepdims=True)).reshape(gh, ghd)
 
-    def np_gqa():
+    def np_gqa() -> F32:
         # Same types as the kernel: the bf16 cache widened to f32 in the call.
-        k32, v32 = bf16_values(gkc), bf16_values(gvc)
-        s = np.matmul(gq.reshape(gkv, ggrp, ghd), k32.transpose(0, 2, 1)) * gscale
-        e = np.exp(s - s.max(axis=2, keepdims=True))
-        return (np.matmul(e, v32) / e.sum(axis=2, keepdims=True)).reshape(gh, ghd)
+        k32: F32 = bf16_values(gkc)
+        v32: F32 = bf16_values(gvc)
+        s: F32 = np.matmul(gq.reshape(gkv, ggrp, ghd), k32.transpose(0, 2, 1)) * gscale
+        e: F32 = np.exp(s - s.max(axis=2, keepdims=True))
+        o: F32 = np.matmul(e, v32) / e.sum(axis=2, keepdims=True)
+        return o.reshape(gh, ghd)
 
     if torch is not None:
         # bf16 throughout (its SDPA wants one dtype), bf16 output. Each group's query heads
         # go in as that KV head's query positions: the same math, and PyTorch's fastest form
         # (enable_gqa=True with one query position per head takes 18x as long).
-        t_gq = tt(gq).bfloat16().view(1, gkv, ggrp, ghd)
-        t_gk, t_gv = torch_bf16(gkc).view(1, gkv, gt, ghd), torch_bf16(gvc).view(1, gkv, gt, ghd)
+        t_gq: torch.Tensor = tt(gq).bfloat16().view(1, gkv, ggrp, ghd)
+        t_gk: torch.Tensor = torch_bf16(gkc).view(1, gkv, gt, ghd)
+        t_gv: torch.Tensor = torch_bf16(gvc).view(1, gkv, gt, ghd)
 
-    def verify_gqa(k):
+    def verify_gqa(k: achainsaw.Kernel) -> float:
         gout[:] = np.nan
         k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt)
         return rel_err(gout, gqa_ref)
 
-    cases.append(dict(
+    cases.append(Case(
         name="gqa_attention",
         label=f"GQA decode attention, Llama 3 8B ({gh}/{gkv} heads x {ghd}, {gt} positions)",
         run=lambda k: k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt),
@@ -379,43 +431,45 @@ def make_cases():
 
     # Decode-step glue at Llama 3 8B sizes (d = 4096, MLP 14336, 32 heads of 128,
     # vocabulary 128256).
-    sw_n = 14336
-    gate = (rng.standard_normal(sw_n) * 3.0).astype(np.float32)
-    up = rng.standard_normal(sw_n).astype(np.float32)
-    sw_out = np.zeros(sw_n, dtype=np.float32)
-    t_gate, t_up = tt(gate), tt(up)
-    gd = gate.astype(np.float64)
-    sw_ref = gd / (1.0 + np.exp(-gd)) * up
+    sw_n: int = 14336
+    gate: F32 = (rng.standard_normal(sw_n) * 3.0).astype(np.float32)
+    up: F32 = rng.standard_normal(sw_n).astype(np.float32)
+    sw_out: F32 = np.zeros(sw_n, dtype=np.float32)
+    t_gate: torch.Tensor = tt(gate)
+    t_up: torch.Tensor = tt(up)
+    gd: F64 = gate.astype(np.float64)
+    sw_ref: F64 = gd / (1.0 + np.exp(-gd)) * up
 
-    def verify_swiglu(k):
+    def verify_swiglu(k: achainsaw.Kernel) -> float:
         k(gate, up, sw_out, sw_n)
         return float(np.max(np.abs(sw_out - sw_ref) / (np.abs(sw_ref) + 1e-30)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="swiglu", label=f"SwiGLU, vectorized exp (n={sw_n})",
         run=lambda k: k(gate, up, sw_out, sw_n),
         verify=verify_swiglu, tol=2e-6,
         numpy=lambda: gate / (1.0 + np.exp(-gate)) * up,
         torch=lambda: F.silu(t_gate) * t_up,
-        torch_check=lambda out: float(np.max(np.abs(out.numpy() - sw_ref) / (np.abs(sw_ref) + 1e-30))),
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - sw_ref)
+                                             / (np.abs(sw_ref) + 1e-30))),
         flops=8 * sw_n,
     ))
 
     # GeGLU (Gemma): GELU with PyTorch's tanh approximation on the gate, times up.
-    gc = np.sqrt(2.0 / np.pi)
-    ginner = gc * (gd + 0.044715 * gd ** 3)
-    ge_ref = gd * up / (1.0 + np.exp(-2.0 * ginner))
+    gc: np.float64 = np.sqrt(2.0 / np.pi)
+    ginner: F64 = gc * (gd + 0.044715 * gd ** 3)
+    ge_ref: F64 = gd * up / (1.0 + np.exp(-2.0 * ginner))
 
-    def np_geglu():
-        g = gate
+    def np_geglu() -> Floats:
+        g: F32 = gate
         return np.float32(0.5) * g * (np.float32(1.0) + np.tanh(
             np.float32(gc) * (g + np.float32(0.044715) * g * g * g))) * up
 
-    def verify_geglu(k):
+    def verify_geglu(k: achainsaw.Kernel) -> float:
         k(gate, up, sw_out, sw_n)
         return rel_err(sw_out, ge_ref)
 
-    cases.append(dict(
+    cases.append(Case(
         name="geglu", label=f"GeGLU, GELU-tanh via vectorized exp (n={sw_n})",
         run=lambda k: k(gate, up, sw_out, sw_n),
         verify=verify_geglu, tol=1e-6, numpy=np_geglu,
@@ -424,11 +478,11 @@ def make_cases():
         flops=11 * sw_n,
     ))
 
-    vocab = 128256
-    logits = rng.standard_normal(vocab).astype(np.float32)
-    am_ref = int(np.argmax(logits))
-    t_logits = tt(logits)
-    cases.append(dict(
+    vocab: int = 128256
+    logits: F32 = rng.standard_normal(vocab).astype(np.float32)
+    am_ref: int = int(np.argmax(logits))
+    t_logits: torch.Tensor = tt(logits)
+    cases.append(Case(
         name="argmax", label=f"Greedy argmax (vocab={vocab})",
         run=lambda k: k(logits, vocab),
         verify=lambda k: float(k(logits, vocab) != am_ref), tol=0.0,
@@ -440,22 +494,22 @@ def make_cases():
     ))
 
     # Top-k sampling's selection: the 40 largest logits, sorted, with their token ids.
-    tk = 40
-    tk_vals = np.zeros(tk, dtype=np.float32)
-    tk_idx = np.zeros(tk, dtype=np.int64)
-    tk_ref = np.argsort(-logits, kind="stable")[:tk]
+    tk: int = 40
+    tk_vals: F32 = np.zeros(tk, dtype=np.float32)
+    tk_idx: npt.NDArray[np.int64] = np.zeros(tk, dtype=np.int64)
+    tk_ref: npt.NDArray[np.intp] = np.argsort(-logits, kind="stable")[:tk]
 
-    def verify_topk(k):
+    def verify_topk(k: achainsaw.Kernel) -> float:
         tk_idx[:] = -1
         k(logits, vocab, tk, tk_vals, tk_idx)
         return float(not (np.array_equal(tk_idx, tk_ref)
                           and np.array_equal(tk_vals, logits[tk_ref])))
 
-    def np_topk():
-        idx = np.argpartition(logits, -tk)[-tk:]
+    def np_topk() -> npt.NDArray[np.intp]:
+        idx: npt.NDArray[np.intp] = np.argpartition(logits, -tk)[-tk:]
         return idx[np.argsort(-logits[idx])]
 
-    cases.append(dict(
+    cases.append(Case(
         name="topk", label=f"Top-k, k={tk} (vocab={vocab})",
         run=lambda k: k(logits, vocab, tk, tk_vals, tk_idx),
         verify=verify_topk, tol=0.0, numpy=np_topk,
@@ -464,66 +518,78 @@ def make_cases():
         flops=vocab,
     ))
 
-    rh, rd, rpos = 32, 128, 1000
-    rhalf = rd // 2
-    ang = rpos * 500000.0 ** (-2.0 * np.arange(rhalf) / rd)
-    rcos, rsin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
-    rq0 = rng.standard_normal((rh, rd)).astype(np.float32)
-    rq = rq0.copy()
-    x1, x2 = rq0[:, :rhalf].astype(np.float64), rq0[:, rhalf:].astype(np.float64)
-    rope_ref = np.concatenate([x1 * rcos - x2 * rsin, x2 * rcos + x1 * rsin], axis=1)
+    rh: int = 32
+    rd: int = 128
+    rpos: int = 1000
+    rhalf: int = rd // 2
+    ang: F64 = rpos * 500000.0 ** (-2.0 * np.arange(rhalf) / rd)
+    rcos: F32 = np.cos(ang).astype(np.float32)
+    rsin: F32 = np.sin(ang).astype(np.float32)
+    rq0: F32 = rng.standard_normal((rh, rd)).astype(np.float32)
+    rq: F32 = rq0.copy()
+    x1: F64 = rq0[:, :rhalf].astype(np.float64)
+    x2: F64 = rq0[:, rhalf:].astype(np.float64)
+    rope_ref: F64 = np.concatenate([x1 * rcos - x2 * rsin, x2 * rcos + x1 * rsin], axis=1)
 
-    def verify_rope(k):
+    def verify_rope(k: achainsaw.Kernel) -> float:
         rq[:] = rq0
         k(rq, rh, rd, rcos, rsin)
         return float(np.max(np.abs(rq - rope_ref)))
 
-    def np_rope():
-        a, b = rq0[:, :rhalf], rq0[:, rhalf:]
+    def np_rope() -> F32:
+        a: F32 = rq0[:, :rhalf]
+        b: F32 = rq0[:, rhalf:]
         return np.concatenate([a * rcos - b * rsin, b * rcos + a * rsin], axis=1)
 
     # PyTorch has no RoPE operator; models write it out like this.
-    t_rq0, t_rcos, t_rsin = tt(rq0), tt(rcos), tt(rsin)
+    t_rq0: torch.Tensor = tt(rq0)
+    t_rcos: torch.Tensor = tt(rcos)
+    t_rsin: torch.Tensor = tt(rsin)
 
-    def torch_rope():
-        a, b = t_rq0[:, :rhalf], t_rq0[:, rhalf:]
+    def torch_rope() -> torch.Tensor:
+        a: torch.Tensor = t_rq0[:, :rhalf]
+        b: torch.Tensor = t_rq0[:, rhalf:]
         return torch.cat([a * t_rcos - b * t_rsin, b * t_rcos + a * t_rsin], dim=1)
 
-    cases.append(dict(
+    cases.append(Case(
         name="rope", label=f"RoPE, in place ({rh} heads x {rd})",
         run=lambda k: k(rq, rh, rd, rcos, rsin),
         verify=verify_rope, tol=1e-5, numpy=np_rope,
-        torch=torch_rope, torch_check=lambda out: float(np.max(np.abs(out.numpy() - rope_ref))),
+        torch=torch_rope,
+        torch_check=lambda out: float(np.max(np.abs(out.numpy() - rope_ref))),
         flops=6 * rh * rhalf,
     ))
 
-    an = 4096
+    an: int = 4096
     # The four buffers are slices of one block, 17 cache lines apart beyond their 16 KB. Left
     # to the allocator, `out` landed exactly 64 KB + 48 bytes after `res`, and this Zen 4
     # then ran the kernel 2x slower in most processes (1.5 vs 3.1 µs): the second pass
     # stores out[i] while loading res a few lanes ahead, apparently taken by the CPU as a
     # possible alias of the load. Fixed offsets keep the timing the same from run to run.
-    gap = an + 17 * 16
-    block = np.zeros(4 * gap, dtype=np.float32)
+    gap: int = an + 17 * 16
+    block: F32 = np.zeros(4 * gap, dtype=np.float32)
     ax, ares, aw, aout = (block[i * gap:i * gap + an] for i in range(4))
     ax[:] = rng.standard_normal(an)
-    ares0 = rng.standard_normal(an).astype(np.float32)
+    ares0: F32 = rng.standard_normal(an).astype(np.float32)
     ares[:] = ares0
     aw[:] = rng.uniform(0.8, 1.2, an)
-    asum = ares0.astype(np.float64) + ax
-    t_ax, t_ares0, t_aw = tt(ax), tt(ares0), tt(aw)
-    an_ref = asum / np.sqrt(np.mean(asum * asum) + 1e-5) * aw
+    asum: F64 = ares0.astype(np.float64) + ax
+    t_ax: torch.Tensor = tt(ax)
+    t_ares0: torch.Tensor = tt(ares0)
+    t_aw: torch.Tensor = tt(aw)
+    an_ref: F64 = asum / np.sqrt(np.mean(asum * asum) + 1e-5) * aw
 
-    def verify_add_rmsnorm(k):
+    def verify_add_rmsnorm(k: achainsaw.Kernel) -> float:
         ares[:] = ares0
         k(ax, ares, aw, aout, an, 1e-5)
         return float(np.max(np.abs(aout - an_ref)))
 
-    def np_add_rmsnorm():
-        r = ares0 + ax
-        return r / np.sqrt(np.mean(r * r) + 1e-5) * aw
+    def np_add_rmsnorm() -> F32:
+        r: F32 = ares0 + ax
+        y: F32 = r / np.sqrt(np.mean(r * r) + 1e-5) * aw
+        return y
 
-    cases.append(dict(
+    cases.append(Case(
         name="add_rmsnorm", label=f"Residual add + RMSNorm (n={an})",
         run=lambda k: k(ax, ares, aw, aout, an, 1e-5),
         verify=verify_add_rmsnorm, tol=1e-5, numpy=np_add_rmsnorm,
@@ -532,24 +598,27 @@ def make_cases():
         flops=5 * an,
     ))
 
-    ln_n = 4096
-    lx = (rng.standard_normal(ln_n) + 0.5).astype(np.float32)
-    lw = rng.uniform(0.8, 1.2, ln_n).astype(np.float32)
-    lb = (rng.standard_normal(ln_n) * 0.1).astype(np.float32)
-    lout = np.zeros(ln_n, dtype=np.float32)
-    lxd = lx.astype(np.float64)
-    ln_ref = (lxd - lxd.mean()) / np.sqrt(lxd.var() + 1e-5) * lw + lb
-    t_lx, t_lw, t_lb = tt(lx), tt(lw), tt(lb)
+    ln_n: int = 4096
+    lx: F32 = (rng.standard_normal(ln_n) + 0.5).astype(np.float32)
+    lw: F32 = rng.uniform(0.8, 1.2, ln_n).astype(np.float32)
+    lb: F32 = (rng.standard_normal(ln_n) * 0.1).astype(np.float32)
+    lout: F32 = np.zeros(ln_n, dtype=np.float32)
+    lxd: F64 = lx.astype(np.float64)
+    ln_ref: F64 = (lxd - lxd.mean()) / np.sqrt(lxd.var() + 1e-5) * lw + lb
+    t_lx: torch.Tensor = tt(lx)
+    t_lw: torch.Tensor = tt(lw)
+    t_lb: torch.Tensor = tt(lb)
 
-    def verify_layernorm(k):
+    def verify_layernorm(k: achainsaw.Kernel) -> float:
         k(lx, lw, lb, lout, ln_n, 1e-5)
         return float(np.max(np.abs(lout - ln_ref)))
 
-    def np_layernorm():
-        d = lx - lx.mean()
-        return d / np.sqrt(np.mean(d * d) + np.float32(1e-5)) * lw + lb
+    def np_layernorm() -> F32:
+        d: F32 = lx - lx.mean()
+        y: F32 = d / np.sqrt(np.mean(d * d) + np.float32(1e-5)) * lw + lb
+        return y
 
-    cases.append(dict(
+    cases.append(Case(
         name="layernorm", label=f"LayerNorm (n={ln_n})",
         run=lambda k: k(lx, lw, lb, lout, ln_n, 1e-5),
         verify=verify_layernorm, tol=1e-5, numpy=np_layernorm,
@@ -558,40 +627,48 @@ def make_cases():
         flops=8 * ln_n,
     ))
 
-    qm, qk = 4096, 4096
-    qnb = qk // 32
-    qq = rng.integers(-127, 128, size=(qm, qk), dtype=np.int8)
+    qm: int = 4096
+    qk: int = 4096
+    qnb: int = qk // 32
+    qq: npt.NDArray[np.int8] = rng.integers(-127, 128, size=(qm, qk), dtype=np.int8)
     # f16 scales, as GGUF stores them (NumPy uses the same values in f32).
-    qs = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (73.0 * np.sqrt(qk))).astype(np.float16)
+    qs16: npt.NDArray[np.float16] = (rng.uniform(0.5, 1.0, size=(qnb, qm))
+                                     / (73.0 * np.sqrt(qk))).astype(np.float16)
     # Packed layout: 64-row chunks; per 32-block, 4 consecutive values of a row per 32-bit
     # lane, lanes ordered by group then row, values + 128 as unsigned bytes (see qmat_chunk).
-    q_packed = np.ascontiguousarray(
-        (qq.view(np.uint8) ^ np.uint8(0x80)).reshape(qm // 64, 64, qnb, 8, 4).transpose(0, 2, 3, 1, 4))
-    s_packed = np.ascontiguousarray(qs.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
-    qs = qs.astype(np.float32)
-    qx = rng.standard_normal(qk).astype(np.float32)
-    qy = np.zeros(qm, dtype=np.float32)
+    q_packed: npt.NDArray[np.uint8] = np.ascontiguousarray(
+        (qq.view(np.uint8) ^ np.uint8(0x80)).reshape(qm // 64, 64, qnb, 8, 4).transpose(
+            0, 2, 3, 1, 4))
+    s_packed: npt.NDArray[np.float16] = np.ascontiguousarray(
+        qs16.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
+    qs: F32 = qs16.astype(np.float32)
+    qx: F32 = rng.standard_normal(qk).astype(np.float32)
+    qy: F32 = np.zeros(qm, dtype=np.float32)
     # NumPy keeps the same int8 weights, block-major ([k/32 x m x 32]).
-    q_blocks = np.ascontiguousarray(qq.reshape(qm, qnb, 32).transpose(1, 0, 2))
+    q_blocks: npt.NDArray[np.int8] = np.ascontiguousarray(
+        qq.reshape(qm, qnb, 32).transpose(1, 0, 2))
     xq_ints, dxs = q8_quantize(qx)
-    dots = np.einsum("rbt,bt->rb", qq.reshape(qm, qnb, 32).astype(np.int64),
-                     xq_ints.reshape(qnb, 32).astype(np.int64))
-    q8_ref = (dots * qs.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
+    dots: npt.NDArray[np.int64] = np.einsum("rbt,bt->rb",
+                                            qq.reshape(qm, qnb, 32).astype(np.int64),
+                                            xq_ints.reshape(qnb, 32).astype(np.int64))
+    q8_ref: F64 = (dots.astype(np.float64) * qs.T.astype(np.float64)
+                   * dxs.astype(np.float64)).sum(axis=1)
 
     # PyTorch's int8 weight-only GEMV (torchao's CPU path): the same int8 weights, but one
     # scale per row (each row's mean block scale here; it has no per-block int8 kernel) and
     # bf16 activations, so it is checked against its own f64 reference.
-    tx_bf16 = tt(qx).bfloat16() if torch is not None else None
+    tx_bf16: torch.Tensor = tt(qx).bfloat16() if torch is not None else None
     if torch is not None:
-        t_w8 = tt(qq)
-        t_s8 = tt(qs.mean(axis=0)).bfloat16()
-        q8_ref_t = qq.astype(np.float64) @ tx_bf16.double().numpy() * t_s8.double().numpy()
+        t_w8: torch.Tensor = tt(qq)
+        t_s8: torch.Tensor = tt(qs.mean(axis=0)).bfloat16()
+        q8_ref_t: F64 = qq.astype(np.float64) @ tx_bf16.double().numpy() * \
+            t_s8.double().numpy()
 
-    def verify_q8(k):
+    def verify_q8(k: achainsaw.Kernel) -> float:
         k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q8_ref)) / np.max(np.abs(q8_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="q8_gemv", label=f"Q8_0 GEMV, all cores ({qm}x{qk})",
         run=lambda k: k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk),
         verify=verify_q8, tol=1e-5, numpy=lambda: np_q8_gemv(q_blocks, qs, qx),
@@ -602,65 +679,72 @@ def make_cases():
 
     # Q4_0: 4-bit weights q in 0..15 (value q - 8), llama.cpp's nibble bytes per block (byte t:
     # values t and t + 16), packed per chunk and block as 1024 bytes in Q8_0's lane order.
-    q4 = rng.integers(0, 16, size=(qm, qk), dtype=np.uint8)
-    q4s = (rng.uniform(0.5, 1.0, size=(qnb, qm)) / (4.6 * np.sqrt(qk))).astype(np.float16)
-    nib = q4.reshape(qm, qnb, 32)
-    nib = nib[:, :, :16] | (nib[:, :, 16:] << 4)                     # [m x k/32 x 16]
-    q4_packed = np.ascontiguousarray(
+    q4: npt.NDArray[np.uint8] = rng.integers(0, 16, size=(qm, qk), dtype=np.uint8)
+    q4s16: npt.NDArray[np.float16] = (rng.uniform(0.5, 1.0, size=(qnb, qm))
+                                      / (4.6 * np.sqrt(qk))).astype(np.float16)
+    v4: npt.NDArray[np.uint8] = q4.reshape(qm, qnb, 32)
+    nib: npt.NDArray[np.integer[Any]] = v4[:, :, :16] | (v4[:, :, 16:] << 4)  # [m x k/32 x 16]
+    q4_packed: npt.NDArray[np.integer[Any]] = np.ascontiguousarray(
         nib.reshape(qm // 64, 64, qnb, 4, 4).transpose(0, 2, 3, 1, 4))
-    q4s_packed = np.ascontiguousarray(q4s.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
-    q4s = q4s.astype(np.float32)
-    q4_vals = q4.astype(np.int8) - np.int8(8)
-    q4_blocks = np.ascontiguousarray(q4_vals.reshape(qm, qnb, 32).transpose(1, 0, 2))
-    dots4 = np.einsum("rbt,bt->rb", q4_vals.reshape(qm, qnb, 32).astype(np.int64),
-                      xq_ints.reshape(qnb, 32).astype(np.int64))
-    q4_ref = (dots4 * q4s.T.astype(np.float64) * dxs.astype(np.float64)).sum(axis=1)
+    q4s_packed: npt.NDArray[np.float16] = np.ascontiguousarray(
+        q4s16.reshape(qnb, qm // 64, 64).transpose(1, 0, 2))
+    q4s: F32 = q4s16.astype(np.float32)
+    q4_vals: npt.NDArray[np.int8] = q4.astype(np.int8) - np.int8(8)
+    q4_blocks: npt.NDArray[np.int8] = np.ascontiguousarray(
+        q4_vals.reshape(qm, qnb, 32).transpose(1, 0, 2))
+    dots4: npt.NDArray[np.int64] = np.einsum("rbt,bt->rb",
+                                             q4_vals.reshape(qm, qnb, 32).astype(np.int64),
+                                             xq_ints.reshape(qnb, 32).astype(np.int64))
+    q4_ref: F64 = (dots4.astype(np.float64) * q4s.T.astype(np.float64)
+                   * dxs.astype(np.float64)).sum(axis=1)
 
     # PyTorch's int4 weight-only GEMV (torchao's CPU path): the same 4-bit values and
     # 32-blocks, packed by PyTorch, its weights (q - 8) * scale + zero with bf16 scales and
     # zeros (0 here), and bf16 activations; checked against its own f64 reference.
     if torch is not None:
-        t_p4 = torch.ops.aten._convert_weight_to_int4pack_for_cpu(tt(q4.astype(np.int32)), 1)
-        t_s4 = tt(q4s).bfloat16()
-        t_sz4 = torch.stack([t_s4, torch.zeros_like(t_s4)], dim=-1).contiguous()
-        dots4t = np.einsum("rbt,bt->rb", q4_vals.reshape(qm, qnb, 32).astype(np.float64),
-                           tx_bf16.double().numpy().reshape(qnb, 32))
-        q4_ref_t = (dots4t * t_s4.double().numpy().T).sum(axis=1)
+        t_p4: torch.Tensor = torch.ops.aten._convert_weight_to_int4pack_for_cpu(
+            tt(q4.astype(np.int32)), 1)
+        t_s4: torch.Tensor = tt(q4s).bfloat16()
+        t_sz4: torch.Tensor = torch.stack([t_s4, torch.zeros_like(t_s4)], dim=-1).contiguous()
+        dots4t: F64 = np.einsum("rbt,bt->rb", q4_vals.reshape(qm, qnb, 32).astype(np.float64),
+                                tx_bf16.double().numpy().reshape(qnb, 32))
+        q4_ref_t: F64 = (dots4t * t_s4.double().numpy().T).sum(axis=1)
 
-    def verify_q4(k):
+    def verify_q4(k: achainsaw.Kernel) -> float:
         k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q4_ref)) / np.max(np.abs(q4_ref)))
 
-    cases.append(dict(
+    cases.append(Case(
         name="q4_gemv", label=f"Q4_0 GEMV, all cores ({qm}x{qk})",
         run=lambda k: k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk),
         verify=verify_q4, tol=1e-5, numpy=lambda: np_q8_gemv(q4_blocks, q4s, qx),
-        torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tx_bf16[None], t_p4, 32, t_sz4),
+        torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tx_bf16[None], t_p4, 32,
+                                                                 t_sz4),
         torch_check=lambda out: rel_err(out, q4_ref_t), torch_tol=1e-2,
         flops=2 * qm * qk,
     ))
 
     # Prefill: the same Q4_0 matrix on a batch of 32 tokens.
-    pn = 32
-    px = rng.standard_normal((pn, qk)).astype(np.float32)
-    p_out = np.zeros((pn, qm), dtype=np.float32)
-    pxq = [q8_quantize(x) for x in px]
-    pxq_ints = np.stack([q.reshape(qnb, 32) for q, _ in pxq], axis=2).astype(np.float64)
-    pdx = np.stack([d for _, d in pxq], axis=1).astype(np.float64)
-    pdots = np.matmul(q4_blocks.astype(np.float64), pxq_ints)        # [k/32 x m x n]
-    q4g_ref = ((pdots * pdx[:, None, :]) * q4s.astype(np.float64)[:, :, None]).sum(axis=0).T
+    pn: int = 32
+    px: F32 = rng.standard_normal((pn, qk)).astype(np.float32)
+    p_out: F32 = np.zeros((pn, qm), dtype=np.float32)
+    pxq: list[tuple[F32, Floats]] = [q8_quantize(x) for x in px]
+    pxq_ints: F64 = np.stack([q.reshape(qnb, 32) for q, _ in pxq], axis=2).astype(np.float64)
+    pdx: F64 = np.stack([d for _, d in pxq], axis=1).astype(np.float64)
+    pdots: F64 = np.matmul(q4_blocks.astype(np.float64), pxq_ints)   # [k/32 x m x n]
+    q4g_ref: F64 = ((pdots * pdx[:, None, :]) * q4s.astype(np.float64)[:, :, None]).sum(axis=0).T
     if torch is not None:
-        tpx_bf16 = tt(px).bfloat16()
-        w4t = (q4_vals.astype(np.float64).reshape(qm, qnb, 32)
+        tpx_bf16: torch.Tensor = tt(px).bfloat16()
+        w4t: F64 = (q4_vals.astype(np.float64).reshape(qm, qnb, 32)
                * t_s4.double().numpy().T[:, :, None]).reshape(qm, qk)
-        q4g_ref_t = tpx_bf16.double().numpy() @ w4t.T
+        q4g_ref_t: F64 = tpx_bf16.double().numpy() @ w4t.T
 
-    def verify_q4_gemm(k):
+    def verify_q4_gemm(k: achainsaw.Kernel) -> float:
         p_out[:] = np.nan
         k.run("q4_gemm", q4_packed, q4s_packed, px, p_out, qm, qk, pn)
         return rel_err(p_out, q4g_ref)
 
-    cases.append(dict(
+    cases.append(Case(
         name="q4_gemm", label=f"Q4_0 GEMM, prefill of {pn} tokens, all cores ({qm}x{qk})",
         run=lambda k: k.run("q4_gemm", q4_packed, q4s_packed, px, p_out, qm, qk, pn),
         verify=verify_q4_gemm, tol=1e-5, numpy=lambda: np_q8_gemm(q4_blocks, q4s, px),
@@ -671,11 +755,11 @@ def make_cases():
     return cases
 
 
-def isa_levels(mode):
-    report = achainsaw.cpu_features()
-    host = report["host"]
-    order = ISA_ORDER.get(host["arch"], [])
-    top = host.get("max_isa")
+def isa_levels(mode: str) -> list[str | None]:
+    report: dict[str, Any] = achainsaw.cpu_features()
+    host: dict[str, Any] = report["host"]
+    order: list[str | None] = list(ISA_ORDER.get(host["arch"], []))
+    top: str | None = host.get("max_isa")
     if mode == "host" or top not in order:
         return [None]
     if mode == "all":
@@ -683,8 +767,10 @@ def isa_levels(mode):
     return [level.strip() for level in mode.split(",")]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def main() -> None:
+    assert __doc__ is not None
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0])
     parser.add_argument("--backends", default="all",
                         help="comma-separated backends, or 'all' available (default)")
     parser.add_argument("--isa", default="host",
@@ -695,15 +781,15 @@ def main():
                         help="skip timing NumPy (results still verified against it)")
     parser.add_argument("--no-torch", action="store_true",
                         help="skip the PyTorch baseline (skipped anyway without PyTorch)")
-    args = parser.parse_args()
-    use_torch = torch is not None and not args.no_torch
+    args: argparse.Namespace = parser.parse_args()
+    use_torch: bool = torch is not None and not args.no_torch
 
-    available = achainsaw.available_backends()
-    backends = available if args.backends == "all" else args.backends.split(",")
-    levels = isa_levels(args.isa)
-    budget = 0.02 if args.quick else 0.3
-    cases = make_cases()
-    original_cap = achainsaw.get_isa_cap()
+    available: list[str] = achainsaw.available_backends()
+    backends: list[str] = available if args.backends == "all" else args.backends.split(",")
+    levels: list[str | None] = isa_levels(args.isa)
+    budget: float = 0.02 if args.quick else 0.3
+    cases: list[Case] = make_cases()
+    original_cap: str | None = achainsaw.get_isa_cap()
 
     print("=" * 96)
     print("CHAINSAW-BLAS KERNEL BENCHMARKS")
@@ -714,47 +800,51 @@ def main():
         print(f"PyTorch {torch.__version__}, {torch.get_num_threads()} threads")
     print("=" * 96)
 
-    results, failures = [], []
-    configs = [(b, l) for b in backends for l in levels]
+    results: list[dict[str, Any]] = []
+    failures: list[str] = []
+    configs: list[tuple[str, str | None]] = [(b, l) for b in backends for l in levels]
     for case in cases:
-        src = source(case["name"])
+        src: str = source(case["name"])
         # Both runtimes busy-wait for a moment after parallel work; let the other's threads
         # settle before timing each one.
         time.sleep(0.02)
-        np_s = None if args.no_numpy else time_call(case["numpy"], budget)
-        row = dict(kernel=case["name"], label=case["label"],
+        np_s: float | None = None if args.no_numpy else time_call(case["numpy"], budget)
+        row: dict[str, Any] = dict(kernel=case["name"], label=case["label"],
                    numpy_us=np_s and np_s * 1e6, torch_us=None, runs=[])
         print(f"\n{case['label']}")
         if np_s:
             print(f"    {'NumPy':<22} {np_s * 1e6:10.2f} us  "
                   f"{case['flops'] / np_s / 1e9:8.2f} GFLOP/s")
         if use_torch:
-            err = case["torch_check"](case["torch"]())
-            tol = case.get("torch_tol", case["tol"])
+            err: float = case["torch_check"](case["torch"]())
+            tol: float = case.get("torch_tol", case["tol"])
             if err > tol:
                 failures.append(f"{case['name']} on PyTorch: error {err:.2e}")
             time.sleep(0.02)
-            pt_s = time_call(case["torch"], budget)
-            row["torch_us"], row["torch_error"] = pt_s * 1e6, err
-            vs = f"  {np_s / pt_s:6.2f}x NumPy" if np_s else ""
+            pt_s: float = time_call(case["torch"], budget)
+            row["torch_us"] = pt_s * 1e6
+            row["torch_error"] = err
+            vs: str = f"  {np_s / pt_s:6.2f}x NumPy" if np_s else ""
             print(f"    {'PyTorch':<22} {pt_s * 1e6:10.2f} us  "
                   f"{case['flops'] / pt_s / 1e9:8.2f} GFLOP/s{vs}  err {err:.1e} "
                   f"{'PASS' if err <= tol else 'FAIL'}")
         for backend, level in configs:
             achainsaw.set_isa_cap(level)
-            kernel = achainsaw.compile(src, backend=backend, fast_math=True)
+            kernel: achainsaw.Kernel = achainsaw.compile(src, backend=backend, fast_math=True)
             time.sleep(0.02)
             err = case["verify"](kernel)
-            ok = err <= case["tol"]
+            ok: bool = err <= case["tol"]
             if not ok:
-                failures.append(f"{case['name']} on {backend}/{level or 'host'}: error {err:.2e}")
-            secs = time_call(lambda: case["run"](kernel), budget)
-            tag = f"{backend}@{level or 'host'}"
+                failures.append(f"{case['name']} on {backend}/{level or 'host'}: "
+                                f"error {err:.2e}")
+            secs: float = time_call(lambda: case["run"](kernel), budget)
+            tag: str = f"{backend}@{level or 'host'}"
             vs = f"  {np_s / secs:6.2f}x NumPy" if np_s else ""
             if row["torch_us"]:
                 vs += f"  {row['torch_us'] / 1e6 / secs:6.2f}x PyTorch"
-            print(f"    {tag:<22} {secs * 1e6:10.2f} us  {case['flops'] / secs / 1e9:8.2f} GFLOP/s"
-                  f"{vs}  err {err:.1e} {'PASS' if ok else 'FAIL'}")
+            print(f"    {tag:<22} {secs * 1e6:10.2f} us  "
+                  f"{case['flops'] / secs / 1e9:8.2f} GFLOP/s{vs}  err {err:.1e} "
+                  f"{'PASS' if ok else 'FAIL'}")
             row["runs"].append(dict(backend=backend, isa=level or "host", us=secs * 1e6,
                                     gflops=case["flops"] / secs / 1e9, error=err, ok=ok))
         results.append(row)

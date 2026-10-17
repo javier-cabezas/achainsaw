@@ -11,21 +11,24 @@ import unittest
 
 import sys
 
-EXE_NAME = "achainsaw.exe" if sys.platform == "win32" else "achainsaw"
-EXE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "debug", EXE_NAME))
+EXE_NAME: str = "achainsaw.exe" if sys.platform == "win32" else "achainsaw"
+EXE_PATH: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "debug",
+                                             EXE_NAME))
 if not os.path.exists(EXE_PATH):
-    rel_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "release", EXE_NAME))
+    rel_path: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target",
+                                                 "release", EXE_NAME))
     if os.path.exists(rel_path):
         EXE_PATH = rel_path
 
-FIB_AIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "fibonacci.air"))
+FIB_AIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples",
+                                            "fibonacci.air"))
 
 
 class TestAotCompilation(unittest.TestCase):
-    def test_aot_build_object(self):
-        out_o = os.path.abspath(os.path.join(os.path.dirname(__file__), "test_fib.o"))
+    def test_aot_build_object(self) -> None:
+        out_o: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "test_fib.o"))
         try:
-            res = subprocess.run(
+            subprocess.run(
                 [EXE_PATH, "build", FIB_AIR, "-o", out_o, "--json"],
                 capture_output=True,
                 text=True,
@@ -37,17 +40,18 @@ class TestAotCompilation(unittest.TestCase):
             if os.path.exists(out_o):
                 os.remove(out_o)
 
-    def test_aot_build_and_link_shared(self):
+    def test_aot_build_and_link_shared(self) -> None:
         # Configure toolchain environment
-        env = os.environ.copy()
-        local_mingw = r"C:\Users\Javier\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
+        env: dict[str, str] = os.environ.copy()
+        local_mingw: str = r"C:\Users\Javier\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
         if os.path.isdir(local_mingw):
             env["PATH"] = os.pathsep.join([local_mingw, env.get("PATH", "")])
 
-        out_o = os.path.abspath(os.path.join(os.path.dirname(__file__), "test_fib_shared.o"))
+        out_o: str = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                                  "test_fib_shared.o"))
 
         try:
-            res = subprocess.run(
+            res: subprocess.CompletedProcess[str] = subprocess.run(
                 [EXE_PATH, "build", FIB_AIR, "-o", out_o, "--shared", "--json"],
                 capture_output=True,
                 text=True,
@@ -58,21 +62,22 @@ class TestAotCompilation(unittest.TestCase):
 
             # Determine platform shared library extension
             if sys.platform == "darwin":
-                ext = ".dylib"
+                ext: str = ".dylib"
             elif sys.platform == "win32":
                 ext = ".dll"
             else:
                 ext = ".so"
 
-            target_shared = FIB_AIR.replace(".air", ext)
-            self.assertTrue(os.path.exists(target_shared), f"Expected shared library at {target_shared}")
+            target_shared: str = FIB_AIR.replace(".air", ext)
+            self.assertTrue(os.path.exists(target_shared),
+                            f"Expected shared library at {target_shared}")
 
             # Load via ctypes and call fib(10)
-            lib = ctypes.CDLL(target_shared)
+            lib: ctypes.CDLL = ctypes.CDLL(target_shared)
             lib.fib.argtypes = [ctypes.c_int32]
             lib.fib.restype = ctypes.c_int32
 
-            result = lib.fib(10)
+            result: int = lib.fib(10)
             self.assertEqual(result, 55)
 
             # Unload DLL before removal on Windows
