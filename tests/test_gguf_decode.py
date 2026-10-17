@@ -368,11 +368,12 @@ class TestGGUFDecode(unittest.TestCase):
 
     def test_prefill_matches_decode(self):
         # llama_prefill over a prompt leaves exactly the cache and hidden state, and predicts
-        # the token, that llama_decode does one token at a time.
-        m = Model.from_gguf(self.gguf, max_ctx=8)
+        # the token, that llama_decode does one token at a time. 13 tokens run a tile of 8, one
+        # of 4 and a single token through every layer's formats.
+        m = Model.from_gguf(self.gguf, max_ctx=16)
         with open(os.path.join(ROOT, "examples", "kernels", "llama_decode.air"), encoding="utf-8") as f:
             src = f.read()
-        prompt = np.array([1, 5, 9, 2, 7, 3, 11], dtype=np.int64)
+        prompt = np.array([1, 5, 9, 2, 7, 3, 11, 4, 0, 8, 6, 10, 12], dtype=np.int64)
         for be in achainsaw.available_backends():
             k = achainsaw.compile(src, backend=be, fast_math=True)
             cache, h = m.new_cache(), np.zeros(m.d, dtype=np.float32)

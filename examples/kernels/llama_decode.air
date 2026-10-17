@@ -14,9 +14,9 @@
 # of its 64 logits, so the logits are never written.
 #
 # llama_prefill runs n prompt tokens through the same passes in one call: every projection
-# task applies its weights to 4 tokens at a time (qmat_batch), so a weight matrix is read
-# once per 4 tokens rather than once per token, and attention, norms and epilogues run per
-# token. Its results are exactly those of n llama_decode calls.
+# task applies its weights to 8 tokens at a time (qmat_batch; 4 with 128-bit vectors), so a
+# weight matrix is read once per 8 tokens rather than once per token, and attention, norms
+# and epilogues run per token. Its results are exactly those of n llama_decode calls.
 #
 # Each weight matrix is Q8_0, Q4_0, Q6_K, Q4_K or Q5_K, chosen per matrix (and per part of a
 # fused matrix: Q, K and V may differ): 8-, 4-, 6- or 5-bit weights with f16 scales per 32
@@ -441,7 +441,7 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
 # model, cache and h of llama_decode (pos + n <= max_ctx). Returns the greedy token after
 # the last one; h holds the last token's final hidden state. Per layer: 2 norm passes over
 # the tokens, then `par` regions like llama_decode's, each projection task computing its rows
-# for every token (4 tokens per weight load). Attention runs one task per token and KV head,
+# for every token (8 tokens per weight load). Attention runs one task per token and KV head,
 # over the cache up to the token's own position (so tokens never see later ones), with the
 # same splits and merges as llama_decode's.
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64

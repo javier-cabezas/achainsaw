@@ -2,8 +2,8 @@
 # times a Q4_0 weight matrix W (m x k, packed as in q4_gemv.air), y = x W^T (f32 [n x m]).
 # Each token is quantized to int8 per 32-block (quantize_q8, one task per token); then one
 # task per 64-row chunk of W runs qmat_batch, which loads and unpacks each weight vector
-# once for 4 tokens, so W is read once per 4 tokens instead of once per token as n q4_gemv
-# calls would. Each token's results are exactly q4_gemv's.
+# once for 8 tokens (4 with 128-bit vectors), so W is read once per 8 tokens instead of once
+# per token as n q4_gemv calls would. Each token's results are exactly q4_gemv's.
 
 use quantize_q8, qmat_batch
 
