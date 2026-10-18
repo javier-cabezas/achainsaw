@@ -54,68 +54,80 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import achainsaw  # noqa: E402
 from gguf import GGUF, Tokenizer  # noqa: E402
 from llama_model import Model, torch  # noqa: E402
+from gguf import F32  # noqa: E402
 
 # Timed prefills after the first, whose mean is the AIR kernel's prompt speed (llama-bench
 # averages 3 repetitions too).
-PREFILL_REPS = 3
+PREFILL_REPS: int = 3
 
-KERNEL = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels",
+KERNEL: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels",
                                       "llama_decode.air"))
 
 
-def chat_prompt(text):
+def chat_prompt(text: str) -> str:
     """Llama 3's chat format for one user turn, without a system message."""
     return (f"<|start_header_id|>user<|end_header_id|>\n\n{text}<|eot_id|>"
             "<|start_header_id|>assistant<|end_header_id|>\n\n")
 
 
-def generate(step, prompt_ids, n_new, stop, prefill=None):
+def generate(step: Callable[[int, int], int], prompt_ids: list[int], n_new: int, stop: set[int],
+             prefill: Callable[[list[int]], int] | None = None
+             ) -> tuple[list[int], float, list[float]]:
     """Greedy generation with `step(token, pos) -> next token`, and `prefill(tokens) -> next
     token` for the prompt when given (else one step per prompt token). Returns the new
     tokens, the prompt time and the per-token decode times."""
-    t0 = time.perf_counter()
-    nxt = None
+    t0: float = time.perf_counter()
+    nxt: int = 0
     if prefill:
         nxt = prefill(prompt_ids)
     else:
         for pos, tok in enumerate(prompt_ids):
             nxt = step(tok, pos)
-    prompt_s = time.perf_counter() - t0
-    out, times = [], []
+    prompt_s: float = time.perf_counter() - t0
+    out: list[int] = []
+    times: list[float] = []
     pos = len(prompt_ids)
     while len(out) < n_new:
         out.append(nxt)
         if nxt in stop:
             break
-        t = time.perf_counter()
+        t: float = time.perf_counter()
         nxt = step(nxt, pos)
         times.append(time.perf_counter() - t)
         pos += 1
     return out, prompt_s, times
 
 
-def llama_bench(path, gguf, prompt_tokens, gen_tokens, threads):
+def llama_bench(path: str, gguf: str, prompt_tokens: int, gen_tokens: int,
+                threads: int) -> tuple[float | None, float, str]:
     """llama.cpp's own benchmark on the same GGUF file: prefill of `prompt_tokens` tokens,
     then `gen_tokens` generated after a context of that length (its --n-depth), as the AIR
     kernel decodes after the prompt. Returns (prompt tokens/s, decode tokens/s, commit)."""
-    def run(*extra):
-        cmd = [path, "-m", gguf, "-t", str(threads), "-r", "3", "-o", "json", *extra]
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-        return json.loads(out)[0]
-    pp = run("-p", str(prompt_tokens), "-n", "0") if prompt_tokens > 1 else None
-    tg = run("-p", "0", "-n", str(gen_tokens), "-d", str(prompt_tokens))
-    return pp and pp["avg_ts"], tg["avg_ts"], tg["build_commit"]
+    def run(*extra: str) -> dict[str, Any]:
+        cmd: list[str] = [path, "-m", gguf, "-t", str(threads), "-r", "3", "-o", "json", *extra]
+        out: str = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        result: dict[str, Any] = json.loads(out)[0]
+        return result
+    pp: dict[str, Any] | None = run("-p", str(prompt_tokens), "-n", "0") \
+        if prompt_tokens > 1 else None
+    tg: dict[str, Any] = run("-p", "0", "-n", str(gen_tokens), "-d", str(prompt_tokens))
+    return pp["avg_ts"] if pp else None, tg["avg_ts"], tg["build_commit"]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def main() -> None:
+    assert __doc__ is not None
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0])
     parser.add_argument("--gguf", metavar="PATH", help="Llama GGUF checkpoint (default: random)")
     parser.add_argument("--prompt", default="The capital of France is",
                         help="prompt for --gguf (default: %(default)r)")
@@ -138,35 +150,35 @@ def main():
                         help="with --gguf: also run llama.cpp's llama-bench on the same file, "
                              "threads, prompt length and token count")
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
-    args = parser.parse_args()
-    use_torch = torch is not None and not args.no_torch
+    args: argparse.Namespace = parser.parse_args()
+    use_torch: bool = torch is not None and not args.no_torch
     if args.llama_bench and not args.gguf:
         parser.error("--llama-bench needs --gguf")
 
-    t0 = time.perf_counter()
+    t0: float = time.perf_counter()
+    tok: Tokenizer | None = None
+    stop: set[int] = set()
     if args.gguf:
-        g = GGUF(args.gguf)
+        g: GGUF = GGUF(args.gguf)
         tok = Tokenizer(g)
         if args.prompt_tokens:
             # Random ordinary tokens (below the special ones), as llama-bench uses; no stop
             # tokens, so every run generates exactly --tokens.
-            prompt_ids = [int(t) for t in np.random.default_rng(1).integers(
+            prompt_ids: list[int] = [int(t) for t in np.random.default_rng(1).integers(
                 0, 128000, args.prompt_tokens)]
-            stop = set()
         else:
-            prompt = chat_prompt(args.prompt) if args.chat else args.prompt
+            prompt: str = chat_prompt(args.prompt) if args.chat else args.prompt
             prompt_ids = tok.encode(prompt)
             stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>")
                     if t in tok.ids}
-        model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
-                                numpy=not args.no_numpy, use_torch=use_torch)
-        name = g.meta.get("general.name", os.path.basename(args.gguf))
-        formats = ", ".join(f"{k} {'/'.join(v)}" for k, v in model.formats.items())
+        model: Model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
+                                       numpy=not args.no_numpy, use_torch=use_torch)
+        name: str = g.meta.get("general.name", os.path.basename(args.gguf))
+        formats: str = ", ".join(f"{k} {'/'.join(v)}" for k, v in model.formats.items())
         print(f"{name}: {len(model.layers)} layers, {model.weight_bytes() / 1e9:.2f} GB of "
               f"packed weights ({formats}), loaded in {time.perf_counter() - t0:.1f} s")
         print(f"prompt: {len(prompt_ids)} tokens; generating up to {args.tokens}")
     else:
-        tok, stop = None, set()
         prompt_ids = [int(t) for t in np.random.default_rng(1).integers(
             0, 128256, max(args.prompt_tokens or 16, 1))]
         model = Model.random(d=2048, layers=args.layers, heads=32, kv_heads=8, head_dim=64,
@@ -176,45 +188,50 @@ def main():
               f"{args.weights.upper()}_0 {model.weight_bytes() / 1e9:.2f} GB "
               f"(built in {time.perf_counter() - t0:.1f} s); prompt of {len(prompt_ids)} "
               f"tokens, decoding {args.tokens}")
-    wb = model.weight_bytes()
+    wb: int = model.weight_bytes()
 
-    src = open(KERNEL, encoding="utf-8").read()
-    backends = achainsaw.available_backends() if args.backends == "all" else args.backends.split(",")
+    src: str = open(KERNEL, encoding="utf-8").read()
+    backends: list[str] = achainsaw.available_backends() if args.backends == "all" else \
+        args.backends.split(",")
 
-    results = []
+    results: list[dict[str, Any]] = []
 
-    def report(label, prompt_s, times, backend=None, nbytes=wb):
-        ms = np.median(times[1:] or times) * 1e3
-        prompt_ms = prompt_s * 1e3 / len(prompt_ids)
+    def report(label: str, prompt_s: float, times: list[float], backend: str | None = None,
+               nbytes: int = wb) -> None:
+        ms: float = float(np.median(times[1:] or times)) * 1e3
+        prompt_ms: float = prompt_s * 1e3 / len(prompt_ids)
         results.append(dict(backend=backend or label, ms_per_token=ms,
                             prompt_ms_per_token=prompt_ms, prompt_tokens=len(prompt_ids)))
-        pre = (f"prompt {prompt_ms:6.2f} ms/token ({1e3 / prompt_ms:6.1f} tokens/s), "
+        pre: str = (f"prompt {prompt_ms:6.2f} ms/token ({1e3 / prompt_ms:6.1f} tokens/s), "
                if len(prompt_ids) > 1 else "")
         print(f"  {label:<22} {pre}decode {ms:7.2f} ms/token  {1e3 / ms:6.1f} tokens/s  "
               f"{nbytes / (ms / 1e3) / 1e9:5.1f} GB/s of weights")
 
-    runs = {}
+    runs: dict[str, list[int]] = {}
     for be in backends:
-        kernel = achainsaw.compile(src, backend=be, fast_math=True)
+        kernel: achainsaw.Kernel = achainsaw.compile(src, backend=be, fast_math=True)
         kernel.set_threads(args.threads)
-        cache, h = model.new_cache(), np.zeros(model.d, dtype=np.float32)
+        cache: npt.NDArray[np.uint16] = model.new_cache()
+        h: F32 = np.zeros(model.d, dtype=np.float32)
 
-        def step(token, pos):
-            return kernel.run("llama_decode", model.table, model.cfg, cache, token, pos, h,
+        def step(token: int, pos: int) -> int:
+            nxt: int = kernel.run("llama_decode", model.table, model.cfg, cache, token, pos, h,
                               float(model.eps))
+            return nxt
 
-        def prefill(ids):
-            toks = np.array(ids, dtype=np.int64)
-            return kernel.run("llama_prefill", model.table, model.cfg, cache, toks, len(ids), 0,
-                              h, float(model.eps))
+        def prefill(ids: list[int]) -> int:
+            toks: npt.NDArray[np.int64] = np.array(ids, dtype=np.int64)
+            nxt: int = kernel.run("llama_prefill", model.table, model.cfg, cache, toks, len(ids),
+                                  0, h, float(model.eps))
+            return nxt
 
         out, prompt_s, times = generate(step, prompt_ids, args.tokens, stop, prefill)
         if len(prompt_ids) > 1:
             # As llama-bench: the mean of 3 prefills after the first (warm-up) one, each
             # rewriting the cache from position 0.
-            reps = []
+            reps: list[float] = []
             for _ in range(PREFILL_REPS):
-                t = time.perf_counter()
+                t: float = time.perf_counter()
                 prefill(prompt_ids)
                 reps.append(time.perf_counter() - t)
             prompt_s = float(np.mean(reps))
@@ -224,21 +241,21 @@ def main():
             print("    " + repr(tok.decode(out)))
 
     if not args.no_numpy:
-        cache = model.numpy_cache()
-        out, prompt_s, times = generate(lambda t, p: model.numpy_step(cache, t, p), prompt_ids,
-                                        args.tokens, stop)
+        np_cache: list[tuple[F32, F32]] = model.numpy_cache()
+        out, prompt_s, times = generate(lambda t, p: model.numpy_step(np_cache, t, p),
+                                        prompt_ids, args.tokens, stop)
         report("NumPy, same types", prompt_s, times, "numpy")
         for be, toks in runs.items():
-            same = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
+            same: int = next((i for i, (a, b) in enumerate(zip(toks, out)) if a != b),
                         min(len(toks), len(out)))
             print(f"  {be}: first {same} of {len(toks)} tokens match NumPy")
 
     if use_torch:
         if args.threads:
             torch.set_num_threads(args.threads)
-        cache = model.torch_cache()
-        out, prompt_s, times = generate(lambda t, p: model.torch_step(cache, t, p), prompt_ids,
-                                        args.tokens, stop)
+        t_cache: list[tuple[torch.Tensor, ...]] = model.torch_cache()
+        out, prompt_s, times = generate(lambda t, p: model.torch_step(t_cache, t, p),
+                                        prompt_ids, args.tokens, stop)
         report(f"PyTorch, {torch.get_num_threads()} thr", prompt_s, times, "torch",
                model.torch_weight_bytes())
         if tok:
@@ -249,7 +266,7 @@ def main():
             print(f"  {be}: first {same} of {len(toks)} tokens match PyTorch")
 
     if args.llama_bench:
-        threads = args.threads or os.cpu_count()
+        threads: int = args.threads or os.cpu_count() or 1
         pp_ts, tg_ts, commit = llama_bench(args.llama_bench, args.gguf, len(prompt_ids),
                                            args.tokens, threads)
         # Its own prefill and decode rates, as the AIR rows report theirs.
