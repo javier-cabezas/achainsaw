@@ -1280,35 +1280,55 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
     ret
 
 # Attention of `group` query heads (f32 rows of hd at qg) over nt >= 1 positions of one KV
-# head, whose K and V rows (hd bf16 values each) start at kb and vb: one split of
-# flash-decoding. For head r it writes at pg + r * head_b the max m of its scores (dot
-# products times `scale`), the sum of exp(score - m), and the hd outputs sum_t
-# exp(score_t - m) V[t], unnormalized; attn_merge combines splits. Heads go 4 at a time with
-# their dot products, then their outputs, in registers, so each K and V vector is widened
-# from bf16 once for 4 heads (then one head at a time for the rest of the group).
+# head: one split of flash-decoding. K is stored in tiles of 32 positions, each [hd x 32]
+# bf16 (value j of position t at (t / 32 * 32 * hd + 32 j + t mod 32) * 2 bytes from kb),
+# so a vector holds one value of consecutive positions; V in rows of hd bf16 from vb. For
+# head r it writes at pg + r * head_b the max m of its scores (dot products times `scale`),
+# the sum of exp(score - m), and the hd outputs sum_t exp(score_t - m) V[t], unnormalized;
+# attn_merge combines splits. Scores take positions in lanes: each K vector, widened from
+# bf16 once, gets 4 heads' FMAs with their query values broadcast (then one head at a time
+# for the rest of the group), and no score needs a horizontal sum. Outputs take V's columns
+# in lanes, 4 heads' sums in registers over all positions of the split.
 fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f32, head_b:i64)
   b0:
     w16 = vl bf16
     w32 = vl f32
     zero = splat 0.0:f32:vx
+    v_scale = splat scale:vx
     low = cst -340282346638528859811704183484516925440.0:f32
     v_low = splat low:vx
     row2 = mul hd, 2:i64
     hd4 = mul hd, 4:i64
-    # scores [group x nt]
-    ntb = mul nt, 4:i64
+    tile_b = mul hd, 64:i64
+    # positions per K load: all lanes up to a tile's 32, or 16 if they do not divide 32 (a
+    # 384-bit SVE vector), so a load stays in one row of a tile; and the f32 lanes of each half
+    lb0 = min w16, 32:i64
+    lb_rem = urem 32:i64, lb0
+    lb_fits = eq lb_rem, 0:i64
+    lb = select lb_fits, lb0, 16:i64
+    n_lo = min w32, lb
+    n_hi = sub lb, n_lo
+    # scores [group x ntp], ntp = nt rounded up to a tile
+    nt31 = add nt, 31:i64
+    ntp0 = ushr nt31, 5:i64
+    ntp = mul ntp0, 32:i64
+    ntb = mul ntp, 4:i64
     sc_bytes = mul group, ntb
     sc = alloc sc_bytes
     quads_end0 = udiv group, 4:i64
     quads_end = mul quads_end0, 4:i64
     jmp score(0:i64)
 
-  # Scores of position t: 4 heads at a time, each K vector widened once for the 4.
+  # Scores of positions t .. t + lb: 4 heads at a time, each K vector widened once for the 4.
   score(t:i64):
     t_more = lt t, nt
     br t_more, score_start, softmax(0:i64)
   score_start:
-    k_off = mul t, row2
+    tile = ushr t, 5:i64
+    tin = and t, 31:i64
+    k_off0 = mul tile, tile_b
+    k_off1 = mul tin, 2:i64
+    k_off = add k_off0, k_off1
     kt = add kb, k_off
     jmp sq_heads(0:i64)
   sq_heads(r:i64):
@@ -1320,54 +1340,43 @@ fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f
     q1 = add q0, hd4
     q2 = add q1, hd4
     q3 = add q2, hd4
-    jmp sq_dot(0:i64, zero, zero, zero, zero)
-  sq_dot(j:i64, a0:vx, a1:vx, a2:vx, a3:vx):
+    jmp sq_dot(0:i64, kt, zero, zero, zero, zero, zero, zero, zero, zero)
+  sq_dot(j:i64, kj:ptr, a0l:vx, a0h:vx, a1l:vx, a1h:vx, a2l:vx, a2h:vx, a3l:vx, a3h:vx):
     j_more = lt j, hd
     br j_more, sq_dot_body, sq_store
   sq_dot_body:
-    rest = sub hd, j
-    kv = ldm kt[j]:vx, rest:bf16
+    kv = ldm kj:vx, lb:bf16
     klo = vfwidenlo kv:bf16
     khi = vfwidenhi kv:bf16
-    rest_hi0 = sub rest, w32
-    rest_hi = max rest_hi0, 0:i64
-    j_hi = add j, w32
-    x0l = ldm q0[j]:vx, rest:f32
-    x0h = ldm q0[j_hi]:vx, rest_hi:f32
-    b0l = vfma klo, x0l, a0:f32
-    b0h = vfma khi, x0h, b0l:f32
-    x1l = ldm q1[j]:vx, rest:f32
-    x1h = ldm q1[j_hi]:vx, rest_hi:f32
-    b1l = vfma klo, x1l, a1:f32
-    b1h = vfma khi, x1h, b1l:f32
-    x2l = ldm q2[j]:vx, rest:f32
-    x2h = ldm q2[j_hi]:vx, rest_hi:f32
-    b2l = vfma klo, x2l, a2:f32
-    b2h = vfma khi, x2h, b2l:f32
-    x3l = ldm q3[j]:vx, rest:f32
-    x3h = ldm q3[j_hi]:vx, rest_hi:f32
-    b3l = vfma klo, x3l, a3:f32
-    b3h = vfma khi, x3h, b3l:f32
-    j2 = add j, w16
-    jmp sq_dot(j2, b0h, b1h, b2h, b3h)
+    x0 = ld q0[j]:f32
+    qy0 = splat x0:vx
+    b0l = vfma klo, qy0, a0l:f32
+    b0h = vfma khi, qy0, a0h:f32
+    x1 = ld q1[j]:f32
+    qy1 = splat x1:vx
+    b1l = vfma klo, qy1, a1l:f32
+    b1h = vfma khi, qy1, a1h:f32
+    x2 = ld q2[j]:f32
+    qy2 = splat x2:vx
+    b2l = vfma klo, qy2, a2l:f32
+    b2h = vfma khi, qy2, a2h:f32
+    x3 = ld q3[j]:f32
+    qy3 = splat x3:vx
+    b3l = vfma klo, qy3, a3l:f32
+    b3h = vfma khi, qy3, a3h:f32
+    j2 = add j, 1:i64
+    kj2 = add kj, 64:i64
+    jmp sq_dot(j2, kj2, b0l, b0h, b1l, b1h, b2l, b2h, b3l, b3h)
   sq_store:
-    si0 = mul r, nt
+    si0 = mul r, ntp
     si = add si0, t
-    e0 = vsum a0:f32
-    f0 = mul e0, scale
-    st sc[si], f0
-    si1 = add si, nt
-    e1 = vsum a1:f32
-    f1 = mul e1, scale
-    st sc[si1], f1
-    si2 = add si1, nt
-    e2 = vsum a2:f32
-    f2 = mul e2, scale
-    st sc[si2], f2
-    si3 = add si2, nt
-    e3 = vsum a3:f32
-    f3 = mul e3, scale
-    st sc[si3], f3
+    call score_store(sc, si, w32, a0l, a0h, v_scale, n_lo, n_hi)
+    si1 = add si, ntp
+    call score_store(sc, si1, w32, a1l, a1h, v_scale, n_lo, n_hi)
+    si2 = add si1, ntp
+    call score_store(sc, si2, w32, a2l, a2h, v_scale, n_lo, n_hi)
+    si3 = add si2, ntp
+    call score_store(sc, si3, w32, a3l, a3h, v_scale, n_lo, n_hi)
     r4 = add r, 4:i64
     jmp sq_heads(r4)
   # The rest of the group, one head at a time.
@@ -1377,34 +1386,29 @@ fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f
   ss_start:
     qu_off = mul u, hd4
     qu = add qg, qu_off
-    jmp ss_dot(0:i64, zero)
-  ss_dot(sj:i64, acc:vx):
+    jmp ss_dot(0:i64, kt, zero, zero)
+  ss_dot(sj:i64, skj:ptr, accl:vx, acch:vx):
     sj_more = lt sj, hd
     br sj_more, ss_dot_body, ss_store
   ss_dot_body:
-    srest = sub hd, sj
-    skv = ldm kt[sj]:vx, srest:bf16
+    skv = ldm skj:vx, lb:bf16
     sklo = vfwidenlo skv:bf16
     skhi = vfwidenhi skv:bf16
-    srest_hi0 = sub srest, w32
-    srest_hi = max srest_hi0, 0:i64
-    sj_hi = add sj, w32
-    sxl = ldm qu[sj]:vx, srest:f32
-    sxh = ldm qu[sj_hi]:vx, srest_hi:f32
-    acc1 = vfma sklo, sxl, acc:f32
-    acc2 = vfma skhi, sxh, acc1:f32
-    sj2 = add sj, w16
-    jmp ss_dot(sj2, acc2)
+    sx = ld qu[sj]:f32
+    sy = splat sx:vx
+    accl2 = vfma sklo, sy, accl:f32
+    acch2 = vfma skhi, sy, acch:f32
+    sj2 = add sj, 1:i64
+    skj2 = add skj, 64:i64
+    jmp ss_dot(sj2, skj2, accl2, acch2)
   ss_store:
-    su0 = mul u, nt
+    su0 = mul u, ntp
     su = add su0, t
-    ev = vsum acc:f32
-    fv = mul ev, scale
-    st sc[su], fv
+    call score_store(sc, su, w32, accl, acch, v_scale, n_lo, n_hi)
     u2 = add u, 1:i64
     jmp ss_heads(u2)
   score_next:
-    t2 = add t, 1:i64
+    t2 = add t, lb
     jmp score(t2)
 
   # Per head: the split's max (whole vectors, then the rest one by one), then the
@@ -1544,6 +1548,17 @@ fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f
     jmp pv(c2)
   done:
     free sc
+    ret
+
+# Stores the scores of attn_split's lb positions from its two f32 halves (lo, hi; n_lo and
+# n_hi lanes) at sc[si ..], times scale.
+inline fn score_store(sc:ptr, si:i64, w32:i64, lo:vx, hi:vx, v_scale:vx, n_lo:i64, n_hi:i64)
+  b0:
+    slo = vmul lo, v_scale:f32
+    stm sc[si], slo, n_lo:f32
+    si_hi = add si, w32
+    shi = vmul hi, v_scale:f32
+    stm sc[si_hi], shi, n_hi:f32
     ret
 
 # Merges `splits` flash-decoding splits of one query head (attn_split's records: max, sum,
