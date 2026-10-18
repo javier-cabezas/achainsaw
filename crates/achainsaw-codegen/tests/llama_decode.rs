@@ -391,6 +391,22 @@ impl Model {
         }
     }
 
+    /// u16s in the kernel's KV cache: per layer K then V, each nkv x cache_ctx x hd, with
+    /// cache_ctx = max_ctx rounded up to K's tiles of 32 positions.
+    fn cache_len(&self) -> usize {
+        self.layers.len() * 2 * self.nkv * self.max_ctx.div_ceil(32) * 32 * self.hd
+    }
+
+    /// Where the kernel's cache holds value e of KV head g at position pos of layer l, in K
+    /// (tiles of 32 positions, each [hd x 32]) and in V ([nkv][cache_ctx][hd]).
+    fn cache_at(&self, l: usize, g: usize, pos: usize, e: usize) -> (usize, usize) {
+        let ctx = self.max_ctx.div_ceil(32) * 32;
+        let plane = self.nkv * ctx * self.hd;
+        let k = l * 2 * plane + (g * ctx + pos / 32 * 32) * self.hd + e * 32 + pos % 32;
+        let v = l * 2 * plane + plane + (g * ctx + pos) * self.hd + e;
+        (k, v)
+    }
+
     /// One decode step; `cache[l]` is (K, V), each [max_ctx][nkv][hd] holding bf16 values.
     /// Returns the hidden state and the logits.
     fn step(
@@ -546,8 +562,8 @@ fn check_decode(mixed: bool) {
         );
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
-        // bf16 bits, per layer K then V, each [nkv][max_ctx][hd].
-        let mut cache = vec![0u16; model.layers.len() * 2 * plane];
+        // bf16 bits, as `Model::cache_at` lays them out.
+        let mut cache = vec![0u16; model.cache_len()];
         let mut ref_cache = vec![(vec![0f64; plane], vec![0f64; plane]); model.layers.len()];
         let mut token = 7usize;
         let mut checked_tokens = 0;
@@ -574,8 +590,8 @@ fn check_decode(mixed: bool) {
             for (l, (kr, vr)) in ref_cache.iter().enumerate() {
                 for j in 0..model.nkv * model.hd {
                     let (g, e) = (j / model.hd, j % model.hd);
-                    let at = l * 2 * plane + (g * model.max_ctx + pos) * model.hd + e;
-                    let (k, v) = (bf(cache[at]), bf(cache[at + plane]));
+                    let (k_at, v_at) = model.cache_at(l, g, pos, e);
+                    let (k, v) = (bf(cache[k_at]), bf(cache[v_at]));
                     let (kw, vw) = (
                         kr[pos * model.nkv * model.hd + j],
                         vr[pos * model.nkv * model.hd + j],
@@ -639,7 +655,7 @@ fn llama_prefill_matches_decode_exactly() {
     for &(mixed, prompt, max_ctx, all_pieces) in &cases {
         let model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         let (table, cfg, _parts) = model.tables();
-        let cache_len = model.layers.len() * 2 * model.max_ctx * model.nkv * model.hd;
+        let cache_len = model.cache_len();
         for (level, features) in host_levels() {
             let mut engine = JitEngine::with_features(&features).unwrap();
             engine.compile_module(&module).unwrap();
@@ -738,7 +754,7 @@ fn llama_long_context_matches_reference() {
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         let prefill: Prefill =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
-        let mut cache = vec![0u16; model.layers.len() * 2 * plane];
+        let mut cache = vec![0u16; model.cache_len()];
         let mut h = vec![f32::NAN; model.d];
         let next = prefill(
             table.as_ptr(),

@@ -388,6 +388,9 @@ def make_cases() -> list[Case]:
     gq: F32 = rng.standard_normal((gh, ghd)).astype(np.float32)
     gkc: U16 = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
     gvc: U16 = bf16_bits(rng.standard_normal((gkv, gt, ghd)))
+    # The kernel's K: tiles of 32 positions, each [hd x 32] (the baselines take gkc's rows).
+    gkt: U16 = np.ascontiguousarray(
+        gkc.reshape(gkv, gt // 32, 32, ghd).transpose(0, 1, 3, 2))
     gout: F32 = np.zeros((gh, ghd), dtype=np.float32)
     gscale: np.float32 = np.float32(1.0 / np.sqrt(ghd))
     gk64: F64 = bf16_values(gkc).astype(np.float64)
@@ -416,13 +419,13 @@ def make_cases() -> list[Case]:
 
     def verify_gqa(k: achainsaw.Kernel) -> float:
         gout[:] = np.nan
-        k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt)
+        k.run("gqa_attention", gq, gkt, gvc, gout, gh, gkv, ghd, gt, gt)
         return rel_err(gout, gqa_ref)
 
     cases.append(Case(
         name="gqa_attention",
         label=f"GQA decode attention, Llama 3 8B ({gh}/{gkv} heads x {ghd}, {gt} positions)",
-        run=lambda k: k.run("gqa_attention", gq, gkc, gvc, gout, gh, gkv, ghd, gt, gt),
+        run=lambda k: k.run("gqa_attention", gq, gkt, gvc, gout, gh, gkv, ghd, gt, gt),
         verify=verify_gqa, tol=1e-5, numpy=np_gqa,
         torch=lambda: F.scaled_dot_product_attention(t_gq, t_gk, t_gv),
         torch_check=lambda out: rel_err(out, gqa_ref), torch_tol=1e-2,

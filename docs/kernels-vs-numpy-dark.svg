@@ -51,8 +51,8 @@
 <path d="M407.5,272.0 H671.2 Q675.2,272.0 675.2,276.0 V278.0 Q675.2,282.0 671.2,282.0 H407.5 Z" fill="#d95926"><title>Top-k (k=40), 128256 logits, LLVM (AVX-512): 50.00x NumPy</title></path>
 <text x="238" y="317.0" font-size="12" text-anchor="end" fill="#ffffff">GQA attention decode, all cores</text>
 <path d="M407.5,296.0 H560.9 Q564.9,296.0 564.9,300.0 V302.0 Q564.9,306.0 560.9,306.0 H407.5 Z" fill="#7a7a75"><title>GQA attention decode, all cores, PyTorch (eager): 9.98x NumPy</title></path>
-<path d="M407.5,308.0 H515.2 Q519.2,308.0 519.2,312.0 V314.0 Q519.2,318.0 515.2,318.0 H407.5 Z" fill="#3987e5"><title>GQA attention decode, all cores, Cranelift (128-bit vectors): 5.11x NumPy</title></path>
-<path d="M407.5,320.0 H616.8 Q620.8,320.0 620.8,324.0 V326.0 Q620.8,330.0 616.8,330.0 H407.5 Z" fill="#d95926"><title>GQA attention decode, all cores, LLVM (AVX-512): 22.58x NumPy</title></path>
+<path d="M407.5,308.0 H569.9 Q573.9,308.0 573.9,312.0 V314.0 Q573.9,318.0 569.9,318.0 H407.5 Z" fill="#3987e5"><title>GQA attention decode, all cores, Cranelift (128-bit vectors): 11.37x NumPy</title></path>
+<path d="M407.5,320.0 H655.9 Q659.9,320.0 659.9,324.0 V326.0 Q659.9,330.0 655.9,330.0 H407.5 Z" fill="#d95926"><title>GQA attention decode, all cores, LLVM (AVX-512): 40.00x NumPy</title></path>
 <text x="238" y="365.0" font-size="12" text-anchor="end" fill="#ffffff">RoPE, 32 heads x 128</text>
 <path d="M407.5,344.0 H392.5 Q388.5,344.0 388.5,348.0 V350.0 Q388.5,354.0 392.5,354.0 H407.5 Z" fill="#7a7a75"><title>RoPE, 32 heads x 128, PyTorch (eager): 0.76x NumPy</title></path>
 <path d="M407.5,356.0 H497.5 Q501.5,356.0 501.5,360.0 V362.0 Q501.5,366.0 497.5,366.0 H407.5 Z" fill="#3987e5"><title>RoPE, 32 heads x 128, Cranelift (128-bit vectors): 3.95x NumPy</title></path>

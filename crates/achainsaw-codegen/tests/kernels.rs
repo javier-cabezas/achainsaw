@@ -840,13 +840,14 @@ fn gqa_attention_matches_reference() {
         let kern: Gqa = unsafe { std::mem::transmute(engine.get_fn_ptr("gqa_attention").unwrap()) };
         let mut rng = Rng(61);
         // (q heads, KV heads, head dim, positions, cache length): one position, partial
-        // splits, a head dim that is no multiple of any vector, and Llama 3 8B's heads.
+        // splits and tiles, a head dim that is no multiple of any vector, and Llama 3 8B's
+        // heads.
         for (nh, nkv, hd, t_len, max_ctx) in [
-            (4, 1, 8, 1, 4),
+            (4, 1, 8, 1, 32),
             (8, 2, 64, 300, 320),
-            (6, 3, 40, 513, 600),
+            (6, 3, 40, 513, 608),
             (7, 7, 16, 256, 256),
-            (32, 8, 128, 260, 300),
+            (32, 8, 128, 260, 320),
         ] {
             let q = rng.vec(nh * hd);
             let cache = |rng: &mut Rng| -> Vec<half::bf16> {
@@ -868,12 +869,16 @@ fn gqa_attention_matches_reference() {
             let scale = 1.0 / (hd as f64).sqrt();
             for h in 0..nh {
                 let g = h / (nh / nkv);
+                // V in rows of hd values; K in tiles of 32 positions, each [hd x 32].
                 let row =
                     |c: &[half::bf16], t: usize, d: usize| c[(g * max_ctx + t) * hd + d].to_f64();
+                let k_at = |t: usize, d: usize| {
+                    kc[(g * max_ctx + t / 32 * 32) * hd + d * 32 + t % 32].to_f64()
+                };
                 let scores: Vec<f64> = (0..t_len)
                     .map(|t| {
                         (0..hd)
-                            .map(|d| q[h * hd + d] as f64 * row(&kc, t, d))
+                            .map(|d| q[h * hd + d] as f64 * k_at(t, d))
                             .sum::<f64>()
                             * scale
                     })

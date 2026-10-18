@@ -578,10 +578,28 @@ class Model:
         return sum(t.nbytes for m in self.matrices() for p in m.parts()
                    for t in ((p.t_w, p.t_sz) if p.fmt in ("q4", "q4k") else (p.t_w, p.t_s)))
 
+    @property
+    def cache_ctx(self) -> int:
+        """Positions per KV head in the kernel's cache: max_ctx rounded up to K's tiles."""
+        return -(-self.max_ctx // 32) * 32
+
     def new_cache(self) -> npt.NDArray[np.uint16]:
-        """The kernel's KV cache: per layer, K then V, each bf16 [nkv x max_ctx x hd] (raw
-        u16 bits)."""
-        return np.zeros(len(self.layers) * 2 * self.nkv * self.max_ctx * self.hd, dtype=np.uint16)
+        """The kernel's KV cache (raw u16 bits of bf16 values): per layer, K then V, each
+        nkv x cache_ctx x hd values. V is [nkv x cache_ctx x hd]; K is in tiles of 32
+        positions, [nkv x cache_ctx / 32 x hd x 32]."""
+        return np.zeros(len(self.layers) * 2 * self.nkv * self.cache_ctx * self.hd,
+                        dtype=np.uint16)
+
+    def cache_kv(self, cache: npt.NDArray[np.uint16]
+                 ) -> tuple[npt.NDArray[np.uint16], npt.NDArray[np.uint16]]:
+        """K and V of a kernel cache, each [layers x nkv x cache_ctx x hd]."""
+        planes: npt.NDArray[np.uint16] = cache.reshape(len(self.layers), 2, self.nkv,
+                                                       self.cache_ctx, self.hd)
+        k: npt.NDArray[np.uint16] = (
+            planes[:, 0].reshape(len(self.layers), self.nkv, self.cache_ctx // 32, self.hd, 32)
+            .transpose(0, 1, 2, 4, 3).reshape(len(self.layers), self.nkv, self.cache_ctx,
+                                              self.hd))
+        return k, planes[:, 1]
 
     # NumPy forward pass of the same model (needs numpy=True at construction).
     def norm(self, h: Floats, w: F32) -> Floats:

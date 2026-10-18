@@ -2,17 +2,20 @@
 # query heads share nkv KV heads (nh / nkv per group) over positions 0 .. t_len - 1 of a
 # bf16 KV cache:
 #   out[h] = sum_t softmax_t(q[h] . K[g][t] / sqrt(hd)) V[g][t],   g = h / (nh / nkv)
-# q: f32 [nh x hd]; kc, vc: bf16 [nkv x max_ctx x hd], head-major like PyTorch's
-# [batch, heads, positions, dim] caches; out: f32 [nh x hd]. Any hd; t_len <= max_ctx.
+# q: f32 [nh x hd]; vc: bf16 [nkv x max_ctx x hd], head-major like PyTorch's [batch, heads,
+# positions, dim] caches; kc: bf16 in tiles of 32 positions, [nkv x max_ctx / 32 x hd x 32],
+# so a vector holds one value of consecutive positions; out: f32 [nh x hd]. Any hd; max_ctx
+# a multiple of 32; t_len <= max_ctx.
 #
 # Flash-decoding: the first `par` runs one task per (KV head, 256-position split), so even a
 # single sequence keeps every core busy. Each task is the standard library's attn_split: it
-# scores its positions for the group's heads, 4 at a time with their dot products in
-# registers and each K vector widened from bf16 once for the 4; takes the split's softmax;
-# and accumulates P V one vector of columns at a time over its positions, again 4 heads in
-# registers. It leaves per head and split the max, the sum of exponentials and the
-# unnormalized output. The second `par`, one task per query head, merges the splits
-# (attn_merge), each rescaled by exp(m_split - m), and divides by the total.
+# scores its positions for the group's heads with positions in lanes, 4 heads at a time with
+# their scores in registers and each K vector widened from bf16 once for the 4, so no score
+# needs a horizontal sum; takes the split's softmax; and accumulates P V one vector of
+# columns at a time over its positions, again 4 heads in registers. It leaves per head and
+# split the max, the sum of exponentials and the unnormalized output. The second `par`, one
+# task per query head, merges the splits (attn_merge), each rescaled by exp(m_split - m), and
+# divides by the total.
 
 use attn_split, attn_merge
 
@@ -48,7 +51,7 @@ fn attend_split(task:i64, q:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i
     h0 = mul g, group
     row2 = mul hd, 2:i64
     hd4 = mul hd, 4:i64
-    # rows t0 .. of KV head g
+    # positions t0 .. of KV head g (V's rows; K's tiles start at the same offsets)
     g_rows = mul g, max_ctx
     first = add g_rows, t0
     kv_off = mul first, row2

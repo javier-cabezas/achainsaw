@@ -389,17 +389,16 @@ class TestGGUFDecode(unittest.TestCase):
             np_cache: list[tuple[F32, F32]] = m.numpy_cache()
             token: int = 1
             checked: int = 0
-            planes: npt.NDArray[np.uint16] = cache.reshape(len(m.layers), 2, m.nkv, m.max_ctx,
-                                                           m.hd)
             for pos in range(8):
                 got: int = k.run("llama_decode", m.table, m.cfg, cache, token, pos, h,
                                  float(m.eps))
                 want: int = m.numpy_step(np_cache, token, pos)
                 # The KV cache holds bf16 values; NumPy's f32 K and V can round to the
                 # neighboring bf16 value where they sit at a rounding boundary.
+                planes: tuple[npt.NDArray[np.uint16], ...] = m.cache_kv(cache)
                 for l, (kc, vc) in enumerate(np_cache):
                     for kv, ref in enumerate((kc[pos], vc[pos])):
-                        bits: Ints = planes[l, kv, :, pos, :].astype(np.uint32) << 16
+                        bits: Ints = planes[kv][l, :, pos, :].astype(np.uint32) << 16
                         np.testing.assert_allclose(bits.view(np.float32), ref, rtol=2.0 ** -7,
                                                    err_msg=f"{be} cache l={l} pos {pos}")
                 # Such a step can flip an int8 quantization of a later attention output,

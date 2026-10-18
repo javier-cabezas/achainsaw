@@ -165,8 +165,9 @@ jobs:
           tools/qemu-aarch64/run.sh +sve,+sme 16 32 256
 
       # Scalable vectors must work at every SVE vector length, not just the runner's
-      # 128 bits: rerun the vx and mm tests (the code that depends on the length) under QEMU
-      # at 256, 512 and 2048 bits. `-cpu max` also has SME, so `mm` uses the SME kernel
+      # 128 bits: rerun the vx and mm tests (the code that depends on the length) and
+      # gqa_attention (attn_split, whose K loads cover a 32-position tile, or part of a
+      # vector above 512 bits) under QEMU at 256, 512 and 2048 bits. `-cpu max` also has SME, so `mm` uses the SME kernel
       # there, at the same streaming vector length. Everything else already ran natively above; QEMU also emulates
       # LLVM itself, so the full suites would take hours.
       - name: SVE vector-length sweep under QEMU
@@ -178,7 +179,8 @@ jobs:
             echo "::group::SVE vector length $((vl_bytes * 8)) bits"
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="$QEMU -cpu max,sve-default-vector-length=$vl_bytes,sme-default-vector-length=$vl_bytes" \
               cargo test -p achainsaw-codegen --features llvm \
-                --test vector_ops --test half_masked_mm -- at_host_vector_length
+                --test vector_ops --test half_masked_mm --test kernels -- \
+                at_host_vector_length gqa_attention
             echo "::endgroup::"
           done
         env:
