@@ -233,6 +233,12 @@ jobs:
       - name: Run Ahead-Of-Time (AOT) compilation tests
         run: python tests/test_aot_e2e.py
 
+      # The README's console examples print what it shows. Not on Windows, whose checkout has CRLF
+      # line endings, which move the source offsets in diagnostics
+      - name: Check the README's console output
+        if: runner.os != 'Windows'
+        run: python tests/test_readme.py
+
       - name: Run Chainsaw-BLAS benchmark verification
         run: python benchmarks/benchmark_kernels.py --quick
 

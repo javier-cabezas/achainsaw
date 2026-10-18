@@ -11,13 +11,10 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
     br more, vbody, done
   vbody:
     rest = sub n, i
-    off = mul i, 4:i64
-    px = add x, off
-    py = add y, off
-    xv = ldm px:vx, rest:f32
-    yv = ldm py:vx, rest:f32
+    xv = ldm x[i]:vx, rest:f32
+    yv = ldm y[i]:vx, rest:f32
     r = vfma va, xv, yv:f32
-    stm py, r, rest:f32
+    stm y[i], r, rest:f32
     i2 = add i, w
     jmp vloop(i2)
   done:

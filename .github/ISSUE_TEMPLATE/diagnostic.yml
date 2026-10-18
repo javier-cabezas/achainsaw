@@ -1,0 +1,25 @@
+name: A diagnostic misled a model
+description: An error didn't help an agent fix its program
+labels: [diagnostics]
+body:
+  - type: textarea
+    id: program
+    attributes:
+      label: Program
+      description: What the model wrote.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Diagnostic
+      description: The JSON achainsaw returned.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: next
+    attributes:
+      label: What the model did next
+      description: How it tried to fix the program, and what would have helped it.
