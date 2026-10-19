@@ -1,6 +1,6 @@
 # achainsaw
 
-Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift JIT or AOT native code. See README.md for the user-facing tour.
+Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift JIT or AOT native code. README.md is the overview for users, and `docs/` the reference.
 
 ## Layout
 - `crates/achainsaw-ir`: lexer, parser, AST, validator (SSA/type checks), optimizer (`opt.rs`), AIRB codec (`binary.rs`), JSON diagnostics (`diag.rs`).
@@ -8,14 +8,16 @@ Compiler toolchain for AI agents: AIR (flat SSA IR) text/bytecode -> Cranelift J
 - `crates/achainsaw-llvm`: optional LLVM backend (empty without its `llvm` feature): AIR -> LLVM IR (`lower.rs`), ORC LLJIT (`jit.rs`), object emission (`aot.rs`).
 - `crates/achainsaw-cli`: `achainsaw` binary (`main.rs`) and the MCP stdio server (`mcp.rs`).
 - `crates/achainsaw-py`: PyO3 bindings; type stubs in `achainsaw.pyi`.
-- `examples/`: `.air` sources with matching `.airb` bytecode; `tests/`: Python e2e tests.
+- `examples/`: `.air` sources with matching `.airb` bytecode (in `examples/` and `examples/kernels/`; `examples/agent/` holds the README's diagnostic demo, a valid program and its broken copy, with no `.airb`); `tests/`: Python e2e tests.
+- `docs/`: the user documentation the README links to: `language.md` (AIR syntax, vector ops, standard library), `parallel.md`, `backends.md` (vector widths, `mm` kernels), `cli.md`, `mcp.md`, `python.md`, `ffi.md`, `kernels.md` (kernel table and NumPy/PyTorch benchmarks, the figure's SVGs) and `llama.md` (single-call decode and prefill, llama.cpp comparisons). New benchmark numbers go there, and into the README's summary table when they change it. `ROADMAP.md` lists planned work; `CONTRIBUTING.md` is for contributors.
+- `tests/test_readme.py` runs every `$ achainsaw ...` command in the README's console blocks and compares the output (JSON without timings and thread counts); CI runs it on Linux and macOS. Update the README's output when a command's output changes. The README states only measured numbers (the FAQ's token counts are from the Llama 3 tokenizer in `benchmarks/gguf.py`).
 - `benchmarks/`: NumPy and PyTorch comparisons of `examples/kernels/` (PyTorch is optional: each script skips it when it is not installed or with `--no-torch`, and every PyTorch baseline is checked against the case's reference); `gguf.py` (GGUF reader, dequantization, Llama 3 tokenizer) and `llama_model.py` (weight packing for `llama_decode.air`, GGUF conversion, NumPy reference, PyTorch forward pass on its weight-only int4/int8 kernels) back `benchmark_decode.py`, which also runs llama.cpp's `llama-bench` on the same GGUF with `--llama-bench PATH`.
 
 ## Commands
 - Build: `cargo build --workspace` (release CLI: `cargo build --release -p achainsaw`)
 - Rust tests: `cargo test --workspace`
 - MCP e2e: `cargo build -p achainsaw && python tests/test_mcp_e2e.py`
-- Python binding tests need the extension built first (`maturin develop` or copy `target/*/libachainsaw.so` to `achainsaw.so`), then `python tests/test_py_binding.py` and `python tests/test_gguf_decode.py` (a synthetic GGUF through the loader and `llama_decode.air`).
+- Python binding tests need the extension built first (`maturin develop` or copy `target/*/libachainsaw.so` to `achainsaw.so`), then `python tests/test_py_binding.py` and `python tests/test_gguf_decode.py` (a synthetic GGUF through the loader and `llama_decode.air`). `python tests/test_readme.py` (after `cargo build -p achainsaw`) checks the README's console output.
 - Lint (CI): `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`; for Python, `python tools/check_py_types.py` and `mypy` (strict, configured in `pyproject.toml`; needs `pip install mypy numpy`, the versions CI pins).
 - Performance (CI's `perf` job on PRs): `python benchmarks/perf_compare.py BASE_DIR HEAD_DIR` runs each checkout's kernel and decode benchmarks (extension at each root) alternately and fails if a result is >25% slower on either backend. An intended slowdown needs the `perf-regression-ok` label, then a re-run of the job.
 - LLVM backend (LLVM 22): `export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22`, then add `--features achainsaw/llvm,achainsaw-codegen/llvm,achainsaw-llvm/llvm` to build/test/clippy. Run the suite on LLVM with `ACHAINSAW_BACKEND=llvm cargo test --workspace --features ...`; CI's `test-llvm` job runs it on both backends.

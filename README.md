@@ -1,128 +1,250 @@
 # achainsaw
 
 [![CI](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/ci.yml)
-[![Release](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml/badge.svg)](https://github.com/javier-cabezas/achainsaw/actions/workflows/release.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![MCP server](https://img.shields.io/badge/MCP-server-blueviolet)](docs/mcp.md)
+[![Llama 3.2 1B prefill](https://img.shields.io/badge/Llama%203.2%201B%20prefill-1.7--2.4x%20llama.cpp-brightgreen)](docs/llama.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **High-Performance, Token-Minimal Compiler Toolchain Designed Exclusively for AI Agents**
+**A compiler for the code AI agents write.** Agents write AIR, a small, flat
+SSA language. achainsaw checks it, answers mistakes with JSON that names the
+fix, and compiles it in under a millisecond to native code for x86-64 and
+AArch64. Claude Code and other MCP clients get it as tools, and run the code
+in a sandbox.
 
-`achainsaw` is a specialized compiler and JIT execution toolchain built from first principles for autonomous LLM agents. It completely discards human-centric syntactic sugar (no curly braces, no indentation sensitivity, no verbose keywords, no English prose compiler errors) to optimize for two uncompromising objectives:
-
-1. **Minimize Agent Processing Time:** Autoregressive LLM decoding latency scales linearly with token count. `achainsaw` uses **AIR (Agent Intermediate Representation)**—a flat, sequential Single Static Assignment (SSA) format with single-token mnemonics. It eliminates nesting hallucinations and reduces token consumption by **60% to 80%** compared to traditional languages.
-2. **Generate Highly Efficient Native Code as Fast as Possible:** Powered by **Cranelift** (the code generator behind Wasmtime), `achainsaw` compiles AIR modules directly to bare-metal x86_64 / AArch64 machine code with JIT compilation times under **10 milliseconds** and near-LLVM execution throughput.
-
----
-
-## ⚡ Key Highlights
-
-- **Linear SSA / Three-Address Code (TAC):** Zero nested expressions (`(+ (* a b) c)`). Eliminates bracket/parenthesis balancing errors and allows causal transformer attention heads to track dependencies with forward sequential ease.
-- **Single-Token Mnemonics:** Operators and keywords (`fn`, `cst`, `add`, `mul`, `ld`, `st`, `br`, `jmp`, `ret`) map strictly to single, indivisible tokens in standard BPE vocabularies (OpenAI `cl100k`/`o200k`, Meta LLaMA 3, Google Gemini).
-- **Machine-Native Diagnostic Protocol:** Zero natural-language prose error messages. Validation failures immediately produce structured JSON diagnostics with exact instruction indices, expected types, and candidate replacement patches for single-shot agent self-repair.
-- **Width-Generic SIMD Vectors:** Fixed `v128`/`v256`/`v512` and scalable `vx` vectors with lane-typed ops (`vadd a, b:f32`) over i8/i16/i32/i64/f32/f64 lanes, fused multiply-add, compares and bitwise select, broadcast, lane extraction, lane permutations (interleave, deinterleave, reverse, broadcast a lane), and deterministic horizontal reductions (see [Vector Types & Ops](#-vector-types--ops-air-v2)).
-- **One-Line Multi-Core Parallelism:** `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores and joins, with no threads, locks or closures to get wrong (see [Parallel Loops](#-parallel-loops-par)).
-- **Autonomous Dynamic Memory Management:** Built-in bare-metal heap allocator intrinsics (`alloc`, `free`) with 64-bit pointer arithmetic, allowing agents to dynamically allocate, reshape, and reclaim scratchpad buffers.
-- **Sub-10ms Bare-Metal JIT:** Direct in-memory compilation and execution via Cranelift with native C-ABI compatibility for host interop.
-- **High-Performance Memory Model:** Flat linear memory addressing (`ld`/`st`), 64-bit pointer arithmetic, and scalar numeric types (`i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`, `v128`).
-
----
-
-## 📐 Token Efficiency: AIR vs Traditional Code
-
-### Vector Dot Product Kernel
-
-#### Python (~68 tokens, slow runtime):
-```python
-def dot(a, b, n):
-    acc = 0.0
-    for i in range(n):
-        acc += a[i] * b[i]
-    return acc
-```
-
-#### C99 (~95 tokens, slow compilation):
-```c
-float dot(const float* a, const float* b, int n) {
-    float acc = 0.0f;
-    for (int i = 0; i < n; i++) {
-        acc += a[i] * b[i];
-    }
-    return acc;
+```console
+$ achainsaw run examples/agent/sum_squares.air --func sum_squares --args 1000000
+{
+  "backend": "cranelift",
+  "compile_time_us": 627,
+  "exec_time_us": 500,
+  "function": "sum_squares",
+  "parse_time_us": 61,
+  "result": 333332833333500000,
+  "status": "ok",
+  "threads": 16,
+  "total_time_ms": 1.273
 }
 ```
 
-#### achainsaw AIR (~42 tokens, <5ms JIT compilation, native AVX speed):
-```air
-fn dot(p0:ptr, p1:ptr, n:i64)->f32
-  b0:
-    zero_f = cst 0.0:f32
-    zero_i = cst 0:i64
-    jmp b1(zero_i, zero_f)
-  b1(i:i64, acc:f32):
-    cond = lt i, n
-    br cond, b2, b3
-  b2:
-    four = cst 4:i64
-    byte_off = mul i, four
-    p0_elem = add p0, byte_off
-    p1_elem = add p1, byte_off
-    v0 = ld p0_elem:f32
-    v1 = ld p1_elem:f32
-    prod = mul v0, v1
-    next_acc = add acc, prod
-    one = cst 1:i64
-    next_i = add i, one
-    jmp b1(next_i, next_acc)
-  b3:
-    ret acc
+- **Made for models to write:** one operation per line, no nesting, every
+  value named once. Errors are JSON with an `ERR_*` code, the source span, and
+  what it takes to fix them, such as the registers in scope.
+- **Safe to run what a model wrote:** through MCP, every load and store is
+  checked against the sandbox's memory, runaway loops run out of fuel, and
+  deep recursion hits a stack limit. Each is an error code, never a crash.
+- **Compiles in under a millisecond** on Cranelift, the default backend.
+  The optional LLVM backend takes a few milliseconds and uses the CPU's full
+  vector width.
+- **Fast code:** vectors that take the CPU's width (SSE to AVX-512, NEON,
+  SVE), int8 dot products (VNNI, `sdot`), matrix engines (AMX, SME), and
+  `par` loops on every core. A whole Llama 3.2 1B forward pass is one AIR
+  file, which prefills 1.7–2.4x faster than llama.cpp on the same CPU and
+  decodes as fast (1.9x as fast at 8K tokens of context).
+- **Use it from anywhere:** the CLI, an MCP server, Python on NumPy arrays, or
+  objects and shared libraries for C, C++ and Rust. CI tests Linux, macOS and
+  Windows.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [See it work](#see-it-work)
+- [Use it from your code](#use-it-from-your-code)
+- [The language](#the-language)
+- [How it works](#how-it-works)
+- [How it compares](#how-it-compares)
+- [FAQ](#faq)
+- [Roadmap and contributing](#roadmap-and-contributing)
+
+## Quick start
+
+You need a Rust toolchain ([rustup](https://rustup.rs)). Build achainsaw and
+run an example:
+
+```sh
+git clone https://github.com/javier-cabezas/achainsaw.git
+cd achainsaw
+cargo build --release -p achainsaw
+target/release/achainsaw run examples/agent/sum_squares.air --func sum_squares --args 10
 ```
 
----
+Or install only the binary, without cloning:
+`cargo install --git https://github.com/javier-cabezas/achainsaw achainsaw`.
 
-## 🧮 Vector Types & Ops
+**In Claude Code**, install the binary and register its MCP server:
 
-Vectors are untyped bit containers; every vector op names the lane type it works on, so one register can be read as `f32` lanes by one op and as `i32` lanes by the next.
+```sh
+cargo install --path crates/achainsaw-cli
+claude mcp add --scope user achainsaw -- achainsaw mcp
+```
 
-| Type | Width | Notes |
-|---|---|---|
-| `v128`, `v256`, `v512` | 128/256/512 bits | Fixed width; usable in AIR function signatures |
-| `vx` | Target maximum (at least 128 bits) | Scalable; `n = vl f32` gives its lane count. Usable in AIR function signatures, not in `extfn` ones |
+Then ask Claude for something like *"count the primes below a million with
+achainsaw"*. Claude writes the AIR, checks it with `air_check`, fixes what
+the diagnostics point at, and runs it with `air_run`. The server's
+instructions teach the model AIR, so it needs no other documentation. Inside
+this repository, Claude Code finds the server through [`.mcp.json`](.mcp.json).
+[docs/mcp.md](docs/mcp.md) covers Claude Desktop and the seven tools.
 
-| Op | Syntax | Lane types |
-|---|---|---|
-| Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
-| Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
-| Broadcast | `v = splat x:v512` (the vector type is required) | i8 to f64 |
-| Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
-| Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
-| Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
-| Int8 dot product | `r = vdot c, a, b:i8` adds to each i32 lane of `c` the four products of the matching i8 lanes of `a` and `b`, exactly (i32 wrapping). One `sdot` on NEON (FEAT_DotProd) and SVE; on x86 with VNNI, `vpdpbusd` on `a ^ 0x80` minus `128 * sum(b)` (it multiplies unsigned by signed bytes), on both backends | i8 |
-| Unsigned-by-signed dot product | `r = vdotu c, a, b:i8`: the same with `a`'s bytes unsigned (0..255). One `vpdpbusd` on x86 VNNI and one `usdot` on Arm with FEAT_I8MM (NEON and SVE), on both backends; Arm without I8MM takes two `sdot`s. Use it when one operand is naturally unsigned (4- and 6-bit quantized weights) | i8 |
-| Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
-| Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
-| Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
-| Convert | `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN to 0); like scalar casts, the suffix is the result lane type | f32, i32 |
-| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half | widen: i16, i32, i64; narrow: i8, i16 |
-| Half-precision floats | `w = vfwidenlo v:f16` / `vfwidenhi` convert the low / high half of the 16-bit float lanes to f32 (the suffix names the source; also `:bf16`); `n = vnarrow a, b:f16` converts f32 lanes to f16 or bf16, rounding to nearest-even like `ftrunc`. Exact and identical on both backends except NaN payloads; LLVM uses F16C or AArch64's `fcvtl`/`fcvtn` where available. `vl`, `ldm` and `stm` count f16/bf16 lanes too | f16, bf16 |
-| Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, taken modulo the lane width | i8 to i64 |
-| Absolute value / negate | `r = vabs v:i32`, `vneg`: integers wrap (`vabs` of the minimum is the minimum); floats clear or flip the sign bit, NaNs included | i8 to f64 |
-| Square root | `r = vsqrt v:f32` (correctly rounded), `vrsqrt` computes `1 / vsqrt(v)` with two roundings, never a hardware estimate, so results are identical on every CPU | f32, f64 |
-| Rounding | `r = vfloor v:f32`, `vceil`, `vround` (halfway cases away from zero, as C's `round`), `vroundeven` (to even), `vroundz` (toward zero) | f32, f64 |
-| Copy sign | `r = vcopysign a, b:f32`: `a`'s magnitude with `b`'s sign bit | f32, f64 |
-| Exponential | `e = vexp v:f32`: e^x within 2 ulp on [-87, 88], inputs clamped to that range, NaN propagated; a fixed algorithm, so results are bit-identical on every backend | f32 |
-| Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
-| Broadcast a lane | `r = vdup v, 3:f32` puts lane 3 of `v` in every lane | Any, including f16/bf16; index checked as for `extlane` |
-| Reverse | `r = vrev v:f32` reverses the order of the lanes | Any, including f16/bf16 |
-| Interleave | `r = vziplo a, b:f32` gives `a0 b0 a1 b1 ...` from the low halves, `vziphi` the same from the high halves | Any, including f16/bf16 |
-| Deinterleave | `r = vunziplo a, b:f32` gives the even lanes of `a` then of `b` (`a0 a2 ... b0 b2 ...`), `vunziphi` the odd lanes; they invert `vziplo`/`vziphi` | Any, including f16/bf16 |
-| Lane count | `n = vl f32` | Any |
+**In Python**, install the package (it builds with Rust):
 
-Semantics are identical on every backend: integer ops wrap, float `vmin`/`vmax` propagate NaN and order `-0.0` below `+0.0`, and reductions use a fixed recursive-halves order (`reduce(v) = op(reduce(lo), reduce(hi))`), so float sums are bit-reproducible for fixed widths.
+```sh
+pip install git+https://github.com/javier-cabezas/achainsaw.git
+```
 
-**Permutations** (`vziplo`/`vziphi`, `vunziplo`/`vunziphi`, `vrev`, `vdup`) are defined relative to the vector's own lane count, so vector-length-agnostic code can use them on `vx` at any width: on SVE each is a single instruction (`zip1`/`zip2`, `uzp1`/`uzp2`, `rev`, `dup`) at every vector length. There is deliberately no shuffle by an index list, since its indices would depend on a width that `vx` code does not know. Zips and unzips cover the common layouts: pairs such as interleaved RoPE's `(x[2i], x[2i+1])` deinterleave with `vunziplo`/`vunziphi` and go back with `vziplo`/`vziphi`, and repeated zips transpose small tiles.
+That builds the Cranelift backend; [docs/python.md](docs/python.md#installation)
+adds LLVM.
 
-**Fast min/max:** float min/max (`min`, `max`, `vmin`, `vmax`, `vminr`, `vmaxr`) propagate NaN and order -0.0 below +0.0 by default. Compiling with fast math (`--fast-math` on `run`, `bench` and `build`, `fast_math=True` in Python's `compile`, `fast_math` in MCP `air_run`, `JitEngine::set_fast_math` or `CodegenOptions` in Rust) lowers the same instructions to compare and select instead, `max(a, b) = a > b ? a : b` and `min(a, b) = a < b ? a : b`, so a NaN operand or two zeros give `b`. That skips the NaN and signed-zero handling, which costs several instructions per op on 128-bit Cranelift vectors, and results stay identical on every backend (they are what x86's `maxps`/`minps` compute). Softmax runs 17% faster on Cranelift and 13% faster on LLVM with it; the kernel benchmarks below use it. Fast math also lets bf16 `mm` use AMX (`tdpbf16ps`), SME (`bfmopa`) and AVX512-BF16 (`vdpbf16ps`), which treat bf16 subnormal inputs as zero; by default bf16 `mm` uses exact vector FMAs on those CPUs, so it widens every bf16 value exactly on every backend (int8, f16 and f32 `mm` use the matrix engines either way).
+## See it work
 
-Vector-length-agnostic code processes `vl` lanes per iteration and finishes with masked accesses, as in [`examples/saxpy_vx.air`](examples/saxpy_vx.air):
+**A mistake, and its fix.** Here an agent returns a register it never defined
+([examples/agent/sum_squares_bug.air](examples/agent/sum_squares_bug.air)).
+The diagnostic names the registers in scope at that point, so the fix is to
+pick one:
+
+```console
+$ achainsaw check examples/agent/sum_squares_bug.air
+{
+  "status": "error",
+  "error_code": "ERR_UNDEFINED_REG",
+  "message": "Register 'total' is used before definition",
+  "instruction_index": 0,
+  "span": {
+    "start": 326,
+    "end": 329,
+    "line": 14,
+    "column": 5
+  },
+  "context": {
+    "available_registers": [
+      "acc",
+      "i",
+      "more",
+      "n"
+    ],
+    "block": "done",
+    "function": "sum_squares",
+    "target": "total"
+  }
+}
+$ achainsaw run examples/agent/sum_squares.air --func sum_squares --args 10
+{
+  "backend": "cranelift",
+  "compile_time_us": 627,
+  "exec_time_us": 0,
+  "function": "sum_squares",
+  "parse_time_us": 110,
+  "result": 285,
+  "status": "ok",
+  "threads": 16,
+  "total_time_ms": 0.792
+}
+```
+
+**Code that goes wrong stops cleanly.** A loop that never ends runs out of
+fuel, which every branch consumes:
+
+```console
+$ achainsaw run examples/infinite_loop.air --fuel 1000000
+{
+  "error_code": "ERR_EXECUTION",
+  "message": "[ERR_OUT_OF_FUEL] Execution halted: loop fuel budget exhausted",
+  "status": "error"
+}
+```
+
+MCP's `air_run` also runs code in a sandbox: memory comes only from `alloc`,
+in an arena of its own, and every access outside it fails. This is a read
+100 million floats past a 4 KB buffer:
+
+```json
+{
+  "error_code": "ERR_EXECUTION",
+  "message": "[ERR_MEMORY_VIOLATION] Access of 4 bytes at 0x73582bd77410 is outside memory obtained from alloc",
+  "status": "error"
+}
+```
+
+**A Llama in one file.** [`llama_decode.air`](examples/kernels/llama_decode.air)
+runs a whole Llama-style forward pass in one call: a token in, the next token
+out, with quantized weights (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) read straight from
+a GGUF file. Llama 3.2 1B Instruct, continuing "The capital of France is" on
+a laptop's Ryzen 7 8845HS with 8 threads:
+
+```console
+$ curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
+$ python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 --no-numpy --no-torch
+Llama 3.2 1B Instruct: 16 layers, 0.79 GB of packed weights (qkv q4, o q4, gate_up q4, down q4/q8, lm q6), loaded in 13.6 s
+prompt: 6 tokens; generating up to 32
+  AIR cranelift, 8 thr   prompt   7.42 ms/token ( 134.8 tokens/s), decode   16.24 ms/token    61.6 tokens/s   48.9 GB/s of weights
+    ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital'
+  AIR llvm, 8 thr        prompt   3.36 ms/token ( 297.9 tokens/s), decode   15.25 ms/token    65.6 tokens/s   52.1 GB/s of weights
+    ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital'
+```
+
+Against llama.cpp on the same file, threads and machine, measured with its own
+`llama-bench` (build 6868a52, with its default f16 KV cache) on prompts of
+each length, then 64 generated tokens:
+
+| Context | Prefill, AIR (LLVM) | Prefill, llama.cpp | Decode, AIR (LLVM) | Decode, llama.cpp |
+|---|---|---|---|---|
+| 64 tokens | 790 tokens/s | 441 tokens/s | 66.3 tokens/s | 65.6 tokens/s |
+| 512 tokens | 1036 tokens/s | 437 tokens/s | 67.4 tokens/s | 60.7 tokens/s |
+| 2048 tokens | 838 tokens/s | 398 tokens/s | 64.1 tokens/s | 48.6 tokens/s |
+| 8192 tokens | 486 tokens/s | 283 tokens/s | 51.9 tokens/s | 27.1 tokens/s |
+
+It prints the same text as llama.cpp, a prefill leaves exactly the state that
+decoding the prompt token by token would, and its decode reads weights at
+about the memory's bandwidth. [docs/llama.md](docs/llama.md) explains how,
+with the numbers for K-quant files and against PyTorch.
+
+**Kernels against NumPy and PyTorch.** [`examples/kernels/`](examples/kernels)
+holds 20 kernels for LLM inference and vector search: quantized GEMV and
+GEMM, attention, norms, activations, RoPE, top-k. On LLVM, each is faster
+than PyTorch's CPU path for the same operation
+([docs/kernels.md](docs/kernels.md)):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/kernels-vs-numpy-dark.svg">
+  <img alt="Speedup of each kernel over NumPy on a log scale, PyTorch, Cranelift and LLVM side by side" src="docs/kernels-vs-numpy-light.svg">
+</picture>
+
+## Use it from your code
+
+**Python.** `compile` returns a kernel whose functions take NumPy arrays as
+pointers, without copies:
+
+```python
+import achainsaw
+import numpy as np
+
+kernel = achainsaw.compile(open("examples/saxpy_vx.air").read())
+x = np.arange(8, dtype=np.float32)
+y = np.ones(8, dtype=np.float32)
+kernel.run("saxpy", 2.0, x, y, len(x))  # y = 2 x + y, in place
+print(y)                                # [ 1.  3.  5.  7.  9. 11. 13. 15.]
+```
+
+Compiling takes about 0.25 ms and a call 0.2 µs. Diagnostics arrive as
+dictionaries on `CompilationError` ([docs/python.md](docs/python.md)).
+
+**C, C++ and Rust.** `achainsaw build` writes an object file or a shared
+library with C-ABI functions, for x86-64 and AArch64
+([docs/cli.md](docs/cli.md#ahead-of-time-compilation-achainsaw-build)):
+
+```sh
+achainsaw build examples/kernels/gemv_f32.air --shared
+achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu znver4 -o gemv_f32.o
+```
+
+**C libraries from AIR.** `extfn` declares C functions, the C math library is
+available, and Python can load shared libraries or register callbacks
+([docs/ffi.md](docs/ffi.md)).
+
+## The language
+
+A vector loop that runs at the CPU's vector width, from
+[`examples/saxpy_vx.air`](examples/saxpy_vx.air). `vl` is the number of
+lanes, and the masked `ldm`/`stm` handle the remainder:
+
 ```air
 fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
   b0:
@@ -134,777 +256,99 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
     br more, vbody, done
   vbody:
     rest = sub n, i
-    off = mul i, 4:i64
-    px = add x, off
-    py = add y, off
-    xv = ldm px:vx, rest:f32
-    yv = ldm py:vx, rest:f32
+    xv = ldm x[i]:vx, rest:f32
+    yv = ldm y[i]:vx, rest:f32
     r = vfma va, xv, yv:f32
-    stm py, r, rest:f32
+    stm y[i], r, rest:f32
     i2 = add i, w
     jmp vloop(i2)
   done:
     ret
 ```
 
-**Half-precision storage types:** `f16` (IEEE binary16) and `bf16` (bfloat16) can be loaded, stored, and converted (`f = fext h:f32`, `h = ftrunc f:bf16`, rounding to nearest-even; vectors with `vfwidenlo`/`vfwidenhi` and `vnarrow`), but not used in arithmetic or function signatures; convert to `f32` first.
-
-**Standard library:** a top-level `use` line links functions from AIR's standard library, written in AIR ([`crates/achainsaw-ir/std/std.air`](crates/achainsaw-ir/std/std.air)), into the module, together with the library functions they call; they are then ordinary functions to `call` or run with `par`, and work the same in files, MCP `air_run`, Python and AOT builds.
-
-```air
-use quantize_q8, qmat_chunk
-
-fn gemv_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
-  b0:
-    off = mul c, 256:i64
-    yc = add y, off
-    call qmat_chunk(c, mat, xq, dx, yc, k)
-    ret
-```
-
-It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
-
-**Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts.
-
-On the LLVM backend, `mm` uses the best kernel the target has:
-
-| Target | `mm` kernel |
-|---|---|
-| x86 with AMX (Sapphire/Emerald Rapids: bf16, i8; Granite Rapids: also f16) | 16x16 AMX tiles (`tdpbf16ps`, `tdpbssd`, `tdpfp16ps`) |
-| AArch64 with SME (e.g. Apple M4) | ZA-tile outer products (`fmopa`, `bfmopa`, `smopa`) in streaming mode |
-| x86 with AVX512-BF16 (Zen 4/5, Cooper Lake), bf16 with fast math | `vdpbf16ps` (two products per f32 lane), tiles of 4 rows of C by 64 columns |
-| Everything else | broadcast-FMA at full `vx` width (AVX-512/AVX2/SVE/NEON), tiles of 4 rows of C by 4 vectors (2 on 16-register targets); bf16, f16 and i8 rows of A are widened once per tile, so the inner loop broadcasts them from memory |
-
-On a Zen 4 core (AVX-512), 256x256x256 `mm` runs at about 155 GFLOP/s for f32, 145 for bf16 (290 with fast math, on `vdpbf16ps`; PyTorch's oneDNN gets 282), 125 GOP/s for i8, and 140 for f16. Cranelift's 128-bit kernel reaches about 50, 30, 33 and 8. The AMX path is compiled and checked in assembly but has not run on AMX hardware yet. The SME path is tested under QEMU (`tools/qemu-aarch64/run.sh`); its objects call the SME ABI routine `__arm_tpidr2_save`, provided by GCC 14+ libgcc or compiler-rt.
-
-**Backend support:** the default Cranelift backend runs every vector program, splitting `v256`/`v512` into 128-bit operations, treating `vx` as 128 bits, and running `mm` as 128-bit tiles (4 rows by 8 columns of C, with FMA where the CPU has it). The opt-in [LLVM backend](#10-choosing-a-backend---backend) uses the hardware's full width:
-
-| Target (LLVM backend) | `vx` | Masked `ldm`/`stm` |
-|---|---|---|
-| x86_64 with AVX-512F | 512 bits (zmm) | AVX-512 k-masks |
-| x86_64 with AVX2 | 256 bits (ymm) | `vmaskmov` |
-| x86_64 SSE/AVX only, AArch64 NEON (including Apple M4) | 128 bits | per-lane |
-| AArch64 with SVE | scalable, the CPU's vector length (`<vscale x ...>`) | `whilelo` predicates |
-
-`v256`/`v512` map to native registers whenever the target has them. On SVE, horizontal reductions follow the same adjacent-pairs tree at the run-time vector length. Programs written against `vl` and `mm` speed up without changes. `vx` width therefore depends on the backend and CPU, so programs must use `vl` rather than assume a lane count; `JitEngine::vx_bits()` and `achainsaw cpu` report it.
-
-## 🧩 Memory Operands, Several Results and Inline Functions
-
-**Indexed operands.** `ld`, `st`, `ldm` and `stm` take `p[i]`, which addresses `p + i * size` for an i64 index: the size of the loaded or stored scalar, or the lane type of `ldm`/`stm`. A vector access, or a byte offset, names its unit: `p[i:f32]`, `p[o:i8]`. The sandbox checks the address the index computes.
-
-```air
-  body:
-    rest = sub n, i
-    g = ldm gate[i]:vx, rest:f32      # was: off = mul i, 4:i64; pg = add gate, off; g = ldm pg:vx, rest:f32
-    st scores[t], s                   # s:f32 at scores + 4t
-```
-
-**Several results.** A function can return several values, `fn divmod(a:i64, b:i64)->(i64, i64)`, with `ret q, r`, received as `q, r = call divmod(x, 10:i64)`. Results of any type cross calls, `vx` included (on SVE, a struct of scalable vectors); hosts call only functions with at most one scalar result.
-
-**Inline functions.** `inline fn` marks a helper whose calls are replaced by its body before compiling, on both backends, JIT and AOT (`achainsaw opt` shows the expansion). A straight-line helper merges into the caller's block, so it adds no branches and no fuel checks; inline functions cannot be recursive (`ERR_RECURSIVE_INLINE`). The standard library's quantized matrix kernels are built this way: `qmat_chunk` (1 token), `qmat_chunk4` (4 tokens) and `qmat_chunk8` (8) call the same inline steps (`qmat_w8`/`qmat_w4`/`qmat_w5`/`qmat_w6` unpack two weight vectors, `qmat_dot` and `qmat_dot1` run `vdotu`s, `qmat_accr`/`qmat_accmr` scale and accumulate), so every token's arithmetic is identical by construction, and `llama_decode.air` reads its tables with `load_cfg`, `model_globals` and `layer_weights`. Together with indexed operands, this cut the standard library from 712 to 447 lines of code (`qmat_chunk` 185 to 80, `qmat_chunk4` 335 to 114) and `llama_decode.air` from 718 to 637, without slowing anything down: in the base-vs-head benchmark comparison every kernel is within noise, and Cranelift's quantized GEMVs and prefill got 6–7% faster (its index shifts fold into x86 addressing modes).
-
-**Scalar math.** Rounding to an integral value, `floor`, `ceil`, `round` (halfway away from zero), `roundeven` and `roundz` (toward zero); bit counts `popcnt`, `clz` and `ctz` (the bit width for 0); `copysign a, b` for floats, `rotl`/`rotr` for integers (amount modulo the width); `r = fma a, b, c` with one rounding; `uitof`/`ftoui` unsigned conversions (`ftoui` saturates, negative values and NaN to 0). All are single instructions or exact sequences, bit-identical on both backends and checked against Rust's own operations (`tests/scalar_math.rs`). `quantize_q8` rounds with `vround`, so it now matches llama.cpp's `roundf` exactly at halfway cases. These mnemonics are recognized only right after `=`, so programs that use them as register names still parse.
-
----
-
-## 🧵 Parallel Loops (`par`)
-
-`par n, f(a, b)` calls `f(i, a, b)` for every `i` in `0..n` across all cores and returns when every call has finished. It is the only parallel construct: no threads, futures, locks or closures. `f` is an ordinary AIR function whose first parameter is the `i64` index, followed by scalar or `ptr` parameters, and that returns nothing. Values the body needs are passed as arguments, exactly like `call`. From [`examples/kernels/gemv_par.air`](examples/kernels/gemv_par.air):
-
-```air
-fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
-  b0:
-    m15 = add m, 15:i64
-    blocks = udiv m15, 16:i64
-    par blocks, gemv_rows(a, x, y, m, k)    # gemv_rows(blk, a, x, y, m, k) does rows 16*blk..16*blk+15
-    ret
-```
-
-The rules:
-- **Write only your own memory.** Calls run concurrently and in any order. Each `i` writes its own memory; to reduce, store per-`i` partial results in an `alloc`'d array and sum them after the `par`.
-- **Give each `i` real work.** A row or a block of thousands of elements works well. Dispatching a `par` costs about a microsecond on 16 threads.
-- **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
-
-How it runs:
-- **Threads.** The calling thread works through the indices together with a process-wide pool of helper threads. Indices are handed out dynamically, so uneven iterations still balance. Starting and joining a `par` takes no locks or allocations, and helpers still waking up when the indices run out skip that `par` instead of delaying it. The pool has `ACHAINSAW_THREADS` threads in all (default: one per core). Helpers that just ran iterations spin for 200 µs before parking, so back-to-back `par` loops do not pay thread wake-ups; the window is short because spinning threads slow down other runtimes' thread pools (OpenBLAS, OpenMP) running in the same process. A `par` with fewer indices than threads uses only that many threads: the other helpers stay parked, so they neither slow down busy threads sharing their core nor need waking for later loops of the same size.
-- **Thread cap.** Limit a run with `--threads` on `achainsaw run`, `threads` in MCP `air_run`, `Kernel.set_threads()` in Python, or `JitEngine::set_threads`. `1` runs serially, which makes it easy to measure the speedup.
-- **Serial fallbacks.** A `par` inside a `par` body runs serially on its worker. So does a `par` started while another thread's `par` has the pool. AOT objects have no runtime, so `par` compiles to a plain loop there; any order is a valid execution.
-- **Fuel.** The fuel budget is shared: each index costs one unit, plus the usual unit per branch. A parallel run therefore uses exactly the fuel of a serial one, and a runaway iteration still ends with `ERR_OUT_OF_FUEL`.
-- **Errors and sandbox.** The first failure in any worker stops all of them and is reported from the `par`: `ERR_MEMORY_VIOLATION`, `ERR_STACK_OVERFLOW` or `ERR_OUT_OF_MEMORY`. Sandboxed bodies share the caller's arena and may `alloc`/`free` scratch memory.
-- **Python.** `Kernel.run` releases the GIL, so host callbacks can run on `par` workers, and other Python threads keep running.
-
-Speedup of `gemv_par`'s `bench` driver on a Ryzen 7 8845HS (8 cores, 16 threads), from `achainsaw run examples/kernels/gemv_par.air --func bench --args M,K,REPS --threads T`:
-
-| Shape | Backend | 1 thread | 16 threads | Speedup |
-|---|---|---|---|---|
-| 4096x4096 (64 MB), 50 runs | Cranelift | 193 ms | 77 ms | 2.5x (memory-bound) |
-| 4096x4096 (64 MB), 50 runs | LLVM (AVX-512) | 148 ms | 74 ms | 2.0x (memory-bound) |
-| 1024x512 (2 MB), 2000 runs | Cranelift | 90 ms | 17 ms | 5.3x |
-| 1024x512 (2 MB), 2000 runs | LLVM (AVX-512) | 43 ms | 9 ms | 4.8x (2000 `par` dispatches) |
-
----
-
-## 🛠️ CLI & Agent Usage
-
-### 1. Validate Syntax & SSA Invariants (`--json`)
-```bash
-achainsaw check examples/sum_loop.air --json
-```
-
-**Output:**
-```json
-{
-  "status": "ok",
-  "function_count": 1,
-  "functions": ["sum_to_n"],
-  "block_count": 4,
-  "instruction_count": 7
-}
-```
-
-### 2. Machine-Native Diagnostic on Errors
-If an agent hallucinates an undefined register:
-```json
-{
-  "status": "error",
-  "error_code": "ERR_UNDEFINED_REG",
-  "instruction_index": 0,
-  "message": "Register 'undefined_var' is used before definition",
-  "span": {
-    "start": 42,
-    "end": 55,
-    "line": 4,
-    "column": 16
-  },
-  "context": {
-    "target": "undefined_var",
-    "available_registers": ["a", "b", "cst0"]
-  }
-}
-```
-
-### 3. Compile and Run via Cranelift JIT
-```bash
-achainsaw run examples/sum_loop.air --func sum_to_n --args 100 --json
-```
-
-**Output:**
-```json
-{
-  "status": "ok",
-  "function": "sum_to_n",
-  "result": 5050,
-  "parse_time_us": 62,
-  "compile_time_us": 3120,
-  "exec_time_us": 1,
-  "total_time_ms": 3.25
-}
-```
-
-### 4. Benchmark JIT Compilation Latency
-```bash
-achainsaw bench examples/fibonacci.air --iters 200
-```
-
-### 5. Assemble & Disassemble Compact Binary Bytecode (`.airb`)
-AIR modules can be assembled into compact binary bytecode for persistent caching, agent-to-agent IPC, and zero-parse reloading. Every AIR construct round-trips through AIRB, and files carry a format version that decoders check:
-```bash
-# Assemble text AIR to compact binary bytecode (.airb)
-achainsaw assemble examples/fibonacci.air -o examples/fibonacci.airb --json
-
-# Direct execution of pre-parsed binary bytecode
-achainsaw run examples/fibonacci.airb --func fib --args 30 --json
-
-# Disassemble binary bytecode back into canonical text AIR
-achainsaw disassemble examples/fibonacci.airb
-```
-
-### 6. Model Context Protocol (MCP) Server (`achainsaw mcp`)
-`achainsaw` includes a native Model Context Protocol (MCP) server communicating over JSON-RPC 2.0 stdio, exposing compiler tools directly to LLM agents and IDE assistants:
-```bash
-achainsaw mcp
-```
-
-**Exposed MCP Tools:**
-- **`air_check`**: Validates AIR textual IR or base64 AIRB bytecode syntax and SSA invariants. Returns structured diagnostic metrics or error payloads with line/column pointers and self-repair hints.
-- **`air_run`**: JIT compiles and executes AIR functions with arguments, loop fuel budget, and memory quota sandboxing. Code runs in a sandbox: memory comes only from `alloc` within a private arena (`max_memory_mb`, default 64), out-of-bounds accesses and bad `free`s fail with `ERR_MEMORY_VIOLATION`, unbounded recursion with `ERR_STACK_OVERFLOW`, and pointer parameters are rejected.
-- **`air_assemble`**: Assembles textual AIR into compact base64-encoded AIRB bytecode with compression metrics.
-- **`air_disassemble`**: Decompiles base64 AIRB bytecode back into canonical, human/agent-readable textual AIR.
-- **`air_optimize`**: Optimizes IR using constant folding, algebraic simplification, branch folding, and DCE to a fixpoint.
-- **`air_target`**: Reports the host's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and each backend's vector width (see [CPU Features & ISA Targeting](#9-cpu-features--isa-targeting-achainsaw-cpu)).
-
-The `initialize` response includes server `instructions`, a compact AIR syntax primer that MCP clients inject into the model's context. That lets an agent write valid AIR on the first attempt without this README.
-
-#### Using with Claude Code
-The repository ships a project-scoped [`.mcp.json`](.mcp.json) that runs the server via `cargo run --release`. Build once so the first startup does not exceed the MCP connection timeout, then start Claude Code in the repo and approve the `achainsaw` server when prompted:
-```bash
-cargo build --release -p achainsaw
-claude
-```
-
-To make the tools available in every project, register an installed binary at user scope instead:
-```bash
-cargo install --path crates/achainsaw-cli
-claude mcp add --scope user achainsaw -- achainsaw mcp
-```
-
-#### Using with Claude Desktop
-Add the server to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`), using the absolute path to the binary, then restart Claude Desktop:
-```json
-{
-  "mcpServers": {
-    "achainsaw": {
-      "command": "/absolute/path/to/achainsaw",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-### 7. IR Optimization Engine (`achainsaw opt`)
-Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks:
-```bash
-achainsaw opt examples/opt_demo.air --json
-```
-
-**Optimization Telemetry:**
-```json
-{
-  "status": "ok",
-  "constants_folded": 2,
-  "algebraic_simplifications": 1,
-  "branches_folded": 0,
-  "dead_instructions_removed": 6,
-  "dead_blocks_removed": 1,
-  "total_optimizations": 10,
-  "iterations": 2,
-  "code": "fn demo(x:i32)->i32\n  b0:\n    ret x\n"
-}
-```
-
-### 8. Ahead-Of-Time (AOT) Compilation (`achainsaw build`)
-Compile AIR modules into native object files (`.o`) or linked shared libraries (`.so` / `.dll`) for direct embedding into C, C++, Rust, or Python programs via standard C ABI:
-```bash
-# Compile to native object file (.o)
-achainsaw build examples/fibonacci.air -o examples/fibonacci.o --json
-
-# Compile and link directly into shared library (.dll / .so)
-achainsaw build examples/fibonacci.air --shared --json
-```
-
-**Build Telemetry:**
-```json
-{
-  "status": "ok",
-  "input": "examples/fibonacci.air",
-  "output": "examples/fibonacci.dll",
-  "object_bytes": 265,
-  "shared": true,
-  "parse_time_us": 304,
-  "compile_time_us": 2563,
-  "link_time_us": 112751,
-  "total_time_ms": 116.0
-}
-```
-
-### 9. CPU Features & ISA Targeting (`achainsaw cpu`)
-Report the host's vector ISA features (feature names use LLVM spelling), the active ISA cap, and the vector width each code generation backend uses:
-```bash
-achainsaw cpu
-```
-
-```json
-{
-  "status": "ok",
-  "host": {
-    "arch": "x86_64",
-    "features": ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16", "avx", "f16c", "avx2", "fma", "...", "avx512f", "avx512vl", "avx512bw", "avx512bf16"],
-    "max_isa": "avx512",
-    "native_vector_bits": 512,
-    "sve_vector_bits": null,
-    "sme_vector_bits": null
-  },
-  "isa_cap": null,
-  "effective": { "...": "host features after the ISA cap" },
-  "backends": {
-    "cranelift": { "available": true, "vector_bits": 128, "unused_features": ["f16c", "avx512bw", "avx512cd", "avx512bf16"] },
-    "llvm": { "available": false }
-  }
-}
-```
-
-Detection covers SSE through AVX-512 (including BF16/FP16/VNNI) and AMX on x86_64, and NEON, SVE/SVE2 (with vector length), and SME/SME2 on AArch64. Cranelift emits 128-bit vector code (using VEX/EVEX encodings when AVX/AVX-512 are available) and runs `v256`/`v512`/`vx` programs as 128-bit operations. The LLVM backend, when built in, uses every enabled feature, and `backends.llvm` reports `"available": true` with its `vx` width (`vector_bits`) and whether `vx` is scalable (`vx_scalable`, on SVE).
-
-**Cap the ISA level** to exercise lower tiers on a more capable machine (for example, AVX2 code on an AVX-512 host). Levels: `sse`, `avx`, `avx2`, `avx512`, `amx` (x86_64) and `neon`, `sve`, `sve2`, `sme` (AArch64):
-```bash
-achainsaw run examples/sum_loop.air --func sum_to_n --args 100 --isa avx2
-ACHAINSAW_MAX_ISA=sse achainsaw mcp      # every JIT compilation in the server is capped
-```
-
-**Target a specific CPU in AOT builds** with LLVM CPU names and feature strings. `+feature` also enables its prerequisites and `-feature` disables everything that depends on it, as in LLVM. Features the backend cannot use are listed in `ignored_features`:
-```bash
-achainsaw build examples/kernels/gemv_f32.air --target-cpu x86-64-v3
-achainsaw build examples/kernels/gemv_f32.air --target-cpu znver4 --target-features -avx512f
-achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu sapphirerapids --emit asm   # writes gemv_f32.s
-```
-
----
-
-## ⚡ Chainsaw-BLAS: High-Performance Agent AI Kernel Library
-
-`examples/kernels/` holds verified kernels for LLM inference (norms, activations, RoPE, decode attention, quantized GEMV and prefill GEMM, greedy and top-k selection), vector search, and normalization. They are vector-length agnostic: each processes `vl` lanes per step with FMAs and finishes with masked `ldm`/`stm`, so the same source runs 128-bit vectors on Cranelift and AVX2/AVX-512/SVE-width vectors on LLVM. Every kernel takes element counts, and each `.air` file has matching `.airb` bytecode.
-
-| Kernel | Signature | Use case |
-|---|---|---|
-| `cosine_similarity.air` | `(a:ptr, b:ptr, n:i64)->f32` | Embedding search and RAG |
-| `euclidean_distance.air` | `(a:ptr, b:ptr, n:i64)->f32` | Nearest neighbors, vector quantization |
-| `softmax.air` | `(x:ptr, out:ptr, n:i64)->f32` (returns the sum of exponentials) | Attention weights, numerically stable; `exp` vectorized in AIR (no libm call) |
-| `rmsnorm.air` | `(x:ptr, w:ptr, out:ptr, n:i64)->f32` (returns the scale) | Token normalization (LLaMA, Mistral, Gemma) |
-| `layernorm.air` | `(x:ptr, w:ptr, b:ptr, out:ptr, n:i64, eps:f32)->f32` (returns the scale) | LayerNorm with weight and bias (GPT-2, BERT, Whisper, ViT): the mean, then the variance from the deviations (accurate when the mean is large next to the spread), then the normalization |
-| `gemv_f32.air` | `(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Matrix-vector projection, 4 rows at a time (independent FMA chains, x loaded once per 4 rows) |
-| `gemv_par.air` | `gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)` | The same on all cores, blocks of 16 rows per `par` index; `bench(m, k, reps)->f32` runs it from the CLI or MCP |
-| `gemm_bf16.air` | `gemm_bf16(c:ptr, a:ptr, b:ptr, m:i64, n:i64, k:i64)` | bf16 matrix multiply into f32 on all cores: `par` over 16-row blocks, each an `mm` (AMX, SME or FMA) |
-| `flash_attention.air` | `(q:ptr, kv:ptr, idx:ptr, sink:ptr, out:ptr, h:i64, d:i64, nk:i64, scale:f32)` | One decode step of sparse multi-query attention with an attention sink, as in DeepSeek V4 Pro (128 heads, 512-dim shared K=V entries, 1152 selected entries). Runs on all cores: one `par` gathers the selected entries, a second runs FlashAttention-2 (blocks of 64 entries, both products on `mm`) for groups of 8 heads |
-| `gqa_attention.air` | `gqa_attention(q:ptr, kc:ptr, vc:ptr, out:ptr, nh:i64, nkv:i64, hd:i64, t_len:i64, max_ctx:i64)` | One decode step of grouped-query attention (Llama 3, Mistral, Qwen) over a bf16 KV cache, on all cores (flash-decoding): a `par` over (KV head, 256-position split) tasks scores and mixes 4 query heads at a time with their sums in registers, widening each K and V vector once for the 4; K is stored in tiles of 32 positions (`[head_dim x 32]`) so scores take positions in lanes; a second `par` merges the splits |
-| `add_rmsnorm.air` | `(x:ptr, res:ptr, w:ptr, out:ptr, n:i64, eps:f32)->f32` | Residual add fused with RMSNorm between sublayers (vLLM's `fused_add_rms_norm`): updates the residual stream and normalizes it in two passes |
-| `rope.air` | `(x:ptr, heads:i64, dim:i64, cos:ptr, sin:ptr)` | Rotary position embedding in place, LLaMA/NeoX rotate-half layout, from a row of the cos/sin cache |
-| `swiglu.air` | `(gate:ptr, up:ptr, out:ptr, n:i64)` | `silu(gate) * up` with `exp` vectorized in AIR (Cephes polynomial; 2^n built by reading the f32 lanes as i32), no libm call |
-| `geglu.air` | `(gate:ptr, up:ptr, out:ptr, n:i64)` | `gelu(gate) * up` with PyTorch's tanh-approximated GELU (Gemma's MLP gate), written as `g / (1 + exp(-2u))`: one vectorized `exp`, no tanh or libm call |
-| `argmax.air` | `(x:ptr, n:i64)->i64` | Greedy decoding: first index of the largest logit, one pass with four independent (value, index) accumulator sets |
-| `topk.air` | `(x:ptr, n:i64, k:i64, vals:ptr, idx:ptr)` | Top-k sampling's selection: the k largest logits in order with their token ids. One pass that compares the maximum of each group of 4 vectors with the current k-th best and scans only groups (then vectors) that beat it |
-| `q8_gemv.air` | `q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q8_0 (llama.cpp) matrix-vector product on all cores: int8 weights in 32-blocks with f16 scales (as GGUF stores them), packed in 64-row chunks with each row's 4 consecutive values in one 32-bit lane and stored plus 128; activations quantized on the fly with their block sums; unsigned-by-signed int8 dots on `vdotu`, minus 128 times the activation sums |
-| `q4_gemv.air` | `q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q4_0 (llama.cpp) matrix-vector product: 4-bit weights, half of Q8_0's bytes; GGUF's own nibble bytes in the same lane order, unpacked in registers (a mask and a shift) as unsigned values for the same `vdotu`s, minus 8 times the activation sums |
-| `q4_gemm.air` | `q4_gemm(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64, n:i64)` | Q4_0 matrix product for prefill: n tokens against q4_gemv's packed matrix, one task per 64-row chunk with `qmat_batch` loading and unpacking each weight vector once per 8 tokens (4 with 128-bit vectors); every token gets exactly q4_gemv's result |
-| `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64`, `llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out; and a whole prompt in one call: see [Single-call decode](#single-call-decode-deep-fusion) |
-
-`crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level, with NumPy and (when installed) PyTorch as baselines:
-
-```bash
-python benchmarks/benchmark_kernels.py                  # host ISA, every available backend
-python benchmarks/benchmark_kernels.py --isa all        # also sweep sse/avx/avx2/avx512 (or neon/sve/...)
-python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
-python benchmarks/benchmark_kernels.py --no-torch       # without the PyTorch baseline
-```
-
-Compared with NumPy and PyTorch, from `benchmarks/benchmark_kernels.py` on a Ryzen 7 8845HS (8 cores, 16 threads), best of three runs. Kernels marked "all cores" use `par`; the others run on one core:
-- **NumPy** computes with the kernels' data types: bf16 inputs are stored as bf16 bits and widened in each call, and Q8_0 and Q4_0 weights stay integers. Its GEMV and GEMM use multithreaded OpenBLAS (16 threads).
-- **PyTorch** 2.14 (CPU wheel, eager, its default 8 threads) runs its own fastest CPU path for each kernel, and the benchmark checks its results too. GEMM and attention use native bf16 (oneDNN; bf16 outputs). The quantized GEMVs use its weight-only kernels, the path torchao takes on CPU, with bf16 activations instead of int8 ones. Q4_0 maps to int4 with the same 32-blocks; Q8_0 maps to int8 with one scale per row, since PyTorch has no per-block int8 kernel, which is less work than Q8_0.
-
-The parentheses give the speedup over NumPy:
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/kernels-vs-numpy-dark.svg">
-  <img alt="Speedup of each kernel over NumPy on a log scale, PyTorch, Cranelift and LLVM side by side; the numbers are in the table below" src="docs/kernels-vs-numpy-light.svg">
-</picture>
-
-| Kernel | NumPy | PyTorch | Cranelift (128-bit) | LLVM (512-bit) |
-|---|---|---|---|---|
-| Q4_0 GEMV 4096x4096, all cores | 5.58 ms (the same, from 4-bit values) | 109 µs (51x; int4 weight-only kernel, bf16 activations) | 143 µs (39x) | 39.4 µs (142x) |
-| Q4_0 GEMM 4096x4096 on 32 tokens (prefill), all cores | 66.9 ms (int widened to f32 per call) | 1.77 ms (38x; int4 weight-only kernel, bf16 activations) | 2.63 ms (25x) | 363 µs (184x) |
-| Q8_0 GEMV 4096x4096, all cores | 5.62 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 111 µs (51x; int8 weight-only kernel, one scale per row, bf16 activations) | 157 µs (36x) | 55.5 µs (101x) |
-| Top-k, k=40 of 128256 logits | 755 µs (`argpartition`, then `argsort` of the 40) | 160 µs (4.7x; `topk`) | 24.7 µs (31x) | 15.1 µs (50x) |
-| GQA decode attention, Llama 3 8B: 32 query / 8 KV heads x 128, 4096 positions of a bf16 cache, all cores | 4.72 ms (the cache widened to f32 per call) | 473 µs (10x; `scaled_dot_product_attention` with each group's heads as query positions, bf16) | 415 µs (11x) | 118 µs (40x) |
-| RoPE, 32 heads x 128 | 7.5 µs | 9.9 µs (0.76x) | 1.9 µs (3.9x) | 0.76 µs (9.9x) |
-| LayerNorm, n=4096 | 9.8 µs | 2.9 µs (3.4x) | 5.4 µs (1.8x) | 1.4 µs (7.0x) |
-| GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 24.4 µs (6.8x) |
-| Residual add + RMSNorm, n=4096 | 6.3 µs | 8.8 µs (0.71x) | 4.1 µs (1.5x) | 1.2 µs (5.3x) |
-| RMSNorm, n=4096 | 5.2 µs | 6.9 µs (0.76x) | 3.5 µs (1.5x) | 1.0 µs (5.1x) |
-| Cosine similarity, n=1024 | 2.1 µs | 5.5 µs (0.39x) | 0.64 µs (3.3x) | 0.47 µs (4.5x) |
-| Softmax, n=1000 | 2.6 µs | 1.2 µs (2.3x) | 1.7 µs (1.6x) | 0.76 µs (3.5x) |
-| GeGLU (GELU-tanh gate), n=14336 | 17.7 µs | 21.5 µs (0.82x) | 15.9 µs (1.1x) | 5.2 µs (3.4x) |
-| Euclidean distance, n=1024 | 1.4 µs | 1.7 µs (0.81x) | 0.63 µs (2.2x) | 0.48 µs (2.8x) |
-| SwiGLU, n=14336 | 9.9 µs | 7.0 µs (1.4x) | 13.3 µs (0.74x) | 4.2 µs (2.3x) |
-| Flash attention decode, DeepSeek V4 Pro, all cores | 1.18 ms | 890 µs (1.3x; `scaled_dot_product_attention`, bf16 output) | 1.80 ms (0.65x) | 522 µs (2.3x) |
-| Greedy argmax, vocabulary 128256 | 6.0 µs | 49.9 µs (0.12x) | 15.7 µs (0.38x) | 4.6 µs (1.3x) |
-| GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 8.5 µs (0.61x) | 5.4 µs (0.96x) |
-| GEMV f32 512x1024, 1 core | 5.6 µs (all cores) | 25.6 µs (0.22x, all cores) | 33.2 µs (0.17x) | 19.3 µs (0.29x) |
-
-`python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
-
-Every pull request also runs a performance check in CI: [`benchmarks/perf_compare.py`](benchmarks/perf_compare.py) builds the PR's base and head on the same runner, runs each side's kernel benchmarks and a 4-layer decode alternately for 5 rounds, and fails if the best time of any kernel on either backend got more than 25% slower. Comparing best times from fresh processes keeps runner noise out; the job summary lists every ratio.
-
-LLVM is ahead of PyTorch on every kernel: 2.8x on Q4_0 and 2.0x on Q8_0 GEMV and 4.9x on the Q4_0 prefill GEMM against its quantized kernels; 1.6x on bf16 GEMM and 1.7x on DeepSeek's attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets); 4.0x on GQA attention; and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch. PyTorch's GQA time is its best form: with `enable_gqa=True` and one query position per head, `scaled_dot_product_attention` leaves its fast path and takes 18x as long.
-
-Where the remaining gaps come from:
-- **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.
-- **f32 GEMV against multithreaded BLAS.** On all cores LLVM and OpenBLAS are level (5.4 vs 5.2 µs; a `par` costs about 1 µs of dispatch at 16 threads). The single-core row compares one core with NumPy's 16 threads: OpenBLAS on one thread (`OPENBLAS_NUM_THREADS=1`) takes 21.6 µs, slightly slower than LLVM. PyTorch's x86 wheel calls MKL here, which runs this size on one thread and is slower on AMD CPUs.
-
-**Quantized GEMV on `vdot`.** Each 32-bit lane of the packed weights holds 4 consecutive values of one row, so one `vdot` (VNNI `vpdpbusd`, Arm `sdot`) does 4 int8 multiply-adds per lane against a broadcast group of 4 activations, and a Q4_0 nibble vector unpacks into two such vectors in registers. Every task walks its 64-row chunk block by block, so each block's bytes are read in one pass (walking each row strip through the whole chunk instead strided through 256 KB and fell out of L3). Against the previous kernels, which unpacked into a tile for an i8 `mm`, the 4096x4096 GEMVs got 2.0–2.3x faster on LLVM and 1.6–1.9x on Cranelift, and Q4_0 is faster than Q8_0 on LLVM and as fast on Cranelift.
-
-Fuel checks are inline (a decrement and a compare per branch, on a counter kept in a register), so loops pay almost nothing for runaway protection. The rare slow path calls the runtime through a stub that preserves every register, so it does not make Cranelift spill loop values: before that, the fuel checks made Cranelift's GEMV 2.6x slower.
-
-#### Single-call decode (deep fusion)
-
-[`examples/kernels/llama_decode.air`](examples/kernels/llama_decode.air) runs a whole decode step of a Llama-style model (RMSNorm, grouped-query attention with RoPE and a bf16 KV cache, SwiGLU MLP, Q4_0/Q8_0/Q6_K/Q4_K/Q5_K weights) in one call: the token id goes in, the greedy next token comes out. Like GPU megakernels ([Hazy Research's Llama-1B megakernel](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles), [AutoMegaKernel](https://arxiv.org/pdf/2606.09682)), it removes the boundaries between the ~100 small kernels of a forward pass; on a CPU that means each elementwise op runs inside the pass that produces or consumes its data:
-
-| Pass | Fused into it |
-|---|---|
-| RMSNorm (serial) | Q8 quantization of its output |
-| QKV projection (`par`, one task per head) | RoPE, bf16 KV-cache append |
-| Attention (`par`, one task per KV head and 256-position split) | the group's query heads 4 at a time with their scores and outputs in registers, each K and V vector widened from bf16 once for the 4 (`attn_split`), scores with positions in lanes so none needs a horizontal sum, vectorized softmax `exp` |
-| Attention merge (`par`, one task per q head) | the splits merged (`attn_merge`), Q8 quantization of its output |
-| O and down projections (`par`, 64 rows per task) | residual add |
-| Gate and up projections (`par`, 64 rows per task) | SwiGLU, Q8 quantization |
-| LM head (`par`, 64 rows per task) | argmax: each task keeps only its best logit, so the logits are never written |
-
-That is 2 serial norms and 6 `par` regions per layer. The KV cache is bf16 and head-major (`[kv_heads x max_ctx x head_dim]` per layer for V, and the same for K in tiles of 32 positions, each `[head_dim x 32]`, so that one vector holds a value of consecutive positions and a score needs no horizontal sum), so a KV head's positions are contiguous, and attention is flash-decoding: positions split across cores even for one sequence, with the standard library's `attn_split` and `attn_merge` (also behind [`gqa_attention.air`](examples/kernels/gqa_attention.air)). Each weight matrix has its own format, Q8_0, Q4_0, Q6_K, Q4_K or Q5_K, in the chunked layout of `q8_gemv` and `q4_gemv` (Q6_K adds a plane of high bits and a scale per 16 values; Q4_K and Q5_K, a min per 32 values that the activation sums apply, and Q5_K a plane of top bits), so every task owns its output rows and applies its epilogue without a cross-task reduction. A matrix is a list of parts, so the fused QKV matrix keeps the formats of Q, K and V when they differ. `crates/achainsaw-codegen/tests/llama_decode.rs` checks it against an f64 reference model, with all five formats mixed within and across matrices, over several positions, at every ISA level on both backends.
-
-**Prefill.** `llama_prefill` runs a whole prompt of n tokens through the same passes in one call. Every projection task applies its rows to 8 tokens per weight load (`qmat_batch`, which runs the standard library's `qmat_chunk8` on tiles of 8 tokens, `qmat_chunk4` on a tile of 4 and `qmat_chunk` on the rest; with 128-bit vectors, as on Cranelift, tiles of 4), so the weights are read once per 8 tokens instead of once per token, and the work turns from memory-bound into compute-bound. Norms, RoPE and epilogues run per token, and attention runs one task per tile of 8 tokens and KV head, each token over the cache up to its own position with `llama_decode`'s splits and merges; the splits that all 8 tokens see whole run once for the tile's query heads, so each K and V vector is read once per tile. Each token's operations are exactly those of `llama_decode`, so a prefill leaves the same KV cache, hidden state and next token bit for bit as decoding the prompt token by token (`llama_prefill_matches_decode_exactly`, in one call or in pieces).
-
-**A real model.** [`benchmarks/gguf.py`](benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, Q4_K and Q5_K values bit for bit with each 32-value scale and min rounded to f16, anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
-
-```bash
-curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
-python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 --tokens 64
-#  ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of ...
-```
-
-Llama 3.2 1B Instruct in Q4_0 (Q4_0 layers, two Q4_1 down projections, a Q6_K embedding shared with the LM head), greedy decoding on a Ryzen 7 8845HS with 8 threads (one per core, the fastest setting for each):
-
-| | ms/token | tokens/s | weights read per token |
-|---|---|---|---|
-| llama.cpp (CPU, build 6868a52, `llama-bench -n 64 -t 8`) | 15.1 | 66.3 | 765 MB at 51 GB/s |
-| AIR on LLVM, one call per token | 14.8 | 67.7 | 794 MB at 54 GB/s |
-| AIR on Cranelift, one call per token | 15.8 | 63.3 | 794 MB at 50 GB/s |
-| PyTorch 2.14, weight-only int4/int8 kernels | 29.7 | 33.7 | 884 MB at 30 GB/s |
-| NumPy, same data types | 723 | 1.4 | |
-
-The kernel prints the same text as llama.cpp (`llama-simple`, greedy), and its tokens match the NumPy implementation of the same arithmetic. Both are bound by memory bandwidth at about the same rate; the kernel reads 4% more bytes, because the two Q4_1 matrices become Q8_0 and its Q6_K scales take 0.5 bit more per weight than llama.cpp's packing.
-
-PyTorch runs the same model eagerly on its weight-only quantized kernels (`benchmark_decode.py` uses them when PyTorch is installed; `--no-torch` skips it). Q4_0 matrices become int4 with the same 32-blocks; the Q8_0 down projections and the Q6_K LM head become int8 with one scale per row. Its tokens match too. Its int4 kernel streams weights at about half the rate of LLVM's `vdotu` loop, and it reads the int8 LM head instead of 6.5-bit Q6_K.
-
-**Against llama.cpp, by context length.** `benchmark_decode.py --llama-bench PATH` runs llama.cpp's own `llama-bench` on the same file, thread count, prompt length and number of generated tokens, and prints it as one more row (`--prompt-tokens N` makes the prompt N random tokens, as llama-bench's are):
-
-```bash
-python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 \
-    --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
-```
-
-Prefill of the prompt (one `llama_prefill` call, the mean of 3 after a first one, as llama-bench's `-p` averages 3), then 64 tokens generated after it (`llama_decode`; llama-bench's `-n 64 -d <prompt>`), 8 threads, llama.cpp build 6868a52 with its default f16 KV cache:
-
-| Context | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
-|---|---|---|---|---|
-| 64 tokens | 790 tokens/s (1.27 ms/token) | 441 tokens/s (2.27 ms/token) | 66.3 tokens/s (15.1 ms/token) | 65.6 tokens/s (15.2 ms/token) |
-| 512 tokens | 1036 tokens/s (0.97 ms/token) | 437 tokens/s (2.29 ms/token) | 67.4 tokens/s (14.8 ms/token) | 60.7 tokens/s (16.5 ms/token) |
-| 2048 tokens | 838 tokens/s (1.19 ms/token) | 398 tokens/s (2.52 ms/token) | 64.1 tokens/s (15.6 ms/token) | 48.6 tokens/s (20.6 ms/token) |
-| 8192 tokens | 486 tokens/s (2.06 ms/token) | 283 tokens/s (3.53 ms/token) | 51.9 tokens/s (19.3 ms/token) | 27.1 tokens/s (37.0 ms/token) |
-
-- **Prefill is 1.7–2.4x faster than llama.cpp at every length.** `llama_prefill` loads and unpacks each weight vector once per 8 tokens and runs the int8 dots on `vdotu`. Its attention does `llama_decode`'s arithmetic for every token (so a prefill stays bit-identical to decoding), in tiles of 8 tokens: the 256-position splits that all 8 see whole run once for their 32 query heads, so each K and V vector is read once for the tile.
-- **Decode is level on short contexts and pulls ahead on long ones**: 1.3x at 2048 tokens, 1.9x at 8192. Both caches take 2 bytes per value; the kernel reads each KV head's positions once for its group's query heads and splits them across cores. Run to run, decode varies by about ±3% and prefill by up to ±10% (this laptop's clocks).
-- **Scores with positions in lanes.** K is stored in tiles of 32 positions (`[head_dim x 32]`), so one FMA multiplies a broadcast query value by one K value of up to 32 positions, and no score needs a horizontal sum; scoring and P V then take 4 FMAs each per head and position (head_dim 64, AVX-512). Before, each score was a dot product along K's row and a horizontal sum, which took three quarters of the attention time; at 2048 and 8192 tokens the kernel prefilled 644 and 293 tokens/s and decoded 62.0 and 48.7 tokens/s (alternating the two kernels: 1.24x and 1.64x faster prefill, 1.03x faster decode at both).
-- Before the bf16 cache and split attention, the kernel's attention took one query head at a time over an f32 cache, and at 2048 and 8192 tokens it prefilled 287 and 46 tokens/s and decoded 45.6 and 17.5 tokens/s.
-- With 16 threads (two per core) at 512 tokens, AIR prefills 1106 tokens/s and decodes 61.0 tokens/s; llama.cpp 540 and 44.7. Both decode faster on 8.
-- Cranelift prefills 170, 172, 146 and 93 tokens/s and decodes 56.9, 59.6, 53.9 and 38.3 tokens/s at the four lengths.
-- Prefill loads and unpacks each weight vector once per 8 tokens on LLVM (once per 4 before, and still on Cranelift's 128-bit vectors), with the 8 tokens' sums kept in registers across blocks. Measured against the previous kernel the same way, alternating the two, that made 512-token prefill 6% faster on Q4_0, 9% on Q4_K_M and 12% on Q5_K_M. Earlier versions of these tables timed one cold `llama_prefill` call, which came out up to 10% faster or slower than this mean of warm ones.
-
-**K-quants.** Most GGUF downloads are Q4_K_M or Q5_K_M files: Q4_K or Q5_K matrices (256-value super-blocks whose 32-value sub-blocks each have a 6-bit scale and a 6-bit min, so a weight is `scale * q - min`), with the V and down projections of half the layers, and the embedding, in Q6_K. The loader keeps the values bit for bit and rounds each sub-block's scale and min (the super-block's f16 factor times the 6-bit one) to f16, so a Q4_K weight takes 5 bits instead of 4.5; the kernel subtracts each min times the block's activation sum, which `quantize_q8` already computes. The fused QKV matrix is stored in parts, keeping Q and K in Q4_K and V in Q6_K. The same comparison at 512 tokens, the three files measured together (the mean of two runs, each started on an idle machine):
-
-| File | Prefill, AIR on LLVM | Prefill, llama.cpp | Decode, AIR on LLVM | Decode, llama.cpp |
-|---|---|---|---|---|
-| Q4_0 (773 MB) | 1036 tokens/s | 437 tokens/s | 67.4 tokens/s | 60.7 tokens/s |
-| Q4_K_M (808 MB) | 889 tokens/s | 503 tokens/s | 60.7 tokens/s | 57.7 tokens/s |
-| Q5_K_M (912 MB) | 876 tokens/s | 787 tokens/s | 54.7 tokens/s | 52.1 tokens/s |
-
-- **Decode stays ahead** by 5% on the K-quant files, both bound by memory bandwidth, although the kernel reads 8% more bytes per token (0.87 and 0.98 GB of packed weights).
-- **Prefill is 1.8x faster on Q4_K_M and 1.1x faster on Q5_K_M**, where llama.cpp is faster than on its own Q4_K_M. Prefill is compute-bound: the int8 dots take half of the inner loop, and scaling each block's sums for every token much of the rest, while unpacking Q5_K's top bits for 8 tokens at a time costs little.
-- Cranelift prefills 146 and 125 tokens/s and decodes 49.4 and 43.1 tokens/s on the two files.
-- The kernel's tokens match NumPy's (`--prompt "The capital of France is"`: 24 of 24 on both files); on random prompts they part only at near-ties, as on Q4_0. PyTorch runs Q4_K on its int4 kernel with the min as its zero point (rounded to bf16) and Q5_K requantized to int8 per row; it decodes Q4_K_M at 30–33 tokens/s.
-
-**Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
-
-| Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |
-|---|---|---|---|---|
-| Q8_0, 1.31 GB | 23.9 ms/token (42 tokens/s, 55 GB/s) | 28.4 ms/token | 37.8 ms/token (int8, one scale per row) | 909 ms/token |
-| Q4_0, 0.70 GB | 12.7 ms/token (79 tokens/s, 55 GB/s) | 13.8 ms/token | 27.3 ms/token (int4) | 661 ms/token |
-
-On LLVM decode streams the weights at close to the memory's bandwidth (run to run, about ±5%), so Q4_0 is about 2x faster than Q8_0. On Cranelift, `vdot`, in-register unpacking and unrolled groups make the int8 dots cheap enough that Q4_0 streams at 50 GB/s too, close to LLVM. NumPy, lacking an int8 matrix product, widens every weight to f32 on each token. PyTorch's int4 and int8 kernels read the weights at 28–33 GB/s.
-
-Every format on the same random model (`--weights q8|q6|q5k|q4k|q4`), prefill of 512 tokens then decode, 8 threads, best of two runs:
-
-| Weights | Prefill, LLVM | Decode, LLVM | Prefill, Cranelift | Decode, Cranelift |
-|---|---|---|---|---|
-| Q8_0, 1.31 GB | 1091 tokens/s | 41.7 tokens/s (55 GB/s) | 180 tokens/s | 35.8 tokens/s |
-| Q6_K, 1.08 GB | 869 tokens/s | 49.5 tokens/s (54 GB/s) | 124 tokens/s | 39.6 tokens/s |
-| Q5_K, 0.93 GB | 965 tokens/s | 59.2 tokens/s (55 GB/s) | 128 tokens/s | 45.1 tokens/s |
-| Q4_K, 0.77 GB | 1075 tokens/s | 70.4 tokens/s (54 GB/s) | 156 tokens/s | 56.6 tokens/s |
-| Q4_0, 0.70 GB | 1147 tokens/s | 77.4 tokens/s (54 GB/s) | 179 tokens/s | 70.1 tokens/s |
-
-Decode on LLVM follows the bytes per weight. Prefill follows the unpacking and scaling work: Q8_0 needs no unpacking, Q4_0 a mask and a shift, Q4_K adds a min, and Q5_K and Q6_K merge a plane of top bits; Q6_K also scales its two halves separately. With 8 tokens per weight load on LLVM, the slowest format (Q6_K) prefills at 76% of the speed of the fastest. `qmat_chunk` chooses the format once per block, for a strip loop of its own, and unrolls each strip's 4 groups: a branch on the format in every strip, which Cranelift cannot hoist out of the loop, had made its quantized GEMVs up to 28% slower; choosing per block made prefill 20–25% faster on LLVM and decode 30–50% faster on Cranelift.
-
-### 10. Choosing a Backend (`--backend`)
-Two code generators share one runtime, so fuel budgets, memory quotas, the MCP sandbox, and the results of scalar and fixed-width vector code are the same on both (`vx` code computes the same values, but `vl` can be larger on LLVM):
-
-| Backend | Compile latency (release, simple kernel) | Code | Availability |
-|---|---|---|---|
-| `cranelift` | ~0.2–0.3 ms | 128-bit vectors | always |
-| `llvm` | ~5–7 ms | fully optimized; full-width AVX2/AVX-512/SVE vectors (`vx` up to 512 bits or scalable) | builds with the `llvm` feature |
-
-Pick one with `--backend` on `run`, `bench` and `build`, the `ACHAINSAW_BACKEND` environment variable, `backend=` in Python, or the `backend` argument of MCP `air_run`. `auto` (the default) uses LLVM, when it is built in, for modules that use `v256`, `v512`, `vx`/`vl` or `mm`, and Cranelift otherwise, so scalar code keeps sub-millisecond compiles. For example, [`examples/saxpy_vx.air`](examples/saxpy_vx.air) on an AVX-512 machine runs 3–4x faster on LLVM.
-
-```bash
-# Build with the LLVM backend (needs LLVM 22, e.g. apt install llvm-22-dev)
-export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
-cargo build --release -p achainsaw --features llvm
-
-achainsaw --backend llvm run examples/fibonacci.air --func fib --args 30
-achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu znver4 --shared
-ACHAINSAW_BACKEND=llvm achainsaw mcp     # every air_run in the server uses LLVM
-```
-
-AOT builds with `--backend llvm` accept the same `--target`, `--target-cpu` and `--target-features` options and can use every feature (nothing ends up in `ignored_features`). `crates/achainsaw-codegen/tests/backend_parity.rs` checks that both backends agree bit for bit, including on division by zero, out-of-range shifts, NaN handling, and saturating conversions.
-
----
-
-## 🐍 Python Host Integration (`achainsaw-py`)
-
-For AI agent orchestrators (LangGraph, AutoGen, CrewAI, DSPy), `achainsaw` provides native in-process Python bindings via PyO3 with **zero-copy NumPy memory integration** and microsecond compilation throughput.
-
-### Installation / Build
-```bash
-pip install .                                     # or, with the LLVM backend:
-MATURIN_PEP517_ARGS="--features llvm" pip install .
-# then: achainsaw.compile(src, backend="llvm"); achainsaw.available_backends()
-
-cargo build --release -p achainsaw-py
-cp target/release/achainsaw.dll achainsaw.pyd  # Windows
-# or cp target/release/libachainsaw.so achainsaw.so  # Linux
-```
-
-### Microsecond JIT & Zero-Copy NumPy Execution
-```python
-import achainsaw
-import numpy as np
-
-# In-place 128-bit SIMD vector scaling kernel
-kernel = achainsaw.compile("""
-fn simd_scale(p:ptr, factor:f32, n:i64)
-  b0:
-    vfactor = splat factor:v128
-    zero = cst 0:i64
-    jmp b1(zero)
-  b1(i:i64):
-    cond = lt i, n
-    br cond, b2, b3
-  b2:
-    sixteen = cst 16:i64
-    off = mul i, sixteen
-    elem_ptr = add p, off
-    v = ld elem_ptr:v128
-    vscaled = vmul v, vfactor:f32
-    st elem_ptr, vscaled
-    one = cst 1:i64
-    next_i = add i, one
-    jmp b1(next_i)
-  b3:
-    ret
-""")
-
-# Contiguous NumPy float32 array
-arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float32)
-
-# Direct zero-copy mutation in native SIMD registers
-kernel.run("simd_scale", arr, 2.5, 2)
-print(arr)  # [ 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0 ]
-```
-
-### Autonomous Agent Self-Repair via Structured Diagnostics
-```python
-try:
-    achainsaw.compile(bad_air_code)
-except achainsaw.CompilationError as e:
-    # Machine-native structured dictionary — zero regex or prose parsing needed
-    diag = e.diagnostic
-    print(diag["error_code"])                         # "ERR_UNDEFINED_REG"
-    print(diag["context"]["target"])                  # "bad_register"
-    print(diag["context"]["available_registers"])     # ["a", "b"]
-    
-    # Instant single-shot repair by LLM agent
-    repaired_code = bad_air_code.replace(
-        diag["context"]["target"],
-        diag["context"]["available_registers"][0]
-    )
-    k = achainsaw.compile(repaired_code)
-```
-
-### CPU Features & ISA Cap in Python
-```python
-report = achainsaw.cpu_features()       # same report as `achainsaw cpu`
-print(report["host"]["max_isa"])        # e.g. "avx512"
-
-achainsaw.set_isa_cap("avx2")           # kernels compiled from now on use at most AVX2
-kernel = achainsaw.compile(air_kernel)
-achainsaw.set_isa_cap(None)             # remove the cap
-```
-
-### Binary Bytecode (AIRB) in Python
-```python
-# Assemble to compact binary payload (for caching or network transfer)
-binary_payload = achainsaw.assemble(air_kernel)
-
-# Directly compile pre-parsed binary bytecode (<0.05 ms)
-kernel = achainsaw.compile_binary(binary_payload)
-result = kernel.run("simd_scale", arr, 2.5, 2)
-
-# Disassemble binary payload back into canonical text AIR
-text_ir = achainsaw.disassemble(binary_payload)
-```
-
-### ⚡ Performance Comparison
-
-| Metric | Subprocess CLI (`achainsaw.exe`) | In-Process Python (`achainsaw-py`) | Speedup |
-| :--- | :--- | :--- | :--- |
-| **JIT Compilation Latency** | ~7.95 ms / compile | **0.136 ms / compile** | **58.3x faster** |
-| **Compilation Throughput** | ~125 compiles/sec | **7,340+ compiles/sec** | **58.3x throughput** |
-| **Execution Call Overhead** | ~7.5 ms (process spawn) | **0.249 µs / call** | **>30,000x faster** |
-| **Execution Call Rate** | ~130 calls/sec | **4,011,000+ calls/sec** | **4.0M calls/sec** |
-| **NumPy Array Memory** | Serialization required | **Zero-copy (direct pointer)** | **0 MB allocated** |
-
----
-
-## 🔗 Foreign Function Interface (FFI) & External Symbols
-
-`achainsaw` can seamlessly call functions and access variables from external C/C++ libraries, Python extensions, and system shared objects (`.dll`, `.so`, `.dylib`).
-
-### 1. Minimal `extfn` Syntax
-External functions are declared with the token-minimal `extfn` keyword and invoked with standard `call`:
-```air
-extfn sinf(x:f32)->f32
-extfn cosf(x:f32)->f32
-extfn sqrtf(x:f32)->f32
-
-fn compute_sincos_norm(x:f32)->f32
-  b0:
-    s = call sinf(x)
-    c = call cosf(x)
-    s2 = mul s, s
-    c2 = mul c, c
-    sum = add s2, c2
-    norm = call sqrtf(sum)
-    ret norm
-```
-
-### 2. Pre-Registered Standard C Math Intrinsics
-The JIT engine pre-registers high-performance standard C math functions out of the box with zero runtime overhead:
-- **32-bit float:** `sinf`, `cosf`, `tanf`, `sqrtf`, `expf`, `logf`, `powf`, `fabsf`, `floorf`, `ceilf`, `roundf`
-- **64-bit float:** `sin`, `cos`, `tan`, `sqrt`, `exp`, `log`, `pow`, `fabs`, `floor`, `ceil`, `round`
-
-### 3. Dynamic Shared Library Loading (`.dll` / `.so`)
-Load any dynamic library at runtime. Exported C symbols are resolved automatically during JIT linking:
-```python
-import achainsaw
-
-# Dynamically load a shared library
-achainsaw.load_library("libcustom_math.so")  # or "custom_math.dll"
-
-# Execute kernel calling symbols from the loaded library
-kernel = achainsaw.compile("""
-extfn custom_dsp_filter(input:ptr, output:ptr, len:i64)
-fn process(a:ptr, b:ptr, n:i64)
-  b0:
-    call custom_dsp_filter(a, b, n)
-    ret
-""")
-```
-
-### 4. Custom Symbol Registration & Callbacks
-Register any raw function pointer or host callback directly into `achainsaw`'s symbol table:
-```python
-import ctypes
-import achainsaw
-
-# Create a C callback from Python
-callback_type = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
-def custom_fma(a, b, c):
-    return a * b + c
-cb = callback_type(custom_fma)
-
-# Register pointer in achainsaw
-achainsaw.register_symbol("host_fma", ctypes.cast(cb, ctypes.c_void_p).value)
-
-# Call registered symbol inside an AIR kernel
-k = achainsaw.compile("""
-extfn host_fma(a:i32, b:i32, c:i32)->i32
-fn compute(x:i32, y:i32, z:i32)->i32
-  b0:
-    res = call host_fma(x, y, z)
-    ret res
-""")
-print(k.run("compute", 3, 4, 5))  # 3 * 4 + 5 = 17
-```
-
-### 5. Accessing External Variables
-External variables and exported global memory can be directly accessed and mutated via pointers (`ptr`):
-- **Method A (Zero-Overhead Pointer Passing):** Pass the address of the external variable directly to the kernel, and read/write it at native CPU speed using `ld` and `st`:
-  ```air
-  fn increment_counter(p:ptr, delta:i32)->i32
-    b0:
-      val = ld p:i32
-      new_val = add val, delta
-      st p, new_val
-      ret new_val
-  ```
-- **Method B (Symbol Address Resolution):** Query any registered or library-exported symbol address directly via `achainsaw.get_symbol_address(name)` or `kernel.lookup_symbol(name)`.
-
----
-
-## 🏗️ Workspace Structure
-
-```
-achainsaw/
-├── .github/
-│   ├── workflows/
-│   │   ├── ci.yml              # Multi-OS matrix CI (Linux, macOS, Windows, Py 3.11-3.13)
-│   │   └── release.yml         # Automated multi-target CLI binary and PyPI wheel releases
-│   └── dependabot.yml          # Automated Cargo & GitHub Actions dependency tracking
-├── Cargo.toml                  # Workspace manifest with unified lints
-├── pyproject.toml              # Python packaging manifest with Maturin backend
-├── crates/
-│   ├── achainsaw-ir/           # Lexer, Parser, AST, SSA Type-Checker, Optimizer, AIRB Codec
-│   ├── achainsaw-codegen/      # Cranelift JIT engine & AOT native object / DLL compiler
-│   ├── achainsaw-cli/          # Agent CLI driver, MCP JSON-RPC 2.0 stdio server
-│   └── achainsaw-py/           # In-process PyO3 host bindings (zero-copy buffer protocol)
-├── examples/                   # Each .air has matching .airb bytecode
-│   ├── kernels/                # Chainsaw-BLAS: cosine, L2, softmax, RMSNorm, GEMV, GEMM, attention, RoPE, SwiGLU, Q8/Q4 GEMV, argmax, single-call decode and prefill
-│   ├── fibonacci.air           # Iterative Fibonacci (branches, block parameters)
-│   ├── sum_loop.air            # Iterative accumulator loop
-│   ├── dot_product.air         # Scalar dot product with pointer arithmetic
-│   ├── simd_vector_dot.air     # Fixed-width 128-bit SIMD dot product (v128, vfma, vsum)
-│   ├── saxpy_vx.air            # Vector-length-agnostic SAXPY (vx, vl, masked tails)
-│   ├── ffi_math_intrinsics.air # Calling C math functions via extfn
-│   ├── opt_demo.air            # Input for `achainsaw opt`
-│   ├── infinite_loop.air       # Stopped by the fuel budget (ERR_OUT_OF_FUEL)
-│   └── py_numpy_simd.py        # Calling a kernel on NumPy arrays from Python
-├── benchmarks/
-│   └── benchmark_kernels.py    # 5,000-iteration BLAS benchmark and verification suite
-├── tests/
-│   ├── test_py_binding.py      # Python binding & buffer protocol test suite
-│   ├── test_mcp_e2e.py         # Model Context Protocol stdio integration tests
-│   └── test_aot_e2e.py         # Ahead-Of-Time DLL/shared object compilation tests
-└── README.md
-```
-
----
-
-## 🔄 CI/CD & Automated Quality Gates
-
-`achainsaw` enforces a rigorous, multi-platform continuous integration and delivery pipeline via GitHub Actions:
-
-- **Continuous Integration (`ci.yml`):**
-  - **Lint & Code Style:** Runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`.
-  - **Cross-Platform Rust Matrix:** Runs `cargo test --workspace` concurrently on **Ubuntu Linux**, **macOS**, and **Windows**.
-  - **Python Test Matrix:** Tests in-process bindings across **Python 3.11, 3.12, and 3.13** on Linux, macOS, and Windows.
-  - **E2E & Numerical Verification:** Automatically runs unit tests, the MCP JSON-RPC server test, AOT native compilation test, and Chainsaw-BLAS NumPy numerical accuracy verification.
-- **Automated Releases (`release.yml`):**
-  - Triggers on version tag push (`v*.*.*`).
-  - Cross-compiles standalone release CLI binaries for Linux (`x86_64-gnu`, `x86_64-musl`), Windows (`x86_64-msvc`), and macOS (`x86_64`, `aarch64` Apple Silicon).
-  - Builds optimized multi-platform binary wheels (`manylinux`, `windows-x64`, `macos-universal2`) using `maturin-action`.
-  - Generates SHA256 checksums and creates a GitHub Release with all binary and wheel assets attached.
-- **Automated Dependency Updates (`dependabot.yml`):**
-  - Weekly scans for Cargo crate dependencies.
-  - Monthly scans for GitHub Actions versions.
-
----
-
-## 📜 License
-
-Licensed under the [Apache License, Version 2.0](LICENSE).
+The same source runs 128-bit vectors on Cranelift, 256 or 512 bits on AVX2
+and AVX-512, and the CPU's own length on SVE. AIR also has integer and float
+scalars, f16 and bf16 storage, int8 dot products, matrix multiplies (`mm`),
+functions with several results, inline functions, and a standard library
+written in AIR:
+
+- [The AIR language](docs/language.md): syntax, types, vector operations, the
+  standard library.
+- [Parallel loops](docs/parallel.md): `par n, f(args)`, one line for all
+  cores.
+- [Backends](docs/backends.md): Cranelift and LLVM, vector widths, matrix
+  engines.
+- [Command line](docs/cli.md), [MCP server](docs/mcp.md),
+  [Python](docs/python.md), [Calling C](docs/ffi.md).
+- [Kernels](docs/kernels.md) and [Llama in one call](docs/llama.md), with
+  their benchmarks.
+
+## How it works
+
+1. **The parser and validator** check every function: types, SSA (each use
+   dominated by its definition), block arguments, terminators. A failure is a
+   `Diagnostic` with an `ERR_*` code, a span and a JSON context, made for a
+   model to act on.
+2. **The optimizer** folds constants, simplifies, removes dead code and
+   expands `inline fn` calls into their callers, before either backend runs.
+3. **Two backends, one semantics.** Cranelift compiles fast, with 128-bit
+   vectors. LLVM 22 compiles in milliseconds and uses AVX2, AVX-512, SVE,
+   VNNI, AMX and SME. Both give the same results, which the test suite checks
+   on every operation, lane type and ISA level, and on Arm at SVE vector lengths
+   up to 2048 bits (under QEMU).
+4. **The runtime** keeps each function's fuel counter in a register (a
+   decrement and a compare per branch), checks memory in sandboxed runs,
+   and runs `par` loops on a lock-free pool of threads.
+5. **AIR programs build on AIR:** the quantized matrix kernels, attention and
+   softmax helpers are a standard library written in AIR, which a module
+   imports with `use`.
+
+## How it compares
+
+- **Asking the agent for C and calling a compiler** needs a toolchain and a
+  build on the machine, returns errors as prose, and runs the result
+  unsandboxed. Vectorized C targets one ISA at a time with intrinsics, or
+  depends on the auto-vectorizer.
+- **WebAssembly** runtimes such as Wasmtime also compile with Cranelift, in a
+  sandbox. Wasm is a target for other languages, with 128-bit SIMD. AIR is
+  written by the model itself, and on LLVM uses the CPU's full vector width,
+  int8 dot products and matrix engines, with parallel loops built in.
+- **Python JITs** (Numba) and new languages (Mojo) are written by people,
+  with nesting and implicit types, and run unsandboxed. AIR is lower level:
+  longer, but each line is one operation that the validator can check and
+  point at.
+
+## FAQ
+
+**Is AIR shorter than Python or C?** No. A loop takes several times the tokens
+of the same loop in Python (in the Llama 3 tokenizer, a scalar dot product is
+37 tokens of Python, 59 of C and 130 of AIR, in
+[examples/dot_product.air](examples/dot_product.air)). AIR trades that for
+programs a model gets right with nothing to balance, errors it can act on, and
+native code a millisecond later.
+
+**Should people write AIR?** You can: it's regular and small. But it's meant
+to be written by models, and read by people when they need to.
+
+**Is the sandbox a security boundary?** It's built to contain a model's
+mistakes: out-of-bounds accesses, runaway loops, unbounded recursion, bad
+`free`s. It hasn't been audited against hostile code, so run untrusted code
+in a container or VM too.
+
+**Which CPUs and systems?** x86-64 (SSE through AVX-512 and AMX) and AArch64
+(NEON, SVE, SME), on Linux, macOS and Windows. The LLVM backend needs LLVM 22
+at build time; without it, everything runs on Cranelift.
+
+**GPUs?** No: achainsaw generates CPU code.
+
+## Roadmap and contributing
+
+[ROADMAP.md](ROADMAP.md) lists what's planned: faster K-quant and long-context
+inference, more model architectures, and release packages. Programs that
+miscompile or diagnostics that mislead a model are the most useful reports.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and send
+changes.
+
+If achainsaw is useful to you, a star helps others find it.
+
+achainsaw is licensed under the [Apache License, Version 2.0](LICENSE).

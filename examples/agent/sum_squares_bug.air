@@ -1,0 +1,14 @@
+# sum_squares.air with a mistake: the result is returned under a name that was never defined
+fn sum_squares(n:i64)->i64
+  b0:
+    jmp loop(0:i64, 0:i64)
+  loop(i:i64, acc:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    sq = mul i, i
+    acc2 = add acc, sq
+    i2 = add i, 1:i64
+    jmp loop(i2, acc2)
+  done:
+    ret total

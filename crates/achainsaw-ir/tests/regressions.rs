@@ -139,3 +139,28 @@ fn test_repro_lane_out_of_bounds() {
     let err = parse_and_validate(code).unwrap_err();
     assert_eq!(err.error_code, "ERR_OUT_OF_BOUNDS_LANE");
 }
+
+#[test]
+fn test_repro_available_registers_omit_immediates() {
+    // The registers the parser makes for inline immediates are not suggested
+    let code = r#"
+    fn f(n:i64)->i64
+      b0:
+        jmp b1(0:i64, 0:i64)
+      b1(i:i64, acc:i64):
+        more = lt i, n
+        br more, b2, b3
+      b2:
+        i2 = add i, 1:i64
+        jmp b1(i2, acc)
+      b3:
+        ret total
+    "#;
+    let err = parse_and_validate(code).unwrap_err();
+    assert_eq!(err.error_code, "ERR_UNDEFINED_REG");
+    let ctx = err.context.expect("context");
+    assert_eq!(
+        ctx["available_registers"],
+        serde_json::json!(["acc", "i", "more", "n"])
+    );
+}

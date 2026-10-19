@@ -1,0 +1,16 @@
+name: Feature request
+description: An operation, kernel, model or integration achainsaw doesn't have yet
+labels: [enhancement]
+body:
+  - type: textarea
+    id: feature
+    attributes:
+      label: Feature
+      description: What you need. ROADMAP.md lists what's already planned.
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: What it's for
+      description: The program, model or workflow that needs it.

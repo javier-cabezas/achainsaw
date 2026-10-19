@@ -1381,7 +1381,9 @@ impl Validator {
         if let Some(ty) = scope.get(name) {
             return Ok(*ty);
         }
-        let mut available: Vec<&String> = scope.keys().collect();
+        // Registers the parser made for inline immediates are not the agent's to use
+        let mut available: Vec<&String> =
+            scope.keys().filter(|r| !r.starts_with("__imm_")).collect();
         available.sort();
 
         if let Some(def_block) = ctx.def_blocks.get(name) {
