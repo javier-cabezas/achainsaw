@@ -722,6 +722,7 @@ fn run_optimize(input: &Path, output: Option<PathBuf>) -> Result<serde_json::Val
         "branches_folded": stats.branches_folded,
         "dead_instructions_removed": stats.dead_instructions_removed,
         "dead_blocks_removed": stats.dead_blocks_removed,
+        "loops_split": stats.loops_split,
         "total_optimizations": stats.total_optimizations(),
         "iterations": stats.iterations,
         "code": optimized_code,

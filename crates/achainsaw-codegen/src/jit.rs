@@ -1888,8 +1888,8 @@ impl JitEngine {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
-        // `inline fn` calls are expanded before lowering, for both backends.
-        let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+        // Inlined and loop-split before lowering, for both backends (`prepare_for_codegen`).
+        let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
         let ir_mod = &*inlined;
         let sandbox = self.sandbox.as_ref().map(|arena| {
             let arena = lock(arena);

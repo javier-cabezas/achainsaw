@@ -642,7 +642,14 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
 
     /// Unaligned load: AIR pointers into user buffers may have any alignment.
     fn load(&self, ty: BasicTypeEnum<'ctx>, addr: IntValue<'ctx>) -> Result<BasicValueEnum<'ctx>> {
-        let p = self.int_ptr(addr)?;
+        self.load_ptr(ty, self.int_ptr(addr)?)
+    }
+
+    fn load_ptr(
+        &self,
+        ty: BasicTypeEnum<'ctx>,
+        p: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
         let v = self.builder.build_load(ty, p, "")?;
         v.as_instruction_value()
             .unwrap()
@@ -652,7 +659,10 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     }
 
     fn store(&self, v: BasicValueEnum<'ctx>, addr: IntValue<'ctx>) -> Result<()> {
-        let p = self.int_ptr(addr)?;
+        self.store_ptr(v, self.int_ptr(addr)?)
+    }
+
+    fn store_ptr(&self, v: BasicValueEnum<'ctx>, p: PointerValue<'ctx>) -> Result<()> {
         self.builder
             .build_store(p, v)?
             .set_alignment(1)
@@ -1220,6 +1230,32 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(self.builder.build_int_add(p, off, "")?)
     }
 
+    /// The address of a memory operand as an integer (for sandbox checks) and as a pointer:
+    /// a `getelementptr` from the base register, so LLVM's loop analyses see which buffer an
+    /// indexed access reads and how it strides (an `inttoptr` of the sum hides both).
+    fn mem_ptr(
+        &self,
+        st: &FnState<'ctx>,
+        ptr: &str,
+        index: Option<&Index>,
+        implied: Type,
+    ) -> Result<(IntValue<'ctx>, PointerValue<'ctx>)> {
+        let addr = self.mem_addr(st, ptr, index, implied)?;
+        let base = self.int_ptr(self.int(st, ptr))?;
+        let Some(ix) = index else {
+            return Ok((addr, base));
+        };
+        let i = self.int(st, &ix.reg);
+        let size = self.c64(ix.unit_or(implied).byte_size() as i64);
+        let off = self.builder.build_int_mul(i, size, "")?;
+        // SAFETY: `gep i8` without `inbounds` is plain address arithmetic.
+        let p = unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), base, &[off], "")?
+        };
+        Ok((addr, p))
+    }
+
     fn jump_with_args(
         &self,
         st: &FnState<'ctx>,
@@ -1327,20 +1363,20 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 ty,
                 ..
             } => {
-                let addr = self.mem_addr(st, ptr, index.as_ref(), *ty)?;
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *ty)?;
                 let bytes = self.access_bytes(*ty)?;
                 self.bounds_check(st, addr, bytes)?;
-                let v = self.load(self.air_type(*ty), addr)?;
+                let v = self.load_ptr(self.air_type(*ty), p)?;
                 st.values.insert(dst.clone(), (v, *ty));
             }
             Instruction::Store {
                 ptr, index, val, ..
             } => {
                 let (v, vty) = self.val(st, val);
-                let addr = self.mem_addr(st, ptr, index.as_ref(), vty)?;
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), vty)?;
                 let bytes = self.access_bytes(vty)?;
                 self.bounds_check(st, addr, bytes)?;
-                self.store(v, addr)?;
+                self.store_ptr(v, p)?;
             }
             Instruction::Call {
                 dsts, func, args, ..
@@ -1627,13 +1663,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 lane,
                 ..
             } => {
-                let addr = self.mem_addr(st, ptr, index.as_ref(), *lane)?;
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *lane)?;
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(*ty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
                 self.bounds_check(st, addr, bytes)?;
                 let vt = self.lane_vec(*ty, *lane);
                 let mask = self.lane_mask(n, *ty, *lane)?;
-                let p = self.int_ptr(addr)?;
                 let f = self.intrinsic("llvm.masked.load", &[vt, p.get_type().into()]);
                 let mut args: Vec<BasicValueEnum> = vec![p.into()];
                 if f.count_params() == 4 {
@@ -1652,14 +1687,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 lane,
                 ..
             } => {
-                let addr = self.mem_addr(st, ptr, index.as_ref(), *lane)?;
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *lane)?;
                 let (v, vty) = self.val(st, val);
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(vty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
                 self.bounds_check(st, addr, bytes)?;
                 let lanes = self.as_lanes(v, vty, *lane)?;
                 let mask = self.lane_mask(n, vty, *lane)?;
-                let p = self.int_ptr(addr)?;
                 let f = self.intrinsic(
                     "llvm.masked.store",
                     &[lanes.get_type(), p.get_type().into()],

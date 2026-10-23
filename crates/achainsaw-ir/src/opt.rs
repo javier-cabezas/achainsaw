@@ -12,6 +12,8 @@ pub struct OptimizationStats {
     pub dead_blocks_removed: usize,
     /// Calls to `inline fn`s replaced by their bodies.
     pub calls_inlined: usize,
+    /// Loops given a full-vector copy for their masked accesses (`crate::loops`).
+    pub loops_split: usize,
     pub iterations: usize,
 }
 
@@ -27,7 +29,7 @@ impl OptimizationStats {
 }
 
 /// Result types of every callable (externs and module functions), by name.
-type Signatures = HashMap<String, Vec<Type>>;
+pub(crate) type Signatures = HashMap<String, Vec<Type>>;
 
 /// Optimizes an entire IR module in-place, returning summary statistics.
 pub fn optimize_module(module: &mut Module) -> OptimizationStats {
@@ -35,6 +37,7 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
         calls_inlined: crate::inline::inline_in_place(module),
         ..Default::default()
     };
+    total_stats.loops_split = crate::loops::split_masked_loops(module);
 
     let mut sigs: Signatures = HashMap::new();
     for ext in &module.extern_functions {
@@ -113,7 +116,7 @@ fn optimize_function_with(func: &mut Function, sigs: &Signatures) -> Optimizatio
 
 /// Infers the type of every register in `func` (parameters, block parameters and
 /// instruction results). Registers whose type cannot be determined are omitted.
-fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> {
+pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<String, Type> {
     let mut types: HashMap<String, Type> = HashMap::new();
     for (name, ty) in &func.params {
         types.insert(name.clone(), *ty);

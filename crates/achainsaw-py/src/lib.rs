@@ -524,6 +524,7 @@ pub fn optimize(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
     dict.set_item("branches_folded", stats.branches_folded)?;
     dict.set_item("dead_instructions_removed", stats.dead_instructions_removed)?;
     dict.set_item("dead_blocks_removed", stats.dead_blocks_removed)?;
+    dict.set_item("loops_split", stats.loops_split)?;
     dict.set_item("total_optimizations", stats.total_optimizations())?;
     Ok(dict.into_any().unbind())
 }

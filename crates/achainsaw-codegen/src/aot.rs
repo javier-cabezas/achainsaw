@@ -112,8 +112,8 @@ impl AotCompiler {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
-        // `inline fn` calls are expanded before lowering.
-        let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+        // Inlined and loop-split before lowering, for both backends (`prepare_for_codegen`).
+        let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
         let ir_mod = &*inlined;
         let mut func_ids = HashMap::new();
         let mut func_returns = HashMap::new();
@@ -215,7 +215,7 @@ pub fn compile_assembly(
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
             let (spec, opts) = llvm_aot_options(target, options)?;
-            let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+            let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
             achainsaw_llvm::compile_assembly(&inlined, &spec, &opts)
         }
         _ => {
@@ -269,7 +269,7 @@ pub fn compile_object(
         #[cfg(feature = "llvm")]
         Backend::Llvm => {
             let (spec, opts) = llvm_aot_options(target, options)?;
-            let inlined = achainsaw_ir::inline::inline_module(ir_mod);
+            let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
             let (bytes, triple) = achainsaw_llvm::compile_object(&inlined, &spec, &opts)?;
             Ok(AotObject {
                 bytes,

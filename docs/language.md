@@ -100,6 +100,8 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
     ret
 ```
 
+Masking every iteration costs nothing extra: before code generation, a loop whose masked counts are `n - i` (with `i` a parameter of the loop header), a `vl`, or the `min` of those, gets a copy in front of it that loads and stores whole vectors while `n - i` covers them, and the original loop runs the tail (`achainsaw opt` shows the copy). Each iteration computes what it did before, on both backends, and the copy never touches memory past the buffers.
+
 **Half-precision storage types:** `f16` (IEEE binary16) and `bf16` (bfloat16) can be loaded, stored, and converted (`f = fext h:f32`, `h = ftrunc f:bf16`, rounding to nearest-even; vectors with `vfwidenlo`/`vfwidenhi` and `vnarrow`), but not used in arithmetic or function signatures; convert to `f32` first.
 
 **Standard library:** a top-level `use` line links functions from AIR's standard library, written in AIR ([`crates/achainsaw-ir/std/std.air`](../crates/achainsaw-ir/std/std.air)), into the module, together with the library functions they call; they are then ordinary functions to `call` or run with `par`, and work the same in files, MCP `air_run`, Python and AOT builds.

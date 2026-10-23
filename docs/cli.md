@@ -77,7 +77,7 @@ achainsaw disassemble examples/fibonacci.airb
 
 
 ## Optimizer (`achainsaw opt`)
-Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks:
+Pre-evaluate constant expressions, simplify algebraic identities (`x + 0 -> x`, `x * 1 -> x`), fold invariant branches, and eliminate dead code and unreachable blocks. The output also shows what code generation does before lowering: `inline fn` calls expanded, and vector loops with masked accesses split into a full-vector copy (see [Vectors](language.md#vectors)):
 ```bash
 achainsaw opt examples/opt_demo.air --json
 ```
@@ -91,6 +91,7 @@ achainsaw opt examples/opt_demo.air --json
   "branches_folded": 0,
   "dead_instructions_removed": 6,
   "dead_blocks_removed": 1,
+  "loops_split": 0,
   "total_optimizations": 10,
   "iterations": 2,
   "code": "fn demo(x:i32)->i32\n  b0:\n    ret x\n"
