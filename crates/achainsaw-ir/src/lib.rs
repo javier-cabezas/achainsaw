@@ -4,6 +4,7 @@ pub mod cfg;
 pub mod diag;
 pub mod inline;
 pub mod lexer;
+pub mod loops;
 pub mod names;
 pub mod opt;
 pub mod parser;
@@ -19,6 +20,17 @@ pub use opt::*;
 pub use parser::Parser;
 pub use types::Type;
 pub use validator::Validator;
+
+/// A valid module as code generation takes it: shadowed registers renamed apart
+/// (`names`), `inline fn` calls expanded (`inline`), and loops with masked accesses split
+/// into a full-vector copy and the original (`loops`). Borrowed when nothing changes.
+pub fn prepare_for_codegen(module: &Module) -> std::borrow::Cow<'_, Module> {
+    let mut prepared = inline::inline_module(module);
+    if prepared.functions.iter().any(loops::has_split_candidates) {
+        loops::split_masked_loops(prepared.to_mut());
+    }
+    prepared
+}
 
 pub fn parse_and_validate(source: &str) -> Result<Module, Diagnostic> {
     let mut parser = Parser::new(source)?;
