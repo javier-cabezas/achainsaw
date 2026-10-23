@@ -26,10 +26,10 @@ AIR syntax:
 - Standard library: a top-level line `use quantize_q8, qmat_chunk` links those AIR functions (and the library functions they call) into the module, ready to `call` or `par`; air_std lists them with signatures and docs, and returns a function's source by name.
 - Function: `fn name(a:i32, b:f32)->i32` (omit `->ty` for void; several results `->(i64, vx)`, returned with `ret a, b` and received with `q, r = call f(x)`; only AIR code can call a function with several results), then indented blocks `label:` or `label(x:i64, acc:f32):`. Float min/max (min max vmin vmax vminr vmaxr) propagate NaN and order -0.0 below +0.0; air_run's `fast_math` compiles them as compare-and-select instead, `max(a,b) = a > b ? a : b` (a NaN operand or two zeros give b): faster, still identical on both backends. It also lets bf16 `mm` use AMX/SME, which flush bf16 subnormal inputs to zero (by default bf16 mm is exact).
 - First block is the entry: no params, cannot be a branch target; function params are in scope. Use a separate loop-header block.
-- One instruction per line. Every register is assigned exactly once (SSA); merge values through block params, not reassignment.
+- One instruction per line. A register holds one value (SSA): values that change around a loop are block params, passed by `jmp`/`br`. Redefining a name shadows it in the code the new definition dominates (`loop(i:i64)` then `body(i:i64)`, or `i = add i, 1:i64`); a use that two definitions could reach is ERR_AMBIGUOUS_REGISTER.
 - Each block ends with exactly one terminator: `jmp b(args)` | `br cond, b_then(args), b_else(args)` | `ret v` | `ret a, b` | `ret`.
 - `inline fn name(...)` marks a helper whose calls are replaced by its body before compiling (no call overhead; not recursive); write small shared steps as inline functions instead of repeating code.
-- Constants: `x = cst 5:i32`, `f = cst 1.5:f32`. Operands may be inline immediates: `y = add x, 1:i32`.
+- Constants: `x = cst 5:i32`, `f = cst 1.5:f32` (or `cst 0:f32`). Operands may be inline immediates: `y = add x, 1:i32`.
 - Binary (operands must share a type): add sub mul div rem and or xor shl shr min max udiv urem ushr umin umax.
 - Compare -> i32 0/1: eq ne lt gt le ge ult ugt ule uge.
 - Pointers: `p2 = add p, off` with off:i64; `v = ld p:f32`; `st p, v`; `p = alloc n` (n:i64 bytes); `free p`. Indexed operands scale an i64 index by the element size: `v = ld x[i]:f32` reads x + 4i, `st y[i], v`, `ldm x[i]:vx, n:f32` (lane size); give the unit when the access is a vector, `ld x[i:f32]:vx`, or for bytes, `x[o:i8]`.

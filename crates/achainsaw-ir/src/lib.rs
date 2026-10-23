@@ -4,6 +4,7 @@ pub mod cfg;
 pub mod diag;
 pub mod inline;
 pub mod lexer;
+pub mod names;
 pub mod opt;
 pub mod parser;
 pub mod stdlib;
@@ -195,15 +196,92 @@ fn fail(a:i32, b:f32)->i32
     }
 
     #[test]
-    fn test_diagnostic_ssa_violation() {
+    fn test_shadowing_follows_dominance() {
+        // `body(i)` shadows `loop(i)`, and a later `x` the earlier one in the same block.
         let code = r#"
-fn fail(a:i32)->i32
+fn count(n:i64)->i64
+  b0:
+    x = cst 1:i64
+    x = add x, 1:i64
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body(i), done
+  body(i:i64):
+    i = add i, x
+    jmp loop(i)
+  done:
+    ret i
+"#;
+        let mut module = parse_and_validate(code).expect("shadowing is valid");
+        // AIRB keeps the names as written.
+        let decoded = decode_module(&encode_module(&module).unwrap()).unwrap();
+        Validator::new()
+            .validate_module(&decoded)
+            .expect("decoded module is valid");
+        assert_eq!(to_air_text(&decoded), to_air_text(&module));
+        assert!(names::unique_names(&mut module));
+        assert!(!names::has_shadowing(&module.functions[0]));
+        // The renamed module is valid, and prints and reads back.
+        let text = to_air_text(&module);
+        parse_and_validate(&text).expect("renamed module is valid");
+    }
+
+    #[test]
+    fn test_diagnostic_ambiguous_register() {
+        // After the join, `x` could be b0's or b1's.
+        let code = r#"
+fn fail(c:i32)->i32
   b0:
     x = cst 1:i32
+    br c, b1, b2
+  b1:
     x = cst 2:i32
+    jmp b2
+  b2:
     ret x
 "#;
         let err = parse_and_validate(code).unwrap_err();
-        assert_eq!(err.error_code, "ERR_SSA_REDEFINITION");
+        assert_eq!(err.error_code, "ERR_AMBIGUOUS_REGISTER");
+        let ctx = err.context.expect("context");
+        assert_eq!(ctx["target"], "x");
+        assert_eq!(ctx["block"], "b2");
+        assert_eq!(ctx["defined_in"], serde_json::json!(["b0", "b1"]));
+    }
+
+    #[test]
+    fn test_diagnostic_ambiguous_loop_carried() {
+        // `acc` is redefined in the loop body but not passed back: the header's use could see
+        // the value from the entry or from the previous iteration.
+        let code = r#"
+fn fail(n:i64)->i64
+  b0:
+    acc = cst 0:i64
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    acc = add acc, i
+    i2 = add i, 1:i64
+    jmp loop(i2)
+  done:
+    ret acc
+"#;
+        let err = parse_and_validate(code).unwrap_err();
+        assert_eq!(err.error_code, "ERR_AMBIGUOUS_REGISTER");
+    }
+
+    #[test]
+    fn test_duplicate_block_param() {
+        let code = r#"
+fn fail(n:i64)->i64
+  b0:
+    jmp b1(n, n)
+  b1(a:i64, a:i64):
+    ret a
+"#;
+        let err = parse_and_validate(code).unwrap_err();
+        assert_eq!(err.error_code, "ERR_DUPLICATE_PARAM");
     }
 }

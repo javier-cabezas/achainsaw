@@ -26,8 +26,8 @@ $ achainsaw run examples/agent/sum_squares.air --func sum_squares --args 1000000
 }
 ```
 
-- **Made for models to write:** one operation per line, no nesting, every
-  value named once. Errors are JSON with an `ERR_*` code, the source span, and
+- **Made for models to write:** one operation per line, no nesting, and
+  values that change around loops passed as block parameters. Errors are JSON with an `ERR_*` code, the source span, and
   what it takes to fix them, such as the registers in scope.
 - **Safe to run what a model wrote:** through MCP, every load and store is
   checked against the sandbox's memory, runaway loops run out of fuel, and

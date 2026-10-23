@@ -1,6 +1,6 @@
 # The AIR language
 
-AIR (Agent Intermediate Representation) is a flat SSA language: one operation per line, every value named once, control flow as basic blocks. Programs are text (`.air`) or bytecode (`.airb`, the same program; see [the command line](cli.md#bytecode-achainsaw-assemble-achainsaw-disassemble)). The MCP server gives models a condensed version of this page as its instructions (`SERVER_INSTRUCTIONS` in [`mcp.rs`](../crates/achainsaw-cli/src/mcp.rs)).
+AIR (Agent Intermediate Representation) is a flat SSA language: one operation per line, values that change around loops passed as block parameters, control flow as basic blocks. Programs are text (`.air`) or bytecode (`.airb`, the same program; see [the command line](cli.md#bytecode-achainsaw-assemble-achainsaw-disassemble)). The MCP server gives models a condensed version of this page as its instructions (`SERVER_INSTRUCTIONS` in [`mcp.rs`](../crates/achainsaw-cli/src/mcp.rs)).
 
 ## Basics
 
@@ -23,16 +23,16 @@ fn sum(x:ptr, n:i64)->f32
 
 - **Types:** `i8` `i16` `i32` `i64` `f32` `f64` `ptr`; `f16` and `bf16` for storage (load, store, convert); vectors `v128` `v256` `v512` and the scalable `vx` (see [Vectors](#vectors)).
 - **Functions:** `fn name(a:i32, b:f32)->i32`, with no `->` for no result and `->(i64, f32)` for several. The body is a list of blocks, `label:` or `label(x:i64, acc:f32):`. The first block is the entry: it takes no parameters and nothing branches to it.
-- **SSA:** every register is assigned exactly once. Values that change around a loop are block parameters, passed by the branches: `jmp loop(i2, acc2)`.
+- **SSA:** a register holds one value. Values that change around a loop are block parameters, passed by the branches: `jmp loop(i2, acc2)`. A name may be defined again: the new definition shadows the old one in the code it dominates, so `loop(i:i64)` and `body(i:i64)` are two registers, and so are the two `i`s of `i = add i, 1:i64`. A use that could see either of two definitions, depending on the path taken (a name defined again in one arm of a branch and used after the join, or in a loop body and not passed back), is `ERR_AMBIGUOUS_REGISTER`.
 - **Terminators:** each block ends with one: `jmp b(args)`, `br cond, then(args), else(args)`, `ret v`, `ret a, b` or `ret`.
-- **Constants:** `x = cst 5:i32`, or inline in an operand, `add x, 1:i32`.
+- **Constants:** `x = cst 5:i32`, or inline in an operand, `add x, 1:i32`; an integer literal of a float type is that float (`cst 0:f32`).
 - **Arithmetic:** `add sub mul div rem and or xor shl shr min max`, and unsigned `udiv urem ushr umin umax`; operands share a type. Compares (`eq ne lt gt le ge`, unsigned `ult ugt ule uge`) give an `i32` 0 or 1, for `br` and `select`.
 - **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`.
 - **Casts:** `itof ftoi uitof ftoui sext zext trunc fext ftrunc bitcast`, written `dst = op src:type`.
 - **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
 - **Comments** start with `#`.
 
-Every function is checked before it compiles: types, SSA (each use dominated by its definition), block arguments, terminators. A failure is a JSON diagnostic with an `ERR_*` code, the source span and the context to fix it, such as the registers in scope ([Diagnostics](cli.md#diagnostics)).
+Every function is checked before it compiles: types, SSA (each use dominated by its definition, and reached by no other), block arguments, terminators. A failure is a JSON diagnostic with an `ERR_*` code, the source span and the context to fix it, such as the registers in scope ([Diagnostics](cli.md#diagnostics)).
 
 ## Vectors
 

@@ -62,6 +62,7 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
 /// Without module context the result types of `call` instructions are unknown, so
 /// optimizations that depend on them are skipped. Prefer [`optimize_module`].
 pub fn optimize_function(func: &mut Function) -> OptimizationStats {
+    crate::names::unique_function_names(func);
     optimize_function_with(func, &HashMap::new())
 }
 
