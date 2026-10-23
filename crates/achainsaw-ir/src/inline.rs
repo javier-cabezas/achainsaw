@@ -6,14 +6,20 @@
 //! inline function adds no branches, and so no fuel checks, where it is used. Code
 //! generation (both backends, JIT and AOT) inlines before lowering, so inline functions have
 //! no call overhead; the optimizer does it too, so `achainsaw opt` shows the result. The
-//! inline functions themselves stay in the module, callable as usual.
+//! inline functions themselves stay in the module, callable as usual. Both entry points first
+//! rename shadowed registers apart (`crate::names`), which the renaming here relies on.
 
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
-/// `module` with every call to an `inline fn` expanded (borrowed when there is none).
+/// `module` with every call to an `inline fn` expanded and shadowed registers renamed apart
+/// (borrowed when there is neither).
 pub fn inline_module(module: &Module) -> std::borrow::Cow<'_, Module> {
-    if !module.functions.iter().any(|f| f.inline) {
+    if !module
+        .functions
+        .iter()
+        .any(|f| f.inline || crate::names::has_shadowing(f))
+    {
         return std::borrow::Cow::Borrowed(module);
     }
     let mut m = module.clone();
@@ -24,6 +30,7 @@ pub fn inline_module(module: &Module) -> std::borrow::Cow<'_, Module> {
 /// Expands every call to an `inline fn` in `module` and returns how many it expanded. The
 /// module must be valid (so inline functions are not recursive); the result is valid too.
 pub fn inline_in_place(module: &mut Module) -> usize {
+    crate::names::unique_names(module);
     let bodies: HashMap<String, Function> = module
         .functions
         .iter()

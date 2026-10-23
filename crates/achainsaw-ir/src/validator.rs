@@ -421,10 +421,10 @@ impl Validator {
         };
 
         // Function parameters are visible everywhere.
-        let mut defs: HashSet<String> = HashSet::new();
+        let mut fn_params: HashSet<&str> = HashSet::new();
         let mut base_scope: Visible = HashMap::new();
         for (p_name, p_ty) in &func.params {
-            if !defs.insert(p_name.clone()) {
+            if !fn_params.insert(p_name.as_str()) {
                 return Err(Diagnostic::error(
                     "ERR_DUPLICATE_PARAM",
                     format!("Duplicate parameter '{p_name}' in function '{}'", func.name),
@@ -451,12 +451,15 @@ impl Validator {
                 base_scope.clone()
             };
 
+            // A block parameter may shadow a register of a dominating block (see
+            // `crate::names`), but a block's parameters have distinct names.
+            let mut own: HashSet<&str> = HashSet::new();
             for (p_name, p_ty) in &block.params {
-                if !defs.insert(p_name.clone()) {
+                if !own.insert(p_name.as_str()) {
                     return Err(Diagnostic::error(
-                        "ERR_SSA_REDEFINITION",
+                        "ERR_DUPLICATE_PARAM",
                         format!(
-                            "Register '{p_name}' re-defined in block '{}' (violates SSA)",
+                            "Block '{}' declares parameter '{p_name}' twice",
                             block.label
                         ),
                         block.span,
@@ -471,7 +474,7 @@ impl Validator {
             }
 
             for (i_idx, inst) in block.instructions.iter().enumerate() {
-                self.validate_instruction(&ctx, inst, &mut scope, &mut defs)
+                self.validate_instruction(&ctx, inst, &mut scope)
                     .map_err(|d| annotate(d, func, block, i_idx))?;
             }
 
@@ -481,26 +484,13 @@ impl Validator {
             final_scopes[b_idx] = Some(scope);
         }
 
-        Ok(())
+        check_reaching_definitions(func, &cfg)
     }
 
-    fn define(
-        scope: &mut Visible,
-        defs: &mut HashSet<String>,
-        dst: &str,
-        ty: Type,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
-        if !defs.insert(dst.to_string()) {
-            return Err(Diagnostic::error(
-                "ERR_SSA_REDEFINITION",
-                format!("Register '{dst}' assigned multiple times (violates SSA)"),
-                span,
-            )
-            .with_context(serde_json::json!({ "target": dst })));
-        }
+    /// A later definition shadows an earlier one in the code it dominates; uses that could
+    /// see both are `ERR_AMBIGUOUS_REGISTER` (`check_reaching_definitions`).
+    fn define(scope: &mut Visible, dst: &str, ty: Type) {
         scope.insert(dst.to_string(), ty);
-        Ok(())
     }
 
     fn validate_instruction(
@@ -508,7 +498,6 @@ impl Validator {
         ctx: &FnCtx,
         inst: &Instruction,
         scope: &mut Visible,
-        defs: &mut HashSet<String>,
     ) -> Result<(), Diagnostic> {
         match inst {
             Instruction::AssignConst { dst, val, ty, span } => {
@@ -535,7 +524,7 @@ impl Validator {
                         ));
                     }
                 }
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::Binary {
                 op,
@@ -548,7 +537,7 @@ impl Validator {
                 let rhs_ty = self.check_reg(ctx, rhs, scope, *span)?;
                 let out_ty = binary_result_type(*op, lhs_ty, rhs_ty)
                     .map_err(|(code, msg)| Diagnostic::error(code, msg, *span))?;
-                Self::define(scope, defs, dst, out_ty, *span)?;
+                Self::define(scope, dst, out_ty);
             }
             Instruction::Load {
                 dst,
@@ -568,7 +557,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::Store {
                 ptr,
@@ -647,7 +636,7 @@ impl Validator {
                     .with_context(serde_json::json!({ "function": func, "returns": rets.iter().map(|t| t.as_str()).collect::<Vec<_>>() })));
                 }
                 for (d, rty) in dsts.iter().zip(rets.clone()) {
-                    Self::define(scope, defs, d, rty, *span)?;
+                    Self::define(scope, d, rty);
                 }
             }
             Instruction::Par {
@@ -735,7 +724,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::ExtractLane {
                 dst,
@@ -753,7 +742,7 @@ impl Validator {
                     ));
                 }
                 Self::check_lane_index("ExtractLane", vec_ty, *lane, *ty, *span)?;
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::VDup {
                 dst,
@@ -765,7 +754,7 @@ impl Validator {
                 Self::check_lane("vdup", *ty, VPERM_LANE_TYPES, *span)?;
                 let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
                 Self::check_lane_index("vdup", vec_ty, *lane, *ty, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VZip {
                 op,
@@ -778,7 +767,7 @@ impl Validator {
                 Self::check_lane(op.as_str(), *lane, VPERM_LANE_TYPES, *span)?;
                 let vec_ty =
                     self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::Alloc { dst, size, span } => {
                 let size_ty = self.check_reg(ctx, size, scope, *span)?;
@@ -789,7 +778,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, Type::Ptr, *span)?;
+                Self::define(scope, dst, Type::Ptr);
             }
             Instruction::Free { ptr, span } => {
                 let ptr_ty = self.check_reg(ctx, ptr, scope, *span)?;
@@ -827,7 +816,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, then_ty, *span)?;
+                Self::define(scope, dst, then_ty);
             }
             Instruction::Unary { op, dst, src, span } => {
                 let src_ty = self.check_reg(ctx, src, scope, *span)?;
@@ -876,7 +865,7 @@ impl Validator {
                     }
                     _ => src_ty,
                 };
-                Self::define(scope, defs, dst, out_ty, *span)?;
+                Self::define(scope, dst, out_ty);
             }
             Instruction::Cast {
                 op,
@@ -1014,7 +1003,7 @@ impl Validator {
                         }
                     }
                 }
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::VectorReduce {
                 op,
@@ -1025,7 +1014,7 @@ impl Validator {
             } => {
                 self.check_vector(ctx, src, scope, *span)?;
                 Self::check_lane(op.as_str(), *ty, ALL_LANES, *span)?;
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::VBinary {
                 op,
@@ -1038,7 +1027,7 @@ impl Validator {
                 Self::check_lane(op.as_str(), *lane, vbin_lane_types(*op), *span)?;
                 let vec_ty =
                     self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VFma {
                 dst,
@@ -1050,7 +1039,7 @@ impl Validator {
             } => {
                 Self::check_lane("vfma", *lane, VFMA_LANE_TYPES, *span)?;
                 let vec_ty = self.check_same_vectors(ctx, "vfma", &[a, b, c], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::Fma { dst, a, b, c, span } => {
                 let ty = self.check_reg(ctx, a, scope, *span)?;
@@ -1071,7 +1060,7 @@ impl Validator {
                         *span,
                     ));
                 }
-                Self::define(scope, defs, dst, ty, *span)?;
+                Self::define(scope, dst, ty);
             }
             Instruction::VDot {
                 dst,
@@ -1085,7 +1074,7 @@ impl Validator {
                 let op = if *unsigned { "vdotu" } else { "vdot" };
                 Self::check_lane(op, *lane, VDOT_LANE_TYPES, *span)?;
                 let vec_ty = self.check_same_vectors(ctx, op, &[acc, a, b], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VCmp {
                 op,
@@ -1098,7 +1087,7 @@ impl Validator {
                 Self::check_lane(op.as_str(), *lane, ALL_LANES, *span)?;
                 let vec_ty =
                     self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VSelect {
                 dst,
@@ -1114,7 +1103,7 @@ impl Validator {
                     scope,
                     *span,
                 )?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::MaskedLoad {
                 dst,
@@ -1136,7 +1125,7 @@ impl Validator {
                     ));
                 }
                 Self::check_lane("ldm", *lane, COUNT_LANES, *span)?;
-                Self::define(scope, defs, dst, *ty, *span)?;
+                Self::define(scope, dst, *ty);
             }
             Instruction::MaskedStore {
                 ptr,
@@ -1193,7 +1182,7 @@ impl Validator {
             } => {
                 Self::check_lane(op.as_str(), *lane, vunary_lane_types(*op), *span)?;
                 let vec_ty = self.check_vector(ctx, src, scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VNarrow {
                 dst,
@@ -1204,7 +1193,7 @@ impl Validator {
             } => {
                 Self::check_lane("vnarrow", *lane, VNARROW_LANE_TYPES, *span)?;
                 let vec_ty = self.check_same_vectors(ctx, "vnarrow", &[lo, hi], scope, *span)?;
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VShift {
                 op,
@@ -1228,11 +1217,11 @@ impl Validator {
                     )
                     .with_context(serde_json::json!({ "target": amount, "found": amount_ty.as_str() })));
                 }
-                Self::define(scope, defs, dst, vec_ty, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::VLen { dst, lane, span } => {
                 Self::check_lane("vl", *lane, COUNT_LANES, *span)?;
-                Self::define(scope, defs, dst, Type::I64, *span)?;
+                Self::define(scope, dst, Type::I64);
             }
         }
         Ok(())
@@ -1580,4 +1569,149 @@ fn annotate(mut diag: Diagnostic, func: &Function, block: &Block, inst_idx: usiz
         .or_insert_with(|| serde_json::Value::String(block.label.clone()));
     diag.context = Some(serde_json::Value::Object(ctx));
     diag
+}
+
+/// Where a register is defined: a block, and the instruction index there (`PARAM` for the
+/// block's parameters, `FN_PARAM` for the function's, in the entry block).
+type DefSite = (usize, i64);
+const PARAM: i64 = -1;
+const FN_PARAM: i64 = -2;
+
+/// With shadowing, a name can have several definitions. Every use must be reached by one of
+/// them only (the one that dominates it): a use that another definition can reach without
+/// passing through that one, such as a name defined again in one arm of a branch and used after
+/// the join, is `ERR_AMBIGUOUS_REGISTER`.
+fn check_reaching_definitions(func: &Function, cfg: &Cfg) -> Result<(), Diagnostic> {
+    let mut sites: HashMap<&str, Vec<DefSite>> = HashMap::new();
+    for (p, _) in &func.params {
+        sites.entry(p.as_str()).or_default().push((0, FN_PARAM));
+    }
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (p, _) in &block.params {
+            sites.entry(p.as_str()).or_default().push((b, PARAM));
+        }
+        for (i, inst) in block.instructions.iter().enumerate() {
+            for d in inst.dsts() {
+                sites.entry(d).or_default().push((b, i as i64));
+            }
+        }
+    }
+    for (name, defs) in &sites {
+        if defs.len() > 1 {
+            check_name(func, cfg, name, defs)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_name(func: &Function, cfg: &Cfg, name: &str, defs: &[DefSite]) -> Result<(), Diagnostic> {
+    let n = func.blocks.len();
+    // The last definition in each block, which is what leaves it.
+    let mut last: Vec<Option<DefSite>> = vec![None; n];
+    for &d in defs {
+        if last[d.0].is_none_or(|l| l.1 < d.1) {
+            last[d.0] = Some(d);
+        }
+    }
+    let entry_in: HashSet<DefSite> = defs.iter().copied().filter(|d| d.1 == FN_PARAM).collect();
+    let mut ins: Vec<HashSet<DefSite>> = vec![HashSet::new(); n];
+    ins[0] = entry_in.clone();
+    let out = |b: usize, ins: &Vec<HashSet<DefSite>>| -> HashSet<DefSite> {
+        match last[b] {
+            Some(d) if d.1 != FN_PARAM => HashSet::from([d]),
+            _ => ins[b].clone(),
+        }
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &cfg.rpo {
+            let mut set: HashSet<DefSite> = if b == 0 {
+                entry_in.clone()
+            } else {
+                HashSet::new()
+            };
+            for &p in &cfg.preds[b] {
+                if cfg.reachable[p] {
+                    set.extend(out(p, &ins));
+                }
+            }
+            if set != ins[b] {
+                ins[b] = set;
+                changed = true;
+            }
+        }
+    }
+    for &b in &cfg.rpo {
+        let block = &func.blocks[b];
+        let reaching = |pos: i64| -> HashSet<DefSite> {
+            match defs
+                .iter()
+                .filter(|d| d.0 == b && d.1 < pos && d.1 != FN_PARAM)
+                .max_by_key(|d| d.1)
+            {
+                Some(&d) => HashSet::from([d]),
+                None => ins[b].clone(),
+            }
+        };
+        let uses = block
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.operands().iter().any(|r| r.as_str() == name))
+            .map(|(i, inst)| (i, inst.span()))
+            .chain(
+                terminator_reads(&block.terminator, name)
+                    .then(|| (block.instructions.len(), terminator_span(&block.terminator))),
+            );
+        for (i, span) in uses {
+            let seen = reaching(i as i64);
+            if seen.len() > 1 {
+                let mut blocks: Vec<&str> = seen
+                    .iter()
+                    .map(|d| func.blocks[d.0].label.as_str())
+                    .collect();
+                blocks.sort();
+                blocks.dedup();
+                return Err(Diagnostic::error(
+                    "ERR_AMBIGUOUS_REGISTER",
+                    format!(
+                        "Register '{name}' here could hold the value defined in block {}, depending on the path taken; give the definitions different names and pass the one you mean to block '{}' as a block parameter",
+                        blocks.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(" or "),
+                        block.label
+                    ),
+                    span,
+                )
+                .with_instruction_index(i)
+                .with_context(serde_json::json!({
+                    "function": func.name,
+                    "block": block.label,
+                    "target": name,
+                    "defined_in": blocks,
+                })));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn terminator_reads(t: &Terminator, name: &str) -> bool {
+    match t {
+        Terminator::Jmp { args, .. } => args.iter().any(|a| a == name),
+        Terminator::Br {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => cond == name || then_args.iter().chain(else_args).any(|a| a == name),
+        Terminator::Ret { vals, .. } => vals.iter().any(|a| a == name),
+    }
+}
+
+fn terminator_span(t: &Terminator) -> Span {
+    match t {
+        Terminator::Jmp { span, .. }
+        | Terminator::Br { span, .. }
+        | Terminator::Ret { span, .. } => *span,
+    }
 }

@@ -840,6 +840,41 @@ pub enum Instruction {
 }
 
 impl Instruction {
+    /// The instruction's place in the source.
+    pub fn span(&self) -> Span {
+        match self {
+            Instruction::AssignConst { span, .. }
+            | Instruction::Binary { span, .. }
+            | Instruction::Load { span, .. }
+            | Instruction::Store { span, .. }
+            | Instruction::Call { span, .. }
+            | Instruction::Par { span, .. }
+            | Instruction::Splat { span, .. }
+            | Instruction::ExtractLane { span, .. }
+            | Instruction::Alloc { span, .. }
+            | Instruction::Free { span, .. }
+            | Instruction::Unary { span, .. }
+            | Instruction::Cast { span, .. }
+            | Instruction::Fma { span, .. }
+            | Instruction::Select { span, .. }
+            | Instruction::VectorReduce { span, .. }
+            | Instruction::VBinary { span, .. }
+            | Instruction::VFma { span, .. }
+            | Instruction::VCmp { span, .. }
+            | Instruction::VSelect { span, .. }
+            | Instruction::VUnary { span, .. }
+            | Instruction::VNarrow { span, .. }
+            | Instruction::VShift { span, .. }
+            | Instruction::VZip { span, .. }
+            | Instruction::VDup { span, .. }
+            | Instruction::VDot { span, .. }
+            | Instruction::VLen { span, .. }
+            | Instruction::MaskedLoad { span, .. }
+            | Instruction::MaskedStore { span, .. }
+            | Instruction::MatMul { span, .. } => *span,
+        }
+    }
+
     /// Registers defined by this instruction (several for a call of a function returning
     /// several values).
     pub fn dsts(&self) -> Vec<&str> {

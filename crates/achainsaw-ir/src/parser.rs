@@ -93,6 +93,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The `:` before a cast's result type, with an example of the cast when it is missing.
+    fn expect_cast_type(&mut self, op: &str, dst: &str, src: &str) -> Result<(), Diagnostic> {
+        self.expect_type_colon(&format!(
+            "{op} needs its result type: `{dst} = {op} {src}:i64` (or another type)"
+        ))
+    }
+
+    /// The `:` before a type, or `ERR_EXPECTED_TYPE` with `message` (which shows the form).
+    fn expect_type_colon(&mut self, message: &str) -> Result<(), Diagnostic> {
+        if self.peek_kind() == &TokenKind::Colon {
+            self.advance();
+            return Ok(());
+        }
+        Err(Diagnostic::error(
+            "ERR_EXPECTED_TYPE",
+            message,
+            self.peek().span,
+        ))
+    }
+
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         match self.peek_kind().clone() {
             TokenKind::Ident(s) => {
@@ -153,7 +173,7 @@ impl<'a> Parser<'a> {
                 self.imm_counter += 1;
                 instructions.push(Instruction::AssignConst {
                     dst: imm_reg.clone(),
-                    val: Constant::Int(n),
+                    val: int_literal(n, ty),
                     ty,
                     span: tok.span,
                 });
@@ -201,7 +221,8 @@ impl<'a> Parser<'a> {
                 });
                 Ok(imm_reg)
             }
-            TokenKind::Ident(name) | TokenKind::VOp(name) => {
+            // Mnemonics are register names here (`rem = sub n, i` then `min rem, 8:i64`).
+            TokenKind::Ident(name) | TokenKind::VOp(name) | TokenKind::Op(name) => {
                 self.advance();
                 Ok(name)
             }
@@ -772,7 +793,9 @@ impl<'a> Parser<'a> {
 
         if name == "ldm" {
             let (ptr, index) = self.parse_mem_ref(instructions)?;
-            self.expect(TokenKind::Colon)?;
+            self.expect_type_colon(&format!(
+                "ldm needs the vector type it loads: `{dst} = ldm p[i]:vx, n:f32`"
+            ))?;
             let ty = self.parse_type()?;
             self.expect(TokenKind::Comma)?;
             let count = self.parse_count_operand(instructions)?;
@@ -987,6 +1010,10 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_type()?;
                 self.expect_eol()?;
+                let val = match val {
+                    Constant::Int(n) => int_literal(n, ty),
+                    other => other,
+                };
                 Ok(Instruction::AssignConst {
                     dst,
                     val,
@@ -997,7 +1024,9 @@ impl<'a> Parser<'a> {
             TokenKind::Ld => {
                 self.advance();
                 let (ptr, index) = self.parse_mem_ref(instructions)?;
-                self.expect(TokenKind::Colon)?;
+                self.expect_type_colon(&format!(
+                    "ld needs the type it loads: `{dst} = ld p[i]:f32` (or another type)"
+                ))?;
                 let ty = self.parse_type()?;
                 self.expect_eol()?;
                 Ok(Instruction::Load {
@@ -1032,12 +1061,27 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Splat => {
                 self.advance();
+                let literal = matches!(
+                    self.peek_kind(),
+                    TokenKind::IntLit(_) | TokenKind::FloatLit(_)
+                );
                 let src = self.parse_operand(instructions, None)?;
                 // The vector type is required: `splat x:v128`, `splat x:vx`.
                 if self.peek_kind() != &TokenKind::Colon {
+                    let message = match instructions.last() {
+                        // `splat 0:vx` read `vx` as the immediate's type.
+                        Some(Instruction::AssignConst { dst: imm, ty, .. })
+                            if literal && *imm == src && ty.is_vector() =>
+                        {
+                            format!(
+                                "An immediate in splat needs its lane type, then the vector type: `{dst} = splat 0:i32:{ty}` or `{dst} = splat 0.0:f32:{ty}`"
+                            )
+                        }
+                        _ => "splat needs its vector type, e.g. `v = splat x:v128` or `v = splat x:vx`".to_string(),
+                    };
                     return Err(Diagnostic::error(
                         "ERR_EXPECTED_TYPE",
-                        "splat needs its vector type, e.g. `v = splat x:v128` or `v = splat x:vx`",
+                        message,
                         self.peek().span,
                     ));
                 }
@@ -1085,7 +1129,7 @@ impl<'a> Parser<'a> {
             TokenKind::Cast(op) => {
                 self.advance();
                 let src = self.parse_operand(instructions, None)?;
-                self.expect(TokenKind::Colon)?;
+                self.expect_cast_type(op.as_str(), &dst, &src)?;
                 let ty = self.parse_type()?;
                 self.expect_eol()?;
                 Ok(Instruction::Cast {
@@ -1144,7 +1188,7 @@ impl<'a> Parser<'a> {
                 }
                 if let Some(op) = CastOp::from_str_opt(&name) {
                     let src = self.parse_operand(instructions, None)?;
-                    self.expect(TokenKind::Colon)?;
+                    self.expect_cast_type(&name, &dst, &src)?;
                     let ty = self.parse_type()?;
                     self.expect_eol()?;
                     return Ok(Instruction::Cast {
@@ -1179,6 +1223,20 @@ impl<'a> Parser<'a> {
                     span: dst_span,
                 })
             }
+            TokenKind::Ident(name) => {
+                let mut diag = Diagnostic::error(
+                    "ERR_UNKNOWN_OP",
+                    format!("Unknown operation '{name}'"),
+                    self.peek().span,
+                );
+                if let Some(near) = closest_op(&name) {
+                    diag.message = format!("Unknown operation '{name}' (did you mean '{near}'?)");
+                    diag = diag.with_context(serde_json::json!({ "target": name, "did_you_mean": near }));
+                } else {
+                    diag = diag.with_context(serde_json::json!({ "target": name }));
+                }
+                Err(diag)
+            }
             _ => Err(Diagnostic::error(
                 "ERR_EXPECTED_RVALUE",
                 format!("Expected cst, ld, call, alloc, splat, extlane, select, cast, unary, binary op, or vector op after '=', found {:?}", self.peek_kind()),
@@ -1186,4 +1244,109 @@ impl<'a> Parser<'a> {
             )),
         }
     }
+}
+
+/// An integer literal as a constant of `ty`: `0:f32` is the float 0.0.
+fn int_literal(n: i64, ty: Type) -> Constant {
+    if ty.is_float() {
+        Constant::Float(n as f64)
+    } else {
+        Constant::Int(n)
+    }
+}
+
+/// The operations an instruction can start with after `=`, for "did you mean" hints.
+const OPERATIONS: &[&str] = &[
+    "cst",
+    "ld",
+    "call",
+    "alloc",
+    "splat",
+    "extlane",
+    "select",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "and",
+    "or",
+    "xor",
+    "shl",
+    "shr",
+    "eq",
+    "ne",
+    "lt",
+    "gt",
+    "le",
+    "ge",
+    "min",
+    "max",
+    "umin",
+    "umax",
+    "udiv",
+    "urem",
+    "ushr",
+    "ult",
+    "ugt",
+    "ule",
+    "uge",
+    "copysign",
+    "rotl",
+    "rotr",
+    "fma",
+    "neg",
+    "abs",
+    "sqrt",
+    "floor",
+    "ceil",
+    "round",
+    "roundeven",
+    "roundz",
+    "popcnt",
+    "clz",
+    "ctz",
+    "itof",
+    "ftoi",
+    "uitof",
+    "ftoui",
+    "sext",
+    "zext",
+    "trunc",
+    "fext",
+    "ftrunc",
+    "bitcast",
+];
+
+/// The operation an unknown name most likely meant: one it contains (`sdiv`, `fadd`), or one
+/// within two edits.
+fn closest_op(name: &str) -> Option<&'static str> {
+    let contained = OPERATIONS
+        .iter()
+        .filter(|op| op.len() >= 2 && name.len() <= op.len() + 2 && name.contains(*op))
+        .max_by_key(|op| op.len());
+    if let Some(op) = contained {
+        return Some(op);
+    }
+    OPERATIONS
+        .iter()
+        .map(|op| (edit_distance(name, op), *op))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, op)| op)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
 }

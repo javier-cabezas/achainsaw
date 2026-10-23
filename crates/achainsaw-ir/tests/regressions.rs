@@ -164,3 +164,78 @@ fn test_repro_available_registers_omit_immediates() {
         serde_json::json!(["acc", "i", "more", "n"])
     );
 }
+
+/// Op mnemonics are register names outside the position after `=`: agents name the
+/// remainder of a loop `rem`.
+#[test]
+fn test_repro_op_mnemonics_are_operands() {
+    let code = r#"
+fn f(n:i64, i:i64)->i64
+  b0:
+    rem = sub n, i
+    min = min rem, 8:i64
+    ret min
+"#;
+    parse_and_validate(code).unwrap_or_else(|d| panic!("{d:?}"));
+}
+
+/// An integer literal of a float type is that float: `cst 0:f32`, `add x, 1:f32`.
+#[test]
+fn test_repro_integer_literals_of_float_type() {
+    let code = r#"
+fn f(x:f32)->f32
+  b0:
+    z = cst 0:f32
+    y = add x, 1:f32
+    r = add y, z
+    ret r
+"#;
+    let module = parse_and_validate(code).unwrap_or_else(|d| panic!("{d:?}"));
+    let consts: Vec<&Constant> = module.functions[0].blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|i| match i {
+            Instruction::AssignConst { val, .. } => Some(val),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(consts[..], [Constant::Float(z), Constant::Float(o)] if *z == 0.0 && *o == 1.0)
+    );
+}
+
+fn parse_error(code: &str) -> achainsaw_ir::Diagnostic {
+    parse_and_validate(code).expect_err("should not parse")
+}
+
+/// The errors agents hit most in the agent benchmark name the fix.
+#[test]
+fn test_repro_diagnostics_name_the_fix() {
+    let splat = parse_error("fn f()->vx\n  b0:\n    z = splat 0:vx\n    ret z\n");
+    assert_eq!(splat.error_code, "ERR_EXPECTED_TYPE");
+    assert!(
+        splat.message.contains("`z = splat 0:i32:vx`"),
+        "{}",
+        splat.message
+    );
+
+    let cast = parse_error("fn f(s:i32)->i64\n  b0:\n    w = zext s\n    ret w\n");
+    assert_eq!(cast.error_code, "ERR_EXPECTED_TYPE");
+    assert!(
+        cast.message.contains("`w = zext s:i64`"),
+        "{}",
+        cast.message
+    );
+
+    let load = parse_error("fn f(p:ptr, i:i64)->i8\n  b0:\n    a = ld p[i:i8]\n    ret a\n");
+    assert_eq!(load.error_code, "ERR_EXPECTED_TYPE");
+    assert!(
+        load.message.contains("`a = ld p[i]:f32`"),
+        "{}",
+        load.message
+    );
+
+    let op = parse_error("fn f(a:i64)->i64\n  b0:\n    h = sdiv a, 2:i64\n    ret h\n");
+    assert_eq!(op.error_code, "ERR_UNKNOWN_OP");
+    assert_eq!(op.context.expect("context")["did_you_mean"], "div");
+}
