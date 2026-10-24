@@ -64,12 +64,12 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_ident(&mut self) -> Result<(String, Span), Diagnostic> {
-        match self.peek_kind().clone() {
-            TokenKind::Ident(s) | TokenKind::Op(s) | TokenKind::VOp(s) => {
+        match name_of(self.peek_kind()) {
+            Some(s) => {
                 let span = self.advance().span;
                 Ok((s, span))
             }
-            _ => {
+            None => {
                 let span = self.peek().span;
                 Err(Diagnostic::error(
                     "ERR_EXPECTED_IDENTIFIER",
@@ -222,9 +222,9 @@ impl<'a> Parser<'a> {
                 Ok(imm_reg)
             }
             // Mnemonics are register names here (`rem = sub n, i` then `min rem, 8:i64`).
-            TokenKind::Ident(name) | TokenKind::VOp(name) | TokenKind::Op(name) => {
+            ref kind if name_of(kind).is_some() => {
                 self.advance();
-                Ok(name)
+                Ok(name_of(kind).expect("a name"))
             }
             other => Err(Diagnostic::error(
                 "ERR_EXPECTED_OPERAND",
@@ -948,6 +948,21 @@ impl<'a> Parser<'a> {
 
         // Otherwise: dst = <op> ..., or `a, b = call f(...)` for several results.
         let (dst, dst_span) = self.expect_ident()?;
+        // A mnemonic that starts a line without `=` after it is an instruction that lost its
+        // destination (`neg x`, `add a, b`), not a register.
+        let mnemonic =
+            !matches!(first_tok.kind, TokenKind::Ident(_)) || Self::is_contextual_op(&dst);
+        if mnemonic && !matches!(self.peek_kind(), TokenKind::Equal | TokenKind::Comma) {
+            return Err(Diagnostic::error(
+                "ERR_MISSING_DESTINATION",
+                format!(
+                    "'{dst}' needs a destination register: write 'r = {dst} ...' (only st, \
+                     stm, mm, free, call and par stand alone)"
+                ),
+                dst_span,
+            )
+            .with_context(serde_json::json!({ "op": dst })));
+        }
         if self.peek_kind() == &TokenKind::Comma {
             let mut dsts = vec![dst];
             while self.peek_kind() == &TokenKind::Comma {
@@ -1244,6 +1259,25 @@ impl<'a> Parser<'a> {
             )),
         }
     }
+}
+
+/// The name a token spells when it stands for a register, label or function: an identifier,
+/// or an instruction mnemonic, since mnemonics are keywords only right after `=` (`neg = lt
+/// v, 0`, `ld x[neg]`). Statement keywords (`st`, `free`, `call`, `jmp`, `br`, `ret`, `fn`,
+/// `extfn`) start lines, so they stay reserved.
+fn name_of(kind: &TokenKind) -> Option<String> {
+    Some(match kind {
+        TokenKind::Ident(s) | TokenKind::Op(s) | TokenKind::VOp(s) => s.clone(),
+        TokenKind::Cst => "cst".into(),
+        TokenKind::Ld => "ld".into(),
+        TokenKind::Splat => "splat".into(),
+        TokenKind::Extlane => "extlane".into(),
+        TokenKind::Alloc => "alloc".into(),
+        TokenKind::Select => "select".into(),
+        TokenKind::Cast(op) => op.as_str().into(),
+        TokenKind::Unary(op) => op.as_str().into(),
+        _ => return None,
+    })
 }
 
 /// An integer literal as a constant of `ty`: `0:f32` is the float 0.0.
