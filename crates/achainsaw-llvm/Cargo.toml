@@ -13,7 +13,7 @@ llvm = ["dep:inkwell"]
 [dependencies]
 achainsaw-ir = { path = "../achainsaw-ir" }
 anyhow = { workspace = true }
-inkwell = { version = "0.10", features = ["llvm22-1-prefer-dynamic"], optional = true }
+inkwell = { version = "0.11", features = ["llvm22-1-prefer-dynamic"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
