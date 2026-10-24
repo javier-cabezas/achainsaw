@@ -395,6 +395,31 @@ pub extern "C" fn rt_try_fuel(units: i64) -> i32 {
     charged.unwrap_or(false) as i32
 }
 
+/// Slow path of a loop dispatch's fuel charge in Cranelift code (`rt_try_fuel` without
+/// arguments, so it can preserve every register): the caller has stored the counter less the
+/// loop's fuel, at most 0. A `par` worker draws on the shared budget to make it positive, which
+/// charges the loop; otherwise the counter stays as it is and the caller restores it, charging
+/// nothing.
+pub extern "C" fn rt_draw_fuel() {
+    if halted() {
+        return;
+    }
+    with_active_fuel(|counter| {
+        let left = counter.get();
+        if left > 0 {
+            return;
+        }
+        if let Some(region) = active_region() {
+            let got = region.draw(PAR_FUEL_CHUNK.saturating_sub(left));
+            if left.saturating_add(got) > 0 {
+                counter.set(left + got);
+            } else {
+                region.refund(got);
+            }
+        }
+    });
+}
+
 /// Takes `units` from an inline fuel counter, topping it up from the shared budget when
 /// this thread is a `par` worker. False when the budget cannot cover them.
 fn charge(counter: &Cell<i64>, units: i64) -> bool {
@@ -424,17 +449,19 @@ pub extern "C" fn rt_fuel_exhausted() -> i32 {
     1
 }
 
-/// `rt_fuel_exhausted` for Cranelift code, in the `PreserveAll` convention: saves every
-/// register a C call may clobber, so the register allocator keeps loop values in registers
-/// across the (cold) call instead of spilling them on the hot path. It returns nothing:
-/// the caller reloads the fuel counter, which is positive exactly when execution continues.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-extern "C" fn rt_fuel_exhausted_preserve_all() {
-    // Saves the System V and Windows caller-saved GPRs and xmm0-15 (the vector registers
-    // Cranelift allocates), keeps the stack 16-byte aligned, and leaves the 32 bytes of
-    // shadow space a Windows callee may use.
-    core::arch::naked_asm!(
+/// Defines `$name`, which calls `$hook` in the `PreserveAll` convention for Cranelift code:
+/// it saves every register a C call may clobber, so the register allocator keeps loop values
+/// in registers across the (cold) call instead of spilling them on the hot path. It takes and
+/// returns nothing: the hooks work on the fuel counter, which the caller reloads.
+macro_rules! preserve_all_stub {
+    ($name:ident, $hook:ident) => {
+        // Saves the System V and Windows caller-saved GPRs and xmm0-15 (the vector registers
+        // Cranelift allocates), keeps the stack 16-byte aligned, and leaves the 32 bytes of
+        // shadow space a Windows callee may use.
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
         "push rax",
@@ -492,15 +519,15 @@ extern "C" fn rt_fuel_exhausted_preserve_all() {
         "pop rax",
         "pop rbp",
         "ret",
-        hook = sym rt_fuel_exhausted,
-    );
-}
+        hook = sym $hook,
+            );
+        }
 
-/// AArch64 version of the `PreserveAll` stub: saves x0-x18 and the full q0-q31.
-#[cfg(target_arch = "aarch64")]
-#[unsafe(naked)]
-extern "C" fn rt_fuel_exhausted_preserve_all() {
-    core::arch::naked_asm!(
+        // AArch64: saves x0-x18 and the full q0-q31.
+        #[cfg(target_arch = "aarch64")]
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            core::arch::naked_asm!(
         "stp x29, x30, [sp, #-16]!",
         "mov x29, sp",
         "sub sp, sp, #672",
@@ -560,9 +587,17 @@ extern "C" fn rt_fuel_exhausted_preserve_all() {
         "add sp, sp, #672",
         "ldp x29, x30, [sp], #16",
         "ret",
-        hook = sym rt_fuel_exhausted,
-    );
+        hook = sym $hook,
+            );
+        }
+    };
 }
+
+// The slow path of the inline fuel check: the counter is positive afterwards exactly when
+// execution continues.
+preserve_all_stub!(rt_fuel_exhausted_preserve_all, rt_fuel_exhausted);
+// The slow path of a loop dispatch's fuel charge (`rt_draw_fuel`).
+preserve_all_stub!(rt_draw_fuel_preserve_all, rt_draw_fuel);
 
 /// `rt_fuel_exhausted` for LLVM code, which may keep values in any register (`ymm`/`zmm`,
 /// AVX-512 mask registers): saves the caller-saved general-purpose registers and, with
@@ -1457,7 +1492,7 @@ struct CraneliftJit {
     rt_free_id: FuncId,
     rt_fuel_exhausted_id: FuncId,
     rt_consume_fuel_id: FuncId,
-    rt_try_fuel_id: FuncId,
+    rt_draw_fuel_id: FuncId,
     rt_sandbox_fault_id: FuncId,
     rt_stack_check_id: FuncId,
     rt_sandbox_check_mm_id: FuncId,
@@ -1497,7 +1532,10 @@ impl CraneliftJit {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         jit_builder.symbol("rt_fuel_exhausted", rt_fuel_exhausted as *const u8);
         jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
-        jit_builder.symbol("rt_try_fuel", rt_try_fuel as *const u8);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        jit_builder.symbol("rt_draw_fuel", rt_draw_fuel_preserve_all as *const u8);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        jit_builder.symbol("rt_draw_fuel", rt_draw_fuel as *const u8);
         jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
         jit_builder.symbol("rt_stack_check", rt_stack_check as *const u8);
         jit_builder.symbol("rt_sandbox_check_mm", rt_sandbox_check_mm as *const u8);
@@ -1525,6 +1563,8 @@ impl CraneliftJit {
         }
         let rt_fuel_exhausted_id =
             module.declare_function("rt_fuel_exhausted", Linkage::Import, &exhausted_sig)?;
+        let rt_draw_fuel_id =
+            module.declare_function("rt_draw_fuel", Linkage::Import, &exhausted_sig)?;
 
         let mut fuel_sig = module.make_signature();
         fuel_sig.returns.push(AbiParam::new(types::I32));
@@ -1534,8 +1574,6 @@ impl CraneliftJit {
         consume_sig.returns.push(AbiParam::new(types::I32));
         let rt_consume_fuel_id =
             module.declare_function("rt_consume_fuel", Linkage::Import, &consume_sig)?;
-        let rt_try_fuel_id =
-            module.declare_function("rt_try_fuel", Linkage::Import, &consume_sig)?;
 
         let mut fault_sig = module.make_signature();
         fault_sig.params.push(AbiParam::new(types::I64));
@@ -1576,7 +1614,7 @@ impl CraneliftJit {
             rt_free_id,
             rt_fuel_exhausted_id,
             rt_consume_fuel_id,
-            rt_try_fuel_id,
+            rt_draw_fuel_id,
             rt_sandbox_fault_id,
             rt_stack_check_id,
             rt_sandbox_check_mm_id,
@@ -1657,7 +1695,7 @@ impl CraneliftJit {
             fuel_check: (fuel_enabled || sandbox.is_some())
                 .then_some((fuel_counter, self.rt_fuel_exhausted_id)),
             fuel_consume_func_id: fuel_enabled.then_some(self.rt_consume_fuel_id),
-            fuel_try_func_id: Some(self.rt_try_fuel_id),
+            fuel_draw_func_id: Some(self.rt_draw_fuel_id),
             loop_checks: loop_checks.clone(),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,

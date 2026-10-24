@@ -564,12 +564,14 @@ fn par_in_aot_shared_library() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Values live in registers across fuel refills (the `rt_fuel_exhausted` slow path, which on
-/// Cranelift saves every register) come back intact: vector, float and integer accumulators
-/// carried through a loop long enough to refill a worker's fuel many times.
+/// Values live in registers across fuel refills come back intact: vector, float and integer
+/// accumulators carried through a loop long enough to refill a worker's fuel many times, both
+/// as written, where the loop charges its fuel on entry and draws it on the shared budget
+/// (`rt_draw_fuel`), and with a bound the loop computes, which keeps a check at every branch
+/// (`rt_fuel_exhausted`). On Cranelift both hooks save every register.
 #[test]
 fn registers_survive_fuel_refills() {
-    let src = r#"
+    let counted = r#"
 fn work(i:i64, out:ptr)
   b0:
     one = cst 1:i32
@@ -606,14 +608,21 @@ fn run(out:ptr, n:i64)
     par n, work(out)
     ret
 "#;
+    // The same loop with a bound it computes, which `achainsaw_ir::checks` cannot count.
+    let checked = counted.replace(
+        "    more = lt j, 300000:i64",
+        "    lim = add 300000:i64, 0:i64\n    more = lt j, lim",
+    );
     let n = 48usize;
     // a = 1 + 300000, b = 2 + 2 * 300000, f = 0.5 + 300000 (truncated), s = 3 + 300000 i.
     let want = |i: usize| (300001 + 600002 + 300000 + 3 + 300000 * i) as i64;
-    for (threads, fuel) in [
-        (None, Some(100_000_000u64)),
-        (Some(1), Some(100_000_000)),
-        (None, None),
-    ] {
+    for (src, threads, fuel) in [counted, &checked].into_iter().flat_map(|src| {
+        [
+            (src, None, Some(100_000_000u64)),
+            (src, Some(1), Some(100_000_000)),
+            (src, None, None),
+        ]
+    }) {
         let mut e = engine(src, None, threads);
         e.set_fuel(fuel);
         let mut out = vec![0i64; n];

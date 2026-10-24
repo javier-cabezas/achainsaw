@@ -122,6 +122,120 @@ fn rows@(x:ptr, m:i64, n:i64)->i64
   done:
     ret s
 
+# Bottom-tested: the body runs before the test, once even when n <= 1.
+fn bsum@(x:ptr, n:i64)->i64
+  entry:
+    jmp loop(0:i64, 0:i64)
+  loop(i:i64, s:i64):
+    v = ld x[i]:i64
+    s2 = add s, v
+    i2 = add i, 1:i64
+{PRE}
+    c = lt i2, {N}
+    br c, loop(i2, s2), done(s2)
+  done(t:i64):
+    ret t
+
+# Tested in the middle: the blocks up to the test run once more than the rest.
+fn msum@(x:ptr, n:i64)->i64
+  entry:
+    jmp head(0:i64, 0:i64)
+  head(i:i64, s:i64):
+    v = ld x[i]:i64
+    jmp test
+  test:
+    w = ld x[i]:i64
+{PRE}
+    c = gt {N}, i
+    br c, tail, done
+  tail:
+    s2 = add s, v
+    s3 = add s2, w
+    i2 = add i, 1:i64
+    jmp head(i2, s3)
+  done:
+    ret s
+
+# An if/else in the body, both ways one branch long, with a load on one way only.
+fn relu@(x:ptr, y:ptr, n:i64)->i64
+  entry:
+    jmp head(0:i64, 0:i64)
+  head(i:i64, s:i64):
+{PRE}
+    c = lt i, {N}
+    br c, body, done
+  body:
+    v = ld x[i]:i64
+    below0 = lt v, 0:i64
+    br below0, minus, plus
+  minus:
+    u = ld y[i]:i64
+    jmp merge(u)
+  plus:
+    jmp merge(v)
+  merge(m:i64):
+    s2 = add s, m
+    i2 = add i, 1:i64
+    jmp head(i2, s2)
+  done:
+    ret s
+
+# Ways of different lengths: the fuel of a trip depends on the data, so it is left alone.
+fn skew@(x:ptr, n:i64)->i64
+  entry:
+    jmp head(0:i64, 0:i64)
+  head(i:i64, s:i64):
+{PRE}
+    c = lt i, {N}
+    br c, body, done
+  body:
+    v = ld x[i]:i64
+    below0 = lt v, 0:i64
+    br below0, minus, merge(v)
+  minus:
+    u = sub 0:i64, v
+    jmp merge(u)
+  merge(m:i64):
+    s2 = add s, m
+    i2 = add i, 1:i64
+    jmp head(i2, s2)
+  done:
+    ret s
+
+# A pointer that moves 8 bytes per trip, to an end pointer.
+fn psum@(x:ptr, n:i64)->i64
+  entry:
+    b = mul n, 8:i64
+    end = add x, b
+    jmp loop(x, 0:i64)
+  loop(p:ptr, s:i64):
+{PRE:end}
+    c = lt p, {B:end}
+    br c, body, done
+  body:
+    v = ld p:i64
+    s2 = add s, v
+    p2 = add p, 8:i64
+    jmp loop(p2, s2)
+  done:
+    ret s
+
+# The bound passed around the loop as a parameter.
+fn fsum@(x:ptr, n:i64)->i64
+  entry:
+    jmp loop(0:i64, 0:i64, n)
+  loop(i:i64, s:i64, m:i64):
+{PRE:m}
+    c = lt i, {B:m}
+    br c, body, done
+  body:
+    v = ld x[i]:i64
+    s2 = add s, v
+    i2 = add i, 1:i64
+    jmp loop(i2, s2, m)
+  done:
+    ret s
+
 # Sandboxed drivers: memory from `alloc`, at `off` bytes into a 64-byte allocation.
 fn walk@(off:i64, n:i64)->i64
   entry:
@@ -131,6 +245,22 @@ fn walk@(off:i64, n:i64)->i64
     s = call peek@(q, n)
     free p
     ret s
+
+fn walk2@(off:i64, n:i64)->i64
+  entry:
+    p = alloc 64:i64
+    q = add p, off
+    a = call bsum@(q, n)
+    b = call msum@(q, n)
+    c = call relu@(q, q, n)
+    d = call psum@(q, n)
+    e = call fsum@(q, n)
+    s1 = add a, b
+    s2 = add s1, c
+    s3 = add s2, d
+    s4 = add s3, e
+    free p
+    ret s4
 
 fn total@(n:i64)->i64
   entry:
@@ -171,10 +301,23 @@ fn program(twin: bool) -> String {
     } else {
         ("", "", "n")
     };
-    TEMPLATE
+    let mut text = TEMPLATE
         .replace('@', suffix)
         .replace("{PRE}\n", &format!("{pre}\n"))
-        .replace("{N}", n)
+        .replace("{N}", n);
+    // `{PRE:x}` and `{B:x}`: the same for a bound `x` other than n (a pointer, or a
+    // parameter), copied as `x + 0`.
+    for x in ["end", "m"] {
+        let (pre, bound) = if twin {
+            (format!("    bb_{x} = add {x}, 0:i64\n"), format!("bb_{x}"))
+        } else {
+            (String::new(), x.to_string())
+        };
+        text = text
+            .replace(&format!("{{PRE:{x}}}\n"), &pre)
+            .replace(&format!("{{B:{x}}}"), &bound);
+    }
+    text
 }
 
 fn source() -> String {
@@ -222,11 +365,14 @@ fn loops_with_known_trip_counts_are_rewritten() {
     let module = parse_and_validate(&source()).unwrap();
     let mut module = achainsaw_ir::prepare_for_codegen(&module).into_owned();
     let checks = achainsaw_ir::checks::hoist_loop_checks(&mut module);
-    for f in ["sum", "fill", "peek", "sumv", "steps", "rows"] {
+    for f in [
+        "sum", "fill", "peek", "sumv", "steps", "rows", "bsum", "msum", "relu", "psum", "fsum",
+    ] {
         assert!(checks.function(f).is_some(), "{f} was not rewritten");
         let twin = format!("{f}_ref");
         assert!(checks.function(&twin).is_none(), "{twin} was rewritten");
     }
+    assert!(checks.function("skew").is_none(), "skew was rewritten");
     // The rewritten module is valid AIR.
     let text = achainsaw_ir::to_air_text(&module);
     parse_and_validate(&text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
@@ -244,6 +390,12 @@ fn rewritten_loops_use_the_same_fuel() {
             ("peek", vec![ptr(&x), RtValue::I64(n as i64)]),
             ("sumv", vec![ptr(&x32), RtValue::I64(n as i64)]),
             ("steps", vec![RtValue::I64(n as i64)]),
+            ("bsum", vec![ptr(&x), RtValue::I64(n as i64)]),
+            ("msum", vec![ptr(&x), RtValue::I64(n as i64)]),
+            ("relu", vec![ptr(&x), ptr(&x), RtValue::I64(n as i64)]),
+            ("skew", vec![ptr(&x), RtValue::I64(n as i64)]),
+            ("psum", vec![ptr(&x), RtValue::I64(n as i64)]),
+            ("fsum", vec![ptr(&x), RtValue::I64(n as i64)]),
             (
                 "rows",
                 vec![ptr(&x), RtValue::I64(3), RtValue::I64(n as i64 / 3)],
@@ -298,9 +450,11 @@ fn sandboxed_loops_fail_where_they_did() {
         for n in [0i64, 1, 2, 3, 6, 7, 8, 500, 509, 510, 511, 512] {
             let args = [RtValue::I64(off), RtValue::I64(n)];
             for budget in [1 << 40, 40, 600] {
-                let got = run(&e, "walk", &args, budget);
-                let want = run(&e, "walk_ref", &args, budget);
-                assert_eq!(got, want, "off={off} n={n} budget={budget}");
+                for f in ["walk", "walk2"] {
+                    let got = run(&e, f, &args, budget);
+                    let want = run(&e, &format!("{f}_ref"), &args, budget);
+                    assert_eq!(got, want, "{f} off={off} n={n} budget={budget}");
+                }
             }
         }
     }
@@ -412,13 +566,21 @@ fn dispatch_blocks_count_trips() {
     let mut e = JitEngine::new().unwrap();
     e.compile_module(&probes).unwrap();
     let w = e.vx_bits() as i64 / 32;
-    let eval = |name: &str, args: &[i64], ptrs: usize| -> i64 {
-        let mut vals: Vec<RtValue> = (0..ptrs).map(|_| RtValue::Ptr(0)).collect();
-        vals.extend(args.iter().map(|&a| RtValue::I64(a)));
-        match unsafe { e.call_typed(name, &vals) }.unwrap() {
+    let call = |name: &str, vals: &[RtValue]| -> i64 {
+        match unsafe { e.call_typed(name, vals) }.unwrap() {
             Some(RtValue::I64(v)) => v,
             other => panic!("{other:?}"),
         }
+    };
+    let eval = |name: &str, args: &[i64], ptrs: usize| -> i64 {
+        let mut vals: Vec<RtValue> = (0..ptrs).map(|_| RtValue::Ptr(0)).collect();
+        vals.extend(args.iter().map(|&a| RtValue::I64(a)));
+        call(name, &vals)
+    };
+    // `cost` branches a trip and `last` on the iteration that leaves.
+    let fuel = |t: Option<i128>, cost: i128, last: i128| match t {
+        Some(t) if t <= 1 << 48 => (t * cost + last) as i64,
+        _ => achainsaw_ir::checks::ENDLESS_UNITS,
     };
     let endless = achainsaw_ir::checks::ENDLESS_UNITS;
     let (min, max) = (i64::MIN, i64::MAX);
@@ -496,5 +658,42 @@ fn dispatch_blocks_count_trips() {
             span_of(tv, false, 4 * w as i128, 4 * w as i128),
             "sumv {i0} {n}"
         );
+        // Tested at the bottom, on i + 1: the block runs once more than the tests that pass.
+        let tb = trips_to(i0.wrapping_add(1), n, 1);
+        let (u, s) = &names["bsum"];
+        assert_eq!(eval(u, &[n, i0, 0], 1), fuel(tb, 1, 1), "bsum {i0} {n}");
+        assert_eq!(
+            eval(s, &[n, i0, 0], 1),
+            span_of(tb, true, 8, 8),
+            "bsum {i0} {n}"
+        );
+        // Tested in the middle: 3 branches a trip, 2 on the last iteration.
+        let (u, s) = &names["msum"];
+        assert_eq!(eval(u, &[n, i0, 0], 1), fuel(t, 3, 2), "msum {i0} {n}");
+        assert_eq!(
+            eval(s, &[n, i0, 0], 1),
+            span_of(t, true, 8, 8),
+            "msum {i0} {n}"
+        );
+        // The bound passed around the loop: the dispatch block's parameter.
+        let (u, s) = &names["fsum"];
+        assert_eq!(eval(u, &[n, i0, 0, n], 1), fuel(t, 2, 1), "fsum {i0} {n}");
+        assert_eq!(
+            eval(s, &[n, i0, 0, n], 1),
+            span_of(t, false, 8, 8),
+            "fsum {i0} {n}"
+        );
+        // A pointer from i0 by 8 bytes to x + 8n, x = 0.
+        let end = n.wrapping_mul(8);
+        let tp = trips_to(i0, end, 8);
+        let (u, s) = &names["psum"];
+        let args = [
+            RtValue::Ptr(0),
+            RtValue::I64(n),
+            RtValue::Ptr(i0 as usize),
+            RtValue::I64(0),
+        ];
+        assert_eq!(call(u, &args), fuel(tp, 2, 1), "psum {i0} {n}");
+        assert_eq!(call(s, &args), span_of(tp, false, 8, 8), "psum {i0} {n}");
     }
 }
