@@ -370,4 +370,88 @@ fn allocate_huge(n:i32)->ptr
         // Reset memory quota to unlimited
         engine.set_memory_quota(0);
     }
+
+    const COUNT: &str = r#"
+fn count(n:i64)->i64
+  entry:
+    jmp head(0:i64)
+  head(i:i64):
+    c = lt i, n
+    br c, body, done
+  body:
+    j = add i, 1:i64
+    jmp head(j)
+  done:
+    ret i
+"#;
+
+    /// Without a budget, code has no fuel checks; a budget set after compiling still holds
+    /// for `call_typed`, which runs a checked copy, and modules compiled after it check it
+    /// inline, also when called through `get_fn_ptr`.
+    #[test]
+    fn fuel_checks_are_compiled_under_a_budget() {
+        let module = parse_and_validate(COUNT).unwrap();
+        let mut engine = JitEngine::new().unwrap();
+        assert!(!engine.is_fuel_enabled());
+        engine.compile_module(&module).unwrap();
+        let count = |e: &JitEngine| unsafe { e.call_typed("count", &[RtValue::I64(1000)]) };
+        assert_eq!(count(&engine).unwrap(), Some(RtValue::I64(1000)));
+
+        engine.set_fuel(Some(100));
+        assert!(engine.is_fuel_enabled());
+        let err = count(&engine).unwrap_err().to_string();
+        assert!(err.contains("[ERR_OUT_OF_FUEL]"), "{err}");
+        // The code compiled without checks runs to the end.
+        let unchecked: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(engine.get_fn_ptr("count").unwrap()) };
+        reset_execution_status();
+        assert_eq!(unchecked(1000), 1000);
+        assert!(check_execution_status().is_ok());
+
+        let mut checked = JitEngine::new().unwrap();
+        checked.set_fuel(Some(100));
+        checked.compile_module(&module).unwrap();
+        let inline: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(checked.get_fn_ptr("count").unwrap()) };
+        reset_execution_status();
+        assert!(inline(1000) < 1000);
+        let err = check_execution_status().unwrap_err().to_string();
+        assert!(err.contains("[ERR_OUT_OF_FUEL]"), "{err}");
+
+        reset_execution_status();
+        engine.set_fuel(None);
+        assert_eq!(count(&engine).unwrap(), Some(RtValue::I64(1000)));
+    }
+
+    /// A memory quota set after compiling also runs the checked copy, so code stops at the
+    /// branch after a failed `alloc` instead of writing through its null pointer.
+    #[test]
+    fn failed_allocations_stop_code_compiled_without_a_quota() {
+        let code = r#"
+fn fill(n:i64)
+  entry:
+    p = alloc n
+    jmp head(0:i64)
+  head(i:i64):
+    c = lt i, n
+    br c, body, done
+  body:
+    st p[i:i8], 1:i8
+    j = add i, 1:i64
+    jmp head(j)
+  done:
+    free p
+    ret
+"#;
+        let module = parse_and_validate(code).unwrap();
+        let mut engine = JitEngine::new().unwrap();
+        engine.compile_module(&module).unwrap();
+        engine.set_memory_quota(1024);
+        let res = unsafe { engine.call_typed("fill", &[RtValue::I64(1 << 20)]) };
+        engine.set_memory_quota(0);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("[ERR_OUT_OF_MEMORY]"), "{err}");
+        let res = unsafe { engine.call_typed("fill", &[RtValue::I64(1 << 20)]) };
+        assert_eq!(res.unwrap(), None);
+    }
 }

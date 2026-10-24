@@ -8,7 +8,7 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use std::alloc::Layout;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -237,6 +237,12 @@ pub fn get_remaining_fuel() -> Option<u64> {
             Some(val as u64)
         }
     })
+}
+
+/// A fuel budget or memory quota applies to calls on this thread: their code must check fuel
+/// at branches, to stop when the budget runs out or an allocation fails.
+fn limits_active() -> bool {
+    FUEL_REMAINING.with(|f| f.get()) >= 0 || MEMORY_QUOTA.with(|q| q.get()) > 0
 }
 
 pub fn set_memory_quota(quota_bytes: usize) {
@@ -1691,7 +1697,20 @@ pub struct JitEngine {
     /// Set by `enable_sandbox`; boxed so its address stays fixed while code runs.
     sandbox: Option<Box<Mutex<Arena>>>,
     pub registry: Arc<RwLock<SymbolRegistry>>,
+    /// Compile fuel checks into modules compiled from now on (sandboxed engines always
+    /// check). Off by default, since a check at every branch keeps LLVM from vectorizing
+    /// loops; `set_fuel` with a budget turns it on.
     pub fuel_enabled: bool,
+    /// CPU features the engine was built for, to build `checked` with.
+    features: crate::cpu::CpuFeatures,
+    /// Every module compiled so far, to recompile into `checked`.
+    modules: Vec<Module>,
+    /// Some compiled module has no fuel checks.
+    unchecked: bool,
+    /// The modules again, with fuel checks: built on the first `call_typed` that runs under
+    /// a fuel budget or memory quota (`limits_active`) on an engine with unchecked code,
+    /// which then runs there, so the budget holds and failures stop at the next branch.
+    checked: OnceCell<Box<JitEngine>>,
     /// Fuel counter JIT code decrements inline at every branch; boxed so its address stays
     /// fixed. `call_typed` loads it from the thread's budget for each call.
     fuel: Box<Cell<i64>>,
@@ -1739,7 +1758,18 @@ impl JitEngine {
 
     /// JIT engine using `backend` for the host CPU restricted to `features`.
     pub fn with_backend(backend: Backend, features: &crate::cpu::CpuFeatures) -> Result<Self> {
-        let registry = Arc::new(RwLock::new(SymbolRegistry::new()));
+        Self::with_registry(
+            backend,
+            features,
+            Arc::new(RwLock::new(SymbolRegistry::new())),
+        )
+    }
+
+    fn with_registry(
+        backend: Backend,
+        features: &crate::cpu::CpuFeatures,
+        registry: Arc<RwLock<SymbolRegistry>>,
+    ) -> Result<Self> {
         let codegen = match backend {
             Backend::Cranelift => {
                 Codegen::Cranelift(Box::new(CraneliftJit::new(features, &registry)?))
@@ -1782,7 +1812,11 @@ impl JitEngine {
             codegen,
             sandbox: None,
             registry,
-            fuel_enabled: true,
+            fuel_enabled: false,
+            features: *features,
+            modules: Vec::new(),
+            unchecked: false,
+            checked: OnceCell::new(),
             fuel: Box::new(Cell::new(UNLIMITED_FUEL)),
             threads: 0,
             fast_math: false,
@@ -1808,7 +1842,14 @@ impl JitEngine {
         }
     }
 
+    /// Sets the thread's fuel budget (`None`: unlimited). A budget also turns on
+    /// `fuel_enabled`, so modules compiled afterwards check it inline; calls through
+    /// `call_typed` honor it either way (see `checked`), but code called directly through
+    /// `get_fn_ptr` runs out of fuel only if it was compiled with checks.
     pub fn set_fuel(&mut self, fuel: Option<u64>) {
+        if fuel.is_some() {
+            self.fuel_enabled = true;
+        }
         set_execution_fuel(fuel);
         // Also applies to code called directly through `get_fn_ptr`.
         self.fuel
@@ -1888,6 +1929,30 @@ impl JitEngine {
     }
 
     pub fn compile_module(&mut self, ir_mod: &Module) -> Result<()> {
+        self.compile_prepared(ir_mod)?;
+        self.unchecked |= !self.fuel_enabled && self.sandbox.is_none();
+        self.modules.push(ir_mod.clone());
+        // Rebuilt with this module on the next call that needs it.
+        self.checked = OnceCell::new();
+        Ok(())
+    }
+
+    /// The engine's modules compiled with fuel checks (see `checked`).
+    fn checked(&self) -> Result<&JitEngine> {
+        if let Some(e) = self.checked.get() {
+            return Ok(e);
+        }
+        let mut e = Self::with_registry(self.backend, &self.features, self.registry.clone())?;
+        e.fuel_enabled = true;
+        e.fast_math = self.fast_math;
+        e.threads = self.threads;
+        for m in &self.modules {
+            e.compile_prepared(m)?;
+        }
+        Ok(self.checked.get_or_init(|| Box::new(e)))
+    }
+
+    fn compile_prepared(&mut self, ir_mod: &Module) -> Result<()> {
         // Inlined and loop-split before lowering, for both backends (`prepare_for_codegen`).
         let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
         let ir_mod = &*inlined;
@@ -2003,6 +2068,18 @@ impl JitEngine {
 
     /// Generic typed function invoker supporting any signature and calling convention
     pub unsafe fn call_typed(&self, name: &str, args: &[RtValue]) -> Result<Option<RtValue>> {
+        if self.unchecked && self.sandbox.is_none() && limits_active() {
+            return self.checked()?.invoke(name, args, self.threads);
+        }
+        self.invoke(name, args, self.threads)
+    }
+
+    unsafe fn invoke(
+        &self,
+        name: &str,
+        args: &[RtValue],
+        threads: usize,
+    ) -> Result<Option<RtValue>> {
         let (param_types, ret_type) = self
             .signatures
             .get(name)
@@ -2035,7 +2112,7 @@ impl JitEngine {
 
         let _fuel = FuelActivation::new(&self.fuel);
         let _sandbox = self.sandbox.as_deref().map(SandboxActivation::new);
-        let _threads = ThreadsActivation::new(self.threads);
+        let _threads = ThreadsActivation::new(threads);
         let tramp_fn: extern "C" fn(*const u64, *mut u64) = std::mem::transmute(tramp_ptr);
         tramp_fn(raw_args.as_ptr(), &mut raw_ret);
 

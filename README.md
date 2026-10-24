@@ -140,7 +140,7 @@ $ achainsaw run examples/agent/sum_squares.air --func sum_squares --args 10
 ```
 
 **Code that goes wrong stops cleanly.** A loop that never ends runs out of
-fuel, which every branch consumes:
+fuel, which every branch consumes when a run has a budget:
 
 ```console
 $ achainsaw run examples/infinite_loop.air --fuel 1000000
@@ -297,7 +297,8 @@ written in AIR:
    on every operation, lane type and ISA level, and on Arm at SVE vector lengths
    up to 2048 bits (under QEMU).
 4. **The runtime** keeps each function's fuel counter in a register (a
-   decrement and a compare per branch), checks memory in sandboxed runs,
+   decrement and a compare per branch, compiled in only under a fuel budget,
+   a memory quota or the sandbox), checks memory in sandboxed runs,
    and runs `par` loops on a lock-free pool of threads.
 5. **AIR programs build on AIR:** the quantized matrix kernels, attention and
    softmax helpers are a standard library written in AIR, which a module
