@@ -179,6 +179,55 @@ fn f(n:i64, i:i64)->i64
     parse_and_validate(code).unwrap_or_else(|d| panic!("{d:?}"));
 }
 
+/// Every instruction mnemonic is a register name outside the position after `=`, those with
+/// their own tokens too (`cst`, `ld`, `select`, the casts, `neg`/`abs`/`sqrt`): as a
+/// destination, an operand, a parameter and a label, and in the printed text.
+#[test]
+fn test_repro_mnemonics_are_destinations() {
+    let code = r#"
+fn f(ld:i64, cst:i64)->i64
+  entry:
+    neg = lt ld, 0:i64
+    abs = select neg, cst, ld
+    sext = add abs, 1:i64
+    splat = alloc 64:i64
+    st splat[ld], sext
+    alloc = ld splat[ld]:i64
+    sqrt = add alloc, cst
+    bitcast = itof sqrt:f64
+    extlane = ftoi bitcast:i64
+    free splat
+    br neg, select(extlane), select(abs)
+  select(itof:i64):
+    ret itof
+"#;
+    let module = parse_and_validate(code).unwrap_or_else(|d| panic!("{d:?}"));
+    let text = achainsaw_ir::to_air_text(&module);
+    let again = parse_and_validate(&text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
+    assert_eq!(achainsaw_ir::to_air_text(&again), text);
+}
+
+/// A mnemonic that starts a line without `=` is an instruction missing its destination.
+#[test]
+fn test_repro_missing_destination() {
+    for (line, op) in [
+        ("neg x", "neg"),
+        ("add x, x", "add"),
+        ("vadd v, v:f32", "vadd"),
+        ("floor x", "floor"),
+    ] {
+        let code = format!("fn g(x:f32, v:v128)->f32\n  entry:\n    {line}\n    ret x\n");
+        let err = parse_and_validate(&code).unwrap_err();
+        assert_eq!(err.error_code, "ERR_MISSING_DESTINATION", "{line}: {err:?}");
+        assert_eq!(err.context.expect("context")["op"], op);
+        assert!(
+            err.message.contains(&format!("r = {op}")),
+            "{}",
+            err.message
+        );
+    }
+}
+
 /// An integer literal of a float type is that float: `cst 0:f32`, `add x, 1:f32`.
 #[test]
 fn test_repro_integer_literals_of_float_type() {
