@@ -197,6 +197,16 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push(':');
                         out.push_str(ty.as_str());
                     }
+                    Instruction::InsertLane {
+                        dst,
+                        vec,
+                        val,
+                        lane,
+                        ty,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = inslane {vec}, {val}, {lane}:{ty}"));
+                    }
                     Instruction::Alloc { dst, size, .. } => {
                         out.push_str(dst);
                         out.push_str(" = alloc ");
@@ -944,6 +954,19 @@ impl BinaryEncoder {
                 self.buf.extend_from_slice(&lane.to_le_bytes());
                 self.buf.push(encode_type(*ty));
             }
+            Instruction::InsertLane {
+                dst,
+                vec,
+                val,
+                lane,
+                ty,
+                ..
+            } => {
+                self.buf.push(0x32);
+                self.push_regs(&[dst, vec, val]);
+                self.buf.extend_from_slice(&lane.to_le_bytes());
+                self.buf.push(encode_type(*ty));
+            }
             Instruction::VDot {
                 dst,
                 acc,
@@ -1587,6 +1610,21 @@ impl<'a> BinaryDecoder<'a> {
                 Ok(Instruction::VDup {
                     dst,
                     vec,
+                    lane,
+                    ty,
+                    span,
+                })
+            }
+            0x32 => {
+                let dst = self.read_string()?;
+                let vec = self.read_string()?;
+                let val = self.read_string()?;
+                let lane = self.read_u32()?;
+                let ty = self.read_lane_type()?;
+                Ok(Instruction::InsertLane {
+                    dst,
+                    vec,
+                    val,
                     lane,
                     ty,
                     span,

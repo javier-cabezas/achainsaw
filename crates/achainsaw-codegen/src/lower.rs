@@ -518,22 +518,33 @@ fn vunary_parts(
     src: &[ClifValue],
 ) -> Parts {
     match op {
-        VUnaryOp::Itof | VUnaryOp::Ftoi | VUnaryOp::Exp => src
+        VUnaryOp::Itof | VUnaryOp::Uitof | VUnaryOp::Ftoi | VUnaryOp::Ftoui | VUnaryOp::Exp => src
             .iter()
             .map(|&p| {
+                let x = as_lanes(builder, p, op.source_lane(lane));
+                let to = lane_vec_type(lane);
                 let r = match op {
-                    VUnaryOp::Itof => {
-                        let x = as_lanes(builder, p, Type::I32);
-                        builder.ins().fcvt_from_sint(types::F32X4, x)
+                    VUnaryOp::Itof => builder.ins().fcvt_from_sint(to, x),
+                    VUnaryOp::Uitof => builder.ins().fcvt_from_uint(to, x),
+                    // x86 has no packed f64 -> i64 conversion, which Cranelift lowers only
+                    // inside a narrowing, so i64 lanes convert one by one (two per part).
+                    VUnaryOp::Ftoi | VUnaryOp::Ftoui if lane == Type::I64 => {
+                        let mut r = builder.ins().iconst(types::I64, 0);
+                        r = builder.ins().splat(types::I64X2, r);
+                        for i in 0..2u8 {
+                            let f = builder.ins().extractlane(x, i);
+                            let v = if op == VUnaryOp::Ftoi {
+                                builder.ins().fcvt_to_sint_sat(types::I64, f)
+                            } else {
+                                builder.ins().fcvt_to_uint_sat(types::I64, f)
+                            };
+                            r = builder.ins().insertlane(r, v, i);
+                        }
+                        r
                     }
-                    VUnaryOp::Ftoi => {
-                        let x = as_lanes(builder, p, Type::F32);
-                        builder.ins().fcvt_to_sint_sat(types::I32X4, x)
-                    }
-                    _ => {
-                        let x = as_lanes(builder, p, Type::F32);
-                        vexp_f32x4(builder, x)
-                    }
+                    VUnaryOp::Ftoi => builder.ins().fcvt_to_sint_sat(to, x),
+                    VUnaryOp::Ftoui => builder.ins().fcvt_to_uint_sat(to, x),
+                    _ => vexp_f32x4(builder, x),
                 };
                 to_part(builder, r)
             })
@@ -588,13 +599,28 @@ fn vunary_parts(
                 .map(|&p| shuffle_lanes(builder, p, p, lane, |j| m - 1 - j))
                 .collect()
         }
-        VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
+        VUnaryOp::WidenLo
+        | VUnaryOp::WidenHi
+        | VUnaryOp::UWidenLo
+        | VUnaryOp::UWidenHi
+        | VUnaryOp::FWidenLo
+        | VUnaryOp::FWidenHi => {
             let narrow = op.source_lane(lane);
             let lo = op.is_low_half();
-            // One half of a part's lanes, widened: sign-extended integers, or f16/bf16 bits
-            // zero-extended to i32 and converted to f32.
+            let unsigned = matches!(op, VUnaryOp::UWidenLo | VUnaryOp::UWidenHi);
+            // One half of a part's lanes, widened: sign- or zero-extended integers, f32 to
+            // f64, or f16/bf16 bits zero-extended to i32 and converted to f32.
             let widen = |b: &mut FunctionBuilder, x: ClifValue, low: bool| -> ClifValue {
                 let r = match narrow {
+                    Type::F32 => {
+                        let x = if low {
+                            x
+                        } else {
+                            let hi = shuffle_lanes(b, x, x, Type::F32, |j| 2 + j % 2);
+                            as_lanes(b, hi, Type::F32)
+                        };
+                        b.ins().fvpromote_low(x)
+                    }
                     Type::F16 | Type::BF16 => {
                         let bits = if low {
                             b.ins().uwiden_low(x)
@@ -608,6 +634,8 @@ fn vunary_parts(
                             b.ins().bitcast(types::F32X4, bitcast_flags(), bits)
                         }
                     }
+                    _ if unsigned && low => b.ins().uwiden_low(x),
+                    _ if unsigned => b.ins().uwiden_high(x),
                     _ if low => b.ins().swiden_low(x),
                     _ => b.ins().swiden_high(x),
                 };
@@ -874,6 +902,9 @@ fn vbinary_part(
         (VBinOp::Min, false) => builder.ins().smin(a, b),
         (VBinOp::Max, true) => float_minmax(builder, true, fast, a, b),
         (VBinOp::Max, false) => builder.ins().smax(a, b),
+        // The validator only allows integer lanes for vumin/vumax.
+        (VBinOp::Umin, _) => builder.ins().umin(a, b),
+        (VBinOp::Umax, _) => builder.ins().umax(a, b),
         // The validator only allows float lanes for vdiv.
         (VBinOp::Div, _) => builder.ins().fdiv(a, b),
         (VBinOp::Copysign, _) => copysign(builder, a, b),
@@ -899,6 +930,8 @@ fn vcmp_part(
             VCmpOp::Gt => FloatCC::GreaterThan,
             VCmpOp::Le => FloatCC::LessThanOrEqual,
             VCmpOp::Ge => FloatCC::GreaterThanOrEqual,
+            // The validator only allows integer lanes for unsigned compares.
+            VCmpOp::Ult | VCmpOp::Ugt | VCmpOp::Ule | VCmpOp::Uge => unreachable!(),
         };
         builder.ins().fcmp(cc, a, b)
     } else {
@@ -909,6 +942,10 @@ fn vcmp_part(
             VCmpOp::Gt => IntCC::SignedGreaterThan,
             VCmpOp::Le => IntCC::SignedLessThanOrEqual,
             VCmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+            VCmpOp::Ult => IntCC::UnsignedLessThan,
+            VCmpOp::Ugt => IntCC::UnsignedGreaterThan,
+            VCmpOp::Ule => IntCC::UnsignedLessThanOrEqual,
+            VCmpOp::Uge => IntCC::UnsignedGreaterThanOrEqual,
         };
         builder.ins().icmp(cc, a, b)
     };
@@ -2296,6 +2333,25 @@ pub fn lower_function<M: ClifModule>(
                     let scalar_val = builder.ins().extractlane(lanes, index);
                     values.insert(dst.clone(), (vec![scalar_val], *ty));
                 }
+                Instruction::InsertLane {
+                    dst,
+                    vec,
+                    val,
+                    lane,
+                    ty,
+                    ..
+                } => {
+                    let (mut vec_parts, vec_ty) = parts(&values, vec);
+                    let (x, _) = scalar(&values, val);
+                    let lane_bytes = ty.byte_size() as u32;
+                    let byte = lane * lane_bytes;
+                    let k = (byte / 16) as usize;
+                    let index = ((byte % 16) / lane_bytes) as u8;
+                    let lanes = as_lanes(&mut builder, vec_parts[k], *ty);
+                    let r = builder.ins().insertlane(lanes, x, index);
+                    vec_parts[k] = to_part(&mut builder, r);
+                    values.insert(dst.clone(), (vec_parts, vec_ty));
+                }
                 Instruction::VDup {
                     dst, vec, lane, ty, ..
                 } => {
@@ -2712,6 +2768,17 @@ pub fn lower_function<M: ClifModule>(
                                     let yb = f(&mut builder, y);
                                     builder.ins().unarrow(xb, yb)
                                 }
+                                // Each f64 pair to the low two f32 lanes (the rest zero).
+                                Type::F32 => {
+                                    let xd = builder.ins().fvdemote(x);
+                                    let yd = builder.ins().fvdemote(y);
+                                    let xd = to_part(&mut builder, xd);
+                                    let yd = to_part(&mut builder, yd);
+                                    let r = shuffle_lanes(&mut builder, xd, yd, Type::F32, |j| {
+                                        (j / 2) * 4 + j % 2
+                                    });
+                                    as_lanes(&mut builder, r, Type::F32)
+                                }
                                 _ => builder.ins().snarrow(x, y),
                             };
                             to_part(&mut builder, r)
@@ -2728,18 +2795,31 @@ pub fn lower_function<M: ClifModule>(
                     ..
                 } => {
                     let (src_parts, vec_ty) = parts(&values, src);
-                    let (n, _) = scalar(&values, amount);
-                    // Vector shifts take the amount modulo the lane width, as AIR defines.
+                    let (amount_parts, amount_ty) = parts(&values, amount);
+                    // Shifts take the amount modulo the lane width, as AIR defines. Cranelift
+                    // vector shifts take one amount, so per-lane amounts shift lane by lane.
+                    let shift = |b: &mut FunctionBuilder, x: ClifValue, n: ClifValue| match op {
+                        VShiftOp::Shl => b.ins().ishl(x, n),
+                        VShiftOp::Shr => b.ins().sshr(x, n),
+                        VShiftOp::Ushr => b.ins().ushr(x, n),
+                    };
                     let out = src_parts
                         .into_iter()
-                        .map(|p| {
-                            let x = as_lanes(&mut builder, p, *lane);
-                            let r = match op {
-                                VShiftOp::Shl => builder.ins().ishl(x, n),
-                                VShiftOp::Shr => builder.ins().sshr(x, n),
-                                VShiftOp::Ushr => builder.ins().ushr(x, n),
-                            };
-                            to_part(&mut builder, r)
+                        .enumerate()
+                        .map(|(k, p)| {
+                            let mut x = as_lanes(&mut builder, p, *lane);
+                            if !amount_ty.is_vector() {
+                                let r = shift(&mut builder, x, amount_parts[0]);
+                                return to_part(&mut builder, r);
+                            }
+                            let n = as_lanes(&mut builder, amount_parts[k], *lane);
+                            for i in 0..(16 / lane.byte_size()) as u8 {
+                                let xi = builder.ins().extractlane(x, i);
+                                let ni = builder.ins().extractlane(n, i);
+                                let r = shift(&mut builder, xi, ni);
+                                x = builder.ins().insertlane(x, r, i);
+                            }
+                            to_part(&mut builder, x)
                         })
                         .collect();
                     values.insert(dst.clone(), (out, vec_ty));

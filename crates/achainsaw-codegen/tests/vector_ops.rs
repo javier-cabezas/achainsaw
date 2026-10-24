@@ -15,8 +15,8 @@ use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, Vector
 use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::{
-    vbin_lane_types, vnarrow_source_lane, vunary_lane_types, VFMA_LANE_TYPES, VNARROW_LANE_TYPES,
-    VPERM_LANE_TYPES, VSHIFT_LANE_TYPES,
+    vbin_lane_types, vcmp_lane_types, vnarrow_source_lane, vunary_lane_types, VFMA_LANE_TYPES,
+    VNARROW_LANE_TYPES, VPERM_LANE_TYPES, VSHIFT_LANE_TYPES,
 };
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
@@ -55,6 +55,10 @@ enum Kernel {
     Narrow(Type, Type),
     /// Shift amount: the i32 at `pc`.
     Shift(VShiftOp, Type, Type),
+    /// Per-lane shift amounts: the lanes of the vector at `pc`.
+    ShiftV(VShiftOp, Type, Type),
+    /// `inslane a, s, i:lane` with `s` the scalar at `pb`: lane type, width, lane index.
+    Ins(Type, Type, u32),
     /// `vmin`/`vmax` compiled with `fast_math` (compare and select).
     FastBin(VBinOp, Type, Type),
     /// `vminr`/`vmaxr` compiled with `fast_math`.
@@ -80,6 +84,8 @@ impl Kernel {
             Kernel::Unary(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
             Kernel::Narrow(l, w) => format!("k_vnarrow_{l}_{w}"),
             Kernel::Shift(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
+            Kernel::ShiftV(op, l, w) => format!("k_{}v_{l}_{w}", op.as_str()),
+            Kernel::Ins(l, w, i) => format!("k_inslane{i}_{l}_{w}"),
             Kernel::FastBin(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
             Kernel::FastReduce(op, l, w) => format!("k_fast_{}_{l}_{w}", op.as_str()),
             Kernel::Zip(op, l, w) => format!("k_{}_{l}_{w}", op.as_str()),
@@ -105,6 +111,10 @@ impl Kernel {
                 "    a = ld pa:{w}\n    n = ld pc:i32\n    r = {} a, n:{l}\n",
                 op.as_str()
             ),
+            Kernel::ShiftV(op, l, w) => format!("{}    r = {} a, c:{l}\n", loads(*w), op.as_str()),
+            Kernel::Ins(l, w, i) => {
+                format!("    a = ld pa:{w}\n    s = ld pb:{l}\n    r = inslane a, s, {i}:{l}\n")
+            }
             Kernel::FastBin(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
             Kernel::FastReduce(op, l, w) => format!("{}    r = {} a:{l}\n", loads(*w), op.as_str()),
             Kernel::Zip(op, l, w) => format!("{}    r = {} a, b:{l}\n", loads(*w), op.as_str()),
@@ -133,6 +143,8 @@ impl Kernel {
             | Kernel::Unary(_, l, _)
             | Kernel::Narrow(l, _)
             | Kernel::Shift(_, l, _)
+            | Kernel::ShiftV(_, l, _)
+            | Kernel::Ins(l, _, _)
             | Kernel::FastBin(_, l, _)
             | Kernel::FastReduce(_, l, _)
             | Kernel::Zip(_, l, _)
@@ -169,6 +181,8 @@ impl Kernel {
             | Kernel::Unary(_, _, w)
             | Kernel::Narrow(_, w)
             | Kernel::Shift(_, _, w)
+            | Kernel::ShiftV(_, _, w)
+            | Kernel::Ins(_, w, _)
             | Kernel::FastBin(_, _, w)
             | Kernel::FastReduce(_, _, w)
             | Kernel::Zip(_, _, w)
@@ -198,10 +212,12 @@ impl Kernel {
             | Kernel::Unary(..)
             | Kernel::FastBin(..)
             | Kernel::FastReduce(..) => self.out_lane().is_float(),
-            Kernel::Narrow(l, _) => l.is_half(),
+            Kernel::Narrow(l, _) => l.is_half() || l.is_float(),
             Kernel::Cmp(..)
             | Kernel::Sel(..)
             | Kernel::Shift(..)
+            | Kernel::ShiftV(..)
+            | Kernel::Ins(..)
             | Kernel::Zip(..)
             | Kernel::Dup(..)
             | Kernel::Dot(..)
@@ -219,7 +235,7 @@ fn all_kernels() -> Vec<Kernel> {
             }
         }
         for op in VCmpOp::ALL {
-            for l in LANES {
+            for &l in vcmp_lane_types(op) {
                 ks.push(Kernel::Cmp(op, l, w));
             }
         }
@@ -246,6 +262,7 @@ fn all_kernels() -> Vec<Kernel> {
         for op in VShiftOp::ALL {
             for &l in VSHIFT_LANE_TYPES {
                 ks.push(Kernel::Shift(op, l, w));
+                ks.push(Kernel::ShiftV(op, l, w));
             }
         }
         for &l in VPERM_LANE_TYPES {
@@ -256,8 +273,11 @@ fn all_kernels() -> Vec<Kernel> {
             let lanes = w.bit_width().unwrap_or(128) / l.bit_width().unwrap();
             let mut indices = vec![0, lanes / 2, lanes - 1];
             indices.dedup();
-            for i in indices {
+            for &i in &indices {
                 ks.push(Kernel::Dup(l, w, i));
+                if l.is_lane() {
+                    ks.push(Kernel::Ins(l, w, i));
+                }
             }
         }
         ks.push(Kernel::Dot(w));
@@ -425,6 +445,8 @@ fn int_bin(op: VBinOp, lane: Type, a: i64, b: i64) -> i64 {
         VBinOp::And => a & b,
         VBinOp::Or => a | b,
         VBinOp::Xor => a ^ b,
+        VBinOp::Umin => unsigned(lane, a).min(unsigned(lane, b)) as i64,
+        VBinOp::Umax => unsigned(lane, a).max(unsigned(lane, b)) as i64,
         VBinOp::Div | VBinOp::Copysign => unreachable!("float-only, rejected by the validator"),
     };
     lane.wrap_int(r)
@@ -449,14 +471,25 @@ macro_rules! float_bin {
 float_bin!(f32_bin, f32, fmin32, fmax32);
 float_bin!(f64_bin, f64, fmin64, fmax64);
 
+/// An integer lane's bits as an unsigned value.
+fn unsigned(lane: Type, x: i64) -> u64 {
+    let bits = lane.bit_width().unwrap();
+    if bits == 64 {
+        x as u64
+    } else {
+        x as u64 & ((1u64 << bits) - 1)
+    }
+}
+
 fn cmp<T: PartialOrd>(op: VCmpOp, a: T, b: T) -> bool {
     match op {
         VCmpOp::Eq => a == b,
         VCmpOp::Ne => a != b,
-        VCmpOp::Lt => a < b,
-        VCmpOp::Gt => a > b,
-        VCmpOp::Le => a <= b,
-        VCmpOp::Ge => a >= b,
+        // The caller passes unsigned values for the unsigned comparisons.
+        VCmpOp::Lt | VCmpOp::Ult => a < b,
+        VCmpOp::Gt | VCmpOp::Ugt => a > b,
+        VCmpOp::Le | VCmpOp::Ule => a <= b,
+        VCmpOp::Ge | VCmpOp::Uge => a >= b,
     }
 }
 
@@ -501,6 +534,11 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 let t = match l {
                     Type::F32 => cmp(op, get_f32(a, i), get_f32(b, i)),
                     Type::F64 => cmp(op, get_f64(a, i), get_f64(b, i)),
+                    _ if op.is_unsigned() => cmp(
+                        op,
+                        unsigned(l, get_int(a, l, i)),
+                        unsigned(l, get_int(b, l, i)),
+                    ),
                     _ => cmp(op, get_int(a, l, i), get_int(b, l, i)),
                 };
                 put_int(
@@ -562,15 +600,41 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             }
         }
         Kernel::Unary(op, l, _) => match op {
-            VUnaryOp::Itof => {
+            // Correctly rounded, as Rust's `as`.
+            VUnaryOp::Itof | VUnaryOp::Uitof => {
+                let src = op.source_lane(l);
                 for i in 0..n {
-                    let r = get_int(a, Type::I32, i) as f32;
-                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                    let x = get_int(a, src, i);
+                    if l == Type::F32 {
+                        // 32-bit integers are exact in f64, so this rounds once.
+                        let x = if op == VUnaryOp::Uitof {
+                            unsigned(src, x) as f64
+                        } else {
+                            x as f64
+                        };
+                        out[i * 4..i * 4 + 4].copy_from_slice(&(x as f32).to_le_bytes());
+                    } else {
+                        let r = if op == VUnaryOp::Uitof {
+                            x as u64 as f64
+                        } else {
+                            x as f64
+                        };
+                        out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                    }
                 }
             }
-            // Saturating, NaN to 0, exactly as Rust's `as`.
-            VUnaryOp::Ftoi => {
-                (0..n).for_each(|i| put_int(&mut out, l, i, get_f32(a, i) as i32 as i64))
+            // Saturating, NaN to 0 (and negative values to 0 for `vftoui`), exactly as
+            // Rust's `as`.
+            VUnaryOp::Ftoi | VUnaryOp::Ftoui => {
+                for i in 0..n {
+                    let r = match (op, l) {
+                        (VUnaryOp::Ftoi, Type::I32) => get_f32(a, i) as i32 as i64,
+                        (VUnaryOp::Ftoui, Type::I32) => get_f32(a, i) as u32 as i64,
+                        (VUnaryOp::Ftoi, _) => get_f64(a, i) as i64,
+                        _ => get_f64(a, i) as u64 as i64,
+                    };
+                    put_int(&mut out, l, i, r);
+                }
             }
             VUnaryOp::Exp => {
                 for i in 0..n {
@@ -578,11 +642,22 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                     out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
                 }
             }
-            VUnaryOp::WidenLo | VUnaryOp::WidenHi => {
+            VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi => {
                 let narrow = op.source_lane(l);
-                let base = if op == VUnaryOp::WidenLo { 0 } else { n };
+                let base = if op.is_low_half() { 0 } else { n };
+                let zext = matches!(op, VUnaryOp::UWidenLo | VUnaryOp::UWidenHi);
                 for i in 0..n {
-                    put_int(&mut out, l, i, get_int(a, narrow, base + i));
+                    let x = get_int(a, narrow, base + i);
+                    let x = if zext { unsigned(narrow, x) as i64 } else { x };
+                    put_int(&mut out, l, i, x);
+                }
+            }
+            // f32 to f64 is exact.
+            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi if l == Type::F32 => {
+                let base = if op.is_low_half() { 0 } else { n };
+                for i in 0..n {
+                    let r = get_f32(a, base + i) as f64;
+                    out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
                 }
             }
             VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
@@ -698,6 +773,15 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 out[i * s..i * s + s].copy_from_slice(&a[k * s..k * s + s]);
             }
         }
+        // f64 to f32, rounding to nearest-even as Rust's `as`.
+        Kernel::Narrow(Type::F32, _) => {
+            let half = w / 8;
+            for i in 0..half {
+                let (x, y) = (get_f64(a, i) as f32, get_f64(b, i) as f32);
+                out[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                out[(half + i) * 4..(half + i) * 4 + 4].copy_from_slice(&y.to_le_bytes());
+            }
+        }
         Kernel::Narrow(l, _) if l.is_half() => {
             let half = w / 4;
             for i in 0..half {
@@ -748,10 +832,15 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 out[..8].copy_from_slice(&r.to_le_bytes());
             }
         }
-        Kernel::Shift(op, l, _) => {
+        Kernel::Ins(l, _, k) => {
+            let (s, k) = (l.byte_size(), k as usize);
+            out[..w].copy_from_slice(&a[..w]);
+            out[k * s..k * s + s].copy_from_slice(&b[..s]);
+        }
+        Kernel::Shift(op, l, _) | Kernel::ShiftV(op, l, _) => {
             let bits = l.bit_width().unwrap() as u64;
-            let amount =
-                (i32::from_le_bytes(c[..4].try_into().unwrap()) as u64 & (bits - 1)) as u32;
+            let per_lane = matches!(k, Kernel::ShiftV(..));
+            let scalar = i32::from_le_bytes(c[..4].try_into().unwrap()) as i64;
             let mask = if bits == 64 {
                 u64::MAX
             } else {
@@ -759,6 +848,8 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             };
             for i in 0..n {
                 let x = get_int(a, l, i);
+                let amount = if per_lane { get_int(c, l, i) } else { scalar };
+                let amount = (amount as u64 & (bits - 1)) as u32;
                 let r = match op {
                     VShiftOp::Shl => x.wrapping_shl(amount),
                     VShiftOp::Shr => x >> amount,

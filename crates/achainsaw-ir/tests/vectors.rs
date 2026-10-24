@@ -72,6 +72,27 @@ fn k(pa:ptr, po:ptr)->f64
     st po, dt
     du = vdotu c, a, b:i8
     st po, du
+    un = vumin a, b:i8
+    ux = vumax un, b:i32
+    ul2 = vult ux, a:i64
+    ug = vugt ul2, a:i8
+    ue = vule ug, a:i16
+    uq = vuge ue, a:i32
+    uw = vuwidenlo uq:i16
+    uv = vuwidenhi uw:i64
+    uf = vuitof uv:f32
+    ud = vitof uf:f64
+    ui = vftoui ud:i32
+    uj = vftoi ui:i64
+    dw = vfwidenlo uj:f32
+    dh = vfwidenhi dw:f32
+    dn = vnarrow dw, dh:f32
+    sv = vshl dn, a:i16
+    st po, sv
+    s8 = cst 2:i8
+    il = inslane a, s8, 31:i8
+    fl = inslane il, 2.5:f64, 3:f64
+    st po, fl
     ret t
 "#;
 
@@ -158,6 +179,9 @@ fn text_and_airb_round_trip() {
     assert!(text.contains("fi = vitof a:f32"), "{text}");
     assert!(text.contains("nr = vnarrow wl, wh:i8"));
     assert!(text.contains("sl = vshl nr, amt:i32"));
+    assert!(text.contains("sv = vshl dn, a:i16"), "{text}");
+    assert!(text.contains("il = inslane a, s8, 31:i8"), "{text}");
+    assert!(text.contains("dn = vnarrow dw, dh:f32"), "{text}");
     assert!(text.contains("hb = vfwidenhi a:bf16"), "{text}");
     assert!(text.contains("nh = vnarrow hf, hb:f16"));
     assert!(text.contains("hm = ldm pa:vx, hn:f16"));
@@ -277,14 +301,41 @@ fn conversion_shift_and_exp_rules() {
         format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
     };
     // Conversions name the result lane type and support only some.
-    assert_eq!(
-        err_code(&one("    r = vitof a:f64\n")),
-        "ERR_INVALID_LANE_TYPE"
-    );
-    assert_eq!(
-        err_code(&one("    r = vftoi a:i64\n")),
-        "ERR_INVALID_LANE_TYPE"
-    );
+    for bad in [
+        "r = vitof a:i64",
+        "r = vuitof a:i32",
+        "r = vftoi a:f64",
+        "r = vftoui a:i16",
+        "r = vuwidenlo a:i8",
+        "r = vfwidenlo a:f64",
+        "r = vnarrow a, b:f64",
+        "r = vult a, b:f32",
+        "r = vuge a, b:f64",
+        "r = vumin a, b:i64",
+        "r = vumax a, b:f32",
+    ] {
+        assert_eq!(
+            err_code(&one(&format!("    {bad}\n"))),
+            "ERR_INVALID_LANE_TYPE",
+            "{bad}"
+        );
+    }
+    for ok in [
+        "r = vitof a:f64",
+        "r = vuitof a:f32",
+        "r = vftoi a:i64",
+        "r = vftoui a:i32",
+        "r = vuwidenhi a:i64",
+        "r = vfwidenhi a:f32",
+        "r = vnarrow a, b:f32",
+        "r = vule a, b:i64",
+        "r = vumax a, b:i8",
+    ] {
+        assert!(
+            parse_and_validate(&one(&format!("    {ok}\n"))).is_ok(),
+            "{ok}"
+        );
+    }
     assert_eq!(
         err_code(&one("    r = vwidenlo a:i8\n")),
         "ERR_INVALID_LANE_TYPE"
@@ -307,8 +358,14 @@ fn conversion_shift_and_exp_rules() {
         err_code("fn k(p:ptr, x:f32)\n  b0:\n    r = vexp x:f32\n    st p, r\n    ret\n"),
         "ERR_TYPE_MISMATCH"
     );
+    // The amount is a scalar integer or a vector of the operand's type (per-lane amounts).
+    assert!(parse_and_validate(&one("    r = vshl a, b:i32\n")).is_ok());
     assert_eq!(
-        err_code(&one("    r = vshl a, b:i32\n")),
+        err_code("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v128\n    r = vshl a, b:i32\n    st p, r\n    ret\n"),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code("fn k(p:ptr, x:f32)\n  b0:\n    a = ld p:v256\n    r = vushr a, x:i32\n    st p, r\n    ret\n"),
         "ERR_TYPE_MISMATCH"
     );
     assert_eq!(
@@ -319,6 +376,46 @@ fn conversion_shift_and_exp_rules() {
     assert!(parse_and_validate(&one("    r = vshl a, 31:i32\n")).is_ok());
     // The new mnemonics are still ordinary register names.
     let src = "fn k(vexp:i32, vshl:i32)->i32\n  b0:\n    vnarrow = add vexp, vshl\n    vitof = mul vnarrow, vexp\n    ret vitof\n";
+    assert!(parse_and_validate(src).is_ok());
+}
+
+#[test]
+fn insert_lane_rules() {
+    let one = |body: &str| {
+        format!("fn k(p:ptr, x:f32, y:i64)\n  b0:\n    a = ld p:v256\n    v = ld p:vx\n{body}    st p, r\n    ret\n")
+    };
+    assert!(parse_and_validate(&one("    r = inslane a, x, 7:f32\n")).is_ok());
+    assert!(parse_and_validate(&one("    r = inslane v, y, 1:i64\n")).is_ok());
+    assert!(parse_and_validate(&one("    r = inslane a, 1.5:f32, 0:f32\n")).is_ok());
+    // The index is checked like extlane's: within the width, and within 128 bits for vx.
+    assert_eq!(
+        err_code(&one("    r = inslane a, x, 8:f32\n")),
+        "ERR_OUT_OF_BOUNDS_LANE"
+    );
+    assert_eq!(
+        err_code(&one("    r = inslane v, y, 2:i64\n")),
+        "ERR_OUT_OF_BOUNDS_LANE"
+    );
+    // The value has the lane type, and the lanes are arithmetic.
+    assert_eq!(
+        err_code(&one("    r = inslane a, y, 0:f32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&one("    r = inslane a, x, 0:f16\n")),
+        "ERR_INVALID_LANE_TYPE"
+    );
+    assert_eq!(
+        err_code(&one("    r = inslane x, x, 0:f32\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        err_code(&one("    r = inslane a, x, y:f32\n")),
+        "ERR_EXPECTED_LANE_INDEX"
+    );
+    // The new mnemonics are still ordinary register names.
+    let src =
+        "fn k(inslane:i32, vult:i32)->i32\n  b0:\n    vumin = add inslane, vult\n    ret vumin\n";
     assert!(parse_and_validate(src).is_ok());
 }
 

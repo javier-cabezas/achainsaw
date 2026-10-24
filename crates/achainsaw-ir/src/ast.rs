@@ -122,7 +122,8 @@ impl BinaryOp {
     }
 }
 
-/// Lane-wise vector binary op: `r = vadd a, b:f32`.
+/// Lane-wise vector binary op: `r = vadd a, b:f32`. `vumin`/`vumax` compare integer lanes
+/// as unsigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VBinOp {
     Add,
@@ -135,10 +136,13 @@ pub enum VBinOp {
     Or,
     Xor,
     Copysign,
+    Umin,
+    Umax,
 }
 
 impl VBinOp {
-    pub const ALL: [VBinOp; 10] = [
+    /// Every op, in AIRB encoding order (append new ops at the end).
+    pub const ALL: [VBinOp; 12] = [
         VBinOp::Add,
         VBinOp::Sub,
         VBinOp::Mul,
@@ -149,6 +153,8 @@ impl VBinOp {
         VBinOp::Or,
         VBinOp::Xor,
         VBinOp::Copysign,
+        VBinOp::Umin,
+        VBinOp::Umax,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -167,6 +173,8 @@ impl VBinOp {
             VBinOp::Or => "vor",
             VBinOp::Xor => "vxor",
             VBinOp::Copysign => "vcopysign",
+            VBinOp::Umin => "vumin",
+            VBinOp::Umax => "vumax",
         }
     }
 
@@ -175,7 +183,8 @@ impl VBinOp {
     }
 }
 
-/// Lane-wise vector comparison producing all-ones (true) or all-zeros (false) lanes.
+/// Lane-wise vector comparison producing all-ones (true) or all-zeros (false) lanes. Integer
+/// lanes compare as signed, except in `vult`, `vugt`, `vule` and `vuge` (integer lanes only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VCmpOp {
     Eq,
@@ -184,16 +193,25 @@ pub enum VCmpOp {
     Gt,
     Le,
     Ge,
+    Ult,
+    Ugt,
+    Ule,
+    Uge,
 }
 
 impl VCmpOp {
-    pub const ALL: [VCmpOp; 6] = [
+    /// Every op, in AIRB encoding order (append new ops at the end).
+    pub const ALL: [VCmpOp; 10] = [
         VCmpOp::Eq,
         VCmpOp::Ne,
         VCmpOp::Lt,
         VCmpOp::Gt,
         VCmpOp::Le,
         VCmpOp::Ge,
+        VCmpOp::Ult,
+        VCmpOp::Ugt,
+        VCmpOp::Ule,
+        VCmpOp::Uge,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -208,7 +226,16 @@ impl VCmpOp {
             VCmpOp::Gt => "vgt",
             VCmpOp::Le => "vle",
             VCmpOp::Ge => "vge",
+            VCmpOp::Ult => "vult",
+            VCmpOp::Ugt => "vugt",
+            VCmpOp::Ule => "vule",
+            VCmpOp::Uge => "vuge",
         }
+    }
+
+    /// Whether the op compares integer lanes as unsigned.
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, VCmpOp::Ult | VCmpOp::Ugt | VCmpOp::Ule | VCmpOp::Uge)
     }
 }
 
@@ -330,12 +357,14 @@ impl CastOp {
 }
 
 /// Vector op with one operand. Like scalar casts, the suffix names the result lane
-/// type: `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN
-/// to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends the low / high half of the
-/// narrower lanes), `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
-/// The exception is `w = vfwidenlo v:f16` / `vfwidenhi` (also `:bf16`): the result is always
-/// f32, so the suffix names the 16-bit float lanes whose low / high half is widened (exactly;
-/// a NaN stays a NaN, its payload unspecified).
+/// type: `f = vitof v:f32` (i32 lanes to f32; `:f64` from i64), `i = vftoi v:i32` (f32 to
+/// i32, saturating, NaN to 0; `:i64` from f64), `vuitof` / `vftoui` the same with unsigned
+/// integers (negative floats and NaN to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends
+/// the low / high half of the narrower lanes; `vuwidenlo` / `vuwidenhi` zero-extend),
+/// `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
+/// The exception is `w = vfwidenlo v:f16` / `vfwidenhi` (also `:bf16`, and `:f32` to f64):
+/// the result is the wider float, so the suffix names the float lanes whose low / high half
+/// is widened (exactly; a NaN stays a NaN, its payload unspecified).
 /// `vabs` and `vneg` wrap on integers (`vabs` of the minimum is the minimum) and clear or flip
 /// the sign bit of floats; `vsqrt` is IEEE's correctly rounded square root and `vrsqrt` is
 /// `1 / vsqrt(x)` (two roundings, not a hardware estimate, so results are identical
@@ -359,11 +388,15 @@ pub enum VUnaryOp {
     Round,
     RoundEven,
     RoundZ,
+    UWidenLo,
+    UWidenHi,
+    Uitof,
+    Ftoui,
 }
 
 impl VUnaryOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VUnaryOp; 17] = [
+    pub const ALL: [VUnaryOp; 21] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
@@ -381,6 +414,10 @@ impl VUnaryOp {
         VUnaryOp::Round,
         VUnaryOp::RoundEven,
         VUnaryOp::RoundZ,
+        VUnaryOp::UWidenLo,
+        VUnaryOp::UWidenHi,
+        VUnaryOp::Uitof,
+        VUnaryOp::Ftoui,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -406,6 +443,10 @@ impl VUnaryOp {
             VUnaryOp::Round => "vround",
             VUnaryOp::RoundEven => "vroundeven",
             VUnaryOp::RoundZ => "vroundz",
+            VUnaryOp::UWidenLo => "vuwidenlo",
+            VUnaryOp::UWidenHi => "vuwidenhi",
+            VUnaryOp::Uitof => "vuitof",
+            VUnaryOp::Ftoui => "vftoui",
         }
     }
 
@@ -413,20 +454,30 @@ impl VUnaryOp {
     pub fn is_widen(&self) -> bool {
         matches!(
             self,
-            VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi
+            VUnaryOp::WidenLo
+                | VUnaryOp::WidenHi
+                | VUnaryOp::UWidenLo
+                | VUnaryOp::UWidenHi
+                | VUnaryOp::FWidenLo
+                | VUnaryOp::FWidenHi
         )
     }
 
-    /// Whether the op works on the low half of its source lanes (`vwidenlo`, `vfwidenlo`).
+    /// Whether the op works on the low half of its source lanes (`vwidenlo`, `vuwidenlo`,
+    /// `vfwidenlo`).
     pub fn is_low_half(&self) -> bool {
-        matches!(self, VUnaryOp::WidenLo | VUnaryOp::FWidenLo)
+        matches!(
+            self,
+            VUnaryOp::WidenLo | VUnaryOp::UWidenLo | VUnaryOp::FWidenLo
+        )
     }
 
     /// Lane type of the result for the op's suffix `lane` (the suffix itself, except for
-    /// `vfwiden*`, whose suffix names the source).
+    /// `vfwiden*`, whose suffix names the source: f64 from f32, else f32).
     pub fn result_lane(&self, lane: Type) -> Type {
-        match self {
-            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => Type::F32,
+        match (self, lane) {
+            (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, Type::F32) => Type::F64,
+            (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, _) => Type::F32,
             _ => lane,
         }
     }
@@ -435,11 +486,22 @@ impl VUnaryOp {
     pub fn source_lane(&self, lane: Type) -> Type {
         match (self, lane) {
             (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, _) => lane,
-            (VUnaryOp::Itof, _) => Type::I32,
-            (VUnaryOp::Ftoi, _) => Type::F32,
-            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I16) => Type::I8,
-            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, Type::I32) => Type::I16,
-            (VUnaryOp::WidenLo | VUnaryOp::WidenHi, _) => Type::I32,
+            (VUnaryOp::Itof | VUnaryOp::Uitof, Type::F64) => Type::I64,
+            (VUnaryOp::Itof | VUnaryOp::Uitof, _) => Type::I32,
+            (VUnaryOp::Ftoi | VUnaryOp::Ftoui, Type::I64) => Type::F64,
+            (VUnaryOp::Ftoi | VUnaryOp::Ftoui, _) => Type::F32,
+            (
+                VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi,
+                Type::I16,
+            ) => Type::I8,
+            (
+                VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi,
+                Type::I32,
+            ) => Type::I16,
+            (
+                VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi,
+                _,
+            ) => Type::I32,
             (VUnaryOp::Exp, _) => Type::F32,
             (
                 VUnaryOp::Abs
@@ -483,8 +545,10 @@ pub mod vexp {
     pub const EXP_BIAS: i32 = 127 - 0x4B40_0000;
 }
 
-/// Lane-wise shift by a scalar amount, taken modulo the lane width as for scalar shifts:
-/// `r = vshl v, n:i32` (`vshr` arithmetic, `vushr` logical).
+/// Lane-wise shift, the amount taken modulo the lane width as for scalar shifts:
+/// `r = vshl v, n:i32` (`vshr` arithmetic, `vushr` logical). The amount is an integer
+/// scalar, the same for every lane, or a vector of `v`'s type giving each lane's amount in
+/// the matching lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VShiftOp {
     Shl,
@@ -660,6 +724,16 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
+    /// `r = inslane v, x, 3:f32`: `vec` with lane `lane` (lanes of type `ty`) replaced by the
+    /// scalar `val`. The index is checked like `extlane`'s.
+    InsertLane {
+        dst: String,
+        vec: String,
+        val: String,
+        lane: u32,
+        ty: Type,
+        span: Span,
+    },
     // Memory Management Intrinsics
     Alloc {
         dst: String,
@@ -757,7 +831,8 @@ pub enum Instruction {
         lane: Type,
         span: Span,
     },
-    /// Lane-wise shift of `src` by the scalar `amount` (see `VShiftOp`).
+    /// Lane-wise shift of `src` by `amount`, a scalar or a vector of per-lane amounts (see
+    /// `VShiftOp`).
     VShift {
         op: VShiftOp,
         dst: String,
@@ -851,6 +926,7 @@ impl Instruction {
             | Instruction::Par { span, .. }
             | Instruction::Splat { span, .. }
             | Instruction::ExtractLane { span, .. }
+            | Instruction::InsertLane { span, .. }
             | Instruction::Alloc { span, .. }
             | Instruction::Free { span, .. }
             | Instruction::Unary { span, .. }
@@ -892,6 +968,7 @@ impl Instruction {
             | Instruction::Load { dst, .. }
             | Instruction::Splat { dst, .. }
             | Instruction::ExtractLane { dst, .. }
+            | Instruction::InsertLane { dst, .. }
             | Instruction::Alloc { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
@@ -930,6 +1007,7 @@ impl Instruction {
             | Instruction::Load { dst, .. }
             | Instruction::Splat { dst, .. }
             | Instruction::ExtractLane { dst, .. }
+            | Instruction::InsertLane { dst, .. }
             | Instruction::Alloc { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
@@ -995,6 +1073,7 @@ impl Instruction {
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
+            Instruction::InsertLane { vec, val, .. } => vec![vec, val],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
                 cond: a,
@@ -1060,6 +1139,7 @@ impl Instruction {
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
+            Instruction::InsertLane { vec, val, .. } => vec![vec, val],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
                 cond: a,
