@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use achainsaw_ir::ast::{
-    vexp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Module, Terminator, UnaryOp,
-    VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
+    vexp, AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Module, Terminator,
+    UnaryOp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
 use anyhow::{anyhow, Result};
@@ -25,7 +25,7 @@ use inkwell::values::{
     AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
     InstructionOpcode, IntValue, PhiValue, PointerValue,
 };
-use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
+use inkwell::{AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate};
 
 /// Runtime hook symbols referenced by JIT code (see `achainsaw-codegen/src/jit.rs`).
 pub const RT_MALLOC: &str = "__achainsaw_rt_malloc";
@@ -965,6 +965,28 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(())
     }
 
+    /// Sandbox checks of an atomic access of `size` bytes at `addr`: in bounds, and aligned
+    /// to `size` (a misaligned one reports its size with `MISALIGNED_FAULT` set).
+    fn atomic_checks(&self, st: &FnState<'ctx>, addr: IntValue<'ctx>, size: u64) -> Result<()> {
+        self.bounds_check(st, addr, self.c64(size as i64))?;
+        let (Some(_), Some((fault, addr_phi, size_phi)), true) =
+            (self.opts.sandbox, st.fault, size > 1)
+        else {
+            return Ok(());
+        };
+        let b = &self.builder;
+        let low = b.build_and(addr, self.c64(size as i64 - 1), "")?;
+        let ok = b.build_int_compare(IntPredicate::EQ, low, self.c64(0), "")?;
+        let flagged = self.c64((size | achainsaw_ir::ast::MISALIGNED_FAULT) as i64);
+        let pass = self.ctx.append_basic_block(st.func, "aligned");
+        let here = b.get_insert_block().unwrap();
+        b.build_conditional_branch(ok, pass, fault)?;
+        addr_phi.add_incoming(&[(&addr, here)]);
+        size_phi.add_incoming(&[(&flagged, here)]);
+        b.position_at_end(pass);
+        Ok(())
+    }
+
     /// Calls a hook returning i32 and branches to the trap block when it is non-zero.
     fn check_hook(
         &self,
@@ -1483,6 +1505,88 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let bytes = self.access_bytes(vty)?;
                 self.bounds_check(st, addr, bytes)?;
                 self.store_ptr(v, p)?;
+            }
+            Instruction::AtomicRmw {
+                op,
+                dst,
+                ptr,
+                index,
+                val,
+                ..
+            } => {
+                let (v, ty) = self.val(st, val);
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                let op = match op {
+                    AtomicOp::Add => AtomicRMWBinOp::Add,
+                    AtomicOp::Sub => AtomicRMWBinOp::Sub,
+                    AtomicOp::And => AtomicRMWBinOp::And,
+                    AtomicOp::Or => AtomicRMWBinOp::Or,
+                    AtomicOp::Xor => AtomicRMWBinOp::Xor,
+                    AtomicOp::Xchg => AtomicRMWBinOp::Xchg,
+                    AtomicOp::Min => AtomicRMWBinOp::Min,
+                    AtomicOp::Max => AtomicRMWBinOp::Max,
+                    AtomicOp::Umin => AtomicRMWBinOp::UMin,
+                    AtomicOp::Umax => AtomicRMWBinOp::UMax,
+                };
+                let old = b.build_atomicrmw(
+                    op,
+                    p,
+                    v.into_int_value(),
+                    AtomicOrdering::SequentiallyConsistent,
+                )?;
+                st.values.insert(dst.clone(), (old.into(), ty));
+            }
+            Instruction::AtomicCas {
+                dst,
+                ptr,
+                index,
+                expected,
+                new,
+                ..
+            } => {
+                let (e, ty) = self.val(st, expected);
+                let n = self.val(st, new).0;
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                let pair = b.build_cmpxchg(
+                    p,
+                    e,
+                    n,
+                    AtomicOrdering::SequentiallyConsistent,
+                    AtomicOrdering::SequentiallyConsistent,
+                )?;
+                let old = b.build_extract_value(pair, 0, "")?;
+                st.values.insert(dst.clone(), (old, ty));
+            }
+            Instruction::AtomicLoad {
+                dst,
+                ptr,
+                index,
+                ty,
+                ..
+            } => {
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *ty)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                let v = b.build_load(self.air_type(*ty), p, "")?;
+                let inst = v.as_instruction_value().unwrap();
+                inst.set_alignment(ty.byte_size() as u32)
+                    .map_err(|e| anyhow!("{e}"))?;
+                inst.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+                    .map_err(|e| anyhow!("{e}"))?;
+                st.values.insert(dst.clone(), (v, *ty));
+            }
+            Instruction::AtomicStore {
+                ptr, index, val, ..
+            } => {
+                let (v, ty) = self.val(st, val);
+                let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                let inst = b.build_store(p, v)?;
+                inst.set_alignment(ty.byte_size() as u32)
+                    .map_err(|e| anyhow!("{e}"))?;
+                inst.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+                    .map_err(|e| anyhow!("{e}"))?;
             }
             Instruction::Call {
                 dsts, func, args, ..

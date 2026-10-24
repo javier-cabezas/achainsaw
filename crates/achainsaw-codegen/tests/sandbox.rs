@@ -393,3 +393,121 @@ fn stm_idx(i:i64, n:i64)->i32
     assert!(call(&engine, "stm_idx", &i64s(&[255, 4])).is_ok());
     expect_violation(&engine, "stm_idx", &i64s(&[256, 1]));
 }
+
+/// Each function allocates the whole arena, then makes an atomic access at byte offset `off`
+/// (`loop_add`: at `p[i]` for every `i < n`, a loop whose trip count is known on entry).
+const ATOMICS: &str = r#"
+fn rmw_i64(off:i64)->i64
+  b0:
+    p = alloc 4096:i64
+    q = add p, off
+    o = atomic add q, 5:i64
+    v = atomic ld q:i64
+    ret v
+
+fn cas_i32(off:i64)->i32
+  b0:
+    p = alloc 4096:i64
+    q = add p, off
+    atomic st q, 4:i32
+    seen = atomic cas q, 4:i32, 7:i32
+    v = ld q:i32
+    r = add seen, v
+    ret r
+
+fn st_i16(off:i64)->i32
+  b0:
+    p = alloc 4096:i64
+    q = add p, off
+    atomic st q, 3:i16
+    ret 0:i32
+
+fn max_i8(off:i64)->i32
+  b0:
+    p = alloc 4096:i64
+    q = add p, off
+    o = atomic umax q, -1:i8
+    ret 0:i32
+
+fn xchg_idx(i:i64)->i64
+  b0:
+    p = alloc 4096:i64
+    o = atomic xchg p[i], 9:i64
+    v = ld p[i]:i64
+    ret v
+
+fn loop_add(n:i64)->i64
+  b0:
+    p = alloc 4096:i64
+    jmp l(0:i64)
+  l(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    o = atomic add p[i], 1:i64
+    i2 = add i, 1:i64
+    jmp l(i2)
+  done:
+    v = ld p:i64
+    ret v
+"#;
+
+/// Asserts the call failed on a misaligned atomic access and returns its message.
+fn expect_misaligned(engine: &JitEngine, name: &str, args: &[RtValue]) -> String {
+    let err = call(engine, name, args).expect_err(name);
+    assert!(
+        err.contains("ERR_MEMORY_VIOLATION") && err.contains("not aligned"),
+        "{name}: {err}"
+    );
+    assert!(
+        matches!(
+            get_execution_status(),
+            ExecutionStatus::MisalignedAtomic { .. }
+        ),
+        "{name}: {:?}",
+        get_execution_status()
+    );
+    err
+}
+
+#[test]
+fn atomics_are_checked_for_bounds_and_alignment() {
+    let e = sandboxed(ATOMICS);
+    let end = ARENA as i64;
+    // Aligned accesses up to the end of the arena.
+    assert_eq!(
+        call(&e, "rmw_i64", &i64s(&[end - 8])).unwrap(),
+        Some(RtValue::I64(5))
+    );
+    assert_eq!(
+        call(&e, "cas_i32", &i64s(&[end - 4])).unwrap(),
+        Some(RtValue::I32(11))
+    );
+    assert!(call(&e, "st_i16", &i64s(&[end - 2])).is_ok());
+    assert!(call(&e, "max_i8", &i64s(&[end - 1])).is_ok());
+    assert_eq!(
+        call(&e, "xchg_idx", &i64s(&[end / 8 - 1])).unwrap(),
+        Some(RtValue::I64(9))
+    );
+    assert_eq!(
+        call(&e, "loop_add", &i64s(&[end / 8])).unwrap(),
+        Some(RtValue::I64(1))
+    );
+    // Past the end, or before the start.
+    for off in [end - 4, end, -8, 1 << 40] {
+        expect_violation(&e, "rmw_i64", &i64s(&[off]));
+    }
+    expect_violation(&e, "cas_i32", &i64s(&[end]));
+    expect_violation(&e, "st_i16", &i64s(&[end - 1]));
+    expect_violation(&e, "max_i8", &i64s(&[end]));
+    expect_violation(&e, "xchg_idx", &i64s(&[end / 8]));
+    expect_violation(&e, "xchg_idx", &i64s(&[-1]));
+    // The loop's last access is one past the end: its checks stay in the copy of the loop
+    // that runs without per-iteration fuel checks.
+    expect_violation(&e, "loop_add", &i64s(&[end / 8 + 1]));
+    // Inside the arena but not aligned to the access size.
+    let msg = expect_misaligned(&e, "rmw_i64", &i64s(&[4]));
+    assert!(msg.contains("8 bytes"), "{msg}");
+    expect_misaligned(&e, "cas_i32", &i64s(&[2]));
+    expect_misaligned(&e, "st_i16", &i64s(&[1]));
+}

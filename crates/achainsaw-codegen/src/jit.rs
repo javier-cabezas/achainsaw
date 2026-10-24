@@ -73,6 +73,12 @@ pub enum ExecutionStatus {
         addr: usize,
         size: usize,
     },
+    /// Sandboxed code made an atomic access of `size` bytes at an `addr` not aligned to
+    /// `size`.
+    MisalignedAtomic {
+        addr: usize,
+        size: usize,
+    },
     /// Sandboxed code exceeded `SANDBOX_STACK_BYTES` of call stack.
     StackOverflow,
 }
@@ -276,15 +282,26 @@ pub fn check_execution_status() -> Result<()> {
         ExecutionStatus::MemoryViolation { addr, size } => Err(anyhow!(
             "[ERR_MEMORY_VIOLATION] Access of {size} bytes at {addr:#x} is outside memory obtained from alloc"
         )),
+        ExecutionStatus::MisalignedAtomic { addr, size } => Err(anyhow!(
+            "[ERR_MEMORY_VIOLATION] Atomic access of {size} bytes at {addr:#x} is not aligned to {size} bytes"
+        )),
         ExecutionStatus::StackOverflow => Err(anyhow!(
             "[ERR_STACK_OVERFLOW] Execution halted: call stack exceeded {SANDBOX_STACK_BYTES} bytes (unbounded recursion?)"
         )),
     }
 }
 
-/// Sandbox bounds-check failure: records the violation; the caller then unwinds.
+/// Sandbox check failure: records the violation; the caller then unwinds.
 extern "C" fn rt_sandbox_fault(addr: usize, size: usize) {
-    raise(ExecutionStatus::MemoryViolation { addr, size });
+    let misaligned = achainsaw_ir::ast::MISALIGNED_FAULT as usize;
+    raise(if size & misaligned != 0 {
+        ExecutionStatus::MisalignedAtomic {
+            addr,
+            size: size & !misaligned,
+        }
+    } else {
+        ExecutionStatus::MemoryViolation { addr, size }
+    });
 }
 
 /// Called on entry to every sandboxed function; returns 1 (and records
@@ -1978,7 +1995,7 @@ impl JitEngine {
     }
 
     /// Runs untrusted code safely: `alloc` draws from a private `arena_bytes` arena
-    /// (at least `MIN_SANDBOX_ARENA_BYTES`), every `ld`/`st`/`ldm`/`stm`/`mm` access and
+    /// (at least `MIN_SANDBOX_ARENA_BYTES`), every `ld`/`st`/`ldm`/`stm`/`mm`/atomic access and
     /// `free` is checked against it, and recursion is capped at `SANDBOX_STACK_BYTES`.
     /// Violations halt execution with `ERR_MEMORY_VIOLATION` or `ERR_STACK_OVERFLOW`
     /// instead of crashing the process. Must be called before `compile_module`, and calls

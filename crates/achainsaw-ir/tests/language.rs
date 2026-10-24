@@ -1,6 +1,6 @@
 //! Indexed memory operands, functions with several results, `inline fn`, and the scalar
 //! rounding / bit-count / rotation / copysign / fma / unsigned-conversion ops: syntax,
-//! validation, inlining, and text and AIRB round trips.
+//! validation, inlining, and text and AIRB round trips; atomic accesses.
 
 use achainsaw_ir::inline::inline_module;
 use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
@@ -270,4 +270,62 @@ fn k(f:f32, d:f64, i:i32, l:i64)->f64
     // The new mnemonics stay valid register names.
     let regs = "fn k(round:i32, floor:i32)->i32\n  b0:\n    clz = add round, floor\n    fma = mul clz, round\n    ret fma\n";
     assert!(parse_and_validate(regs).is_ok());
+}
+
+#[test]
+fn atomics_round_trip_and_type_rules() {
+    let src = r#"
+fn k(p:ptr, i:i64, v:i32, w:i8)->i64
+  b0:
+    a = atomic add p, 1:i64
+    b = atomic sub p[i], v
+    c = atomic and p[i:i8], w
+    d = atomic or p, a
+    e = atomic xor p, a
+    f = atomic xchg p[3], v
+    g = atomic min p, w
+    h = atomic max p, w
+    j = atomic umin p, v
+    l = atomic umax p, -1:i16
+    m = atomic cas p[i], v, 7:i32
+    n = atomic ld p[i]:i64
+    atomic st p[i], n
+    atomic st p, w
+    atomic = add a, n
+    ret atomic
+"#;
+    let text = round_trips(src);
+    for line in [
+        "a = atomic add p, __imm_0",
+        "b = atomic sub p[i], v",
+        "c = atomic and p[i:i8], w",
+        "m = atomic cas p[i], v, __imm_",
+        "n = atomic ld p[i]:i64",
+        "atomic st p[i], n",
+        "atomic = add a, n",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let one = |body: &str| format!("fn k(p:ptr, f:f32, x:i32, y:i64)\n  b0:\n{body}    ret\n");
+    // Integers only, a pointer, matching cas operands, i64 indices.
+    for bad in [
+        "    a = atomic add p, f\n",
+        "    a = atomic ld p:f64\n",
+        "    atomic st p, f\n",
+        "    a = atomic add x, x\n",
+        "    a = atomic cas p, x, y\n",
+        "    a = atomic xchg p[x], y\n",
+    ] {
+        assert_eq!(err_code(&one(bad)), "ERR_TYPE_MISMATCH", "{bad}");
+    }
+    assert_eq!(
+        err_code(&one("    a = atomic nand p, x\n")),
+        "ERR_UNKNOWN_OP"
+    );
+    assert_eq!(err_code(&one("    a = atomic st p, x\n")), "ERR_UNKNOWN_OP");
+    assert_eq!(
+        err_code(&one("    atomic add p, x\n")),
+        "ERR_MISSING_DESTINATION"
+    );
+    assert_eq!(err_code(&one("    a = atomic ld p\n")), "ERR_EXPECTED_TYPE");
 }

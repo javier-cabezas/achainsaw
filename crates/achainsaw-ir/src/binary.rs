@@ -161,6 +161,44 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push_str(", ");
                         out.push_str(val);
                     }
+                    Instruction::AtomicRmw {
+                        op,
+                        dst,
+                        ptr,
+                        index,
+                        val,
+                        ..
+                    } => {
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("{dst} = atomic {} {p}, {val}", op.as_str()));
+                    }
+                    Instruction::AtomicCas {
+                        dst,
+                        ptr,
+                        index,
+                        expected,
+                        new,
+                        ..
+                    } => {
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("{dst} = atomic cas {p}, {expected}, {new}"));
+                    }
+                    Instruction::AtomicLoad {
+                        dst,
+                        ptr,
+                        index,
+                        ty,
+                        ..
+                    } => {
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("{dst} = atomic ld {p}:{ty}"));
+                    }
+                    Instruction::AtomicStore {
+                        ptr, index, val, ..
+                    } => {
+                        let p = mem_ref(ptr, index);
+                        out.push_str(&format!("atomic st {p}, {val}"));
+                    }
                     Instruction::Call {
                         dsts, func, args, ..
                     } => {
@@ -954,6 +992,33 @@ impl BinaryEncoder {
                 self.buf.extend_from_slice(&lane.to_le_bytes());
                 self.buf.push(encode_type(*ty));
             }
+            Instruction::AtomicRmw {
+                op, dst, ptr, val, ..
+            } => {
+                self.buf.push(0x33);
+                self.buf
+                    .push(AtomicOp::ALL.iter().position(|o| o == op).unwrap() as u8);
+                self.push_regs(&[dst, ptr, val]);
+            }
+            Instruction::AtomicCas {
+                dst,
+                ptr,
+                expected,
+                new,
+                ..
+            } => {
+                self.buf.push(0x34);
+                self.push_regs(&[dst, ptr, expected, new]);
+            }
+            Instruction::AtomicLoad { dst, ptr, ty, .. } => {
+                self.buf.push(0x35);
+                self.buf.push(encode_type(*ty));
+                self.push_regs(&[dst, ptr]);
+            }
+            Instruction::AtomicStore { ptr, val, .. } => {
+                self.buf.push(0x36);
+                self.push_regs(&[ptr, val]);
+            }
             Instruction::InsertLane {
                 dst,
                 vec,
@@ -1330,6 +1395,10 @@ impl<'a> BinaryDecoder<'a> {
                     | Instruction::Store { index, .. }
                     | Instruction::MaskedLoad { index, .. }
                     | Instruction::MaskedStore { index, .. }
+                    | Instruction::AtomicRmw { index, .. }
+                    | Instruction::AtomicCas { index, .. }
+                    | Instruction::AtomicLoad { index, .. }
+                    | Instruction::AtomicStore { index, .. }
                         if index.is_none() =>
                     {
                         *index = Some(Index { reg, unit });
@@ -1615,6 +1684,45 @@ impl<'a> BinaryDecoder<'a> {
                     span,
                 })
             }
+            0x33 => {
+                let op = *AtomicOp::ALL
+                    .get(self.read_u8()? as usize)
+                    .ok_or_else(|| self.err("Invalid atomic op in AIRB"))?;
+                Ok(Instruction::AtomicRmw {
+                    op,
+                    dst: self.read_string()?,
+                    ptr: self.read_string()?,
+                    index: None,
+                    val: self.read_string()?,
+                    span,
+                })
+            }
+            0x34 => Ok(Instruction::AtomicCas {
+                dst: self.read_string()?,
+                ptr: self.read_string()?,
+                index: None,
+                expected: self.read_string()?,
+                new: self.read_string()?,
+                span,
+            }),
+            0x35 => {
+                let ty = decode_type(self.read_u8()?)
+                    .filter(|t| t.is_int())
+                    .ok_or_else(|| self.err("Invalid atomic load type in AIRB"))?;
+                Ok(Instruction::AtomicLoad {
+                    dst: self.read_string()?,
+                    ptr: self.read_string()?,
+                    index: None,
+                    ty,
+                    span,
+                })
+            }
+            0x36 => Ok(Instruction::AtomicStore {
+                ptr: self.read_string()?,
+                index: None,
+                val: self.read_string()?,
+                span,
+            }),
             0x32 => {
                 let dst = self.read_string()?;
                 let vec = self.read_string()?;

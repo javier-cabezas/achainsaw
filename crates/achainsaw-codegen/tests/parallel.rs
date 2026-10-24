@@ -641,3 +641,134 @@ fn run(out:ptr, n:i64)
         set_execution_fuel(None);
     }
 }
+
+/// Workers that share memory through atomics: a histogram, a counter, an f32 total updated
+/// by a `cas` loop, and a work queue workers take items from until it is empty. Totals are
+/// exact at every thread count, with or without the sandbox and a fuel budget.
+#[test]
+fn atomics_are_exact_under_contention() {
+    let src = r#"
+fn task(i:i64, hist:ptr, total:ptr)
+  b0:
+    b = and i, 7:i64
+    o = atomic add hist[b], 1:i64
+    c = atomic add hist[8:i64], i
+    m = atomic max hist[9:i64], i
+    jmp retry
+  retry:
+    bits = atomic ld total:i32
+    f = bitcast bits:f32
+    g = add f, 0.5:f32
+    nb = bitcast g:i32
+    seen = atomic cas total, bits, nb
+    ok = eq seen, bits
+    br ok, done, retry
+  done:
+    ret
+
+fn worker(w:i64, next:ptr, out:ptr, n:i64)
+  b0:
+    jmp loop
+  loop:
+    i = atomic add next, 1:i64
+    more = lt i, n
+    br more, body, done
+  body:
+    sq = mul i, i
+    atomic st out[i], sq
+    jmp loop
+  done:
+    ret
+
+# hist[0..8): tasks per bucket, hist[8]: sum of indices, hist[9]: largest index; then the
+# work queue's squares.
+fn run(n:i64, items:i64, out:ptr)
+  b0:
+    hist = alloc 80:i64
+    total = alloc 4:i64
+    jmp zero(0:i64)
+  zero(k:i64):
+    more = lt k, 10:i64
+    br more, clear, go
+  clear:
+    st hist[k], 0:i64
+    k2 = add k, 1:i64
+    jmp zero(k2)
+  go:
+    st total, 0:i32
+    par n, task(hist, total)
+    jmp copy(0:i64)
+  copy(j:i64):
+    m = lt j, 10:i64
+    br m, put, rest
+  put:
+    h = ld hist[j]:i64
+    st out[j], h
+    j2 = add j, 1:i64
+    jmp copy(j2)
+  rest:
+    t = ld total:f32
+    ti = ftoi t:i64
+    st out[10:i64], ti
+    next = alloc 8:i64
+    st next, 0:i64
+    sq = add out, 88:i64
+    par 4:i64, worker(next, sq, items)
+    free next
+    free total
+    free hist
+    ret
+
+# run with `out` in the sandbox's memory: sum of out[k] * (k + 1).
+fn checksum(n:i64, items:i64)->i64
+  b0:
+    len = add items, 11:i64
+    bytes = mul len, 8:i64
+    out = alloc bytes
+    call run(n, items, out)
+    jmp sum(0:i64, 0:i64)
+  sum(k:i64, acc:i64):
+    more = lt k, len
+    br more, step, done
+  step:
+    v = ld out[k]:i64
+    w = add k, 1:i64
+    x = mul v, w
+    acc2 = add acc, x
+    jmp sum(w, acc2)
+  done:
+    free out
+    ret acc
+"#;
+    let (n, items) = (2000i64, 3000usize);
+    let mut want = vec![n / 8; 8];
+    want.extend([n * (n - 1) / 2, n - 1, n / 2]);
+    want.extend((0..items as i64).map(|i| i * i));
+    for sandbox in [None, Some(1 << 20)] {
+        for threads in [Some(1), Some(2), None, Some(8)] {
+            for fuel in [None, Some(1_000_000_000)] {
+                let mut e = engine(src, sandbox, threads);
+                e.set_fuel(fuel);
+                let mut out = vec![-1i64; 11 + items];
+                let args = [
+                    RtValue::I64(n),
+                    RtValue::I64(items as i64),
+                    RtValue::Ptr(out.as_mut_ptr() as usize),
+                ];
+                if sandbox.is_some() {
+                    // Host memory is out of reach in the sandbox: `out` is in its arena.
+                    let sum: i64 = want.iter().zip(1..).map(|(v, k)| v * k).sum();
+                    assert_eq!(
+                        call_i64(&e, "checksum", &[n, items as i64]).unwrap(),
+                        sum,
+                        "sandbox, threads {threads:?}, fuel {fuel:?}"
+                    );
+                } else {
+                    call(&e, "run", &args).unwrap();
+                    assert_eq!(out, want, "threads {threads:?}, fuel {fuel:?}");
+                }
+                set_execution_fuel(None);
+            }
+        }
+    }
+}

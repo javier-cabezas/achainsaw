@@ -28,7 +28,7 @@ fn sum(x:ptr, n:i64)->f32
 - **Terminators:** each block ends with one: `jmp b(args)`, `br cond, then(args), else(args)`, `ret v`, `ret a, b` or `ret`.
 - **Constants:** `x = cst 5:i32`, or inline in an operand, `add x, 1:i32`; an integer literal of a float type is that float (`cst 0:f32`).
 - **Arithmetic:** `add sub mul div rem and or xor shl shr min max`, and unsigned `udiv urem ushr umin umax`; operands share a type. Compares (`eq ne lt gt le ge`, unsigned `ult ugt ule uge`) give an `i32` 0 or 1, for `br` and `select`.
-- **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`.
+- **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`. Memory that `par` calls share takes [atomic accesses](#atomics).
 - **Casts:** `itof ftoi uitof ftoui sext zext trunc fext ftrunc bitcast`, written `dst = op src:type`.
 - **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
 - **Comments** start with `#`.
@@ -139,3 +139,37 @@ It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 acti
 **Inline functions.** `inline fn` marks a helper whose calls are replaced by its body before compiling, on both backends, JIT and AOT (`achainsaw opt` shows the expansion). A straight-line helper merges into the caller's block, so it adds no branches and no fuel checks; inline functions cannot be recursive (`ERR_RECURSIVE_INLINE`). The standard library's quantized matrix kernels are built this way: `qmat_chunk` (1 token), `qmat_chunk4` (4 tokens) and `qmat_chunk8` (8) call the same inline steps (`qmat_w8`/`qmat_w4`/`qmat_w5`/`qmat_w6` unpack two weight vectors, `qmat_dot` and `qmat_dot1` run `vdotu`s, `qmat_accr`/`qmat_accmr` scale and accumulate), so every token's arithmetic is identical by construction, and `llama_decode.air` reads its tables with `load_cfg`, `model_globals` and `layer_weights`. Together with indexed operands, this cut the standard library from 712 to 447 lines of code (`qmat_chunk` 185 to 80, `qmat_chunk4` 335 to 114) and `llama_decode.air` from 718 to 637, without slowing anything down: in the base-vs-head benchmark comparison every kernel is within noise, and Cranelift's quantized GEMVs and prefill got 6–7% faster (its index shifts fold into x86 addressing modes).
 
 **Scalar math.** Rounding to an integral value, `floor`, `ceil`, `round` (halfway away from zero), `roundeven` and `roundz` (toward zero); bit counts `popcnt`, `clz` and `ctz` (the bit width for 0); `copysign a, b` for floats, `rotl`/`rotr` for integers (amount modulo the width); `r = fma a, b, c` with one rounding; `uitof`/`ftoui` unsigned conversions (`ftoui` saturates, negative values and NaN to 0). All are single instructions or exact sequences, bit-identical on both backends and checked against Rust's own operations (`tests/scalar_math.rs`). `quantize_q8` rounds with `vround`, so it now matches llama.cpp's `roundf` exactly at halfway cases. These mnemonics are recognized only right after `=`, so programs that use them as register names still parse.
+
+## Atomics
+
+`par` calls that update the same memory do it through atomic accesses, on integers (`i8` to `i64`):
+
+| Instruction | Effect |
+|---|---|
+| `old = atomic add p, v` | Stores `old + v` and returns `old`; also `sub`, `and`, `or`, `xor`, `xchg` (stores `v`), `min`, `max` (signed), `umin`, `umax` (unsigned) |
+| `old = atomic cas p, expected, new` | Stores `new` if the value is `expected`, and returns the value it found: the swap happened when `old == expected` |
+| `v = atomic ld p:i64` | Reads the value |
+| `atomic st p, v` | Writes the value |
+
+Every atomic access is sequentially consistent: all threads see them in one order, and a value stored with `st` before an `atomic st` is visible to a thread whose `atomic ld` reads that store. `par` returns only after every call has finished, so the caller reads results with plain `ld`. There is no separate fence. The address must be aligned to the integer's size; in the sandbox (MCP `air_run`), a misaligned atomic is an `ERR_MEMORY_VIOLATION`, and outside it the hardware may fault. Atomics take indexed operands like `ld` and `st` (`atomic add hist[b], 1:i64` adds to `hist + 8b`), and `atomic` remains a valid register name elsewhere.
+
+Floats have no atomic arithmetic; update their bits with a `cas` loop, which retries when another call changed the value in between:
+
+```air
+# total += x for an f32 total that other par calls update too
+fn add_total(total:ptr, x:f32)
+  b0:
+    jmp retry
+  retry:
+    bits = atomic ld total:i32
+    f = bitcast bits:f32
+    g = add f, x
+    nb = bitcast g:i32
+    seen = atomic cas total, bits, nb
+    ok = eq seen, bits
+    br ok, done, retry
+  done:
+    ret
+```
+
+A work queue is a counter that calls take items from, `i = atomic add next, 1:i64`, until `i` reaches the item count; it balances items of uneven cost across a few `par` calls. Each backend uses the target's atomic instructions (x86 `lock` prefixes, AArch64 LSE when the target has it, else load-exclusive/store-exclusive loops), and `crates/achainsaw-codegen/tests/atomics.rs` checks every op at every width on both.

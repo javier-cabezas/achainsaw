@@ -595,6 +595,69 @@ impl Validator {
                 let val_ty = self.check_reg(ctx, val, scope, *span)?;
                 self.check_index(ctx, index.as_ref(), val_ty, "st", scope, *span)?;
             }
+            Instruction::AtomicRmw {
+                op,
+                dst,
+                ptr,
+                index,
+                val,
+                span,
+            } => {
+                let op = format!("atomic {}", op.as_str());
+                let ty = self.check_reg(ctx, val, scope, *span)?;
+                self.check_atomic(ctx, &op, ptr, index.as_ref(), val, ty, scope, *span)?;
+                Self::define(scope, dst, ty);
+            }
+            Instruction::AtomicCas {
+                dst,
+                ptr,
+                index,
+                expected,
+                new,
+                span,
+            } => {
+                let ty = self.check_reg(ctx, expected, scope, *span)?;
+                self.check_atomic(
+                    ctx,
+                    "atomic cas",
+                    ptr,
+                    index.as_ref(),
+                    expected,
+                    ty,
+                    scope,
+                    *span,
+                )?;
+                self.check_typed(ctx, new, ty, "atomic cas new value", scope, *span)?;
+                Self::define(scope, dst, ty);
+            }
+            Instruction::AtomicLoad {
+                dst,
+                ptr,
+                index,
+                ty,
+                span,
+            } => {
+                self.check_atomic(
+                    ctx,
+                    "atomic ld",
+                    ptr,
+                    index.as_ref(),
+                    dst,
+                    *ty,
+                    scope,
+                    *span,
+                )?;
+                Self::define(scope, dst, *ty);
+            }
+            Instruction::AtomicStore {
+                ptr,
+                index,
+                val,
+                span,
+            } => {
+                let ty = self.check_reg(ctx, val, scope, *span)?;
+                self.check_atomic(ctx, "atomic st", ptr, index.as_ref(), val, ty, scope, *span)?;
+            }
             Instruction::Call {
                 dsts,
                 func,
@@ -1261,6 +1324,36 @@ impl Validator {
     /// Checks the index of a memory access (`p[i]`): an i64 register, scaled by a type with a
     /// fixed size. Without a unit, the access's element type `implied` scales it, which must
     /// not be a vector (`ld p[i]:v256` would be ambiguous).
+    /// Checks an atomic access of an integer of type `ty` (the type of `what`, or the type
+    /// loaded) at `ptr` or `ptr[index]`.
+    #[allow(clippy::too_many_arguments)]
+    fn check_atomic(
+        &self,
+        ctx: &FnCtx,
+        op: &str,
+        ptr: &str,
+        index: Option<&Index>,
+        what: &str,
+        ty: Type,
+        scope: &Visible,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        self.check_typed(ctx, ptr, Type::Ptr, &format!("{op} pointer"), scope, span)?;
+        self.check_index(ctx, index, ty, op, scope, span)?;
+        if !ty.is_int() {
+            return Err(Diagnostic::error(
+                "ERR_TYPE_MISMATCH",
+                format!(
+                    "'{op}' works on integers (i8, i16, i32, i64), found '{what}' of type '{ty}'; \
+                     for floats, bitcast to an integer of the same size and loop on 'atomic cas'"
+                ),
+                span,
+            )
+            .with_context(serde_json::json!({ "op": op, "target": what, "found": ty.as_str() })));
+        }
+        Ok(())
+    }
+
     fn check_index(
         &self,
         ctx: &FnCtx,
