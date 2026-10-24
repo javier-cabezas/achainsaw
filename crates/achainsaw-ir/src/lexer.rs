@@ -333,9 +333,9 @@ impl<'a> Lexer<'a> {
                 | "vwidenlo" | "vwidenhi" | "vfwidenlo" | "vfwidenhi" | "vexp" | "vnarrow"
                 | "vshl" | "vshr" | "vushr" | "vabs" | "vneg" | "vsqrt" | "vrsqrt" | "vrev"
                 | "vziplo" | "vziphi" | "vunziplo" | "vunziphi" | "vdup" | "vdot" | "vdotu"
-                | "vfloor" | "vceil" | "vround" | "vroundeven" | "vroundz" | "vcopysign" => {
-                    TokenKind::VOp(ident)
-                }
+                | "vfloor" | "vceil" | "vround" | "vroundeven" | "vroundz" | "vcopysign"
+                | "vumin" | "vumax" | "vult" | "vugt" | "vule" | "vuge" | "vuwidenlo"
+                | "vuwidenhi" | "vuitof" | "vftoui" | "inslane" => TokenKind::VOp(ident),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
                 | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "min" | "max" | "umin" | "umax"
                 | "udiv" | "urem" | "ushr" | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),

@@ -49,24 +49,25 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
 | Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
 | Broadcast | `v = splat x:v512` (the vector type is required) | i8 to f64 |
-| Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`) | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64 |
+| Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`); `vumin`, `vumax` compare as unsigned | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64; `vumin`/`vumax`: i8, i16, i32 |
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
 | Fused multiply-add | `r = vfma a, b, c:f32` computes `a*b + c` with one rounding | f32, f64 |
 | Int8 dot product | `r = vdot c, a, b:i8` adds to each i32 lane of `c` the four products of the matching i8 lanes of `a` and `b`, exactly (i32 wrapping). One `sdot` on NEON (FEAT_DotProd) and SVE; on x86 with VNNI, `vpdpbusd` on `a ^ 0x80` minus `128 * sum(b)` (it multiplies unsigned by signed bytes), on both backends | i8 |
 | Unsigned-by-signed dot product | `r = vdotu c, a, b:i8`: the same with `a`'s bytes unsigned (0..255). One `vpdpbusd` on x86 VNNI and one `usdot` on Arm with FEAT_I8MM (NEON and SVE), on both backends; Arm without I8MM takes two `sdot`s. Use it when one operand is naturally unsigned (4- and 6-bit quantized weights) | i8 |
-| Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true | Any (signed for integers) |
+| Compare | `m = vlt a, b:f32` (`veq`, `vne`, `vgt`, `vle`, `vge`) gives all-ones lanes where true; `vult`, `vugt`, `vule`, `vuge` compare integers as unsigned | Any (signed for integers); unsigned: i8 to i64 |
 | Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
 | Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
-| Convert | `f = vitof v:f32` (i32 lanes to f32), `i = vftoi v:i32` (f32 to i32, saturating, NaN to 0); like scalar casts, the suffix is the result lane type | f32, i32 |
-| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half | widen: i16, i32, i64; narrow: i8, i16 |
+| Convert | `f = vitof v:f32` (i32 lanes to f32, or i64 to f64 with `:f64`), `i = vftoi v:i32` (f32 to i32, or f64 to i64 with `:i64`; saturating, NaN to 0); `vuitof` and `vftoui` read and write unsigned integers (`vftoui` takes negative values and NaN to 0). Like scalar casts, the suffix is the result lane type. Cranelift converts f64 to i64 one lane at a time, since x86 has no packed instruction for it | `vitof`, `vuitof`: f32, f64; `vftoi`, `vftoui`: i32, i64 |
+| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes, `vuwidenlo` / `vuwidenhi` zero-extend them; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half. Floats: `w = vfwidenlo v:f32` / `vfwidenhi` give f64 lanes (the suffix names the source, as for f16), `n = vnarrow a, b:f32` rounds f64 lanes to f32 (nearest-even, as `ftrunc`) | widen: i16, i32, i64; narrow: i8, i16, f32 |
 | Half-precision floats | `w = vfwidenlo v:f16` / `vfwidenhi` convert the low / high half of the 16-bit float lanes to f32 (the suffix names the source; also `:bf16`); `n = vnarrow a, b:f16` converts f32 lanes to f16 or bf16, rounding to nearest-even like `ftrunc`. Exact and identical on both backends except NaN payloads; LLVM uses F16C or AArch64's `fcvtl`/`fcvtn` where available. `vl`, `ldm` and `stm` count f16/bf16 lanes too | f16, bf16 |
-| Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, taken modulo the lane width | i8 to i64 |
+| Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, or by a vector of `v`'s type that gives each lane its own amount; amounts are taken modulo the lane width. On LLVM, per-lane amounts are one variable shift on NEON and SVE, on AVX-512 for every lane size, and on AVX2 for 32- and 64-bit lanes (other lanes take a short sequence); Cranelift has no variable vector shift and shifts each lane separately | i8 to i64 |
 | Absolute value / negate | `r = vabs v:i32`, `vneg`: integers wrap (`vabs` of the minimum is the minimum); floats clear or flip the sign bit, NaNs included | i8 to f64 |
 | Square root | `r = vsqrt v:f32` (correctly rounded), `vrsqrt` computes `1 / vsqrt(v)` with two roundings, never a hardware estimate, so results are identical on every CPU | f32, f64 |
 | Rounding | `r = vfloor v:f32`, `vceil`, `vround` (halfway cases away from zero, as C's `round`), `vroundeven` (to even), `vroundz` (toward zero) | f32, f64 |
 | Copy sign | `r = vcopysign a, b:f32`: `a`'s magnitude with `b`'s sign bit | f32, f64 |
 | Exponential | `e = vexp v:f32`: e^x within 2 ulp on [-87, 88], inputs clamped to that range, NaN propagated; a fixed algorithm, so results are bit-identical on every backend | f32 |
 | Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
+| Insert | `r = inslane v, x, 7:f32`: `v` with lane 7 replaced by the scalar `x` (of the lane type) | i8 to f64; index checked as for `extlane` |
 | Broadcast a lane | `r = vdup v, 3:f32` puts lane 3 of `v` in every lane | Any, including f16/bf16; index checked as for `extlane` |
 | Reverse | `r = vrev v:f32` reverses the order of the lanes | Any, including f16/bf16 |
 | Interleave | `r = vziplo a, b:f32` gives `a0 b0 a1 b1 ...` from the low halves, `vziphi` the same from the high halves | Any, including f16/bf16 |

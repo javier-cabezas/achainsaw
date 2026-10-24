@@ -659,6 +659,12 @@ impl<'a> Parser<'a> {
     fn parse_lane_ref(&mut self) -> Result<(String, u32, Type), Diagnostic> {
         let (vec, _) = self.expect_ident()?;
         self.expect(TokenKind::Comma)?;
+        let (lane, ty) = self.parse_lane_index()?;
+        Ok((vec, lane, ty))
+    }
+
+    /// Parses a lane index and its lane type, `3:f32`, up to the end of the line.
+    fn parse_lane_index(&mut self) -> Result<(u32, Type), Diagnostic> {
         let lane = match self.peek_kind() {
             TokenKind::IntLit(n) => u32::try_from(*n).map_err(|_| {
                 Diagnostic::error(
@@ -679,7 +685,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
         self.expect_eol()?;
-        Ok((vec, lane, ty))
+        Ok((lane, ty))
     }
 
     /// Parses the operands of a vector op whose mnemonic `name` was just consumed.
@@ -741,6 +747,21 @@ impl<'a> Parser<'a> {
             return Ok(Instruction::VDup {
                 dst,
                 vec,
+                lane,
+                ty,
+                span,
+            });
+        }
+        if name == "inslane" {
+            let (vec, _) = self.expect_ident()?;
+            self.expect(TokenKind::Comma)?;
+            let val = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let (lane, ty) = self.parse_lane_index()?;
+            return Ok(Instruction::InsertLane {
+                dst,
+                vec,
+                val,
                 lane,
                 ty,
                 span,

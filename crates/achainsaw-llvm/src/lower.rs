@@ -1547,6 +1547,25 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 )?);
                 st.values.insert(dst.clone(), (x, *ty));
             }
+            Instruction::InsertLane {
+                dst,
+                vec,
+                val,
+                lane,
+                ty,
+                ..
+            } => {
+                let (v, vty) = self.val(st, vec);
+                let lanes = self.as_lanes(v, vty, *ty)?;
+                let x = self.val(st, val).0;
+                let r = vec1!(lanes, |l| b.build_insert_element(
+                    l,
+                    x,
+                    self.c32(*lane),
+                    ""
+                )?);
+                st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
+            }
             Instruction::VDup {
                 dst, vec, lane, ty, ..
             } => {
@@ -1740,15 +1759,28 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (sv, vty) = self.val(st, src);
                 let x = self.as_lanes(sv, vty, *lane)?;
                 // The amount is taken modulo the lane width; LLVM shifts past it are poison.
-                let amt = self.int(st, amount);
-                let masked = b.build_and(
-                    amt,
-                    amt.get_type().const_int(lane_bits(*lane) as u64 - 1, false),
-                    "",
-                )?;
-                let lane_int = self.scalar_type(*lane).into_int_type();
-                let cast = b.build_int_cast_sign_flag(masked, lane_int, false, "")?;
-                let n = self.splat(cast.into(), *lane, vty)?;
+                let (av, aty) = self.val(st, amount);
+                let n = if aty.is_vector() {
+                    let a = self.as_lanes(av, vty, *lane)?;
+                    let lane_int = self.scalar_type(*lane).into_int_type();
+                    let m = self.splat_const(
+                        lane_int
+                            .const_int(lane_bits(*lane) as u64 - 1, false)
+                            .into(),
+                        Self::shape_of(a),
+                    )?;
+                    vec2!(a, m, |p, q| b.build_and(p, q, "")?)
+                } else {
+                    let amt = self.int(st, amount);
+                    let masked = b.build_and(
+                        amt,
+                        amt.get_type().const_int(lane_bits(*lane) as u64 - 1, false),
+                        "",
+                    )?;
+                    let lane_int = self.scalar_type(*lane).into_int_type();
+                    let cast = b.build_int_cast_sign_flag(masked, lane_int, false, "")?;
+                    self.splat(cast.into(), *lane, vty)?
+                };
                 let r = match op {
                     VShiftOp::Shl => anyi2!(x, n, |a, c| b.build_left_shift(a, c, "")?),
                     VShiftOp::Shr => anyi2!(x, n, |a, c| b.build_right_shift(a, c, true, "")?),
@@ -2309,6 +2341,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             (VBinOp::Min, false) => self.intr("llvm.smin", &[t], &[x, y])?,
             (VBinOp::Max, true) => self.float_minmax(true, x, y)?,
             (VBinOp::Max, false) => self.intr("llvm.smax", &[t], &[x, y])?,
+            // The validator only allows integer lanes for vumin/vumax.
+            (VBinOp::Umin, _) => self.intr("llvm.umin", &[t], &[x, y])?,
+            (VBinOp::Umax, _) => self.intr("llvm.umax", &[t], &[x, y])?,
             // The validator only allows float lanes for vdiv.
             (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
             (VBinOp::Copysign, _) => self.intr("llvm.copysign", &[t], &[x, y])?,
@@ -2336,6 +2371,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 VCmpOp::Gt => FloatPredicate::OGT,
                 VCmpOp::Le => FloatPredicate::OLE,
                 VCmpOp::Ge => FloatPredicate::OGE,
+                // The validator only allows integer lanes for unsigned compares.
+                VCmpOp::Ult | VCmpOp::Ugt | VCmpOp::Ule | VCmpOp::Uge => unreachable!(),
             };
             vec2!(x, y, |a, c| b.build_float_compare(p, a, c, "")?)
         } else {
@@ -2346,6 +2383,10 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 VCmpOp::Gt => IntPredicate::SGT,
                 VCmpOp::Le => IntPredicate::SLE,
                 VCmpOp::Ge => IntPredicate::SGE,
+                VCmpOp::Ult => IntPredicate::ULT,
+                VCmpOp::Ugt => IntPredicate::UGT,
+                VCmpOp::Ule => IntPredicate::ULE,
+                VCmpOp::Uge => IntPredicate::UGE,
             };
             vec2!(x, y, |a, c| b.build_int_compare(p, a, c, "")?)
         };
@@ -2416,7 +2457,18 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             VUnaryOp::Itof => {
                 b.build_cast(InstructionOpcode::SIToFP, x, self.lane_vec(vty, lane), "")?
             }
-            VUnaryOp::Ftoi => self.vftoi(x, self.lane_vec(vty, lane))?,
+            VUnaryOp::Uitof => {
+                b.build_cast(InstructionOpcode::UIToFP, x, self.lane_vec(vty, lane), "")?
+            }
+            VUnaryOp::Ftoi if lane == Type::I32 => self.vftoi(x, self.lane_vec(vty, lane))?,
+            VUnaryOp::Ftoi => {
+                let rt = self.lane_vec(vty, lane);
+                self.intr("llvm.fptosi.sat", &[rt, x.get_type()], &[x])?
+            }
+            VUnaryOp::Ftoui => {
+                let rt = self.lane_vec(vty, lane);
+                self.intr("llvm.fptoui.sat", &[rt, x.get_type()], &[x])?
+            }
             VUnaryOp::Exp => self.vexp(x)?,
             VUnaryOp::Abs if lane.is_float() => self.intr("llvm.fabs", &[x.get_type()], &[x])?,
             // `false`: the minimum integer gives itself rather than poison.
@@ -2446,7 +2498,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             VUnaryOp::Round => self.intr("llvm.round", &[x.get_type()], &[x])?,
             VUnaryOp::RoundEven => self.intr("llvm.roundeven", &[x.get_type()], &[x])?,
             VUnaryOp::RoundZ => self.intr("llvm.trunc", &[x.get_type()], &[x])?,
-            VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
+            VUnaryOp::WidenLo
+            | VUnaryOp::WidenHi
+            | VUnaryOp::UWidenLo
+            | VUnaryOp::UWidenHi
+            | VUnaryOp::FWidenLo
+            | VUnaryOp::FWidenHi => {
                 // The low or high half of the lanes (for SVE, the index scales with vscale).
                 let n = self.lanes_min(vty, src_lane);
                 let half_ty = self.vec_of(self.scalar_type(src_lane), n / 2, self.scalable(vty));
@@ -2456,12 +2513,15 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                     &[half_ty, x.get_type()],
                     &[x, self.c64(at as i64).into()],
                 )?;
-                match src_lane {
-                    Type::F16 => self.f16_lanes_to_f32(half)?,
-                    Type::BF16 => self.bf16_to_f32(half)?,
-                    _ => {
-                        b.build_cast(InstructionOpcode::SExt, half, self.lane_vec(vty, lane), "")?
+                let wide = self.lane_vec(vty, op.result_lane(lane));
+                match (src_lane, op) {
+                    (Type::F16, _) => self.f16_lanes_to_f32(half)?,
+                    (Type::BF16, _) => self.bf16_to_f32(half)?,
+                    (Type::F32, _) => b.build_cast(InstructionOpcode::FPExt, half, wide, "")?,
+                    (_, VUnaryOp::UWidenLo | VUnaryOp::UWidenHi) => {
+                        b.build_cast(InstructionOpcode::ZExt, half, wide, "")?
                     }
+                    _ => b.build_cast(InstructionOpcode::SExt, half, wide, "")?,
                 }
             }
         };
@@ -2739,6 +2799,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             match lane {
                 Type::F16 => return self.f32_lanes_to_f16(x),
                 Type::BF16 => return self.f32_to_bf16(x),
+                Type::F32 => {
+                    return Ok(b.build_cast(InstructionOpcode::FPTrunc, x, half_ty, "")?)
+                }
                 _ => {}
             }
             let wide_int = self.scalar_type(wide).into_int_type();
