@@ -117,6 +117,7 @@ pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
         VBinOp::Mul => &[I16, I32, I64, F32, F64],
         VBinOp::Div => &[F32, F64],
         VBinOp::Min | VBinOp::Max => &[I8, I16, I32, F32, F64],
+        VBinOp::Umin | VBinOp::Umax => &[I8, I16, I32],
         VBinOp::Copysign => &[F32, F64],
     }
 }
@@ -129,6 +130,19 @@ const ALL_LANES: &[Type] = &[
     Type::F32,
     Type::F64,
 ];
+
+/// Integer lane types (unsigned comparisons, shifts).
+const INT_LANES: &[Type] = &[Type::I8, Type::I16, Type::I32, Type::I64];
+
+/// Lane types each vector comparison supports: every lane type, but only integers for the
+/// unsigned ones.
+pub fn vcmp_lane_types(op: VCmpOp) -> &'static [Type] {
+    if op.is_unsigned() {
+        INT_LANES
+    } else {
+        ALL_LANES
+    }
+}
 
 /// Lane types of `vl`, `ldm` and `stm`, which only count lanes: also the 16-bit floats.
 const COUNT_LANES: &[Type] = &[
@@ -151,11 +165,13 @@ pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
 /// Result lane types each one-operand vector op supports.
 pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
     match op {
-        VUnaryOp::Itof => &[Type::F32],
-        VUnaryOp::Ftoi => &[Type::I32],
-        VUnaryOp::WidenLo | VUnaryOp::WidenHi => &[Type::I16, Type::I32, Type::I64],
+        VUnaryOp::Itof | VUnaryOp::Uitof => &[Type::F32, Type::F64],
+        VUnaryOp::Ftoi | VUnaryOp::Ftoui => &[Type::I32, Type::I64],
+        VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi => {
+            &[Type::I16, Type::I32, Type::I64]
+        }
         VUnaryOp::Exp => &[Type::F32],
-        VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => &[Type::F16, Type::BF16],
+        VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => &[Type::F16, Type::BF16, Type::F32],
         VUnaryOp::Abs | VUnaryOp::Neg => ALL_LANES,
         VUnaryOp::Sqrt | VUnaryOp::Rsqrt => &[Type::F32, Type::F64],
         VUnaryOp::Rev => VPERM_LANE_TYPES,
@@ -175,20 +191,21 @@ pub const VDOT_LANE_TYPES: &[Type] = &[Type::I8];
 pub const VPERM_LANE_TYPES: &[Type] = COUNT_LANES;
 
 /// Result lane types of `vnarrow`: i8 and i16 from i16 and i32 lanes (saturating), f16 and
-/// bf16 from f32 lanes (rounding to nearest-even, as `ftrunc`).
-pub const VNARROW_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::F16, Type::BF16];
+/// bf16 from f32 lanes and f32 from f64 lanes (rounding to nearest-even, as `ftrunc`).
+pub const VNARROW_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::F16, Type::BF16, Type::F32];
 
 /// Lane type `vnarrow` narrows from, for its result lane type.
 pub fn vnarrow_source_lane(lane: Type) -> Type {
     match lane {
         Type::I8 => Type::I16,
         Type::I16 => Type::I32,
+        Type::F32 => Type::F64,
         _ => Type::F32,
     }
 }
 
 /// Lane types of `vshl`, `vshr` and `vushr`.
-pub const VSHIFT_LANE_TYPES: &[Type] = &[Type::I8, Type::I16, Type::I32, Type::I64];
+pub const VSHIFT_LANE_TYPES: &[Type] = INT_LANES;
 
 fn lane_list(types: &[Type]) -> String {
     types
@@ -744,6 +761,20 @@ impl Validator {
                 Self::check_lane_index("ExtractLane", vec_ty, *lane, *ty, *span)?;
                 Self::define(scope, dst, *ty);
             }
+            Instruction::InsertLane {
+                dst,
+                vec,
+                val,
+                lane,
+                ty,
+                span,
+            } => {
+                Self::check_lane("inslane", *ty, ALL_LANES, *span)?;
+                let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
+                self.check_typed(ctx, val, *ty, "inslane value", scope, *span)?;
+                Self::check_lane_index("inslane", vec_ty, *lane, *ty, *span)?;
+                Self::define(scope, dst, vec_ty);
+            }
             Instruction::VDup {
                 dst,
                 vec,
@@ -1084,7 +1115,7 @@ impl Validator {
                 lane,
                 span,
             } => {
-                Self::check_lane(op.as_str(), *lane, ALL_LANES, *span)?;
+                Self::check_lane(op.as_str(), *lane, vcmp_lane_types(*op), *span)?;
                 let vec_ty =
                     self.check_same_vectors(ctx, op.as_str(), &[lhs, rhs], scope, *span)?;
                 Self::define(scope, dst, vec_ty);
@@ -1206,11 +1237,11 @@ impl Validator {
                 Self::check_lane(op.as_str(), *lane, VSHIFT_LANE_TYPES, *span)?;
                 let vec_ty = self.check_vector(ctx, src, scope, *span)?;
                 let amount_ty = self.check_reg(ctx, amount, scope, *span)?;
-                if !amount_ty.is_int() {
+                if !amount_ty.is_int() && amount_ty != vec_ty {
                     return Err(Diagnostic::error(
                         "ERR_TYPE_MISMATCH",
                         format!(
-                            "'{}' shift amount '{amount}' must be a scalar integer, found '{amount_ty}'",
+                            "'{}' shift amount '{amount}' must be a scalar integer or a '{vec_ty}' of per-lane amounts, found '{amount_ty}'",
                             op.as_str()
                         ),
                         *span,

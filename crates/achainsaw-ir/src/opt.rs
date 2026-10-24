@@ -149,6 +149,7 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     | Instruction::VCmp { dst, lhs, .. }
                     | Instruction::VZip { dst, lhs, .. }
                     | Instruction::VDup { dst, vec: lhs, .. }
+                    | Instruction::InsertLane { dst, vec: lhs, .. }
                     | Instruction::VDot { dst, acc: lhs, .. }
                     | Instruction::Fma { dst, a: lhs, .. }
                     | Instruction::VFma { dst, a: lhs, .. }
@@ -1127,6 +1128,7 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VShift { dst, .. }
                 | Instruction::VZip { dst, .. }
                 | Instruction::VDup { dst, .. }
+                | Instruction::InsertLane { dst, .. }
                 | Instruction::VDot { dst, .. }
                 | Instruction::Fma { dst, .. } => used.contains(dst),
 
