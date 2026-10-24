@@ -32,6 +32,7 @@ pub const RT_MALLOC: &str = "__achainsaw_rt_malloc";
 pub const RT_FREE: &str = "__achainsaw_rt_free";
 pub const RT_FUEL_EXHAUSTED: &str = "__achainsaw_rt_fuel_exhausted";
 pub const RT_CONSUME_FUEL: &str = "__achainsaw_rt_consume_fuel";
+pub const RT_TRY_FUEL: &str = "__achainsaw_rt_try_fuel";
 pub const RT_SANDBOX_FAULT: &str = "__achainsaw_rt_sandbox_fault";
 pub const RT_STACK_CHECK: &str = "__achainsaw_rt_stack_check";
 pub const RT_SANDBOX_CHECK_MM: &str = "__achainsaw_rt_sandbox_check_mm";
@@ -129,6 +130,8 @@ pub struct LowerOptions {
     pub native_f16: bool,
     /// Int8 dot products for `vdot`; without one, `vdot` widens and adds.
     pub int8_dot: Int8Dot,
+    /// Loops that pay for their checks on entry (`achainsaw_ir::checks`).
+    pub loop_checks: achainsaw_ir::checks::LoopChecks,
 }
 
 /// LLVM intrinsic of a scalar rounding op.
@@ -311,6 +314,8 @@ struct FnState<'ctx> {
     fault: Option<(BasicBlock<'ctx>, PhiValue<'ctx>, PhiValue<'ctx>)>,
     /// The function's fuel counter, when it has fuel checks.
     fuel: Option<Fuel<'ctx>>,
+    /// The instruction being lowered is an access a loop dispatch checked as a range.
+    covered: bool,
 }
 
 /// Fuel counter of a function: kept in a stack slot that LLVM promotes to a register between
@@ -526,6 +531,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         decl(RT_FREE, void.fn_type(&[i64t.into()], false));
         decl(RT_FUEL_EXHAUSTED, i32t.fn_type(&[], false));
         decl(RT_CONSUME_FUEL, i32t.fn_type(&[i64t.into()], false));
+        decl(RT_TRY_FUEL, i32t.fn_type(&[i64t.into()], false));
         decl(
             RT_SANDBOX_FAULT,
             void.fn_type(&[i64t.into(), i64t.into()], false),
@@ -939,7 +945,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         addr: IntValue<'ctx>,
         size: IntValue<'ctx>,
     ) -> Result<()> {
-        let (Some(sb), Some((fault, addr_phi, size_phi))) = (self.opts.sandbox, st.fault) else {
+        let (Some(sb), Some((fault, addr_phi, size_phi)), false) =
+            (self.opts.sandbox, st.fault, st.covered)
+        else {
             return Ok(());
         };
         let b = &self.builder;
@@ -972,6 +980,80 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.builder
             .build_conditional_branch(bad, st.trap.expect("trap block"), next)?;
         Ok(())
+    }
+
+    /// The condition of a loop dispatch block (`achainsaw_ir::checks::Dispatch`): whether every
+    /// range lies in the sandbox and the loop's fuel could be charged, in which case it is.
+    /// The charge comes off the counter in its slot; when that would empty it, `RT_TRY_FUEL`
+    /// draws on the shared budget (a `par` worker) or reports that the budget cannot cover
+    /// it, and charges nothing.
+    fn dispatch_cond(
+        &self,
+        st: &FnState<'ctx>,
+        d: &achainsaw_ir::checks::Dispatch,
+    ) -> Result<IntValue<'ctx>> {
+        let b = &self.builder;
+        let mut ok = self.i1().const_int(1, false);
+        if let (Some(sb), false) = (self.opts.sandbox, self.opts.aot) {
+            let base = self.c64(sb.base as i64);
+            let len = self.c64(sb.len as i64);
+            for (lo, span) in &d.ranges {
+                let lo = self.int(st, lo);
+                let span = self.int(st, span);
+                let off = b.build_int_sub(lo, base, "")?;
+                let room = b.build_int_sub(len, span, "")?;
+                let small = b.build_int_compare(IntPredicate::ULE, span, len, "")?;
+                let inside = b.build_int_compare(IntPredicate::ULE, off, room, "")?;
+                let fits = b.build_and(small, inside, "")?;
+                let empty = b.build_int_compare(IntPredicate::EQ, span, self.c64(0), "")?;
+                let this = b.build_or(fits, empty, "")?;
+                ok = b.build_and(ok, this, "")?;
+            }
+        }
+        let Some(fuel) = st.fuel else {
+            return Ok(ok);
+        };
+        let units = self.int(st, &d.units);
+        let start = b.get_insert_block().unwrap();
+        let charge = self.ctx.append_basic_block(st.func, "loop.charge");
+        let commit = self.ctx.append_basic_block(st.func, "loop.charged");
+        let slow = self.ctx.append_basic_block(st.func, "loop.draw");
+        let done = self.ctx.append_basic_block(st.func, "loop.dispatch");
+        b.build_conditional_branch(ok, charge, done)?;
+
+        b.position_at_end(charge);
+        let counter = b
+            .build_load(self.i64(), fuel.slot, "fuel")?
+            .into_int_value();
+        let left = b.build_int_sub(counter, units, "fuel")?;
+        let covers = b.build_int_compare(IntPredicate::SGT, left, self.c64(0), "")?;
+        b.build_conditional_branch(covers, commit, slow)?;
+
+        b.position_at_end(commit);
+        b.build_store(fuel.slot, left)?;
+        b.build_unconditional_branch(done)?;
+
+        b.position_at_end(slow);
+        self.spill_fuel(st)?;
+        let charged = self
+            .call1(self.runtime_fn(RT_TRY_FUEL), &[units.into()])?
+            .into_int_value();
+        self.reload_fuel(st)?;
+        let charged = b.build_int_compare(
+            IntPredicate::NE,
+            charged,
+            charged.get_type().const_zero(),
+            "",
+        )?;
+        let slow_end = b.get_insert_block().unwrap();
+        b.build_unconditional_branch(done)?;
+
+        b.position_at_end(done);
+        let phi = b.build_phi(self.i1(), "run.copy")?;
+        let no = self.i1().const_zero();
+        let yes = self.i1().const_int(1, false);
+        phi.add_incoming(&[(&no, start), (&yes, commit), (&charged, slow_end)]);
+        Ok(phi.as_basic_value().into_int_value())
     }
 
     /// Fuel check before a branch: continues in a fresh block unless fuel ran out.
@@ -1105,6 +1187,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             trap,
             fault,
             fuel: None,
+            covered: false,
         };
         for (i, (name, ty)) in func.params.iter().enumerate() {
             st.values
@@ -1140,13 +1223,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             b.build_unconditional_branch(first)?;
         }
 
+        let loop_checks = self.opts.loop_checks.function(&func.name);
         for block in &func.blocks {
             let (bb, phis) = st.blocks[&block.label].clone();
             b.position_at_end(bb);
             for ((name, ty), phi) in block.params.iter().zip(phis) {
                 st.values.insert(name.clone(), (phi.as_basic_value(), *ty));
             }
-            for inst in &block.instructions {
+            for (k, inst) in block.instructions.iter().enumerate() {
+                st.covered =
+                    loop_checks.is_some_and(|c| c.covered.contains(&(block.label.clone(), k)));
                 // Calls (AIR, runtime hooks, `mm` and `par` charging fuel) see the counter in
                 // memory and may change it.
                 let calls_out = matches!(
@@ -1165,7 +1251,10 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                     self.reload_fuel(&st)?;
                 }
             }
-            self.lower_terminator(&st, &block.terminator)?;
+            st.covered = false;
+            let free = loop_checks.is_some_and(|c| c.free.contains(&block.label));
+            let dispatch = loop_checks.and_then(|c| c.dispatch.get(&block.label));
+            self.lower_terminator(&st, &block.terminator, free, dispatch)?;
         }
 
         if let Some((bb, addr, size)) = st.fault {
@@ -1287,11 +1376,21 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(edge)
     }
 
-    fn lower_terminator(&self, st: &FnState<'ctx>, term: &Terminator) -> Result<()> {
+    /// Lowers a block's terminator: without its fuel check in a block of a loop that paid on
+    /// entry (`free`), and with the computed condition in a loop dispatch block.
+    fn lower_terminator(
+        &self,
+        st: &FnState<'ctx>,
+        term: &Terminator,
+        free: bool,
+        dispatch: Option<&achainsaw_ir::checks::Dispatch>,
+    ) -> Result<()> {
         let b = &self.builder;
         match term {
             Terminator::Jmp { target, args, .. } => {
-                self.fuel_check(st)?;
+                if !free {
+                    self.fuel_check(st)?;
+                }
                 let dest = self.jump_with_args(st, target, args)?;
                 b.build_unconditional_branch(dest)?;
             }
@@ -1303,9 +1402,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 else_args,
                 ..
             } => {
-                self.fuel_check(st)?;
-                let c = self.int(st, cond);
-                let c = b.build_int_compare(IntPredicate::NE, c, c.get_type().const_zero(), "")?;
+                if !free {
+                    self.fuel_check(st)?;
+                }
+                let c = match dispatch {
+                    Some(d) => self.dispatch_cond(st, d)?,
+                    None => {
+                        let c = self.int(st, cond);
+                        b.build_int_compare(IntPredicate::NE, c, c.get_type().const_zero(), "")?
+                    }
+                };
                 let t = self.edge(st, then_block, then_args)?;
                 let e = self.edge(st, else_block, else_args)?;
                 b.build_conditional_branch(c, t, e)?;

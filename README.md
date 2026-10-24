@@ -298,7 +298,8 @@ written in AIR:
    up to 2048 bits (under QEMU).
 4. **The runtime** keeps each function's fuel counter in a register (a
    decrement and a compare per branch, compiled in only under a fuel budget,
-   a memory quota or the sandbox), checks memory in sandboxed runs,
+   a memory quota or the sandbox, and paid once on entry by loops with a
+   known trip count), checks memory in sandboxed runs,
    and runs `par` loops on a lock-free pool of threads.
 5. **AIR programs build on AIR:** the quantized matrix kernels, attention and
    softmax helpers are a standard library written in AIR, which a module
