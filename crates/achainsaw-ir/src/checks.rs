@@ -8,14 +8,20 @@
 //! original loop, which fails exactly where it did. Results, the memory touched and the fuel
 //! used are the same either way.
 //!
-//! A loop qualifies when its blocks form a chain from the header, whose branch is the only way
-//! out, through blocks that each jump to the next and back to the header; it calls nothing
-//! (calls, `alloc`, `free`, `mm`, `par`), and one block outside it enters it. Its header tests
-//! one counter `i`, a header parameter that grows by a positive constant or a `vl` per
-//! iteration, as `lt i, n`, `gt n, i`, or `gt r, k` / `ge r, k` on `r = sub n, i` (the
-//! masked-loop guards of `crate::loops`), possibly several such tests joined by `and`, with
-//! `n` and `k` invariant. The module must have unique register names; the result is meant for
-//! code generation only (the dispatch block's condition is the backend's to compute).
+//! A loop qualifies when one block outside it enters it; it calls nothing (calls, `alloc`,
+//! `free`, `mm`, `par`); its blocks, apart from the edges back to the header, form a DAG in
+//! which every way around takes the same number of branches (an if/else whose ways are equally
+//! long, so an iteration's fuel does not depend on the data); and one block that every
+//! iteration runs leaves it, by a branch on a test that holds while the loop goes on. The test
+//! is `lt v, n`, `gt n, v`, or `gt r, k` / `ge r, k` on `r = sub n, v` (the masked-loop guards
+//! of `crate::loops`), possibly several joined by `and`, where `v` is an induction variable
+//! plus a constant: a header parameter, a counter or a pointer, that grows by a positive
+//! constant or a `vl` on every way back. `n` and `k` are invariant: defined before the loop, a
+//! constant or `vl`, or a header parameter every way back passes unchanged. The copy needs no
+//! checks for accesses through an invariant pointer indexed by a counter plus a constant,
+//! through a pointer induction variable plus a constant, or at an invariant address. The
+//! module must have unique register names; the result is meant for code generation only (the
+//! dispatch block's condition is the backend's to compute).
 
 use crate::ast::*;
 use crate::cfg::Cfg;
@@ -70,8 +76,8 @@ const MAX_TRIPS: i64 = 1 << 48;
 const MAX_SPAN: i64 = 1 << 40;
 /// Steps above this many elements leave the dispatch's ranges unchecked: the copy never runs.
 const MAX_STEP: i64 = 1 << 20;
-/// Longer chains of blocks are left alone, so `trips * blocks` cannot overflow.
-const MAX_CHAIN: usize = 1 << 10;
+/// Loops of more blocks are left alone, so `trips * cost` cannot overflow.
+const MAX_BLOCKS: usize = 1 << 10;
 
 /// Rewrites every qualifying loop in `module` (see the module docs).
 pub fn hoist_loop_checks(module: &mut Module) -> LoopChecks {
@@ -101,18 +107,34 @@ pub fn hoist_loop_checks(module: &mut Module) -> LoopChecks {
     checks
 }
 
-/// How the counter grows per iteration: a constant, or a register holding a `vl`.
-#[derive(Clone)]
+/// How an induction variable grows per iteration: a constant, or a register holding a `vl`.
+#[derive(Clone, PartialEq)]
 enum Step {
     Const(i64),
     Reg(String),
 }
 
-/// A header test that holds while the trips go on.
-enum Test {
-    /// `i < n`.
+/// A header parameter that grows by a positive `step` on every way back to the header: a
+/// counter (i64), whose steps count elements of the accesses it indexes, or a pointer, whose
+/// steps are bytes.
+struct Iv {
+    param: usize,
+    step: Step,
+    ptr: bool,
+}
+
+/// A test that holds while the trips go on, on `v + o` for header parameter `param`'s value
+/// `v` in the iteration.
+struct Test {
+    param: usize,
+    o: i64,
+    kind: TestKind,
+}
+
+enum TestKind {
+    /// `v < n`.
     Below { n: String },
-    /// `n - i > k`, `k` a constant or `vl - 1` (`ge r, vl`).
+    /// `n - v > k`, `k` a constant or `vl - 1` (`ge r, vl`).
     Above { n: String, k: Bound },
 }
 
@@ -144,36 +166,24 @@ fn int_const(defs: &HashMap<&str, &Instruction>, r: &str) -> Option<i64> {
     }
 }
 
-/// The tests `cond` (defined in the header) joins, all on header parameter `iv`, or `None`.
+/// The tests `cond` (defined in the loop) joins, on registers that are an induction variable
+/// plus a constant (`counter`), or `None`.
 fn parse_tests(
     cond: &str,
     defs: &HashMap<&str, &Instruction>,
-    header_defs: &HashSet<&str>,
+    in_loop: &HashSet<&str>,
     invariant: &dyn Fn(&str) -> bool,
-    iv: &mut Option<String>,
-    header_params: &HashSet<&str>,
+    counter: &dyn Fn(&str) -> Option<(usize, i64)>,
 ) -> Option<Vec<Test>> {
-    if !header_defs.contains(cond) {
+    if !in_loop.contains(cond) {
         return None;
     }
     let Instruction::Binary { op, lhs, rhs, .. } = defs.get(cond)? else {
         return None;
     };
-    let mut counter = |r: &str| -> bool {
-        if !header_params.contains(r) {
-            return false;
-        }
-        match iv {
-            Some(p) => p == r,
-            None => {
-                *iv = Some(r.to_string());
-                true
-            }
-        }
-    };
-    // `r = sub n, i` defined in the header: its `n`.
-    let rest = |r: &str, counter: &mut dyn FnMut(&str) -> bool| -> Option<String> {
-        if !header_defs.contains(r) {
+    // `r = sub n, v` defined in the loop: its `n` and `v`.
+    let rest = |r: &str| -> Option<(String, (usize, i64))> {
+        if !in_loop.contains(r) {
             return None;
         }
         match defs.get(r)? {
@@ -182,7 +192,7 @@ fn parse_tests(
                 lhs,
                 rhs,
                 ..
-            } if invariant(lhs) && counter(rhs) => Some(lhs.clone()),
+            } if invariant(lhs) => Some((lhs.clone(), counter(rhs)?)),
             _ => None,
         }
     };
@@ -196,25 +206,22 @@ fn parse_tests(
             _ => None,
         }
     };
+    let below = |n: &str, v: &str| -> Option<Vec<Test>> {
+        let (param, o) = counter(v)?;
+        Some(vec![Test {
+            param,
+            o,
+            kind: TestKind::Below { n: n.to_string() },
+        }])
+    };
     match op {
         BinaryOp::And => {
-            let mut tests = parse_tests(lhs, defs, header_defs, invariant, iv, header_params)?;
-            tests.extend(parse_tests(
-                rhs,
-                defs,
-                header_defs,
-                invariant,
-                iv,
-                header_params,
-            )?);
+            let mut tests = parse_tests(lhs, defs, in_loop, invariant, counter)?;
+            tests.extend(parse_tests(rhs, defs, in_loop, invariant, counter)?);
             Some(tests)
         }
-        BinaryOp::Lt if invariant(rhs) && counter(lhs) => {
-            Some(vec![Test::Below { n: rhs.clone() }])
-        }
-        BinaryOp::Gt if invariant(lhs) && counter(rhs) => {
-            Some(vec![Test::Below { n: lhs.clone() }])
-        }
+        BinaryOp::Lt if invariant(rhs) && counter(lhs).is_some() => below(rhs, lhs),
+        BinaryOp::Gt if invariant(lhs) && counter(rhs).is_some() => below(lhs, rhs),
         // `r > k`, `k < r`, `r >= k`, `k <= r`.
         BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Lt | BinaryOp::Le => {
             let (r, k) = match op {
@@ -222,13 +229,43 @@ fn parse_tests(
                 _ => (rhs, lhs),
             };
             let minus = matches!(op, BinaryOp::Ge | BinaryOp::Le) as i64;
-            let n = rest(r, &mut counter)?;
-            Some(vec![Test::Above {
-                n,
-                k: bound(k, minus)?,
+            let (n, (param, o)) = rest(r)?;
+            Some(vec![Test {
+                param,
+                o,
+                kind: TestKind::Above {
+                    n,
+                    k: bound(k, minus)?,
+                },
             }])
         }
         _ => None,
+    }
+}
+
+/// The argument lists of `t`'s edges into `target`.
+fn edge_args<'t>(t: &'t Terminator, target: &str) -> Vec<&'t Vec<String>> {
+    match t {
+        Terminator::Jmp {
+            target: to, args, ..
+        } if to == target => vec![args],
+        Terminator::Br {
+            then_block,
+            then_args,
+            else_block,
+            else_args,
+            ..
+        } => {
+            let mut v = Vec::new();
+            if then_block == target {
+                v.push(then_args);
+            }
+            if else_block == target {
+                v.push(else_args);
+            }
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -283,6 +320,22 @@ impl Emitter<'_> {
             cond: cond.to_string(),
             then_val: a.to_string(),
             else_val: b.to_string(),
+            span: self.span,
+        });
+        dst
+    }
+
+    /// `r` as an i64: pointers through a `bitcast`, so the arithmetic is valid AIR.
+    fn int(&mut self, r: &str, ty: Type) -> String {
+        if ty != Type::Ptr {
+            return r.to_string();
+        }
+        let dst = self.fresh();
+        self.out.push(Instruction::Cast {
+            op: CastOp::Bitcast,
+            dst: dst.clone(),
+            src: r.to_string(),
+            ty: Type::I64,
             span: self.span,
         });
         dst
@@ -359,7 +412,7 @@ fn hoist_loop(
         return false;
     };
     let body = natural_loop(&cfg, h);
-    if body.is_empty() {
+    if body.is_empty() || body.len() > MAX_BLOCKS {
         return false;
     }
     let in_body: HashSet<usize> = body.iter().copied().collect();
@@ -370,42 +423,104 @@ fn hoist_loop(
         .map(|(i, b)| (b.label.as_str(), i))
         .collect();
 
-    // The header's branch goes on into the chain and leaves to `exit`.
+    // One block leaves the loop, by a branch whose other way stays in it.
+    let mut exiting = None;
+    for &b in &body {
+        let to = targets(&f.blocks[b].terminator);
+        let out = to
+            .iter()
+            .filter(|t| !in_body.contains(&index[t.as_str()]))
+            .count();
+        if out == 0 {
+            continue;
+        }
+        if exiting.is_some() || out != 1 || to.len() != 2 {
+            return false;
+        }
+        exiting = Some(b);
+    }
+    let Some(ex) = exiting else {
+        return false;
+    };
     let Terminator::Br {
         cond,
         then_block,
-        then_args,
         else_block,
         ..
-    } = &f.blocks[h].terminator
+    } = &f.blocks[ex].terminator
     else {
         return false;
     };
-    if !in_body.contains(&index[then_block.as_str()])
-        || in_body.contains(&index[else_block.as_str()])
-    {
+    if !in_body.contains(&index[then_block.as_str()]) {
         return false;
     }
     let exit = else_block.clone();
 
-    // The chain: header, then blocks that each jump to the next, the last back to the header.
-    let mut chain = vec![h];
-    let mut next = index[then_block.as_str()];
-    while next != h {
-        if !in_body.contains(&next) || chain.contains(&next) {
-            return false;
+    // The loop's edges, apart from those back to the header, form a DAG from the header in
+    // which every way to a block takes the same number of branches (`dist`), and every way
+    // back to the header the same (`cost`): the fuel of an iteration does not depend on the
+    // way it takes.
+    let forward = |b: usize| -> Vec<usize> {
+        targets(&f.blocks[b].terminator)
+            .into_iter()
+            .map(|t| index[t.as_str()])
+            .filter(|&t| t != h && in_body.contains(&t))
+            .collect()
+    };
+    let mut indegree: HashMap<usize, usize> = body.iter().map(|&b| (b, 0)).collect();
+    for &b in &body {
+        for t in forward(b) {
+            *indegree.get_mut(&t).unwrap() += 1;
         }
-        chain.push(next);
-        let Terminator::Jmp { target, .. } = &f.blocks[next].terminator else {
-            return false;
-        };
-        next = index[target.as_str()];
     }
-    if chain.len() != body.len() || chain.len() > MAX_CHAIN {
+    let mut order = Vec::with_capacity(body.len());
+    let mut ready = vec![h];
+    while let Some(b) = ready.pop() {
+        order.push(b);
+        for t in forward(b) {
+            let d = indegree.get_mut(&t).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                ready.push(t);
+            }
+        }
+    }
+    if order.len() != body.len() {
         return false;
     }
-    let size: usize = chain.iter().map(|&b| f.blocks[b].instructions.len()).sum();
-    let calls_out = chain
+    let mut dist: HashMap<usize, usize> = HashMap::from([(h, 0)]);
+    for &b in &order {
+        let d = dist[&b] + 1;
+        for t in forward(b) {
+            if *dist.entry(t).or_insert(d) != d {
+                return false;
+            }
+        }
+    }
+    let latches: Vec<usize> = body
+        .iter()
+        .copied()
+        .filter(|&b| !edge_args(&f.blocks[b].terminator, header).is_empty())
+        .collect();
+    let cost = dist[&latches[0]] + 1;
+    // Every iteration runs the exiting block's test.
+    if latches
+        .iter()
+        .any(|&l| dist[&l] + 1 != cost || !cfg.dominates(ex, l))
+    {
+        return false;
+    }
+    // Blocks that may run on the last iteration too, the one that leaves: the exiting block
+    // and those before it.
+    let mut before_exit: HashSet<usize> = HashSet::from([ex]);
+    for &b in order.iter().rev() {
+        if forward(b).iter().any(|t| before_exit.contains(t)) {
+            before_exit.insert(b);
+        }
+    }
+
+    let size: usize = body.iter().map(|&b| f.blocks[b].instructions.len()).sum();
+    let calls_out = body
         .iter()
         .flat_map(|&b| &f.blocks[b].instructions)
         .any(|i| {
@@ -456,49 +571,32 @@ fn hoist_loop(
         }
     }
     let header_block = &f.blocks[h];
-    let header_params: HashSet<&str> = header_block
+
+    // Registers equal to an i64 or pointer header parameter plus a constant, in the iteration
+    // that computes them; a block parameter only when every edge into it agrees.
+    let mut offset: HashMap<String, (usize, i64)> = header_block
         .params
         .iter()
-        .map(|(p, _)| p.as_str())
+        .enumerate()
+        .filter(|(_, (_, t))| matches!(t, Type::I64 | Type::Ptr))
+        .map(|(k, (p, _))| (p.clone(), (k, 0)))
         .collect();
-    let header_defs: HashSet<&str> = header_block
-        .instructions
-        .iter()
-        .flat_map(|i| i.dsts())
-        .collect();
-    let invariant = |r: &str| !in_loop.contains(r) || constant_like(&defs, r);
-
-    let mut iv: Option<String> = None;
-    let Some(tests) = parse_tests(
-        cond,
-        &defs,
-        &header_defs,
-        &invariant,
-        &mut iv,
-        &header_params,
-    ) else {
-        return false;
-    };
-    let Some(iv) = iv else {
-        return false;
-    };
-    let k = header_block
-        .params
-        .iter()
-        .position(|(p, _)| *p == iv)
-        .expect("header parameter");
-    if header_block.params[k].1 != Type::I64 {
-        return false;
-    }
-
-    // Registers equal to the counter plus a constant, along the chain.
-    let mut offset: HashMap<String, i64> = HashMap::from([(iv.clone(), 0)]);
-    let mut incoming = then_args.clone();
-    for (pos, &b) in chain.iter().enumerate() {
+    for &b in &order {
         let block = &f.blocks[b];
-        if pos > 0 {
-            for ((p, _), a) in block.params.iter().zip(&incoming) {
-                if let Some(&o) = offset.get(a.as_str()) {
+        if b != h {
+            for (pi, (p, _)) in block.params.iter().enumerate() {
+                let mut agreed: Option<Option<(usize, i64)>> = None;
+                for &pred in &cfg.preds[b] {
+                    for args in edge_args(&f.blocks[pred].terminator, &block.label) {
+                        let o = offset.get(args[pi].as_str()).copied();
+                        agreed = match agreed {
+                            None => Some(o),
+                            Some(prev) if prev == o => Some(o),
+                            Some(_) => Some(None),
+                        };
+                    }
+                }
+                if let Some(Some(o)) = agreed {
                     offset.insert(p.clone(), o);
                 }
             }
@@ -509,14 +607,14 @@ fn hoist_loop(
             } = inst
             {
                 let shifted = match (op, offset.get(lhs.as_str()), offset.get(rhs.as_str())) {
-                    (BinaryOp::Add, Some(&o), None) => {
-                        int_const(&defs, rhs).and_then(|c| o.checked_add(c))
+                    (BinaryOp::Add, Some(&(k, o)), None) => {
+                        int_const(&defs, rhs).and_then(|c| Some((k, o.checked_add(c)?)))
                     }
-                    (BinaryOp::Add, None, Some(&o)) => {
-                        int_const(&defs, lhs).and_then(|c| o.checked_add(c))
+                    (BinaryOp::Add, None, Some(&(k, o))) => {
+                        int_const(&defs, lhs).and_then(|c| Some((k, o.checked_add(c)?)))
                     }
-                    (BinaryOp::Sub, Some(&o), None) => {
-                        int_const(&defs, rhs).and_then(|c| o.checked_sub(c))
+                    (BinaryOp::Sub, Some(&(k, o)), None) => {
+                        int_const(&defs, rhs).and_then(|c| Some((k, o.checked_sub(c)?)))
                     }
                     _ => None,
                 };
@@ -525,55 +623,107 @@ fn hoist_loop(
                 }
             }
         }
-        if let Terminator::Jmp { args, .. } = &block.terminator {
-            incoming = args.clone();
+    }
+
+    // What every way back passes for each parameter: itself (`fixed`, invariant), or itself
+    // plus a positive step (an induction variable).
+    let step_of = |a: &str, k: usize| -> Option<Step> {
+        match offset.get(a) {
+            Some(&(kk, s)) if kk == k && (0..=1 << 32).contains(&s) => Some(Step::Const(s)),
+            Some(_) => None,
+            None => match defs.get(a) {
+                Some(Instruction::Binary {
+                    op: BinaryOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                }) => {
+                    let w = match (offset.get(lhs.as_str()), offset.get(rhs.as_str())) {
+                        (Some(&(kk, 0)), None) if kk == k => rhs,
+                        (None, Some(&(kk, 0))) if kk == k => lhs,
+                        _ => return None,
+                    };
+                    match defs.get(w.as_str()) {
+                        Some(Instruction::VLen { .. }) => Some(Step::Reg(w.clone())),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        }
+    };
+    let mut ivs: Vec<Iv> = Vec::new();
+    let mut fixed: Vec<usize> = Vec::new();
+    for (k, (p, ty)) in header_block.params.iter().enumerate() {
+        if !offset.contains_key(p.as_str()) {
+            continue;
+        }
+        let mut step: Option<Option<Step>> = None;
+        for &l in &latches {
+            for args in edge_args(&f.blocks[l].terminator, header) {
+                let s = step_of(&args[k], k);
+                step = match step {
+                    None => Some(s),
+                    Some(prev) if prev == s => Some(s),
+                    Some(_) => Some(None),
+                };
+            }
+        }
+        match step.flatten() {
+            Some(Step::Const(0)) => fixed.push(k),
+            Some(step) => ivs.push(Iv {
+                param: k,
+                step,
+                ptr: *ty == Type::Ptr,
+            }),
+            None => {}
         }
     }
-    // The next counter, which the last block passes back to the header.
-    let next_iv = match chain.len() {
-        1 => &then_args[k],
-        _ => &incoming[k],
+    let iv_of = |k: usize| ivs.iter().position(|iv| iv.param == k);
+    let fixed_names: HashSet<&str> = fixed
+        .iter()
+        .map(|&k| header_block.params[k].0.as_str())
+        .collect();
+    let invariant =
+        |r: &str| !in_loop.contains(r) || constant_like(&defs, r) || fixed_names.contains(r);
+    let counter = |r: &str| -> Option<(usize, i64)> {
+        let &(k, o) = offset.get(r)?;
+        iv_of(k).map(|_| (k, o))
     };
-    let step = match offset.get(next_iv.as_str()) {
-        Some(&s) if s > 0 && s <= 1 << 32 => Step::Const(s),
-        Some(_) => return false,
-        None => match defs.get(next_iv.as_str()) {
-            Some(Instruction::Binary {
-                op: BinaryOp::Add,
-                lhs,
-                rhs,
-                ..
-            }) => {
-                let w = match (offset.get(lhs.as_str()), offset.get(rhs.as_str())) {
-                    (Some(0), None) => rhs,
-                    (None, Some(0)) => lhs,
-                    _ => return false,
-                };
-                match defs.get(w.as_str()) {
-                    Some(Instruction::VLen { .. }) => Step::Reg(w.clone()),
-                    _ => return false,
-                }
-            }
-            _ => return false,
-        },
+    let Some(tests) = parse_tests(cond, &defs, &in_loop, &invariant, &counter) else {
+        return false;
     };
 
     // Types are needed for stores and live-out registers.
     let types_cell: std::cell::OnceCell<HashMap<String, Type>> = std::cell::OnceCell::new();
     let types = || types_cell.get_or_init(|| infer_reg_types(f, sigs));
 
-    // Indexed accesses of invariant pointers by the counter plus a constant, and accesses at
-    // invariant addresses: (chain position, instruction, pointer, offset and unit bytes of
-    // the index, type of the access).
+    // Accesses whose addresses the dispatch block can bound: through an invariant pointer at
+    // a counter plus a constant, through a pointer induction variable plus a constant, or at
+    // an invariant address.
+    enum Place {
+        Fixed {
+            ptr: String,
+        },
+        Indexed {
+            ptr: String,
+            iv: usize,
+            o: i64,
+            unit: i64,
+        },
+        Bumped {
+            iv: usize,
+            o: i64,
+        },
+    }
     struct Access {
-        pos: usize,
+        block: usize,
         inst: usize,
-        ptr: String,
-        index: Option<(i64, i64)>,
+        place: Place,
         ty: Type,
     }
     let mut accesses: Vec<Access> = Vec::new();
-    for (pos, &b) in chain.iter().enumerate() {
+    for &b in &body {
         for (i, inst) in f.blocks[b].instructions.iter().enumerate() {
             let (ptr, index, ty, implied) = match inst {
                 Instruction::Load { ptr, index, ty, .. } => (ptr, index, *ty, *ty),
@@ -606,21 +756,28 @@ fn hoist_loop(
                 }
                 _ => continue,
             };
-            if in_loop.contains(ptr.as_str()) {
-                continue;
-            }
-            let index = match index {
-                None => None,
-                Some(ix) => match offset.get(ix.reg.as_str()) {
-                    Some(&o) => Some((o, ix.unit_or(implied).byte_size() as i64)),
-                    None => continue,
+            let ivs_at = |r: &str| offset.get(r).and_then(|&(k, o)| Some((iv_of(k)?, o)));
+            let place = match index {
+                None if invariant(ptr) => Place::Fixed { ptr: ptr.clone() },
+                None => match ivs_at(ptr) {
+                    Some((iv, o)) if ivs[iv].ptr => Place::Bumped { iv, o },
+                    _ => continue,
                 },
+                Some(ix) if invariant(ptr) => match ivs_at(&ix.reg) {
+                    Some((iv, o)) if !ivs[iv].ptr => Place::Indexed {
+                        ptr: ptr.clone(),
+                        iv,
+                        o,
+                        unit: ix.unit_or(implied).byte_size() as i64,
+                    },
+                    _ => continue,
+                },
+                Some(_) => continue,
             };
             accesses.push(Access {
-                pos,
+                block: b,
                 inst: i,
-                ptr: ptr.clone(),
-                index,
+                place,
                 ty,
             });
         }
@@ -650,43 +807,63 @@ fn hoist_loop(
         again: HashMap::new(),
     };
 
-    // The dispatch block takes the header's parameters; `i0` is the counter's first value.
+    // The dispatch block takes the header's parameters: the induction variables' first
+    // values, and the fixed ones' values throughout.
     let dparams: Vec<(String, Type)> = f.blocks[h]
         .params
         .iter()
         .map(|(p, t)| (format!("{prefix}_p_{p}"), *t))
         .collect();
-    let i0 = dparams[k].0.clone();
-    let s = match &step {
-        Step::Const(c) => e.cst(*c, Type::I64),
-        Step::Reg(w) => e.reg(w, &in_loop, &defs),
-    };
+    for &k in &fixed {
+        e.again
+            .insert(f.blocks[h].params[k].0.clone(), dparams[k].0.clone());
+    }
+    let steps: Vec<String> = ivs
+        .iter()
+        .map(|iv| match &iv.step {
+            Step::Const(c) => e.cst(*c, Type::I64),
+            Step::Reg(w) => e.reg(w, &in_loop, &defs),
+        })
+        .collect();
 
-    // Trips: the fewest any test allows. `i < n` holds for `(n - i0 - 1) / s + 1` trips when
-    // i0 < n, unless the counter would wrap past i64::MAX and the loop never end;
-    // `n - i > k` holds for `(n - i0 - k - 1) / s + 1` when `n - i0 > k` (wrapping), since it
-    // falls by `s` without wrapping while it is above k.
+    // Trips: the fewest any test allows, on `v0 = x0 + o` for the variable's first value
+    // x0. `v < n` holds for `(n - v0 - 1) / s + 1` trips when v0 < n, unless v would wrap
+    // past i64::MAX and the loop never end; `n - v > k` holds for `(n - v0 - k - 1) / s + 1`
+    // when `n - v0 > k` (wrapping), since it falls by `s` without wrapping while it is above
+    // k.
     let zero = e.cst(0, Type::I64);
     let endless = e.cst(ENDLESS_UNITS, Type::I64);
     let mut trips: Option<String> = None;
     for test in &tests {
-        let t = match test {
-            Test::Below { n } => {
+        let iv = iv_of(test.param).expect("tests are on induction variables");
+        let (s, step) = (&steps[iv], &ivs[iv].step);
+        let (x0, ty) = &dparams[test.param];
+        let x0 = e.int(x0, *ty);
+        let v0 = match test.o {
+            0 => x0,
+            o => e.bin_c(BinaryOp::Add, &x0, o),
+        };
+        let t = match &test.kind {
+            TestKind::Below { n } => {
+                let ty = types().get(n.as_str()).copied().unwrap_or(Type::I64);
                 let n = e.reg(n, &in_loop, &defs);
-                let some = e.bin(BinaryOp::Lt, &i0, &n);
-                let d = e.bin(BinaryOp::Sub, &n, &i0);
-                let t = e.ceil_div(&d, &s, &step);
+                let n = e.int(&n, ty);
+                let some = e.bin(BinaryOp::Lt, &v0, &n);
+                let d = e.bin(BinaryOp::Sub, &n, &v0);
+                let t = e.ceil_div(&d, s, step);
                 let t1 = e.bin_c(BinaryOp::Sub, &t, 1);
-                let last = e.bin(BinaryOp::Mul, &t1, &s);
-                let last = e.bin(BinaryOp::Add, &i0, &last);
+                let last = e.bin(BinaryOp::Mul, &t1, s);
+                let last = e.bin(BinaryOp::Add, &v0, &last);
                 let max = e.cst(i64::MAX, Type::I64);
-                let room = e.bin(BinaryOp::Sub, &max, &s);
+                let room = e.bin(BinaryOp::Sub, &max, s);
                 let wraps = e.bin(BinaryOp::Gt, &last, &room);
                 let t = e.select(&wraps, &endless, &t);
                 e.select(&some, &t, &zero)
             }
-            Test::Above { n, k } => {
+            TestKind::Above { n, k } => {
+                let ty = types().get(n.as_str()).copied().unwrap_or(Type::I64);
                 let n = e.reg(n, &in_loop, &defs);
+                let n = e.int(&n, ty);
                 let k = match k {
                     Bound::Const(c) => e.cst(*c, Type::I64),
                     Bound::VlMinus1(w) => {
@@ -694,10 +871,10 @@ fn hoist_loop(
                         e.bin_c(BinaryOp::Sub, &w, 1)
                     }
                 };
-                let r0 = e.bin(BinaryOp::Sub, &n, &i0);
+                let r0 = e.bin(BinaryOp::Sub, &n, &v0);
                 let some = e.bin(BinaryOp::Gt, &r0, &k);
                 let d = e.bin(BinaryOp::Sub, &r0, &k);
-                let t = e.ceil_div(&d, &s, &step);
+                let t = e.ceil_div(&d, s, step);
                 e.select(&some, &t, &zero)
             }
         };
@@ -708,41 +885,57 @@ fn hoist_loop(
     }
     let trips = trips.expect("at least one test");
 
-    // Fuel: one unit per block per trip, and the header's last branch.
+    // Fuel: `cost` units per trip, and the branches of the last iteration up to and including
+    // the exiting block's.
     let many = e.bin_c(BinaryOp::Ugt, &trips, MAX_TRIPS);
-    let per_trip = e.bin_c(BinaryOp::Mul, &trips, chain.len() as i64);
-    let all = e.bin_c(BinaryOp::Add, &per_trip, 1);
+    let per_trip = e.bin_c(BinaryOp::Mul, &trips, cost as i64);
+    let all = e.bin_c(BinaryOp::Add, &per_trip, dist[&ex] as i64 + 1);
     let units = e.select(&many, &endless, &all);
 
-    // Ranges. The header runs once more than the other blocks, on the last test, so its
-    // accesses reach `trips * s` elements past the first, and the others' `(trips - 1) * s`
-    // (none when there are no trips). Too many trips, or too long a step, cannot fit: with
-    // trips <= MAX_SPAN and s <= MAX_STEP the products stay below 2^64.
+    // Ranges. Blocks up to the exiting one run once more than the others, on the last
+    // iteration, so their accesses reach `trips` steps past the first, and the others'
+    // `trips - 1` (none when there are no trips); counting every block as if it ran on every
+    // trip covers the accesses of those that run on some. Too many trips, or too long a step,
+    // cannot fit: with trips <= MAX_SPAN and steps <= MAX_STEP the products stay below 2^64.
     let mut ranges = Vec::new();
     let no_trips = e.bin(BinaryOp::Eq, &trips, &zero);
     let many = e.bin_c(BinaryOp::Ugt, &trips, MAX_SPAN);
-    let long = e.bin_c(BinaryOp::Ugt, &s, MAX_STEP);
-    let unfit = e.bin(BinaryOp::Or, &many, &long);
     let too_far = e.cst(-1, Type::I64);
     let trips1 = e.bin_c(BinaryOp::Sub, &trips, 1);
+    let unfit: Vec<String> = steps
+        .iter()
+        .map(|s| {
+            let long = e.bin_c(BinaryOp::Ugt, s, MAX_STEP);
+            e.bin(BinaryOp::Or, &many, &long)
+        })
+        .collect();
     for a in &accesses {
+        let last_too = before_exit.contains(&a.block);
         let bytes = access_bytes(&mut e, a.ty);
-        let (lo, span) = match a.index {
-            None => (a.ptr.clone(), bytes),
-            Some((o, unit)) => {
-                let first = e.bin_c(BinaryOp::Add, &i0, o);
-                let off = e.bin_c(BinaryOp::Mul, &first, unit);
-                let lo = e.bin(BinaryOp::Add, &a.ptr, &off);
-                let steps = if a.pos == 0 { &trips } else { &trips1 };
-                let dist = e.bin(BinaryOp::Mul, steps, &s);
-                let wide = e.bin_c(BinaryOp::Ugt, &dist, MAX_SPAN);
-                let bad = e.bin(BinaryOp::Or, &unfit, &wide);
-                let dist = e.bin_c(BinaryOp::Mul, &dist, unit);
-                let span = e.bin(BinaryOp::Add, &dist, &bytes);
-                (lo, e.select(&bad, &too_far, &span))
+        let strided = |e: &mut Emitter, lo: String, iv: usize, unit: i64| {
+            let n = if last_too { &trips } else { &trips1 };
+            let dist = e.bin(BinaryOp::Mul, n, &steps[iv]);
+            let wide = e.bin_c(BinaryOp::Ugt, &dist, MAX_SPAN);
+            let bad = e.bin(BinaryOp::Or, &unfit[iv], &wide);
+            let dist = e.bin_c(BinaryOp::Mul, &dist, unit);
+            let span = e.bin(BinaryOp::Add, &dist, &bytes);
+            (lo, e.select(&bad, &too_far, &span))
+        };
+        let (lo, span) = match &a.place {
+            Place::Fixed { ptr } => (e.reg(ptr, &in_loop, &defs), bytes.clone()),
+            Place::Indexed { ptr, iv, o, unit } => {
+                let first = e.bin_c(BinaryOp::Add, &dparams[ivs[*iv].param].0, *o);
+                let off = e.bin_c(BinaryOp::Mul, &first, *unit);
+                let ptr = e.reg(ptr, &in_loop, &defs);
+                let lo = e.bin(BinaryOp::Add, &ptr, &off);
+                strided(&mut e, lo, *iv, *unit)
+            }
+            Place::Bumped { iv, o } => {
+                let lo = e.bin_c(BinaryOp::Add, &dparams[ivs[*iv].param].0, *o);
+                strided(&mut e, lo, *iv, 1)
             }
         };
-        let span = if a.pos == 0 {
+        let span = if last_too {
             span
         } else {
             e.select(&no_trips, &zero, &span)
@@ -759,7 +952,7 @@ fn hoist_loop(
     let dispatch_insts = e.out;
 
     // The copy, entered from the dispatch block, with the loop's own registers renamed.
-    let labels: HashSet<&str> = chain.iter().map(|&b| f.blocks[b].label.as_str()).collect();
+    let labels: HashSet<&str> = body.iter().map(|&b| f.blocks[b].label.as_str()).collect();
     let reg = |name: &str| -> String {
         if in_loop.contains(name) {
             format!("{prefix}_{name}")
@@ -779,7 +972,7 @@ fn hoist_loop(
         .map(|v| (v.clone(), format!("{prefix}_x_{v}")))
         .collect();
     let mut copy: Vec<Block> = Vec::new();
-    for &b in &chain {
+    for &b in &body {
         let src = &f.blocks[b];
         let mut instructions = Vec::with_capacity(src.instructions.len());
         for inst in &src.instructions {
@@ -824,8 +1017,7 @@ fn hoist_loop(
     };
 
     for a in &accesses {
-        fc.covered
-            .insert((label(&f.blocks[chain[a.pos]].label), a.inst));
+        fc.covered.insert((label(&f.blocks[a.block].label), a.inst));
     }
     fc.free.insert(dispatch_label.clone());
     fc.free.extend(copy.iter().map(|b| b.label.clone()));

@@ -1615,9 +1615,11 @@ fn emit_fuel_check<M: ClifModule>(
 
 /// The condition of a loop dispatch block (`achainsaw_ir::checks::Dispatch`): whether every
 /// range lies in the sandbox and the loop's fuel could be charged, in which case it is. The
-/// charge comes off the counter in its register; when that would empty it, `rt_try_fuel`
-/// draws on the shared budget (a `par` worker) or reports that the budget cannot cover it,
-/// and charges nothing.
+/// charge comes off the counter in its register; when that would empty it, the counter less
+/// the charge goes to memory for `rt_draw_fuel`, which draws on the shared budget (a `par`
+/// worker) to make it positive, and otherwise the counter keeps its value and nothing is
+/// charged. The hook preserves every register, so values live across the loop are not
+/// spilled around it.
 fn emit_dispatch<M: ClifModule>(
     builder: &mut FunctionBuilder,
     module: &mut M,
@@ -1647,7 +1649,7 @@ fn emit_dispatch<M: ClifModule>(
             ok = builder.ins().band(ok, this);
         }
     }
-    let Some((fuel, try_fuel)) = fuel else {
+    let Some((fuel, draw_fuel)) = fuel else {
         return ok;
     };
     let (units, _) = scalar(values, &dispatch.units);
@@ -1674,12 +1676,17 @@ fn emit_dispatch<M: ClifModule>(
     builder.ins().jump(done, &[BlockArg::Value(yes)]);
 
     builder.switch_to_block(slow);
-    fuel.spill(builder);
-    let callee = module.declare_func_in_func(try_fuel, builder.func);
-    let call = builder.ins().call(callee, &[units]);
-    let charged = builder.inst_results(call)[0];
-    fuel.reload(builder);
-    let charged = builder.ins().icmp_imm_u(IntCC::NotEqual, charged, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), left, fuel.addr, 0);
+    let callee = module.declare_func_in_func(draw_fuel, builder.func);
+    builder.ins().call(callee, &[]);
+    let drawn = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), fuel.addr, 0);
+    let charged = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, drawn, 0);
+    let after = builder.ins().select(charged, drawn, counter);
+    builder.def_var(fuel.var, after);
     builder.ins().jump(done, &[BlockArg::Value(charged)]);
 
     builder.switch_to_block(done);
@@ -1735,8 +1742,8 @@ pub struct LowerConfig {
     pub fuel_check: Option<(i64, FuncId)>,
     /// `rt_consume_fuel(units: i64) -> i32`, charged up front by bulk ops (`mm`).
     pub fuel_consume_func_id: Option<FuncId>,
-    /// `rt_try_fuel(units: i64) -> i32`, the slow path of a loop dispatch's fuel charge.
-    pub fuel_try_func_id: Option<FuncId>,
+    /// `rt_draw_fuel()` (`PreserveAll`), the slow path of a loop dispatch's fuel charge.
+    pub fuel_draw_func_id: Option<FuncId>,
     /// Loops that pay for their checks on entry (`achainsaw_ir::checks`).
     pub loop_checks: achainsaw_ir::checks::LoopChecks,
     pub rt_malloc_id: FuncId,
@@ -2775,7 +2782,7 @@ pub fn lower_function<M: ClifModule>(
                 let dispatch = loop_checks.and_then(|c| c.dispatch.get(&block.label));
                 let cond_val = match dispatch {
                     Some(d) => {
-                        let fuel = fuel.zip(config.fuel_try_func_id);
+                        let fuel = fuel.zip(config.fuel_draw_func_id);
                         emit_dispatch(&mut builder, module, &values, d, outer_guard, fuel)
                     }
                     None => scalar(&values, cond).0,
