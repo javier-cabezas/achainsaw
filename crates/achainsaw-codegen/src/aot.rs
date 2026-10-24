@@ -156,6 +156,8 @@ impl AotCompiler {
         let config = LowerConfig {
             fuel_check: None,
             fuel_consume_func_id: None,
+            fuel_try_func_id: None,
+            loop_checks: Default::default(),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
             sandbox: None,

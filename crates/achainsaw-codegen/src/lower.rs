@@ -1613,6 +1613,79 @@ fn emit_fuel_check<M: ClifModule>(
     builder.switch_to_block(cont);
 }
 
+/// The condition of a loop dispatch block (`achainsaw_ir::checks::Dispatch`): whether every
+/// range lies in the sandbox and the loop's fuel could be charged, in which case it is. The
+/// charge comes off the counter in its register; when that would empty it, `rt_try_fuel`
+/// draws on the shared budget (a `par` worker) or reports that the budget cannot cover it,
+/// and charges nothing.
+fn emit_dispatch<M: ClifModule>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    values: &Values,
+    dispatch: &achainsaw_ir::checks::Dispatch,
+    guard: Option<Guard>,
+    fuel: Option<(FuelVar, FuncId)>,
+) -> ClifValue {
+    let mut ok = builder.ins().iconst(types::I8, 1);
+    if let Some(g) = guard {
+        let base = c64(builder, g.base);
+        let len = c64(builder, g.len);
+        for (lo, span) in &dispatch.ranges {
+            let (lo, _) = scalar(values, lo);
+            let (span, _) = scalar(values, span);
+            let off = builder.ins().isub(lo, base);
+            let room = builder.ins().isub(len, span);
+            let small = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, span, len);
+            let inside = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, off, room);
+            let fits = builder.ins().band(small, inside);
+            let empty = builder.ins().icmp_imm_u(IntCC::Equal, span, 0);
+            let this = builder.ins().bor(fits, empty);
+            ok = builder.ins().band(ok, this);
+        }
+    }
+    let Some((fuel, try_fuel)) = fuel else {
+        return ok;
+    };
+    let (units, _) = scalar(values, &dispatch.units);
+    let charge = builder.create_block();
+    let commit = builder.create_block();
+    let slow = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I8);
+    builder.set_cold_block(slow);
+    let no = builder.ins().iconst(types::I8, 0);
+    builder
+        .ins()
+        .brif(ok, charge, &[], done, &[BlockArg::Value(no)]);
+
+    builder.switch_to_block(charge);
+    let counter = builder.use_var(fuel.var);
+    let left = builder.ins().isub(counter, units);
+    let covers = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, left, 0);
+    builder.ins().brif(covers, commit, &[], slow, &[]);
+
+    builder.switch_to_block(commit);
+    builder.def_var(fuel.var, left);
+    let yes = builder.ins().iconst(types::I8, 1);
+    builder.ins().jump(done, &[BlockArg::Value(yes)]);
+
+    builder.switch_to_block(slow);
+    fuel.spill(builder);
+    let callee = module.declare_func_in_func(try_fuel, builder.func);
+    let call = builder.ins().call(callee, &[units]);
+    let charged = builder.inst_results(call)[0];
+    fuel.reload(builder);
+    let charged = builder.ins().icmp_imm_u(IntCC::NotEqual, charged, 0);
+    builder.ins().jump(done, &[BlockArg::Value(charged)]);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
 /// Packs a scalar into the u64 slot layout of scalar trampolines (`lower_trampoline`).
 fn pack_u64(builder: &mut FunctionBuilder, v: ClifValue, ty: Type) -> ClifValue {
     match ty {
@@ -1662,6 +1735,10 @@ pub struct LowerConfig {
     pub fuel_check: Option<(i64, FuncId)>,
     /// `rt_consume_fuel(units: i64) -> i32`, charged up front by bulk ops (`mm`).
     pub fuel_consume_func_id: Option<FuncId>,
+    /// `rt_try_fuel(units: i64) -> i32`, the slow path of a loop dispatch's fuel charge.
+    pub fuel_try_func_id: Option<FuncId>,
+    /// Loops that pay for their checks on entry (`achainsaw_ir::checks`).
+    pub loop_checks: achainsaw_ir::checks::LoopChecks,
     pub rt_malloc_id: FuncId,
     pub rt_free_id: FuncId,
     /// Bounds-check memory accesses and cap stack depth (JIT only; see `JitEngine::enable_sandbox`).
@@ -1752,6 +1829,10 @@ pub fn lower_function<M: ClifModule>(
     // Values map: SSA register name -> (Cranelift parts, Type)
     let mut values: Values = HashMap::new();
 
+    // Loops that pay for their checks on entry.
+    let loop_checks = config.loop_checks.function(&func.name);
+    let free = |label: &str| loop_checks.is_some_and(|c| c.free.contains(label));
+
     // Map function parameters in synthetic entry
     builder.switch_to_block(synth_entry);
     let entry_params = builder.block_params(synth_entry).to_vec();
@@ -1829,7 +1910,13 @@ pub fn lower_function<M: ClifModule>(
         }
 
         // Translate instructions
-        for inst in &block.instructions {
+        let outer_guard = guard;
+        for (k, inst) in block.instructions.iter().enumerate() {
+            // Accesses a loop dispatch checked as a range.
+            let guard = match loop_checks {
+                Some(c) if c.covered.contains(&(block.label.clone(), k)) => None,
+                _ => outer_guard,
+            };
             // Calls (AIR, runtime hooks, `mm` and `par` charging fuel) see the counter in
             // memory and may change it.
             let calls_out = matches!(
@@ -2670,8 +2757,8 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some((_, exhausted)), Some(f), Some(trap_block)) =
-                    (config.fuel_check, fuel, fuel_trap_block)
+                if let (Some((_, exhausted)), Some(f), Some(trap_block), false) =
+                    (config.fuel_check, fuel, fuel_trap_block, free(&block.label))
                 {
                     emit_fuel_check(&mut builder, module, f, exhausted, trap_block);
                 }
@@ -2685,7 +2772,14 @@ pub fn lower_function<M: ClifModule>(
                 else_args,
                 ..
             } => {
-                let (cond_val, _) = scalar(&values, cond);
+                let dispatch = loop_checks.and_then(|c| c.dispatch.get(&block.label));
+                let cond_val = match dispatch {
+                    Some(d) => {
+                        let fuel = fuel.zip(config.fuel_try_func_id);
+                        emit_dispatch(&mut builder, module, &values, d, outer_guard, fuel)
+                    }
+                    None => scalar(&values, cond).0,
+                };
                 let then_target = *clif_blocks.get(then_block).unwrap();
                 let then_vals: Vec<BlockArg> = flat_args(&values, then_args)
                     .into_iter()
@@ -2697,8 +2791,8 @@ pub fn lower_function<M: ClifModule>(
                     .map(BlockArg::Value)
                     .collect();
 
-                if let (Some((_, exhausted)), Some(f), Some(trap_block)) =
-                    (config.fuel_check, fuel, fuel_trap_block)
+                if let (Some((_, exhausted)), Some(f), Some(trap_block), false) =
+                    (config.fuel_check, fuel, fuel_trap_block, free(&block.label))
                 {
                     emit_fuel_check(&mut builder, module, f, exhausted, trap_block);
                 }

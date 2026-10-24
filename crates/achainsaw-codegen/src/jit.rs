@@ -367,6 +367,34 @@ pub extern "C" fn rt_consume_fuel(units: i64) -> i32 {
     })
 }
 
+/// Slow path of a loop dispatch's fuel charge (`achainsaw_ir::checks`), reached when `units`
+/// would empty the inline counter: a `par` worker draws on the shared budget to cover them.
+/// Returns 1 and takes them when the budget covers them; otherwise 0, charging nothing, and
+/// the loop runs with its checks (which then stop it where it runs out).
+pub extern "C" fn rt_try_fuel(units: i64) -> i32 {
+    if halted() {
+        return 0;
+    }
+    let charged = with_active_fuel(|counter| {
+        let left = counter.get().saturating_sub(units);
+        if left > 0 {
+            counter.set(left);
+            return true;
+        }
+        let Some(region) = active_region() else {
+            return false;
+        };
+        let got = region.draw(PAR_FUEL_CHUNK.saturating_sub(left));
+        if left.saturating_add(got) > 0 {
+            counter.set(left + got);
+            return true;
+        }
+        region.refund(got);
+        false
+    });
+    charged.unwrap_or(false) as i32
+}
+
 /// Takes `units` from an inline fuel counter, topping it up from the shared budget when
 /// this thread is a `par` worker. False when the budget cannot cover them.
 fn charge(counter: &Cell<i64>, units: i64) -> bool {
@@ -694,6 +722,13 @@ impl ParRegion {
                 Ok(_) => return got,
                 Err(now) => left = now,
             }
+        }
+    }
+
+    /// Returns fuel `draw` took and nothing used.
+    fn refund(&self, units: i64) {
+        if !self.unlimited && units > 0 {
+            self.fuel.fetch_add(units, Ordering::AcqRel);
         }
     }
 
@@ -1422,6 +1457,7 @@ struct CraneliftJit {
     rt_free_id: FuncId,
     rt_fuel_exhausted_id: FuncId,
     rt_consume_fuel_id: FuncId,
+    rt_try_fuel_id: FuncId,
     rt_sandbox_fault_id: FuncId,
     rt_stack_check_id: FuncId,
     rt_sandbox_check_mm_id: FuncId,
@@ -1461,6 +1497,7 @@ impl CraneliftJit {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         jit_builder.symbol("rt_fuel_exhausted", rt_fuel_exhausted as *const u8);
         jit_builder.symbol("rt_consume_fuel", rt_consume_fuel as *const u8);
+        jit_builder.symbol("rt_try_fuel", rt_try_fuel as *const u8);
         jit_builder.symbol("rt_sandbox_fault", rt_sandbox_fault as *const u8);
         jit_builder.symbol("rt_stack_check", rt_stack_check as *const u8);
         jit_builder.symbol("rt_sandbox_check_mm", rt_sandbox_check_mm as *const u8);
@@ -1497,6 +1534,8 @@ impl CraneliftJit {
         consume_sig.returns.push(AbiParam::new(types::I32));
         let rt_consume_fuel_id =
             module.declare_function("rt_consume_fuel", Linkage::Import, &consume_sig)?;
+        let rt_try_fuel_id =
+            module.declare_function("rt_try_fuel", Linkage::Import, &consume_sig)?;
 
         let mut fault_sig = module.make_signature();
         fault_sig.params.push(AbiParam::new(types::I64));
@@ -1537,6 +1576,7 @@ impl CraneliftJit {
             rt_free_id,
             rt_fuel_exhausted_id,
             rt_consume_fuel_id,
+            rt_try_fuel_id,
             rt_sandbox_fault_id,
             rt_stack_check_id,
             rt_sandbox_check_mm_id,
@@ -1553,6 +1593,7 @@ impl CraneliftJit {
         fuel_counter: i64,
         sandbox: Option<(i64, i64)>,
         fast_math: bool,
+        loop_checks: &achainsaw_ir::checks::LoopChecks,
     ) -> Result<Vec<(String, usize, Option<usize>)>> {
         let mut func_ids = HashMap::new();
         let mut func_returns = HashMap::new();
@@ -1616,6 +1657,8 @@ impl CraneliftJit {
             fuel_check: (fuel_enabled || sandbox.is_some())
                 .then_some((fuel_counter, self.rt_fuel_exhausted_id)),
             fuel_consume_func_id: fuel_enabled.then_some(self.rt_consume_fuel_id),
+            fuel_try_func_id: Some(self.rt_try_fuel_id),
+            loop_checks: loop_checks.clone(),
             rt_malloc_id: self.rt_malloc_id,
             rt_free_id: self.rt_free_id,
             sandbox,
@@ -1953,8 +1996,14 @@ impl JitEngine {
     }
 
     fn compile_prepared(&mut self, ir_mod: &Module) -> Result<()> {
-        // Inlined and loop-split before lowering, for both backends (`prepare_for_codegen`).
-        let inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
+        // Inlined and loop-split before lowering, for both backends (`prepare_for_codegen`);
+        // with checks, loops that can pay for them on entry get a copy without them.
+        let mut inlined = achainsaw_ir::prepare_for_codegen(ir_mod);
+        let loop_checks = if self.fuel_enabled || self.sandbox.is_some() {
+            achainsaw_ir::checks::hoist_loop_checks(inlined.to_mut())
+        } else {
+            Default::default()
+        };
         let ir_mod = &*inlined;
         let sandbox = self.sandbox.as_ref().map(|arena| {
             let arena = lock(arena);
@@ -1968,6 +2017,7 @@ impl JitEngine {
                 fuel_counter,
                 sandbox,
                 self.fast_math,
+                &loop_checks,
             )?,
             #[cfg(feature = "llvm")]
             Codegen::Llvm {
@@ -1985,6 +2035,7 @@ impl JitEngine {
                     free: rt_free as *const () as usize,
                     fuel_exhausted: rt_fuel_exhausted as *const () as usize,
                     consume_fuel: rt_consume_fuel as *const () as usize,
+                    try_fuel: rt_try_fuel as *const () as usize,
                     sandbox_fault: rt_sandbox_fault as *const () as usize,
                     stack_check: rt_stack_check as *const () as usize,
                     sandbox_check_mm: rt_sandbox_check_mm as *const () as usize,
@@ -2005,6 +2056,7 @@ impl JitEngine {
                     native_f16: *native_f16,
                     int8_dot: *int8_dot,
                     fast_math: self.fast_math,
+                    loop_checks,
                     ..Default::default()
                 };
                 // Functions from earlier modules first, then registered symbols.

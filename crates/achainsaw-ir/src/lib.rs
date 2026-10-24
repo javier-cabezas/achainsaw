@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod binary;
 pub mod cfg;
+pub mod checks;
 pub mod diag;
 pub mod inline;
 pub mod lexer;

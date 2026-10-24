@@ -102,7 +102,7 @@ fn split_function(f: &mut Function, sigs: &Signatures) -> usize {
 }
 
 /// The blocks of the natural loop of block `h` (empty if `h` heads no loop).
-fn natural_loop(cfg: &Cfg, h: usize) -> Vec<usize> {
+pub(crate) fn natural_loop(cfg: &Cfg, h: usize) -> Vec<usize> {
     let tails: Vec<usize> = cfg.preds[h]
         .iter()
         .copied()
@@ -123,7 +123,7 @@ fn natural_loop(cfg: &Cfg, h: usize) -> Vec<usize> {
     blocks
 }
 
-fn targets(t: &Terminator) -> Vec<&String> {
+pub(crate) fn targets(t: &Terminator) -> Vec<&String> {
     match t {
         Terminator::Jmp { target, .. } => vec![target],
         Terminator::Br {
@@ -275,44 +275,15 @@ fn split_loop(f: &mut Function, header: &str, sigs: &Signatures, serial: &mut us
     // guarded `rest = sub n, p`): the copy then goes straight to the branch it takes.
     let taken = header_test(&f.blocks[h], &defs, &header_params, &in_loop, &mut facts);
 
-    // Registers the loop defines and later code reads: the exit block takes them as
-    // parameters, since the copy defines them too.
-    let mut live_out: Vec<String> = Vec::new();
-    for (bi, block) in f.blocks.iter().enumerate() {
-        if in_body.contains(&bi) {
-            continue;
-        }
-        let mut reads: Vec<&String> = block
-            .instructions
-            .iter()
-            .flat_map(|i| i.operands())
-            .collect();
-        reads.extend(terminator_reads(&block.terminator));
-        for r in reads {
-            if in_loop.contains(r.as_str()) && !live_out.contains(r) {
-                live_out.push(r.clone());
-            }
-        }
-    }
-
-    // The exit block takes the live-out registers as parameters, so every other way into it
-    // must come from code it dominates, where those parameters are in scope.
     let exit_idx = f
         .blocks
         .iter()
         .position(|b| b.label == exit)
         .expect("exit block");
-    if !live_out.is_empty() {
-        let outside = cfg.preds[exit_idx]
-            .iter()
-            .filter(|p| !in_body.contains(p) && cfg.reachable[**p]);
-        if outside.clone().any(|&p| !cfg.dominates(exit_idx, p))
-            || live_out.iter().any(|v| !types().contains_key(v))
-        {
-            return false;
-        }
-    }
-    let live_types: Vec<Type> = live_out.iter().map(|v| types()[v.as_str()]).collect();
+    let Some((live_out, live_types)) = live_outs(f, &cfg, &in_body, &in_loop, exit_idx, &types)
+    else {
+        return false;
+    };
 
     // A prefix no name in the function starts with.
     let names = all_names(f);
@@ -404,13 +375,9 @@ fn split_loop(f: &mut Function, header: &str, sigs: &Signatures, serial: &mut us
     }
     let guard = guard_block(&f.blocks[h], &guard_label, &prefix, &facts, header);
 
-    // The original loop passes its registers to the exit too; entries go to the guard.
+    // Entries go to the guard.
     for (bi, block) in f.blocks.iter_mut().enumerate() {
-        if in_body.contains(&bi) {
-            add_exit_args(&mut block.terminator, &exit, &exit_params, |v| {
-                v.to_string()
-            });
-        } else {
+        if !in_body.contains(&bi) {
             retarget(&mut block.terminator, &|l: &str| {
                 if l == header {
                     guard_label.clone()
@@ -420,40 +387,99 @@ fn split_loop(f: &mut Function, header: &str, sigs: &Signatures, serial: &mut us
             });
         }
     }
-    if !exit_params.is_empty() {
-        let subst: HashMap<String, String> = exit_params.iter().cloned().collect();
-        for (bi, block) in f.blocks.iter_mut().enumerate() {
-            if in_body.contains(&bi) {
-                continue;
-            }
-            for inst in &mut block.instructions {
-                for r in inst.operands_mut() {
-                    if let Some(n) = subst.get(r.as_str()) {
-                        *r = n.clone();
-                    }
-                }
-            }
-            for r in crate::names::terminator_operands_mut(&mut block.terminator) {
-                if let Some(n) = subst.get(r.as_str()) {
-                    *r = n.clone();
-                }
-            }
-            // Other ways into the exit block come from code it dominates, which now reads the
-            // parameters.
-            add_exit_args(&mut block.terminator, &exit, &exit_params, |v| {
-                subst[v].clone()
-            });
-        }
-        let exit_block = &mut f.blocks[exit_idx];
-        for ((_, p), ty) in exit_params.iter().zip(&live_types) {
-            exit_block.params.push((p.clone(), *ty));
-        }
-    }
+    route_live_outs(f, &in_body, exit_idx, &exit_params, &live_types);
     let at = body.iter().min().copied().unwrap_or(h);
     let mut inserted = vec![guard];
     inserted.extend(copy);
     f.blocks.splice(at..at, inserted);
     true
+}
+
+/// Registers the loop (blocks `in_body`, defining `in_loop`) defines and later code reads,
+/// with their types: the exit block takes them as parameters when a copy of the loop also
+/// defines them. `None` when it cannot, since another way into it does not come from code it
+/// dominates, where those parameters are in scope.
+pub(crate) fn live_outs<'a>(
+    f: &Function,
+    cfg: &Cfg,
+    in_body: &HashSet<usize>,
+    in_loop: &HashSet<&str>,
+    exit_idx: usize,
+    types: &dyn Fn() -> &'a HashMap<String, Type>,
+) -> Option<(Vec<String>, Vec<Type>)> {
+    let mut live_out: Vec<String> = Vec::new();
+    for (bi, block) in f.blocks.iter().enumerate() {
+        if in_body.contains(&bi) {
+            continue;
+        }
+        let mut reads: Vec<&String> = block
+            .instructions
+            .iter()
+            .flat_map(|i| i.operands())
+            .collect();
+        reads.extend(terminator_reads(&block.terminator));
+        for r in reads {
+            if in_loop.contains(r.as_str()) && !live_out.contains(r) {
+                live_out.push(r.clone());
+            }
+        }
+    }
+    if !live_out.is_empty() {
+        let outside = cfg.preds[exit_idx]
+            .iter()
+            .filter(|p| !in_body.contains(p) && cfg.reachable[**p]);
+        if outside.clone().any(|&p| !cfg.dominates(exit_idx, p))
+            || live_out.iter().any(|v| !types().contains_key(v))
+        {
+            return None;
+        }
+    }
+    let live_types = live_out.iter().map(|v| types()[v.as_str()]).collect();
+    Some((live_out, live_types))
+}
+
+/// Gives the exit block `exit_params` (live-out register, parameter), passed by the edges of
+/// the loop (`in_body`) as the registers themselves; code outside the loop reads the
+/// parameters instead. Copies of the loop pass their own registers (`add_exit_args`).
+pub(crate) fn route_live_outs(
+    f: &mut Function,
+    in_body: &HashSet<usize>,
+    exit_idx: usize,
+    exit_params: &[(String, String)],
+    live_types: &[Type],
+) {
+    if exit_params.is_empty() {
+        return;
+    }
+    let exit = f.blocks[exit_idx].label.clone();
+    let subst: HashMap<String, String> = exit_params.iter().cloned().collect();
+    for (bi, block) in f.blocks.iter_mut().enumerate() {
+        if in_body.contains(&bi) {
+            add_exit_args(&mut block.terminator, &exit, exit_params, |v| v.to_string());
+            continue;
+        }
+        for inst in &mut block.instructions {
+            for r in inst.operands_mut() {
+                if let Some(n) = subst.get(r.as_str()) {
+                    *r = n.clone();
+                }
+            }
+        }
+        for r in crate::names::terminator_operands_mut(&mut block.terminator) {
+            if let Some(n) = subst.get(r.as_str()) {
+                *r = n.clone();
+            }
+        }
+        // Other ways into the exit block come from code it dominates, which now reads the
+        // parameters.
+        add_exit_args(&mut block.terminator, &exit, exit_params, |v| {
+            subst[v].clone()
+        });
+    }
+    let exit_block = &mut f.blocks[exit_idx];
+    for ((_, p), ty) in exit_params.iter().zip(live_types) {
+        exit_block.params.push((p.clone(), *ty));
+    }
 }
 
 /// Which way the header's branch goes when the guard holds, if the guard decides it; adds the
@@ -670,7 +696,7 @@ fn unmasked(inst: &Instruction) -> Instruction {
     }
 }
 
-fn retarget(t: &mut Terminator, map: &dyn Fn(&str) -> String) {
+pub(crate) fn retarget(t: &mut Terminator, map: &dyn Fn(&str) -> String) {
     match t {
         Terminator::Jmp { target, .. } => *target = map(target),
         Terminator::Br {
@@ -686,7 +712,7 @@ fn retarget(t: &mut Terminator, map: &dyn Fn(&str) -> String) {
 }
 
 /// Appends `arg(v)` for each live-out register `v` to the edges of `t` into `exit`.
-fn add_exit_args(
+pub(crate) fn add_exit_args(
     t: &mut Terminator,
     exit: &str,
     params: &[(String, String)],
@@ -732,7 +758,7 @@ fn terminator_reads(t: &Terminator) -> Vec<&String> {
     }
 }
 
-fn all_names(f: &Function) -> HashSet<String> {
+pub(crate) fn all_names(f: &Function) -> HashSet<String> {
     let mut names: HashSet<String> = f.params.iter().map(|(p, _)| p.clone()).collect();
     for b in &f.blocks {
         names.insert(b.label.clone());
