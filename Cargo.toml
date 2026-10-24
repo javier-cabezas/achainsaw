@@ -17,7 +17,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 cranelift-codegen = "0.136.2"
 cranelift-frontend = "0.136.2"
-cranelift-module = "0.136.2"
+cranelift-module = "0.137.0"
 cranelift-jit = "0.136.2"
 cranelift-native = "0.136.2"
 cranelift-object = "0.136.2"
