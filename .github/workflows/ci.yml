@@ -36,7 +36,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -115,7 +115,7 @@ jobs:
           ACHAINSAW_BACKEND: llvm
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -202,7 +202,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -276,7 +276,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
