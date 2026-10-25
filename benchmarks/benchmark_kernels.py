@@ -1,7 +1,9 @@
 """
 Chainsaw-BLAS: verification and benchmarks for the kernels in examples/kernels/: the
 operators of LLM inference (norms, activations, RoPE, attention for decode, quantized GEMV and
-prefill GEMM, argmax and top-k sampling) and a few BLAS-style ones.
+prefill GEMM, argmax and top-k sampling), a few BLAS-style ones, and a byte histogram and
+a sparse matrix-vector product on all cores, each also in a form for comparison (one atomic
+per byte; a work queue of its own instead of `par`).
 
 Every kernel is checked against NumPy, then timed on each available code generation
 backend (Cranelift, and LLVM when the build has it) and, with --isa all, at every ISA
@@ -34,6 +36,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from typing import Any, NotRequired, TypeAlias, TypedDict
 
@@ -60,6 +63,8 @@ Floats: TypeAlias = npt.NDArray[np.floating[Any]]
 class Case(TypedDict):
     """A kernel to verify and time (see make_cases)."""
     name: str
+    # The source file in examples/kernels/ when it is not `name`.
+    file: NotRequired[str]
     label: str
     run: Callable[[achainsaw.Kernel], object]
     verify: Callable[[achainsaw.Kernel], float]
@@ -755,6 +760,83 @@ def make_cases() -> list[Case]:
         torch_check=lambda out: rel_err(out, q4g_ref_t), torch_tol=1e-2,
         flops=2 * qm * qk * pn,
     ))
+
+    # Byte histogram of 16 MB: private tables per 64 KB chunk merged with one atomic per
+    # bin, and for comparison one atomic per byte on the shared bins.
+    hn: int = 1 << 24
+    hx: npt.NDArray[np.uint8] = rng.integers(0, 256, hn, dtype=np.uint8)
+    h_bins: npt.NDArray[np.int64] = np.zeros(256, dtype=np.int64)
+    h_ref: npt.NDArray[np.intp] = np.bincount(hx, minlength=256)
+    thx: torch.Tensor = tt(hx)
+
+    def histogram_case(func: str, how: str) -> Case:
+        def run(k: achainsaw.Kernel) -> None:
+            h_bins[:] = 0
+            k.run(func, hx, hn, h_bins)
+
+        def verify(k: achainsaw.Kernel) -> float:
+            run(k)
+            return float(not np.array_equal(h_bins, h_ref))
+
+        return Case(
+            name=func, file="histogram", label=f"Byte histogram, {hn >> 20} MB, {how}",
+            run=run, verify=verify, tol=0.0,
+            numpy=lambda: np.bincount(hx, minlength=256),
+            torch=lambda: torch.bincount(thx, minlength=256),
+            torch_check=lambda out: float(not np.array_equal(out.numpy(), h_ref)),
+            flops=hn,
+        )
+
+    cases.append(histogram_case("histogram", "all cores"))
+    cases.append(histogram_case("histogram_atomic", "one atomic add per byte, all cores"))
+
+    # Sparse matrix-vector product in CSR form with power-law row lengths (Zipf, as in graph
+    # adjacency matrices): most rows have a few nonzeros, a few have tens of thousands. Each
+    # row's columns are sorted and distinct (canonical CSR, as scipy and PyTorch keep it).
+    sm: int = 1 << 18
+    s_lens: npt.NDArray[np.int64] = np.minimum(rng.zipf(1.8, sm), 1 << 16).astype(np.int64)
+    s_keys: npt.NDArray[np.int64] = np.unique(
+        np.repeat(np.arange(sm, dtype=np.int64), s_lens) * sm
+        + rng.integers(0, sm, int(s_lens.sum()), dtype=np.int64))
+    s_rowptr: npt.NDArray[np.int64] = np.concatenate(
+        [[0], np.cumsum(np.bincount(s_keys // sm, minlength=sm))]).astype(np.int64)
+    s_nnz: int = int(s_rowptr[-1])
+    s_cols: npt.NDArray[np.int32] = (s_keys % sm).astype(np.int32)
+    s_vals: F32 = rng.standard_normal(s_nnz).astype(np.float32)
+    s_x: F32 = rng.standard_normal(sm).astype(np.float32)
+    s_y: F32 = np.zeros(sm, dtype=np.float32)
+    # Every row has a nonzero, so reduceat sums exactly each row's terms.
+    spmv_ref: F64 = np.add.reduceat(s_vals.astype(np.float64) * s_x[s_cols], s_rowptr[:-1])
+    if torch is not None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # CSR tensors are a beta feature
+            t_csr: torch.Tensor = torch.sparse_csr_tensor(
+                tt(s_rowptr), tt(s_cols.astype(np.int64)), tt(s_vals), (sm, sm),
+                check_invariants=True)
+    t_sx: torch.Tensor = tt(s_x)
+
+    def spmv_case(func: str, how: str) -> Case:
+        def run(k: achainsaw.Kernel) -> None:
+            k.run(func, s_rowptr, s_cols, s_vals, s_x, s_y, sm)
+
+        def verify(k: achainsaw.Kernel) -> float:
+            s_y[:] = np.nan
+            run(k)
+            return rel_err(s_y, spmv_ref)
+
+        return Case(
+            name=func, file="spmv",
+            label=f"SpMV, CSR {sm}x{sm} with {s_nnz / 1e6:.1f}M power-law nonzeros, {how}",
+            run=run, verify=verify, tol=1e-5,
+            # NumPy has no sparse matrices: the products, then each row's sum.
+            numpy=lambda: np.add.reduceat(s_vals * s_x[s_cols], s_rowptr[:-1]),
+            torch=lambda: torch.mv(t_csr, t_sx),
+            torch_check=lambda out: rel_err(out, spmv_ref),
+            flops=2 * s_nnz,
+        )
+
+    cases.append(spmv_case("spmv", "all cores"))
+    cases.append(spmv_case("spmv_queue", "atomic work queue instead of par, all cores"))
     return cases
 
 
@@ -807,7 +889,7 @@ def main() -> None:
     failures: list[str] = []
     configs: list[tuple[str, str | None]] = [(b, l) for b in backends for l in levels]
     for case in cases:
-        src: str = source(case["name"])
+        src: str = source(case.get("file", case["name"]))
         # Both runtimes busy-wait for a moment after parallel work; let the other's threads
         # settle before timing each one.
         time.sleep(0.02)

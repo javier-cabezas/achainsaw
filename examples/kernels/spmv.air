@@ -1,0 +1,101 @@
+# Sparse matrix-vector product y = A x on all cores, for an m-row f32 matrix A in CSR form
+# (as scipy.sparse.csr_matrix stores it): row r's nonzeros are vals[rowptr[r]..rowptr[r+1])
+# (f32) in the columns cols[...] (i32), and rowptr holds m + 1 i64 offsets. One `par` index
+# per block of 64 rows: `par` hands the indices out to the threads as they finish, so rows
+# of very different lengths (a power-law graph) still balance.
+fn spmv(rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    m63 = add m, 63:i64
+    blocks = udiv m63, 64:i64
+    par blocks, spmv_block(rowptr, cols, vals, x, y, m)
+    ret
+
+# Rows [64 * blk, min(64 * blk + 64, m)).
+fn spmv_block(blk:i64, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    first = mul blk, 64:i64
+    end0 = add first, 64:i64
+    end = min end0, m
+    call spmv_rows(first, end, rowptr, cols, vals, x, y)
+    ret
+
+# The same product with a work queue: 64 `par` calls (more than the threads that run them)
+# take blocks of 64 rows from a shared counter with `atomic add` until none are left.
+fn spmv_queue(rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    next = alloc 8
+    st next, 0:i64
+    par 64, spmv_worker(next, rowptr, cols, vals, x, y, m)
+    free next
+    ret
+
+# Takes the next block of rows until the counter passes m.
+fn spmv_worker(w:i64, next:ptr, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    jmp take
+  take:
+    first = atomic add next, 64:i64
+    more = lt first, m
+    br more, block, done
+  block:
+    end0 = add first, 64:i64
+    end = min end0, m
+    call spmv_rows(first, end, rowptr, cols, vals, x, y)
+    jmp take
+  done:
+    ret
+
+# y[r] for the rows r in [first, end): four independent sums over the row's nonzeros, then
+# one at a time for the rest.
+inline fn spmv_rows(first:i64, end:i64, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr)
+  b0:
+    z = cst 0.0:f32
+    jmp rows(first)
+  rows(r:i64):
+    r_more = lt r, end
+    br r_more, row_init, done
+  row_init:
+    k0 = ld rowptr[r]:i64
+    r1 = add r, 1:i64
+    k1 = ld rowptr[r1]:i64
+    jmp quads(k0, z, z, z, z)
+  quads(k:i64, a0:f32, a1:f32, a2:f32, a3:f32):
+    k4 = add k, 4:i64
+    full = le k4, k1
+    br full, quad_body, quad_sum
+  quad_body:
+    a0n = call term(k, cols, vals, x, a0)
+    ka = add k, 1:i64
+    a1n = call term(ka, cols, vals, x, a1)
+    kb = add k, 2:i64
+    a2n = call term(kb, cols, vals, x, a2)
+    kc = add k, 3:i64
+    a3n = call term(kc, cols, vals, x, a3)
+    jmp quads(k4, a0n, a1n, a2n, a3n)
+  quad_sum:
+    a01 = add a0, a1
+    a23 = add a2, a3
+    s = add a01, a23
+    jmp singles(k, s)
+  singles(j:i64, acc:f32):
+    j_more = lt j, k1
+    br j_more, single_body, row_done
+  single_body:
+    acc2 = call term(j, cols, vals, x, acc)
+    j2 = add j, 1:i64
+    jmp singles(j2, acc2)
+  row_done:
+    st y[r], acc
+    jmp rows(r1)
+  done:
+    ret
+
+# acc + vals[k] * x[cols[k]], one rounding.
+inline fn term(k:i64, cols:ptr, vals:ptr, x:ptr, acc:f32)->f32
+  b0:
+    c = ld cols[k]:i32
+    cw = sext c:i64
+    xv = ld x[cw]:f32
+    v = ld vals[k]:f32
+    r = fma v, xv, acc
+    ret r

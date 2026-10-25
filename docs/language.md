@@ -172,4 +172,4 @@ fn add_total(total:ptr, x:f32)
     ret
 ```
 
-A work queue is a counter that calls take items from, `i = atomic add next, 1:i64`, until `i` reaches the item count; it balances items of uneven cost across a few `par` calls. Each backend uses the target's atomic instructions (x86 `lock` prefixes, AArch64 LSE when the target has it, else load-exclusive/store-exclusive loops), and `crates/achainsaw-codegen/tests/atomics.rs` checks every op at every width on both.
+A work queue is a counter that calls take items from, `i = atomic add next, 1:i64`, until `i` reaches the item count. `par` already hands out its indices this way, so a queue of your own gains nothing over a `par` with one index per item: in [`spmv.air`](../examples/kernels/spmv.air), whose rows' costs differ by four orders of magnitude, both take the same time ([docs/kernels.md](kernels.md)). Each backend uses the target's atomic instructions (x86 `lock` prefixes, AArch64 LSE when the target has it, else load-exclusive/store-exclusive loops), and `crates/achainsaw-codegen/tests/atomics.rs` checks every op at every width on both.

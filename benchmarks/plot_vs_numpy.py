@@ -6,7 +6,8 @@ PyTorch's speedup over NumPy beside them when the results include it.
     python benchmarks/benchmark_kernels.py --json results.json
     python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy
 
-One row per kernel, sorted by the LLVM speedup; PyTorch and each backend are a bar growing
+One row per kernel (not the forms that are there for comparison, in COMPARISONS), sorted
+by the LLVM speedup; PyTorch and each backend are a bar growing
 from the 1x line (NumPy) on a log scale, left when slower and right when faster. Colors and
 chrome follow the data-viz reference palette (categorical slots 1-2 for the backends,
 validated for both modes; PyTorch, a second baseline, in a neutral gray).
@@ -53,7 +54,12 @@ SHORT: dict[str, str] = {
     "layernorm": "LayerNorm, n=4096",
     "geglu": "GeGLU, n=14336",
     "topk": "Top-k (k=40), 128256 logits",
+    "histogram": "Byte histogram, 16 MB, all cores",
+    "spmv": "SpMV, power-law CSR, all cores",
 }
+# Forms of a kernel that benchmark_kernels.py times to compare with it, left out of the
+# figure: one atomic per byte instead of private tables, a work queue instead of `par`.
+COMPARISONS: set[str] = {"histogram_atomic", "spmv_queue"}
 
 THEMES: dict[str, Theme] = {
     "light": Theme(surface="#fcfcfb", primary="#0b0b0b", secondary="#52514e",
@@ -156,6 +162,8 @@ def main() -> None:
         series.insert(0, "torch")
     rows: list[Row] = []
     for r in data["results"]:
+        if r["kernel"] in COMPARISONS:
+            continue
         speedup: dict[str, float] = {run["backend"]: r["numpy_us"] / run["us"] for run in r["runs"]
                    if run["isa"] == "host"}
         if r.get("torch_us"):

@@ -1,6 +1,6 @@
 # Kernels
 
-`examples/kernels/` holds verified kernels for LLM inference (norms, activations, RoPE, decode attention, quantized GEMV and prefill GEMM, greedy and top-k selection), vector search, and normalization. They are vector-length agnostic: each processes `vl` lanes per step with FMAs and finishes with masked `ldm`/`stm`, so the same source runs 128-bit vectors on Cranelift and AVX2/AVX-512/SVE-width vectors on LLVM. Every kernel takes element counts, and each `.air` file has matching `.airb` bytecode.
+`examples/kernels/` holds verified kernels for LLM inference (norms, activations, RoPE, decode attention, quantized GEMV and prefill GEMM, greedy and top-k selection), vector search, normalization, a byte histogram and a sparse matrix-vector product. The vector kernels are vector-length agnostic: each processes `vl` lanes per step with FMAs and finishes with masked `ldm`/`stm`, so the same source runs 128-bit vectors on Cranelift and AVX2/AVX-512/SVE-width vectors on LLVM. Every kernel takes element counts, and each `.air` file has matching `.airb` bytecode.
 
 | Kernel | Signature | Use case |
 |---|---|---|
@@ -23,6 +23,8 @@
 | `q8_gemv.air` | `q8_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q8_0 (llama.cpp) matrix-vector product on all cores: int8 weights in 32-blocks with f16 scales (as GGUF stores them), packed in 64-row chunks with each row's 4 consecutive values in one 32-bit lane and stored plus 128; activations quantized on the fly with their block sums; unsigned-by-signed int8 dots on `vdotu`, minus 128 times the activation sums |
 | `q4_gemv.air` | `q4_gemv(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64)` | Q4_0 (llama.cpp) matrix-vector product: 4-bit weights, half of Q8_0's bytes; GGUF's own nibble bytes in the same lane order, unpacked in registers (a mask and a shift) as unsigned values for the same `vdotu`s, minus 8 times the activation sums |
 | `q4_gemm.air` | `q4_gemm(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64, n:i64)` | Q4_0 matrix product for prefill: n tokens against q4_gemv's packed matrix, one task per 64-row chunk with `qmat_batch` loading and unpacking each weight vector once per 8 tokens (4 with 128-bit vectors); every token gets exactly q4_gemv's result |
+| `histogram.air` | `histogram(x:ptr, n:i64, bins:ptr)` | Byte histogram on all cores (adds to 256 i64 bins, as `numpy.bincount(x, minlength=256)`): each 64 KB chunk counts into private tables, then adds them to the shared bins with one `atomic add` per bin. `histogram_atomic` does one `atomic add` per byte instead, for comparison |
+| `spmv.air` | `spmv(rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)` | Sparse matrix-vector product, CSR as scipy stores it (i64 row offsets, i32 columns, f32 values), on all cores: one `par` index per 64 rows, which `par` balances however uneven the rows are. `spmv_queue` takes the blocks from an `atomic add` work queue instead, for comparison |
 | `llama_decode.air` | `llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64`, `llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64` | A whole Llama-style decode step in one call, token in, next token out; and a whole prompt in one call: see [Llama in one call](llama.md) |
 
 `crates/achainsaw-codegen/tests/kernels.rs` checks every kernel against a scalar reference at each ISA level, including lengths that end in partial vectors. The benchmark verifies them against NumPy and times each backend and ISA level, with NumPy and (when installed) PyTorch as baselines:
@@ -52,6 +54,8 @@ The parentheses give the speedup over NumPy:
 | Q8_0 GEMV 4096x4096, all cores | 5.62 ms (int8 widened to f32 per call; NumPy has no int8 matmul) | 111 µs (51x; int8 weight-only kernel, one scale per row, bf16 activations) | 157 µs (36x) | 55.5 µs (101x) |
 | Top-k, k=40 of 128256 logits | 755 µs (`argpartition`, then `argsort` of the 40) | 160 µs (4.7x; `topk`) | 24.7 µs (31x) | 15.1 µs (50x) |
 | GQA decode attention, Llama 3 8B: 32 query / 8 KV heads x 128, 4096 positions of a bf16 cache, all cores | 4.72 ms (the cache widened to f32 per call) | 473 µs (10x; `scaled_dot_product_attention` with each group's heads as query positions, bf16) | 415 µs (11x) | 118 µs (40x) |
+| Byte histogram, 16 MB, all cores | 19.3 ms (`bincount`) | 4.65 ms (4.2x; `bincount`) | 596 µs (33x) | 515 µs (38x) |
+| SpMV, CSR 262144x262144 with 6.8M power-law nonzeros, all cores | 14.9 ms (products, then `add.reduceat` per row) | 3.55 ms (4.2x; CSR tensor `mv`) | 1.07 ms (14x) | 1.07 ms (14x) |
 | RoPE, 32 heads x 128 | 7.5 µs | 9.9 µs (0.76x) | 1.9 µs (3.9x) | 0.76 µs (9.9x) |
 | LayerNorm, n=4096 | 9.8 µs | 2.9 µs (3.4x) | 5.4 µs (1.8x) | 1.4 µs (7.0x) |
 | GEMM bf16 -> f32, 256³, all cores | 166 µs | 38.3 µs (4.3x; bf16 output) | 183 µs (0.91x) | 24.4 µs (6.8x) |
@@ -67,11 +71,15 @@ The parentheses give the speedup over NumPy:
 | GEMV f32 512x1024, all cores | 5.2 µs | 26.7 µs (0.20x) | 8.5 µs (0.61x) | 5.4 µs (0.96x) |
 | GEMV f32 512x1024, 1 core | 5.6 µs (all cores) | 25.6 µs (0.22x, all cores) | 33.2 µs (0.17x) | 19.3 µs (0.29x) |
 
+**Atomics.** Both `par` kernels that share memory come with a second form, timed by the same benchmark and left out of the figure:
+- **Contended atomics are slow.** `histogram_atomic`, one `atomic add` on the shared bins per byte, takes 42 ms on both backends: 0.46x NumPy, 70–80x the private tables, and slower than its 29 ms on one thread, since the bins' 32 cache lines move between cores on almost every byte. Count privately and merge with one atomic per bin: `histogram` takes 3.6 ms (LLVM) to 4.0 ms (Cranelift) on one thread and 7x less on 16.
+- **`par` is a work queue already.** `spmv`'s rows have 1 to 58000 nonzeros (Zipf). `spmv_queue`, 64 calls taking 64-row blocks from an `atomic add` counter, takes 1.07 ms like the `par` over blocks, on both backends. With one row per index or per claim, both take 3.8–4.0 ms instead: the `par` dispatch of an index costs about what an `atomic add` on a shared counter does. SpMV is memory-bound (8 bytes per nonzero and a scattered read of x), so 16 threads run it 5.7x faster than one (6.1 ms).
+
 `python benchmarks/plot_vs_numpy.py results.json docs/kernels-vs-numpy` redraws the figure from `benchmark_kernels.py --json results.json`.
 
 Every pull request also runs a performance check in CI: [`benchmarks/perf_compare.py`](../benchmarks/perf_compare.py) builds the PR's base and head on the same runner, runs each side's kernel benchmarks and a 4-layer decode alternately for 5 rounds, and fails if the best time of any kernel on either backend got more than 25% slower. Comparing best times from fresh processes keeps runner noise out; the job summary lists every ratio.
 
-LLVM is ahead of PyTorch on every kernel: 2.8x on Q4_0 and 2.0x on Q8_0 GEMV and 4.9x on the Q4_0 prefill GEMM against its quantized kernels; 1.6x on bf16 GEMM and 1.7x on DeepSeek's attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets); 4.0x on GQA attention; and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch. PyTorch's GQA time is its best form: with `enable_gqa=True` and one query position per head, `scaled_dot_product_attention` leaves its fast path and takes 18x as long.
+LLVM is ahead of PyTorch on every kernel: 2.8x on Q4_0 and 2.0x on Q8_0 GEMV and 4.9x on the Q4_0 prefill GEMM against its quantized kernels; 1.6x on bf16 GEMM and 1.7x on DeepSeek's attention, where both use AVX512-BF16 dot products on this CPU (`mm` takes them with fast math, which the benchmark sets); 4.0x on GQA attention; 9.1x on the histogram and 3.3x on SpMV; and 1.5–13x on the small kernels, where each PyTorch eager op costs a few µs of dispatch. PyTorch's GQA time is its best form: with `enable_gqa=True` and one query position per head, `scaled_dot_product_attention` leaves its fast path and takes 18x as long.
 
 Where the remaining gaps come from:
 - **Cranelift's vector width.** Cranelift has only 128-bit vectors, so vector-bound kernels (SwiGLU, argmax, and `mm` in GEMM and attention) do a quarter of the work per instruction of AVX-512 code; on LLVM the same sources beat NumPy.

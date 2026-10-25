@@ -1,0 +1,128 @@
+# Byte histogram on all cores: adds to bins[b] (256 i64 counts) the number of bytes of
+# x[0..n) equal to b, so zeroed bins give numpy.bincount(x, minlength=256). Each `par` index
+# counts a 64 KB chunk into private tables, then adds its 256 counts to the shared bins with
+# one `atomic add` each: 256 atomics per chunk instead of one per byte (histogram_atomic).
+fn histogram(x:ptr, n:i64, bins:ptr)
+  b0:
+    n1 = add n, 65535:i64
+    chunks = udiv n1, 65536:i64
+    par chunks, hist_chunk(x, n, bins)
+    ret
+
+# Bytes [65536 * c, min(65536 * c + 65536, n)) into four tables of 256 i32 counts, eight bytes
+# per step: consecutive bytes go to different tables, so a run of equal bytes does not wait
+# on its own increments. The tail goes byte by byte into the first table.
+fn hist_chunk(c:i64, x:ptr, n:i64, bins:ptr)
+  b0:
+    t0 = alloc 4096
+    t1 = add t0, 1024:i64
+    t2 = add t0, 2048:i64
+    t3 = add t0, 3072:i64
+    jmp zero(0:i64)
+  zero(z:i64):
+    z_more = lt z, 512:i64
+    br z_more, zero_body, count_init
+  zero_body:
+    st t0[z], 0:i64
+    z2 = add z, 1:i64
+    jmp zero(z2)
+
+  count_init:
+    start = mul c, 65536:i64
+    end0 = add start, 65536:i64
+    end = min end0, n
+    jmp words(start)
+  words(i:i64):
+    i_next = add i, 8:i64
+    full = le i_next, end
+    br full, word_body, bytes(i)
+  word_body:
+    w = ld x[i:i8]:i64
+    k0 = and w, 255:i64
+    call bump(t0, k0)
+    s1 = ushr w, 8:i64
+    k1 = and s1, 255:i64
+    call bump(t1, k1)
+    s2 = ushr w, 16:i64
+    k2 = and s2, 255:i64
+    call bump(t2, k2)
+    s3 = ushr w, 24:i64
+    k3 = and s3, 255:i64
+    call bump(t3, k3)
+    s4 = ushr w, 32:i64
+    k4 = and s4, 255:i64
+    call bump(t0, k4)
+    s5 = ushr w, 40:i64
+    k5 = and s5, 255:i64
+    call bump(t1, k5)
+    s6 = ushr w, 48:i64
+    k6 = and s6, 255:i64
+    call bump(t2, k6)
+    k7 = ushr w, 56:i64
+    call bump(t3, k7)
+    jmp words(i_next)
+  bytes(j:i64):
+    j_more = lt j, end
+    br j_more, byte_body, merge(0:i64)
+  byte_body:
+    v = ld x[j]:i8
+    kb = zext v:i64
+    call bump(t0, kb)
+    j2 = add j, 1:i64
+    jmp bytes(j2)
+
+  merge(b:i64):
+    b_more = lt b, 256:i64
+    br b_more, merge_body, done
+  merge_body:
+    c0 = ld t0[b]:i32
+    c1 = ld t1[b]:i32
+    c2 = ld t2[b]:i32
+    c3 = ld t3[b]:i32
+    c01 = add c0, c1
+    c23 = add c2, c3
+    sum = add c01, c23
+    sum64 = sext sum:i64
+    old = atomic add bins[b], sum64
+    b2 = add b, 1:i64
+    jmp merge(b2)
+  done:
+    free t0
+    ret
+
+# Increments the i32 count t[k].
+inline fn bump(t:ptr, k:i64)
+  b0:
+    c = ld t[k]:i32
+    c2 = add c, 1:i32
+    st t[k], c2
+    ret
+
+# The same histogram with one `atomic add` on the shared bins per byte: every core updates
+# the same 32 cache lines, which move between cores on almost every byte. For comparison
+# with histogram; do not count this way.
+fn histogram_atomic(x:ptr, n:i64, bins:ptr)
+  b0:
+    n1 = add n, 65535:i64
+    chunks = udiv n1, 65536:i64
+    par chunks, hist_chunk_atomic(x, n, bins)
+    ret
+
+# Bytes [65536 * c, min(65536 * c + 65536, n)), one `atomic add` each.
+fn hist_chunk_atomic(c:i64, x:ptr, n:i64, bins:ptr)
+  b0:
+    start = mul c, 65536:i64
+    end0 = add start, 65536:i64
+    end = min end0, n
+    jmp bytes(start)
+  bytes(j:i64):
+    j_more = lt j, end
+    br j_more, byte_body, done
+  byte_body:
+    v = ld x[j]:i8
+    k = zext v:i64
+    old = atomic add bins[k], 1:i64
+    j2 = add j, 1:i64
+    jmp bytes(j2)
+  done:
+    ret

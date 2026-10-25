@@ -1059,3 +1059,75 @@ fn qmat_tiles_match_single_tokens() {
         }
     }
 }
+
+#[test]
+fn histogram_matches_bincount() {
+    type Hist = extern "C" fn(*const u8, i64, *mut i64);
+    let mut rng = Rng(61);
+    // Partial words, partial and whole 64 KB chunks; random bytes and runs of one byte.
+    let inputs: Vec<Vec<u8>> = [0, 1, 7, 8, 9, 1031, 65536, 65543, 300_001]
+        .iter()
+        .flat_map(|&n| {
+            let random: Vec<u8> = (0..n).map(|_| (rng.next().to_bits() >> 3) as u8).collect();
+            [random, vec![0xa5; n]]
+        })
+        .collect();
+    for (level, engine) in engines("histogram") {
+        for func in ["histogram", "histogram_atomic"] {
+            let k: Hist = unsafe { std::mem::transmute(engine.get_fn_ptr(func).unwrap()) };
+            for x in &inputs {
+                let mut want = [3i64; 256];
+                for &b in x {
+                    want[b as usize] += 1;
+                }
+                // The kernels add to the bins.
+                let mut bins = [3i64; 256];
+                k(x.as_ptr(), x.len() as i64, bins.as_mut_ptr());
+                assert_eq!(bins, want, "{func} of {} bytes at {level}", x.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn spmv_matches_reference() {
+    type Spmv = extern "C" fn(*const i64, *const i32, *const f32, *const f32, *mut f32, i64);
+    let mut rng = Rng(67);
+    for (level, engine) in engines("spmv") {
+        for func in ["spmv", "spmv_queue"] {
+            let k: Spmv = unsafe { std::mem::transmute(engine.get_fn_ptr(func).unwrap()) };
+            for m in [1usize, 5, 64, 65, 1000] {
+                // Row lengths 0 (empty rows) to 3, with every 97th row long.
+                let lens: Vec<usize> = (0..m)
+                    .map(|r| if r % 97 == 3 { 1031 } else { r % 4 })
+                    .collect();
+                let mut rowptr = vec![0i64];
+                for l in &lens {
+                    rowptr.push(rowptr.last().unwrap() + *l as i64);
+                }
+                let nnz = *rowptr.last().unwrap() as usize;
+                let cols: Vec<i32> = (0..nnz)
+                    .map(|_| ((rng.next() + 2.0) / 4.0 * m as f32) as i32 % m as i32)
+                    .collect();
+                let vals = rng.vec(nnz);
+                let x = rng.vec(m);
+                let mut y = vec![f32::NAN; m];
+                k(
+                    rowptr.as_ptr(),
+                    cols.as_ptr(),
+                    vals.as_ptr(),
+                    x.as_ptr(),
+                    y.as_mut_ptr(),
+                    m as i64,
+                );
+                for r in 0..m {
+                    let (a, b) = (rowptr[r] as usize, rowptr[r + 1] as usize);
+                    let terms = (a..b).map(|j| vals[j] as f64 * x[cols[j] as usize] as f64);
+                    let scale: f64 = terms.clone().map(f64::abs).sum();
+                    let ctx = format!("{func} m={m} row {r} at {level}");
+                    close(y[r] as f64, terms.sum(), scale, &ctx);
+                }
+            }
+        }
+    }
+}

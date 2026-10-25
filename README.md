@@ -197,8 +197,9 @@ about the memory's bandwidth. [docs/llama.md](docs/llama.md) explains how,
 with the numbers for K-quant files and against PyTorch.
 
 **Kernels against NumPy and PyTorch.** [`examples/kernels/`](examples/kernels)
-holds 20 kernels for LLM inference and vector search: quantized GEMV and
-GEMM, attention, norms, activations, RoPE, top-k. On LLVM, each is faster
+holds 22 kernels for LLM inference, vector search and more: quantized GEMV
+and GEMM, attention, norms, activations, RoPE, top-k, a histogram, sparse
+matrix-vector products. On LLVM, each is faster
 than PyTorch's CPU path for the same operation
 ([docs/kernels.md](docs/kernels.md)):
 
