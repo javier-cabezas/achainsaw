@@ -509,3 +509,47 @@ fn k(i:i64)->f32
     )
     .unwrap();
 }
+
+#[test]
+fn gather_round_trips_and_rules() {
+    let src = r#"
+fn k(t:ptr, ip:ptr, n:i64)->f32
+  b0:
+    idx = ld ip:vx
+    a = vgather t, idx:f32
+    b = vgather t, idx, n:i32
+    c = vgather t, idx, 3:f32
+    wide = ld ip:v256
+    d = vgather t, wide:f64
+    e = vgather t, wide, n:i64
+    vgather = vadd a, a:f32
+    s = vsum vgather:f32
+    ret s
+"#;
+    let text = round_trips(src);
+    for line in [
+        "a = vgather t, idx:f32",
+        "b = vgather t, idx, n:i32",
+        "d = vgather t, wide:f64",
+        "e = vgather t, wide, n:i64",
+        "vgather = vadd a, a:f32",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let one = |body: &str| {
+        format!(
+            "fn k(t:ptr, ip:ptr, n:i64, x:f32, m:i32)\n  b0:\n    v = ld ip:v128\n{body}    ret\n"
+        )
+    };
+    for (bad, code) in [
+        ("    r = vgather t, v:i16\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vgather t, v:i8\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vgather t, x:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vgather x, v:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vgather t, v, m:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vgather t, v\n", "ERR_EXPECTED_LANE_TYPE"),
+        ("    vgather t, v:f32\n", "ERR_MISSING_DESTINATION"),
+    ] {
+        assert_eq!(err_code(&one(bad)), code, "{bad}");
+    }
+}

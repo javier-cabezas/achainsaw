@@ -166,6 +166,10 @@ pub const MM_DTYPES: &[Type] = &[Type::BF16, Type::F16, Type::I8, Type::F32];
 pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
 
 /// Result lane types each one-operand vector op supports.
+/// Element types `vgather` reads: each with indices of its own width (i32 for 32-bit
+/// elements, i64 for 64-bit ones).
+pub const VGATHER_LANE_TYPES: &[Type] = &[Type::I32, Type::I64, Type::F32, Type::F64];
+
 pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
     match op {
         VUnaryOp::Itof | VUnaryOp::Uitof => &[Type::F32, Type::F64],
@@ -1313,6 +1317,22 @@ impl Validator {
                 }
                 Self::check_lane("ldm", *lane, COUNT_LANES, *span)?;
                 Self::define(scope, dst, *ty);
+            }
+            Instruction::VGather {
+                dst,
+                ptr,
+                idx,
+                count,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vgather", *lane, VGATHER_LANE_TYPES, *span)?;
+                self.check_typed(ctx, ptr, Type::Ptr, "vgather pointer", scope, *span)?;
+                if let Some(count) = count {
+                    self.check_typed(ctx, count, Type::I64, "vgather lane count", scope, *span)?;
+                }
+                let vec_ty = self.check_vector(ctx, idx, scope, *span)?;
+                Self::define(scope, dst, vec_ty);
             }
             Instruction::MaskedStore {
                 ptr,

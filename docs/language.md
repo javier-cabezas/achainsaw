@@ -49,6 +49,7 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 |---|---|---|
 | Load / store | `v = ld p:v256`, `st p, v` | Any alignment |
 | Masked load / store | `v = ldm p:vx, n:f32`, `stm p, v, n:f32` touch only the first `n` lanes (a masked load zeroes the rest) | Any |
+| Gather | `v = vgather p, idx:f32` reads lane `i` from `p[idx[i]]`; `vgather p, idx, n:f32` reads only the first `n` lanes and zeroes the rest. The indices are signed lanes as wide as the elements, scaled by the element size, and `idx`'s vector type is the result's (see [Gather](#gather)) | f32, i32 (i32 indices); f64, i64 (i64 indices) |
 | Broadcast | `v = splat x:v512` (the vector type is required) | i8 to f64 |
 | Arithmetic | `r = vadd a, b:f32` (`vsub`, `vmul`, `vdiv`, `vmin`, `vmax`); `vumin`, `vumax` compare as unsigned | `vmul`: not i8; `vdiv`: f32/f64; `vmin`/`vmax`: not i64; `vumin`/`vumax`: i8, i16, i32 |
 | Bitwise | `r = vand a, b:i32` (`vor`, `vxor`) | Any |
@@ -104,6 +105,10 @@ fn saxpy(a:f32, x:ptr, y:ptr, n:i64)
 ```
 
 Masking every iteration costs nothing extra: before code generation, a loop whose masked counts are `n - i` (with `i` a parameter of the loop header), a `vl`, or the `min` of those, gets a copy in front of it that loads and stores whole vectors while `n - i` covers them, and the original loop runs the tail (`achainsaw opt` shows the copy). Each iteration computes what it did before, on both backends, and the copy never touches memory past the buffers.
+
+**Gather.** `vgather` reads one element per lane from addresses that vector code computed: a lookup table indexed by data, or `x[cols[k]]` in a sparse product. It reads what scalar `ld`s of `p[idx[i]]` would, in any order; with a count, lanes from `n` on are not read, so their indices may be anything. In the sandbox each lane read is checked, and an index out of bounds reports the first such lane. LLVM emits one instruction where the target has a fast one: `vgatherdps`/`vgatherqpd` (and their integer forms) with AVX-512, and on SVE `ld1w`/`ld1d` with vector offsets (`[x0, z0.s, sxtw #2]` for 32-bit indices); for AVX2 CPUs that LLVM does not tune for fast gathers, and on NEON, it loads lane by lane. Cranelift has no gather instruction and always loads lane by lane. A count of `n - i`, as for `ldm`, is dropped in the full-vector copy of the loop.
+
+Gathering pays off when the elements are close: a lookup of 1M floats in a 256-entry table (`k = vftoi` of the scaled input, then `vgather`) runs 1.5x faster than the scalar loop on Cranelift and 1.2x on LLVM. When they are scattered over memory, the loads wait on the cache however they are issued: [`spmv.air`](../examples/kernels/spmv.air)'s `spmv_gather` takes 4% longer than the scalar `spmv` with 16 threads, on both backends ([docs/kernels.md](kernels.md)).
 
 **Half-precision storage types:** `f16` (IEEE binary16) and `bf16` (bfloat16) can be loaded, stored, and converted (`f = fext h:f32`, `h = ftrunc f:bf16`, rounding to nearest-even; vectors with `vfwidenlo`/`vfwidenhi` and `vnarrow`), but not used in arithmetic or function signatures; convert to `f32` first.
 

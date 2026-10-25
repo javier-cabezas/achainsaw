@@ -358,6 +358,71 @@ fn emit_masked_load(
     builder.block_params(merge).to_vec()
 }
 
+/// `vgather p, idx[, n]:lane`, lane by lane (Cranelift has no gather instruction): each
+/// lane's read is bounds-checked in the sandbox, in lane order. With a count, lanes from `n`
+/// on are neither read nor checked, and are zero.
+fn emit_gather(
+    builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
+    ptr: ClifValue,
+    idx_parts: &[ClifValue],
+    count: Option<ClifValue>,
+    lane: Type,
+) -> Parts {
+    let size = lane.byte_size();
+    let per_part = 16 / size;
+    let idx_lane = if size == 4 { Type::I32 } else { Type::I64 };
+    let n = count.map(|c| clamp_count(builder, c, (per_part * idx_parts.len()) as i64));
+    let zero_f = builder.ins().f32const(0.0);
+    let zero = builder.ins().splat(VEC_PART, zero_f);
+    let mut out = Vec::with_capacity(idx_parts.len());
+    for (k, &part) in idx_parts.iter().enumerate() {
+        let iv = as_lanes(builder, part, idx_lane);
+        let mut acc = as_lanes(builder, zero, lane);
+        for i in 0..per_part {
+            let x = builder.ins().extractlane(iv, i as u8);
+            let x = if idx_lane == Type::I32 {
+                builder.ins().sextend(types::I64, x)
+            } else {
+                x
+            };
+            let off = builder.ins().ishl_imm_u(x, size.trailing_zeros() as i64);
+            let addr = builder.ins().iadd(ptr, off);
+            let load = |builder: &mut FunctionBuilder, acc: ClifValue| {
+                emit_bounds_check_const(builder, guard, addr, size);
+                let v = builder
+                    .ins()
+                    .load(to_clif_type(lane), MemFlagsData::trusted(), addr, 0);
+                builder.ins().insertlane(acc, v, i as u8)
+            };
+            acc = match n {
+                None => load(builder, acc),
+                Some(n) => {
+                    let live = builder.create_block();
+                    let merge = builder.create_block();
+                    let acc_ty = builder.func.dfg.value_type(acc);
+                    builder.append_block_param(merge, acc_ty);
+                    let read = builder.ins().icmp_imm_u(
+                        IntCC::UnsignedGreaterThan,
+                        n,
+                        (k * per_part + i) as i64,
+                    );
+                    builder
+                        .ins()
+                        .brif(read, live, &[], merge, &[BlockArg::Value(acc)]);
+                    builder.switch_to_block(live);
+                    let loaded = load(builder, acc);
+                    builder.ins().jump(merge, &[BlockArg::Value(loaded)]);
+                    builder.switch_to_block(merge);
+                    builder.block_params(merge)[0]
+                }
+            };
+        }
+        out.push(to_part(builder, acc));
+    }
+    out
+}
+
 /// `stm p, v, n:lane`: writes only the first `n` lanes.
 fn emit_masked_store(
     builder: &mut FunctionBuilder,
@@ -2800,6 +2865,20 @@ pub fn lower_function<M: ClifModule>(
                     let parts =
                         emit_masked_load(&mut builder, guard, ptr_val, count_val, *ty, *lane);
                     values.insert(dst.clone(), (parts, *ty));
+                }
+                Instruction::VGather {
+                    dst,
+                    ptr,
+                    idx,
+                    count,
+                    lane,
+                    ..
+                } => {
+                    let (p, _) = scalar(&values, ptr);
+                    let (idx_parts, vec_ty) = parts(&values, idx);
+                    let n = count.as_ref().map(|c| scalar(&values, c).0);
+                    let out = emit_gather(&mut builder, guard, p, &idx_parts, n, *lane);
+                    values.insert(dst.clone(), (out, vec_ty));
                 }
                 Instruction::MaskedStore {
                     ptr,

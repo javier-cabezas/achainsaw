@@ -355,6 +355,19 @@ pub fn to_air_text(module: &Module) -> String {
                         let p = mem_ref(ptr, index);
                         out.push_str(&format!("{dst} = ldm {p}:{ty}, {count}:{lane}"));
                     }
+                    Instruction::VGather {
+                        dst,
+                        ptr,
+                        idx,
+                        count,
+                        lane,
+                        ..
+                    } => match count {
+                        Some(n) => {
+                            out.push_str(&format!("{dst} = vgather {ptr}, {idx}, {n}:{lane}"))
+                        }
+                        None => out.push_str(&format!("{dst} = vgather {ptr}, {idx}:{lane}")),
+                    },
                     Instruction::MaskedStore {
                         ptr,
                         index,
@@ -1017,6 +1030,22 @@ impl BinaryEncoder {
                 self.buf.push(encode_type(*ty));
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst, ptr, count]);
+            }
+            Instruction::VGather {
+                dst,
+                ptr,
+                idx,
+                count,
+                lane,
+                ..
+            } => {
+                // 0x39 with a count, 0x3A without.
+                self.buf.push(if count.is_some() { 0x39 } else { 0x3A });
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, ptr, idx]);
+                if let Some(n) = count {
+                    self.push_regs(&[n]);
+                }
             }
             Instruction::MaskedStore {
                 ptr,
@@ -1853,6 +1882,25 @@ impl<'a> BinaryDecoder<'a> {
                 val: self.read_string()?,
                 span,
             }),
+            0x39 | 0x3A => {
+                let lane = self.read_lane_type()?;
+                let dst = self.read_string()?;
+                let ptr = self.read_string()?;
+                let idx = self.read_string()?;
+                let count = if tag == 0x39 {
+                    Some(self.read_string()?)
+                } else {
+                    None
+                };
+                Ok(Instruction::VGather {
+                    dst,
+                    ptr,
+                    idx,
+                    count,
+                    lane,
+                    span,
+                })
+            }
             0x37 => Ok(Instruction::Stack {
                 dst: self.read_string()?,
                 size: self.read_u32()?,

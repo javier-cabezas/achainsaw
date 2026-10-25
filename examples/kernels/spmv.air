@@ -44,6 +44,50 @@ fn spmv_worker(w:i64, next:ptr, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:
   done:
     ret
 
+# The same product with vector code: per row, one vector of sums, a `vgather` of x at the
+# columns of each vector of nonzeros (the last one masked), then `vsum`. For comparison: it
+# takes as long as spmv, whose scalar loads of x are not what limits it.
+fn spmv_gather(rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    m63 = add m, 63:i64
+    blocks = udiv m63, 64:i64
+    par blocks, spmv_gather_block(rowptr, cols, vals, x, y, m)
+    ret
+
+fn spmv_gather_block(blk:i64, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
+  b0:
+    w = vl f32
+    z = splat 0.0:f32:vx
+    first = mul blk, 64:i64
+    end0 = add first, 64:i64
+    end = min end0, m
+    jmp rows(first)
+  rows(r:i64):
+    r_more = lt r, end
+    br r_more, row_init, done
+  row_init:
+    k0 = ld rowptr[r]:i64
+    r1 = add r, 1:i64
+    k1 = ld rowptr[r1]:i64
+    jmp steps(k0, z)
+  steps(k:i64, acc:vx):
+    more = lt k, k1
+    br more, step, row_done
+  step:
+    rest = sub k1, k
+    c = ldm cols[k]:vx, rest:i32
+    v = ldm vals[k]:vx, rest:f32
+    xv = vgather x, c, rest:f32
+    acc2 = vfma v, xv, acc:f32
+    k2 = add k, w
+    jmp steps(k2, acc2)
+  row_done:
+    s = vsum acc:f32
+    st y[r], s
+    jmp rows(r1)
+  done:
+    ret
+
 # y[r] for the rows r in [first, end): four independent sums over the row's nonzeros, then
 # one at a time for the rest.
 inline fn spmv_rows(first:i64, end:i64, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr)
