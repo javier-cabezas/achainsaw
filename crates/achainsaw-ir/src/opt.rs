@@ -142,7 +142,13 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                 }
                 let (dst, ty) = match inst {
                     Instruction::AssignConst { dst, ty, .. } => (dst, Some(*ty)),
-                    Instruction::Load { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::Load { dst, ty, .. } | Instruction::AtomicLoad { dst, ty, .. } => {
+                        (dst, Some(*ty))
+                    }
+                    Instruction::AtomicRmw { dst, val, .. }
+                    | Instruction::AtomicCas {
+                        dst, expected: val, ..
+                    } => (dst, types.get(val).copied()),
                     Instruction::ExtractLane { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Splat { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::VBinary { dst, lhs, .. }
@@ -1135,6 +1141,10 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 // Effectful instructions must never be eliminated
                 Instruction::Load { .. }
                 | Instruction::Store { .. }
+                | Instruction::AtomicRmw { .. }
+                | Instruction::AtomicCas { .. }
+                | Instruction::AtomicLoad { .. }
+                | Instruction::AtomicStore { .. }
                 | Instruction::Call { .. }
                 | Instruction::Alloc { .. }
                 | Instruction::Free { .. }

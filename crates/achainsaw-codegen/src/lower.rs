@@ -1,6 +1,6 @@
 use achainsaw_ir::ast::{
-    vexp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Terminator, UnaryOp, VBinOp,
-    VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
+    vexp, AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Terminator, UnaryOp,
+    VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp, MISALIGNED_FAULT,
 };
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::vnarrow_source_lane;
@@ -9,8 +9,8 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    AbiParam, Block as ClifBlock, ConstantData, FuncRef, InstBuilder, MemFlagsData, StackSlotData,
-    StackSlotKind, Value as ClifValue,
+    AbiParam, AtomicRmwOp, Block as ClifBlock, ConstantData, FuncRef, InstBuilder, MemFlagsData,
+    StackSlotData, StackSlotKind, Value as ClifValue,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module as ClifModule};
@@ -432,6 +432,33 @@ fn emit_bounds_check(
         &[],
         g.fault,
         &[BlockArg::Value(ptr), BlockArg::Value(size)],
+    );
+    builder.switch_to_block(pass);
+}
+
+/// Sandbox checks of an atomic access of `size` bytes at `ptr`: in bounds, and aligned to
+/// `size` (a misaligned one reports its size with `MISALIGNED_FAULT` set).
+fn emit_atomic_checks(
+    builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
+    ptr: ClifValue,
+    size: usize,
+) {
+    let Some(g) = guard else { return };
+    emit_bounds_check_const(builder, guard, ptr, size);
+    if size == 1 {
+        return;
+    }
+    let low = builder.ins().band_imm_u(ptr, size as i64 - 1);
+    let aligned = builder.ins().icmp_imm_u(IntCC::Equal, low, 0);
+    let flagged = c64(builder, (size as u64 | MISALIGNED_FAULT) as i64);
+    let pass = builder.create_block();
+    builder.ins().brif(
+        aligned,
+        pass,
+        &[],
+        g.fault,
+        &[BlockArg::Value(ptr), BlockArg::Value(flagged)],
     );
     builder.switch_to_block(pass);
 }
@@ -2278,6 +2305,78 @@ pub fn lower_function<M: ClifModule>(
                         ));
                     }
                     values.insert(dst.clone(), (loaded, *ty));
+                }
+                Instruction::AtomicRmw {
+                    op,
+                    dst,
+                    ptr,
+                    index,
+                    val,
+                    ..
+                } => {
+                    let (v, ty) = scalar(&values, val);
+                    let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
+                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    let op = match op {
+                        AtomicOp::Add => AtomicRmwOp::Add,
+                        AtomicOp::Sub => AtomicRmwOp::Sub,
+                        AtomicOp::And => AtomicRmwOp::And,
+                        AtomicOp::Or => AtomicRmwOp::Or,
+                        AtomicOp::Xor => AtomicRmwOp::Xor,
+                        AtomicOp::Xchg => AtomicRmwOp::Xchg,
+                        AtomicOp::Min => AtomicRmwOp::Smin,
+                        AtomicOp::Max => AtomicRmwOp::Smax,
+                        AtomicOp::Umin => AtomicRmwOp::Umin,
+                        AtomicOp::Umax => AtomicRmwOp::Umax,
+                    };
+                    let old = builder.ins().atomic_rmw(
+                        to_clif_type(ty),
+                        MemFlagsData::trusted(),
+                        op,
+                        addr,
+                        v,
+                    );
+                    values.insert(dst.clone(), (vec![old], ty));
+                }
+                Instruction::AtomicCas {
+                    dst,
+                    ptr,
+                    index,
+                    expected,
+                    new,
+                    ..
+                } => {
+                    let (e, ty) = scalar(&values, expected);
+                    let (n, _) = scalar(&values, new);
+                    let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
+                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    let old = builder
+                        .ins()
+                        .atomic_cas(MemFlagsData::trusted(), addr, e, n);
+                    values.insert(dst.clone(), (vec![old], ty));
+                }
+                Instruction::AtomicLoad {
+                    dst,
+                    ptr,
+                    index,
+                    ty,
+                    ..
+                } => {
+                    let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), *ty);
+                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    let v =
+                        builder
+                            .ins()
+                            .atomic_load(to_clif_type(*ty), MemFlagsData::trusted(), addr);
+                    values.insert(dst.clone(), (vec![v], *ty));
+                }
+                Instruction::AtomicStore {
+                    ptr, index, val, ..
+                } => {
+                    let (v, ty) = scalar(&values, val);
+                    let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
+                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    builder.ins().atomic_store(MemFlagsData::trusted(), v, addr);
                 }
                 Instruction::Store {
                     ptr, index, val, ..

@@ -652,7 +652,78 @@ impl<'a> Parser<'a> {
                 | "fma"
                 | "uitof"
                 | "ftoui"
+                | "atomic"
         )
+    }
+
+    /// Parses an atomic access after `dst = atomic` (or the store after `atomic`).
+    fn parse_atomic(
+        &mut self,
+        dst: String,
+        span: Span,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Instruction, Diagnostic> {
+        let tok = self.advance();
+        let name = match &tok.kind {
+            TokenKind::Ld => {
+                let (ptr, index) = self.parse_mem_ref(instructions)?;
+                self.expect_type_colon(&format!(
+                    "atomic ld needs the type it loads: `{dst} = atomic ld p[i]:i64` (or another integer type)"
+                ))?;
+                let ty = self.parse_type()?;
+                self.expect_eol()?;
+                return Ok(Instruction::AtomicLoad {
+                    dst,
+                    ptr,
+                    index,
+                    ty,
+                    span,
+                });
+            }
+            TokenKind::Ident(n) | TokenKind::Op(n) => n.clone(),
+            _ => String::new(),
+        };
+        let op = AtomicOp::from_str_opt(&name);
+        if op.is_none() && name != "cas" {
+            let ops: Vec<&str> = AtomicOp::ALL.iter().map(|o| o.as_str()).collect();
+            return Err(Diagnostic::error(
+                "ERR_UNKNOWN_OP",
+                format!(
+                    "Expected an atomic op after 'atomic' ({}, cas or ld; 'atomic st p, v' stands alone), found {:?}",
+                    ops.join(", "),
+                    tok.kind
+                ),
+                tok.span,
+            )
+            .with_context(serde_json::json!({ "ops": ops })));
+        }
+        let (ptr, index) = self.parse_mem_ref(instructions)?;
+        self.expect(TokenKind::Comma)?;
+        let val = self.parse_operand(instructions, None)?;
+        let inst = match op {
+            Some(op) => Instruction::AtomicRmw {
+                op,
+                dst,
+                ptr,
+                index,
+                val,
+                span,
+            },
+            None => {
+                self.expect(TokenKind::Comma)?;
+                let new = self.parse_operand(instructions, None)?;
+                Instruction::AtomicCas {
+                    dst,
+                    ptr,
+                    index,
+                    expected: val,
+                    new,
+                    span,
+                }
+            }
+        };
+        self.expect_eol()?;
+        Ok(inst)
     }
 
     /// Parses `v, 3:f32` (the operands of `extlane` and `vdup`) up to the end of the line.
@@ -930,6 +1001,24 @@ impl<'a> Parser<'a> {
             });
         }
 
+        // `atomic st p, v`; `atomic` is otherwise an ordinary register name.
+        if matches!(&first_tok.kind, TokenKind::Ident(name) if name == "atomic")
+            && self.peek_at(1) == Some(&TokenKind::St)
+        {
+            let span = self.advance().span;
+            self.advance();
+            let (ptr, index) = self.parse_mem_ref(instructions)?;
+            self.expect(TokenKind::Comma)?;
+            let val = self.parse_operand(instructions, None)?;
+            self.expect_eol()?;
+            return Ok(Instruction::AtomicStore {
+                ptr,
+                index,
+                val,
+                span,
+            });
+        }
+
         // Check if store: st ptr, val
         if first_tok.kind == TokenKind::St {
             let span = self.advance().span;
@@ -978,7 +1067,7 @@ impl<'a> Parser<'a> {
                 "ERR_MISSING_DESTINATION",
                 format!(
                     "'{dst}' needs a destination register: write 'r = {dst} ...' (only st, \
-                     stm, mm, free, call and par stand alone)"
+                     atomic st, stm, mm, free, call and par stand alone)"
                 ),
                 dst_span,
             )
@@ -1212,6 +1301,9 @@ impl<'a> Parser<'a> {
             // right after `=` names an op, and stays a valid register name elsewhere.
             TokenKind::Ident(name) if Self::is_contextual_op(&name) => {
                 self.advance();
+                if name == "atomic" {
+                    return self.parse_atomic(dst, dst_span, instructions);
+                }
                 if let Some(op) = UnaryOp::from_str_opt(&name) {
                     let src = self.parse_operand(instructions, None)?;
                     self.expect_eol()?;

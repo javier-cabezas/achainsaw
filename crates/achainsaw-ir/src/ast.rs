@@ -183,6 +183,61 @@ impl VBinOp {
     }
 }
 
+/// Set in the size a sandboxed atomic access reports to the runtime's fault hook when its
+/// address is misaligned (rather than out of bounds), on both backends.
+pub const MISALIGNED_FAULT: u64 = 1 << 63;
+
+/// Atomic read-modify-write op: `old = atomic add p, v` stores `old op v` and returns `old`
+/// (`xchg` stores `v`; `min`/`max` compare as signed, `umin`/`umax` as unsigned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AtomicOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Xchg,
+    Min,
+    Max,
+    Umin,
+    Umax,
+}
+
+impl AtomicOp {
+    /// Every op, in AIRB encoding order (append new ops at the end).
+    pub const ALL: [AtomicOp; 10] = [
+        AtomicOp::Add,
+        AtomicOp::Sub,
+        AtomicOp::And,
+        AtomicOp::Or,
+        AtomicOp::Xor,
+        AtomicOp::Xchg,
+        AtomicOp::Min,
+        AtomicOp::Max,
+        AtomicOp::Umin,
+        AtomicOp::Umax,
+    ];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AtomicOp::Add => "add",
+            AtomicOp::Sub => "sub",
+            AtomicOp::And => "and",
+            AtomicOp::Or => "or",
+            AtomicOp::Xor => "xor",
+            AtomicOp::Xchg => "xchg",
+            AtomicOp::Min => "min",
+            AtomicOp::Max => "max",
+            AtomicOp::Umin => "umin",
+            AtomicOp::Umax => "umax",
+        }
+    }
+}
+
 /// Lane-wise vector comparison producing all-ones (true) or all-zeros (false) lanes. Integer
 /// lanes compare as signed, except in `vult`, `vugt`, `vule` and `vuge` (integer lanes only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -724,6 +779,43 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
+    /// Atomic accesses (`AtomicRmw`, `AtomicCas`, `AtomicLoad`, `AtomicStore`) are
+    /// sequentially consistent, on an integer (i8 to i64) at an address aligned to its size,
+    /// and may take an index like `ld`/`st` (`p[i]`, scaled by the integer's size).
+    /// `old = atomic add p, v`: see `AtomicOp`.
+    AtomicRmw {
+        op: AtomicOp,
+        dst: String,
+        ptr: String,
+        index: Option<Index>,
+        val: String,
+        span: Span,
+    },
+    /// `old = atomic cas p, expected, new`: stores `new` if the value is `expected`, and
+    /// returns the value it found (the swap happened when `old == expected`).
+    AtomicCas {
+        dst: String,
+        ptr: String,
+        index: Option<Index>,
+        expected: String,
+        new: String,
+        span: Span,
+    },
+    /// `v = atomic ld p:i64`.
+    AtomicLoad {
+        dst: String,
+        ptr: String,
+        index: Option<Index>,
+        ty: Type,
+        span: Span,
+    },
+    /// `atomic st p, v`.
+    AtomicStore {
+        ptr: String,
+        index: Option<Index>,
+        val: String,
+        span: Span,
+    },
     /// `r = inslane v, x, 3:f32`: `vec` with lane `lane` (lanes of type `ty`) replaced by the
     /// scalar `val`. The index is checked like `extlane`'s.
     InsertLane {
@@ -922,6 +1014,10 @@ impl Instruction {
             | Instruction::Binary { span, .. }
             | Instruction::Load { span, .. }
             | Instruction::Store { span, .. }
+            | Instruction::AtomicRmw { span, .. }
+            | Instruction::AtomicCas { span, .. }
+            | Instruction::AtomicLoad { span, .. }
+            | Instruction::AtomicStore { span, .. }
             | Instruction::Call { span, .. }
             | Instruction::Par { span, .. }
             | Instruction::Splat { span, .. }
@@ -986,12 +1082,16 @@ impl Instruction {
             | Instruction::VDup { dst, .. }
             | Instruction::VDot { dst, .. }
             | Instruction::Fma { dst, .. }
+            | Instruction::AtomicRmw { dst, .. }
+            | Instruction::AtomicCas { dst, .. }
+            | Instruction::AtomicLoad { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => Some(dst),
             Instruction::Call { dsts, .. } => match dsts.as_slice() {
                 [d] => Some(d),
                 _ => None,
             },
             Instruction::Store { .. }
+            | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
@@ -1025,9 +1125,13 @@ impl Instruction {
             | Instruction::VDup { dst, .. }
             | Instruction::VDot { dst, .. }
             | Instruction::Fma { dst, .. }
+            | Instruction::AtomicRmw { dst, .. }
+            | Instruction::AtomicCas { dst, .. }
+            | Instruction::AtomicLoad { dst, .. }
             | Instruction::MaskedLoad { dst, .. } => vec![dst],
             Instruction::Call { dsts, .. } => dsts.iter_mut().collect(),
             Instruction::Store { .. }
+            | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
@@ -1049,7 +1153,11 @@ impl Instruction {
             Instruction::Load { index, .. }
             | Instruction::Store { index, .. }
             | Instruction::MaskedLoad { index, .. }
-            | Instruction::MaskedStore { index, .. } => index.as_ref(),
+            | Instruction::MaskedStore { index, .. }
+            | Instruction::AtomicRmw { index, .. }
+            | Instruction::AtomicCas { index, .. }
+            | Instruction::AtomicLoad { index, .. }
+            | Instruction::AtomicStore { index, .. } => index.as_ref(),
             _ => None,
         }
     }
@@ -1061,8 +1169,15 @@ impl Instruction {
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
             | Instruction::VZip { lhs, rhs, .. } => vec![lhs, rhs],
-            Instruction::Load { ptr, .. } | Instruction::Free { ptr, .. } => vec![ptr],
-            Instruction::Store { ptr, val, .. } => vec![ptr, val],
+            Instruction::Load { ptr, .. }
+            | Instruction::AtomicLoad { ptr, .. }
+            | Instruction::Free { ptr, .. } => vec![ptr],
+            Instruction::Store { ptr, val, .. }
+            | Instruction::AtomicRmw { ptr, val, .. }
+            | Instruction::AtomicStore { ptr, val, .. } => vec![ptr, val],
+            Instruction::AtomicCas {
+                ptr, expected, new, ..
+            } => vec![ptr, expected, new],
             Instruction::Call { args, .. } => args.iter().collect(),
             Instruction::Par { count, args, .. } => std::iter::once(count).chain(args).collect(),
             Instruction::Splat { src, .. }
@@ -1117,13 +1232,31 @@ impl Instruction {
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
             | Instruction::VZip { lhs, rhs, .. } => vec![lhs, rhs],
-            Instruction::Load { ptr, index, .. } => std::iter::once(ptr)
-                .chain(index.as_mut().map(|ix| &mut ix.reg))
-                .collect(),
+            Instruction::Load { ptr, index, .. } | Instruction::AtomicLoad { ptr, index, .. } => {
+                std::iter::once(ptr)
+                    .chain(index.as_mut().map(|ix| &mut ix.reg))
+                    .collect()
+            }
             Instruction::Free { ptr, .. } => vec![ptr],
             Instruction::Store {
                 ptr, val, index, ..
+            }
+            | Instruction::AtomicRmw {
+                ptr, val, index, ..
+            }
+            | Instruction::AtomicStore {
+                ptr, val, index, ..
             } => [ptr, val]
+                .into_iter()
+                .chain(index.as_mut().map(|ix| &mut ix.reg))
+                .collect(),
+            Instruction::AtomicCas {
+                ptr,
+                expected,
+                new,
+                index,
+                ..
+            } => [ptr, expected, new]
                 .into_iter()
                 .chain(index.as_mut().map(|ix| &mut ix.reg))
                 .collect(),

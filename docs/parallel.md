@@ -12,7 +12,8 @@ fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)
 ```
 
 The rules:
-- **Write only your own memory.** Calls run concurrently and in any order. Each `i` writes its own memory; to reduce, store per-`i` partial results in an `alloc`'d array and sum them after the `par`.
+- **Write only your own memory, or use atomics.** Calls run concurrently and in any order. Each `i` writes its own memory with `ld`/`st`; to reduce, store per-`i` partial results in an `alloc`'d array and sum them after the `par`. Memory that several calls update, such as a counter, a histogram or a running minimum, takes [atomic accesses](language.md#atomics): `atomic add hist[b], 1:i64`. A plain `ld` of a location another call writes concurrently gives an unspecified value.
+- **Never wait for another index.** A call may spin on an atomic only for work it can finish itself (a `cas` retry). Waiting for another `i` to set a flag can hang: calls may run one after another on a single thread (`--threads 1`, a nested `par`, AOT code).
 - **Give each `i` real work.** A row or a block of thousands of elements works well. Dispatching a `par` costs about a microsecond on 16 threads.
 - **The validator checks the body.** `ERR_PAR_SIGNATURE` reports a body with the wrong signature and gives the expected one in `context.expected_signature`. External functions (`extfn`) cannot be bodies, and vectors cannot be passed (pass them through memory).
 
