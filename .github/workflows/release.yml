@@ -75,7 +75,7 @@ jobs:
           "$hash  ${{ matrix.artifact_name }}" | Out-File -Encoding ascii "${{ matrix.artifact_name }}.sha256"
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -112,7 +112,7 @@ jobs:
           args: --release --out dist
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: dist/*.whl
