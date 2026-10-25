@@ -49,7 +49,8 @@ impl Fmt {
         }
     }
 
-    /// Q4_K and Q5_K: unsigned values, a scale and a min per 32-block.
+    /// Q4_K and Q5_K: unsigned values, a scale and a min per 32-block (6-bit codes times f16
+    /// factors per 256 values).
     fn has_min(self) -> bool {
         matches!(self, Fmt::Q4K | Fmt::Q5K)
     }
@@ -57,7 +58,8 @@ impl Fmt {
 
 /// A Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0,
 /// -32..=31 for Q6_K, 0..=15 for Q4_K, 0..=31 for Q5_K), f16 scales `s` [k/group x rows]
-/// and, for Q4_K and Q5_K, f16 mins `m` [k/32 x rows] (weight s * q - m), plus the kernel's
+/// and, for Q4_K and Q5_K, mins `m` [k/32 x rows] (weight s * q - m; both the products of a
+/// 6-bit code and an f16 factor per 256 values, `codes`), plus the kernel's
 /// packed layout (see `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of
 /// 4 consecutive elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row
 /// r's element 4g + q plus 128 for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and
@@ -65,7 +67,10 @@ impl Fmt {
 /// low 4 bits of the values offset by 32, then 512 bytes whose byte (g * 64 + r) * 4 + q
 /// (g < 2) holds the high 2 bits of element 8p + 4g + q in bit pair p; for Q5_K the nibbles
 /// of the low 4 bits, then 256 bytes whose byte r * 4 + q holds the top bit of element 4g + q
-/// in bit g and of element 16 + 4g + q in bit 4 + g.
+/// in bit g and of element 16 + 4g + q in bit 4 + g. The scales follow per chunk: f16 [64]
+/// vectors per block (two for Q6_K), or for Q4_K and Q5_K the codes, [64] u16s per block
+/// (scale code | min code << 8), then the f16 factors, [64] for the scales then [64] for the
+/// mins per 8 blocks.
 struct Mat {
     rows: usize,
     k: usize,
@@ -74,7 +79,7 @@ struct Mat {
     s: Vec<f32>,
     m: Vec<f32>,
     packed_q: Vec<u8>,
-    packed_s: Vec<u16>,
+    packed_s: Vec<u8>,
 }
 
 impl Mat {
@@ -95,9 +100,10 @@ impl Mat {
                 (if fmt.has_min() { v + qmax as i32 } else { v }) as i8
             })
             .collect();
+        let f16 = |v: f32| half::f16::from_f32(v).to_f32();
         // Entries of roughly unit variance times 1/sqrt(k), as in a trained layer; f16 scales
         // (Q4_0's are often negative).
-        let s: Vec<f32> = (0..k / g * rows)
+        let mut s: Vec<f32> = (0..k / g * rows)
             .map(|_| {
                 let v = (0.75 + 0.25 * rng.next()) / (smax * (k as f32).sqrt());
                 let v = if matches!(fmt, Fmt::Q4 | Fmt::Q6) && rng.next() < 0.0 {
@@ -105,28 +111,44 @@ impl Mat {
                 } else {
                     v
                 };
-                half::f16::from_f32(v).to_f32()
+                f16(v)
             })
             .collect();
-        // Mins near the middle of the values' range times the scale, so the weights center
-        // on zero.
-        let m: Vec<f32> = if fmt.has_min() {
-            s.iter()
-                .map(|&sv| half::f16::from_f32(sv * qmax * (1.0 + 0.2 * rng.next())).to_f32())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Q4_K and Q5_K: codes near the top of their 6 bits times an f16 factor per 256
+        // values (some subnormal), and mins near the middle of the values' range times the
+        // scale, so the weights center on zero. The codes and factors are [k/32 x rows] and
+        // [k/256 x rows] (the last super-block possibly partial).
+        let mut m: Vec<f32> = Vec::new();
+        let mut codes = (vec![], vec![], vec![], vec![]);
+        if fmt.has_min() {
+            let ds: Vec<f32> = (0..nb.div_ceil(8) * rows)
+                .map(|_| f16((1.0 + 0.1 * rng.next()) / (63.0 * smax * (k as f32).sqrt())))
+                .collect();
+            let dm: Vec<f32> = ds.iter().map(|&d| f16(d * qmax)).collect();
+            let sc: Vec<u8> = (0..nb * rows)
+                .map(|_| (56.0 + 3.9 * rng.next()) as u8)
+                .collect();
+            let mn: Vec<u8> = sc
+                .iter()
+                .map(|&c| (c as f32 * (1.0 + 0.1 * rng.next())).min(63.0) as u8)
+                .collect();
+            let sup = |b: usize, r: usize| (b / 8) * rows + r;
+            s = (0..nb * rows)
+                .map(|i| ds[sup(i / rows, i % rows)] * sc[i] as f32)
+                .collect();
+            m = (0..nb * rows)
+                .map(|i| dm[sup(i / rows, i % rows)] * mn[i] as f32)
+                .collect();
+            codes = (sc, mn, ds, dm);
+        }
         let block_bytes = match fmt {
             Fmt::Q8 => 2048,
             Fmt::Q4 | Fmt::Q4K => 1024,
             Fmt::Q6 => 1536,
             Fmt::Q5K => 1280,
         };
-        // Scale vectors per block: Q6_K's two scale groups, or Q4_K's and Q5_K's scale and min.
-        let per_block = if fmt.has_min() { 2 } else { 32 / g };
         let mut packed_q = vec![0u8; rows / 64 * nb * block_bytes];
-        let mut packed_s = vec![0u16; nb * per_block * rows];
+        let mut packed_s = Vec::new();
         for c in 0..rows / 64 {
             for kk in 0..k {
                 let (b, t) = (kk / 32, kk % 32);
@@ -155,16 +177,26 @@ impl Mat {
                     }
                 }
             }
-            for vi in 0..nb * per_block {
-                // Scale vector vi of the chunk: Q4_K's and Q5_K's alternate scale and min.
-                let (src, gi) = if fmt.has_min() {
-                    (if vi % 2 == 0 { &s } else { &m }, vi / 2)
-                } else {
-                    (&s, vi)
-                };
-                for r in 0..64 {
-                    packed_s[(c * nb * per_block + vi) * 64 + r] =
-                        half::f16::from_f32(src[gi * rows + c * 64 + r]).to_bits();
+            let rows_of = |v: usize| (v * rows + c * 64)..(v * rows + c * 64 + 64);
+            let f16_bytes = |src: &[f32]| -> Vec<u8> {
+                src.iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+                    .collect()
+            };
+            if fmt.has_min() {
+                let (sc, mn, ds, dm) = &codes;
+                for b in 0..nb {
+                    for (&c, &n) in sc[rows_of(b)].iter().zip(&mn[rows_of(b)]) {
+                        packed_s.extend((c as u16 | (n as u16) << 8).to_le_bytes());
+                    }
+                }
+                for sb in 0..nb.div_ceil(8) {
+                    packed_s.extend(f16_bytes(&ds[rows_of(sb)]));
+                    packed_s.extend(f16_bytes(&dm[rows_of(sb)]));
+                }
+            } else {
+                for gi in 0..nb * 32 / g {
+                    packed_s.extend(f16_bytes(&s[rows_of(gi)]));
                 }
             }
         }

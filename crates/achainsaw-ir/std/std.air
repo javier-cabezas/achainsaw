@@ -25,7 +25,11 @@
 #                    256 bytes whose byte j * 4 + q holds the top bits of row j's values
 #                    4g + q in bit g and 16 + 4g + q in bit 4 + g (g < 4).
 # Scales are f16 [64] vectors per block: one for Q8_0 and Q4_0, two for Q6_K (one per 16
-# values), and for Q4_K and Q5_K a scale s and a min m, the weight being s * value - m.
+# values). Q4_K and Q5_K weights are s * value - m with a scale s and a min m per block, kept
+# as GGUF stores them: per block the 6-bit codes, [64] i16s holding a row's scale code in the
+# low byte and its min code in the high one, and after a chunk's blocks the f16 factors d
+# and dmin of each 256-value super-block (8 blocks, the last one of a row possibly fewer),
+# [64] each, so s = d * code and m = dmin * code (exact in f32).
 # Blocks are the outer loop, so each block's bytes are read in one pass; for each strip of
 # `vl i32` rows, two exact int32 dot chains (values 0..15 and 16..31, Q6_K's two scale
 # groups) lose bias * sum(x) (the sums from quantize_q8's block records), then are converted
@@ -57,6 +61,7 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     xb = add xq, xo
     sb_off = mul b, sc_blk
     sb = add sc, sb_off
+    sd = call qmat_ksup(sc, nb, b)
     d, c_lo, c_hi = call qmat_block(dx, b, bias)
     # One strip loop per format, chosen once per block.
     odd = and fmt, 1:i64
@@ -103,9 +108,8 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     m_k4 = lt jk4, 64:i64
     br m_k4, k4_body, block_next
   k4_body:
-    wb_k4, s_k4, py_k4 = call qmat_strip(wb0, sb, dst, jk4)
+    wb_k4, s_k4, s1_k4, py_k4 = call qmat_kstrip(wb0, sb, sd, dst, jk4)
     l_k4, h_k4 = call qmat_dots4(wb_k4, xb)
-    s1_k4 = call qmat_scale1(sb, jk4)
     call qmat_accm(py_k4, l_k4, h_k4, s_k4, s1_k4, d, c_lo, c_hi)
     jk4n = add jk4, w
     jmp k4(jk4n)
@@ -113,9 +117,8 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     m_k5 = lt jk5, 64:i64
     br m_k5, k5_body, block_next
   k5_body:
-    wb_k5, s_k5, py_k5 = call qmat_strip(wb0, sb, dst, jk5)
+    wb_k5, s_k5, s1_k5, py_k5 = call qmat_kstrip(wb0, sb, sd, dst, jk5)
     l_k5, h_k5 = call qmat_dots5(wb_k5, xb)
-    s1_k5 = call qmat_scale1(sb, jk5)
     call qmat_accm(py_k5, l_k5, h_k5, s_k5, s1_k5, d, c_lo, c_hi)
     jk5n = add jk5, w
     jmp k5(jk5n)
@@ -162,6 +165,7 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     xb3 = add xq3, xo
     sb_off = mul b, sc_blk
     sb = add sc, sb_off
+    sd = call qmat_ksup(sc, nb, b)
     d0, l0, h0 = call qmat_block(dx, b, bias)
     d1, l1, h1 = call qmat_block(dx1, b, bias)
     d2, l2, h2 = call qmat_block(dx2, b, bias)
@@ -229,12 +233,11 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     m_k4 = lt jk4, 64:i64
     br m_k4, k4_body, block_next
   k4_body:
-    wb_k4, s_k4, py_k4 = call qmat_strip(wb0, sb, dst, jk4)
+    wb_k4, s_k4, s1_k4, py_k4 = call qmat_kstrip(wb0, sb, sd, dst, jk4)
     k40l, k40h, k41l, k41h, k42l, k42h, k43l, k43h = call qmat_dots4x4(wb_k4, xb0, xb1, xb2, xb3)
     py1_k4 = add py_k4, 256:i64
     py2_k4 = add py_k4, 512:i64
     py3_k4 = add py_k4, 768:i64
-    s1_k4 = call qmat_scale1(sb, jk4)
     call qmat_accm(py_k4, k40l, k40h, s_k4, s1_k4, d0, l0, h0)
     call qmat_accm(py1_k4, k41l, k41h, s_k4, s1_k4, d1, l1, h1)
     call qmat_accm(py2_k4, k42l, k42h, s_k4, s1_k4, d2, l2, h2)
@@ -245,12 +248,11 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     m_k5 = lt jk5, 64:i64
     br m_k5, k5_body, block_next
   k5_body:
-    wb_k5, s_k5, py_k5 = call qmat_strip(wb0, sb, dst, jk5)
+    wb_k5, s_k5, s1_k5, py_k5 = call qmat_kstrip(wb0, sb, sd, dst, jk5)
     k50l, k50h, k51l, k51h, k52l, k52h, k53l, k53h = call qmat_dots5x4(wb_k5, xb0, xb1, xb2, xb3)
     py1_k5 = add py_k5, 256:i64
     py2_k5 = add py_k5, 512:i64
     py3_k5 = add py_k5, 768:i64
-    s1_k5 = call qmat_scale1(sb, jk5)
     call qmat_accm(py_k5, k50l, k50h, s_k5, s1_k5, d0, l0, h0)
     call qmat_accm(py1_k5, k51l, k51h, s_k5, s1_k5, d1, l1, h1)
     call qmat_accm(py2_k5, k52l, k52h, s_k5, s1_k5, d2, l2, h2)
@@ -403,9 +405,9 @@ fn qmat_chunk8(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     jmp k4_body
   k4_body:
     wbb_k4, sb_k4, xr_k4, e_k4 = call qmat_tile8(wb0, sc, tab, bk4, blk, sc_blk)
-    wb_k4, s_k4, unused_k4 = call qmat_strip(wbb_k4, sb_k4, dst, jk4)
+    sd_k4 = call qmat_ksup(sc, nb, bk4)
+    wb_k4, s_k4, s1_k4, unused_k4 = call qmat_kstrip(wbb_k4, sb_k4, sd_k4, dst, jk4)
     r0k4, r1k4, r2k4, r3k4, r4k4, r5k4, r6k4, r7k4 = call qmat_dots4x8(wb_k4, xr_k4)
-    s1_k4 = call qmat_scale1(sb_k4, jk4)
     g0k4, g1k4, g2k4, g3k4, g4k4, g5k4, g6k4, g7k4 = call qmat_accm8(e_k4, s_k4, s1_k4, f0k4, f1k4, f2k4, f3k4, f4k4, f5k4, f6k4, f7k4, r0k4, r1k4, r2k4, r3k4, r4k4, r5k4, r6k4, r7k4)
     bk42 = add bk4, 1:i64
     jmp k4_blocks(bk42, g0k4, g1k4, g2k4, g3k4, g4k4, g5k4, g6k4, g7k4)
@@ -430,9 +432,9 @@ fn qmat_chunk8(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     jmp k5_body
   k5_body:
     wbb_k5, sb_k5, xr_k5, e_k5 = call qmat_tile8(wb0, sc, tab, bk5, blk, sc_blk)
-    wb_k5, s_k5, unused_k5 = call qmat_strip(wbb_k5, sb_k5, dst, jk5)
+    sd_k5 = call qmat_ksup(sc, nb, bk5)
+    wb_k5, s_k5, s1_k5, unused_k5 = call qmat_kstrip(wbb_k5, sb_k5, sd_k5, dst, jk5)
     r0k5, r1k5, r2k5, r3k5, r4k5, r5k5, r6k5, r7k5 = call qmat_dots5x8(wb_k5, xr_k5)
-    s1_k5 = call qmat_scale1(sb_k5, jk5)
     g0k5, g1k5, g2k5, g3k5, g4k5, g5k5, g6k5, g7k5 = call qmat_accm8(e_k5, s_k5, s1_k5, f0k5, f1k5, f2k5, f3k5, f4k5, f5k5, f6k5, f7k5, r0k5, r1k5, r2k5, r3k5, r4k5, r5k5, r6k5, r7k5)
     bk52 = add bk5, 1:i64
     jmp k5_blocks(bk52, g0k5, g1k5, g2k5, g3k5, g4k5, g5k5, g6k5, g7k5)
@@ -447,9 +449,10 @@ fn qmat_chunk8(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     ret
 
 # Chunk c of `mat` (see qmat_chunk): its weights, its scales, the number of 32-blocks of a
-# row, the bytes per block of weights and of scales, the format, and the bias of its unsigned
-# weights (128 for Q8_0, 8 for Q4_0, 32 for Q6_K; 1 for Q4_K and Q5_K, whose weights have no
-# offset, so that qmat_block's corrections are the activation sums their mins multiply).
+# row, the bytes per block of weights and of scales (of codes for Q4_K and Q5_K), the format,
+# and the bias of its unsigned weights (128 for Q8_0, 8 for Q4_0, 32 for Q6_K; 1 for Q4_K and
+# Q5_K, whose weights have no offset, so that qmat_block's corrections are the activation
+# sums their mins multiply).
 inline fn qmat_layout(c:i64, mat:ptr, k:i64)->(ptr, ptr, i64, i64, i64, i64, i32)
   b0:
     jmp find(mat, c)
@@ -475,13 +478,18 @@ inline fn qmat_layout(c:i64, mat:ptr, k:i64)->(ptr, ptr, i64, i64, i64, i64, i32
     blk_a = select is_n, 1024:i64, 2048:i64
     blk_b = select is_q6, 1536:i64, blk_a
     blk = select is_q5, 1280:i64, blk_b
-    two = or is_q6, is_k
-    nsub = select two, 2:i64, 1:i64
-    sc_blk = shl nsub, 7:i64
+    # Scales per block: 128 bytes, 256 for Q6_K; Q4_K and Q5_K add 256 per 8 blocks (or
+    # fewer, at the end of a row).
+    sc_blk = select is_q6, 256:i64, 128:i64
+    nb7 = add nb, 7:i64
+    nsup = ushr nb7, 3:i64
+    sup_b = shl nsup, 8:i64
+    sup = select is_k, sup_b, 0:i64
     chunk_w = mul nb, blk
     w_off = mul pc, chunk_w
     wc = add wq, w_off
-    chunk_s = mul nb, sc_blk
+    chunk_b = mul nb, sc_blk
+    chunk_s = add chunk_b, sup
     s_off = mul pc, chunk_s
     sc = add scales, s_off
     bias_a = select is_n, 8:i32, 128:i32
@@ -619,13 +627,48 @@ inline fn qmat_strip(wb0:ptr, sb:ptr, dst:ptr, j:i64)->(ptr, vx, ptr)
     py = add dst, j4
     ret wb, s, py
 
-# Scale group 1 of the strip of rows j .. (Q6_K's values 16..31; the mins of Q4_K and Q5_K).
+# Scale group 1 of the strip of rows j .. (Q6_K's values 16..31).
 inline fn qmat_scale1(sb:ptr, j:i64)->vx
   b0:
     jh = add j, 64:i64
     rest = sub 64:i64, j
     s1 = call qmat_scale(sb, jh, rest)
     ret s1
+
+# The strip of rows j .. of a Q4_K or Q5_K block (weights at wb0, codes at sb, its
+# super-block's factors at sd): its weights, scales and mins (each a 6-bit code times an f16
+# factor, exact in f32) and its outputs at dst + 4j. One plain load reads the strip's codes:
+# past row 63 it reads the next block's codes or the chunk's factors, which follow them.
+inline fn qmat_kstrip(wb0:ptr, sb:ptr, sd:ptr, dst:ptr, j:i64)->(ptr, vx, vx, ptr)
+  b0:
+    j4 = shl j, 2:i64
+    wb = add wb0, j4
+    cv = ld sb[j:i16]:vx
+    c32 = vwidenlo cv:i32
+    low = splat 255:i32:vx
+    sc = vand c32, low:i32
+    mn = vushr c32, 8:i32
+    scf = vitof sc:f32
+    mnf = vitof mn:f32
+    rest = sub 64:i64, j
+    fs = call qmat_scale(sd, j, rest)
+    jh = add j, 64:i64
+    fm = call qmat_scale(sd, jh, rest)
+    s = vmul scf, fs:f32
+    m = vmul mnf, fm:f32
+    py = add dst, j4
+    ret wb, s, m, py
+
+# The f16 factors of block b's super-block in a Q4_K or Q5_K chunk whose scales are at sc
+# (nb blocks of codes, then one entry per 8 blocks; see qmat_chunk).
+inline fn qmat_ksup(sc:ptr, nb:i64, b:i64)->ptr
+  b0:
+    co = shl nb, 7:i64
+    sup = ushr b, 3:i64
+    so = shl sup, 8:i64
+    o = add co, so
+    sd = add sc, o
+    ret sd
 
 # One token's dots for a strip of Q8_0 weights at wb, groups 0..3 unrolled (see
 # qmat_dot): the int32 sums of values 0..15 and of values 16..31.
@@ -980,7 +1023,7 @@ inline fn qmat_st8(py:ptr, f0:vx, f1:vx, f2:vx, f3:vx, f4:vx, f5:vx, f6:vx, f7:v
     ret
 
 # f16 scales sb[i ..] of a strip's rows (at most n of them), widened to f32: scale group
-# 0 of rows j .. at sb[j], Q6_K's group 1 (the mins of Q4_K and Q5_K) at sb[j + 64].
+# 0 of rows j .. at sb[j], Q6_K's group 1 at sb[j + 64] (and Q4_K's and Q5_K's factors).
 inline fn qmat_scale(sb:ptr, i:i64, n:i64)->vx
   b0:
     h = ldm sb[i]:vx, n:f16

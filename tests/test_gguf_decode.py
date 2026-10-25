@@ -306,16 +306,16 @@ class TestGGUFDecode(unittest.TestCase):
         self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, l2["gate_up"].fmt, l2["down"].fmt),
                          ("q4k+q4k+q6", "q5k", "q4k", "q5k"))
         self.assertEqual(m.lm.fmt, "q6")
-        # Q4_K and Q5_K: values exact, scales and mins rounded to f16.
+        # Q4_K and Q5_K: values exact, and scales and mins too (6-bit codes times f16 factors).
         for name in ("attn_output", "ffn_down"):
             mat: Mat = l2["o"] if name == "attn_output" else l2["down"]
             codes: Ints = mat.q_blocks.transpose(1, 0, 2).reshape(mat.rows, -1)
             np.testing.assert_array_equal(codes, self.k_codes[f"blk.2.{name}.weight"])
         for i, layer in enumerate(m.layers):
             if i == 2:
-                # Each part of QKV keeps its format. The f16 roundings of the scales and mins
-                # (2^-11 relative, Q6_K's too) move a weight by at most 2^-11 (|s q| + |m|),
-                # and |s q| + |m| <= 3 max|w| (m is minus the weight at q = 0).
+                # Each part of QKV keeps its format. Q4_K and Q5_K weights are exact; QKV's
+                # Q6_K part rounds its scales to f16 (2^-11 relative), which moves a weight by
+                # at most 2^-11 |s q|.
                 p: str = "blk.2."
                 hf_q: Floats = np.empty_like(e[p + "attn_q.weight"])
                 hf_q[gguf_order(HEADS)] = e[p + "attn_q.weight"]
@@ -330,9 +330,12 @@ class TestGGUFDecode(unittest.TestCase):
                                            1).reshape(-1, D)
                 for n in MATS:
                     w: Floats = want[n]
-                    np.testing.assert_allclose(weights(layer[n]), w,
-                                               atol=3 * 2 ** -11 * np.abs(w).max(),
-                                               err_msg=f"{p}{n}")
+                    if layer[n].fmt in ("q4k", "q5k"):
+                        np.testing.assert_array_equal(weights(layer[n]), w, err_msg=f"{p}{n}")
+                    else:
+                        np.testing.assert_allclose(weights(layer[n]), w,
+                                                   atol=2 ** -11 * np.abs(w).max(),
+                                                   err_msg=f"{p}{n}")
                 continue
             p = f"blk.{i}."
             # Q and K rows back in Hugging Face order; exact for Q4_0 and Q8_0 (layer 1's

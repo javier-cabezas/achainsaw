@@ -21,8 +21,8 @@
 #
 # Each weight matrix is Q8_0, Q4_0, Q6_K, Q4_K or Q5_K, chosen per matrix (and per part of a
 # fused matrix: Q, K and V may differ): 8-, 4-, 6- or 5-bit weights with f16 scales per 32
-# (Q6_K: 16) values of a row, plus a min per 32 for Q4_K and Q5_K, packed in chunks of 64
-# output rows; activations are quantized to int8 per 32-block on the fly and the int8 dots
+# (Q6_K: 16) values of a row, or for Q4_K and Q5_K a 6-bit scale and min per 32 under f16
+# factors per 256, packed in chunks of 64 output rows; activations are quantized to int8 per 32-block on the fly and the int8 dots
 # run on `vdotu` (weights stored unsigned; the activation sums of quantize_q8 remove their
 # offset or apply the mins).
 # The matrix chunks (qmat_chunk), the quantization, RoPE, softmax's exp (vexp, no libm call)

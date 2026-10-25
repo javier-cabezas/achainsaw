@@ -6,7 +6,8 @@ math and, when PyTorch is installed, a PyTorch one.
 The AIR kernel runs the whole prompt in one llama_prefill call (8 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
-Q4_0, Q8_0, Q6_K, Q4_K or Q5_K weights with f16 block scales (and mins for Q4_K and Q5_K),
+Q4_0, Q8_0, Q6_K, Q4_K or Q5_K weights with f16 block scales (Q4_K and Q5_K: GGUF's 6-bit
+scales and mins under f16 super-block factors),
 activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
 RoPE, attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights

@@ -141,11 +141,11 @@ def _deq_q6_k(b: U8) -> F32:
     return y
 
 
-def k_quant_values(b: U8, bits: int) -> tuple[U8, F32, F32]:
+def k_quant_codes(b: U8, bits: int) -> tuple[U8, F32, F32, U8, U8]:
     """Q4_K (bits 4) or Q5_K (bits 5) blocks [n x 144 or 176] -> (values uint8 [n x 256],
-    0..15 or 0..31; scales and mins f32 [n x 8], one per 32 values: the f16 super-block
-    scale d times the 6-bit sub-block scale, and dmin times the 6-bit min, as llama.cpp
-    computes them). Value t of sub-block j is scale[j] * q - min[j]."""
+    0..15 or 0..31; the f16 super-block scale d and min dmin, f32 [n x 1]; the 6-bit sub-block
+    scales and mins, uint8 [n x 8], one per 32 values). Value t of sub-block j is
+    d * scale[j] * q - dmin * min[j]."""
     d: F32 = _f16(b[:, 0:2])
     dmin: F32 = _f16(b[:, 2:4])
     sc: U8 = b[:, 4:16].astype(np.uint8)
@@ -164,6 +164,15 @@ def k_quant_values(b: U8, bits: int) -> tuple[U8, F32, F32]:
         if qh is not None:
             v = v | (((qh >> j) & 1) << 4)
         q[:, 32 * j:32 * j + 32] = v
+    return q, d, dmin, s6, m6
+
+
+def k_quant_values(b: U8, bits: int) -> tuple[U8, F32, F32]:
+    """Q4_K (bits 4) or Q5_K (bits 5) blocks [n x 144 or 176] -> (values uint8 [n x 256];
+    scales and mins f32 [n x 8], one per 32 values: d times the 6-bit sub-block scale, and
+    dmin times the 6-bit min, as llama.cpp computes them, exact in f32). Value t of
+    sub-block j is scale[j] * q - min[j]."""
+    q, d, dmin, s6, m6 = k_quant_codes(b, bits)
     return q, d * s6.astype(np.float32), dmin * m6.astype(np.float32)
 
 
