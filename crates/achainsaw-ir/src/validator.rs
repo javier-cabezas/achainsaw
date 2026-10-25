@@ -13,6 +13,8 @@ pub struct Validator {
     functions: HashMap<String, (Vec<Type>, Vec<Type>)>,
     /// Names declared with `extfn`, which `par` may not run.
     externs: HashSet<String>,
+    /// Names of the module's `data`.
+    data: HashSet<String>,
 }
 
 impl Validator {
@@ -20,6 +22,7 @@ impl Validator {
         Self {
             functions: HashMap::new(),
             externs: HashSet::new(),
+            data: HashSet::new(),
         }
     }
 }
@@ -313,11 +316,62 @@ impl Validator {
                 .insert(func.name.clone(), (param_types, func.rets.clone()));
         }
 
+        for d in &module.data {
+            self.validate_data(d)?;
+        }
+
         // Validate each function
         for func in &module.functions {
             self.validate_function(func)?;
         }
         check_inline_recursion(module)
+    }
+
+    fn validate_data(&mut self, d: &Data) -> Result<(), Diagnostic> {
+        if d.name.starts_with(RESERVED_PREFIX) {
+            return Err(Diagnostic::error(
+                "ERR_RESERVED_NAME",
+                format!(
+                    "Data name '{}' uses the reserved prefix '{RESERVED_PREFIX}'",
+                    d.name
+                ),
+                d.span,
+            ));
+        }
+        if !self.data.insert(d.name.clone()) {
+            return Err(Diagnostic::error(
+                "ERR_DUPLICATE_DATA",
+                format!("Duplicate data name '{}'", d.name),
+                d.span,
+            )
+            .with_context(serde_json::json!({ "target": d.name })));
+        }
+        if !matches!(
+            d.ty,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64
+        ) {
+            return Err(Diagnostic::error(
+                "ERR_INVALID_DATA_TYPE",
+                format!(
+                    "data '{}' has element type '{}'; use i8, i16, i32, i64, f32 or f64",
+                    d.name, d.ty
+                ),
+                d.span,
+            ));
+        }
+        if d.bytes.is_empty() || !d.bytes.len().is_multiple_of(d.ty.byte_size()) {
+            return Err(Diagnostic::error(
+                "ERR_INVALID_DATA_TYPE",
+                format!(
+                    "data '{}' holds {} bytes, which is not a positive number of '{}' values",
+                    d.name,
+                    d.bytes.len(),
+                    d.ty
+                ),
+                d.span,
+            ));
+        }
+        Ok(())
     }
 
     fn check_reserved(name: &str, span: Span) -> Result<(), Diagnostic> {
@@ -875,6 +929,31 @@ impl Validator {
                         format!("Alloc size must be i64 or i32, found '{size_ty}'"),
                         *span,
                     ));
+                }
+                Self::define(scope, dst, Type::Ptr);
+            }
+            Instruction::Stack { dst, size, span } => {
+                if !(1..=MAX_STACK_BYTES).contains(size) {
+                    return Err(Diagnostic::error(
+                        "ERR_INVALID_STACK_SIZE",
+                        format!(
+                            "stack size {size} is outside 1..={MAX_STACK_BYTES} bytes; use alloc for larger buffers"
+                        ),
+                        *span,
+                    ));
+                }
+                Self::define(scope, dst, Type::Ptr);
+            }
+            Instruction::Addr { dst, name, span } => {
+                if !self.data.contains(name) {
+                    let mut names: Vec<&String> = self.data.iter().collect();
+                    names.sort();
+                    return Err(Diagnostic::error(
+                        "ERR_UNDEFINED_DATA",
+                        format!("addr names '{name}', which no `data` declaration defines"),
+                        *span,
+                    )
+                    .with_context(serde_json::json!({ "target": name, "available_data": names })));
                 }
                 Self::define(scope, dst, Type::Ptr);
             }

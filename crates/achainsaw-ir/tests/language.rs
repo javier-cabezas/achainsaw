@@ -1,6 +1,7 @@
 //! Indexed memory operands, functions with several results, `inline fn`, and the scalar
 //! rounding / bit-count / rotation / copysign / fma / unsigned-conversion / math ops: syntax,
-//! validation, inlining, and text and AIRB round trips; atomic accesses.
+//! validation, inlining, and text and AIRB round trips; atomic accesses; `data`, `addr` and
+//! `stack`.
 
 use achainsaw_ir::inline::inline_module;
 use achainsaw_ir::{decode_module, encode_module, parse_and_validate, to_air_text};
@@ -398,4 +399,113 @@ fn k(x:f32, p:ptr)->f32
     let text = to_air_text(&prepared);
     assert!(!achainsaw_ir::math::has_math(&prepared), "{text}");
     parse_and_validate(&text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
+}
+
+#[test]
+fn data_and_stack_round_trip_and_rules() {
+    let src = r#"
+data masks:i8 = -1, 0, 255, 127,
+    -128, 1
+data inv_freq:f32 = 1.0, 0.5, 1e-40, 3.4028235e38, -0.0, inf, nan, 3
+data big:i64 = -9223372036854775808, 9223372036854775807
+data halves:f64 = 0.1, -2.5e300
+
+fn k(i:i64)->f32
+  b0:
+    t = addr inv_freq
+    m = addr masks
+    buf = stack 384
+    data = ld t[i]:f32
+    st buf, data
+    stack = ld buf:f32
+    addr = add stack, 1.0:f32
+    ret addr
+"#;
+    let text = round_trips(src);
+    for line in [
+        "data masks:i8 = -1, 0, -1, 127, -128, 1\n",
+        "data inv_freq:f32 = 1.0, 0.5, 1e-40, 3.4028235e38, -0.0, inf, nan, 3.0\n",
+        "data big:i64 = -9223372036854775808, 9223372036854775807\n",
+        "data halves:f64 = 0.1, -2.5e300\n",
+        "t = addr inv_freq",
+        "buf = stack 384",
+        "stack = ld buf:f32",
+        "addr = add stack, __imm_0",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let module = parse_and_validate(src).unwrap();
+    assert_eq!(module.data[0].bytes, [0xff, 0, 0xff, 0x7f, 0x80, 1]);
+    assert_eq!(module.data[1].bytes.len(), 32);
+    assert_eq!(&module.data[1].bytes[8..12], &1e-40f32.to_le_bytes());
+
+    // Long tables print 16 values per line and read back.
+    let long: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+    let text = round_trips(&format!(
+        "data t:i16 = {}\nfn k()->ptr\n  b0:\n    p = addr t\n    ret p\n",
+        long.join(", ")
+    ));
+    assert_eq!(
+        text.lines().take_while(|l| !l.is_empty()).count(),
+        3,
+        "{text}"
+    );
+
+    // Every f32 bit pattern class reads back exactly from its printed form.
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut values = vec![
+        f32::MIN_POSITIVE,
+        f32::from_bits(1),
+        f32::MAX,
+        1e16,
+        1e-4,
+        9.999e-5,
+    ];
+    for _ in 0..20_000 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let f = f32::from_bits((s >> 32) as u32);
+        if !f.is_nan() {
+            values.push(f);
+        }
+    }
+    let list: Vec<String> = values.iter().map(|v| format!("{v:e}")).collect();
+    let src = format!(
+        "data t:f32 = {}\nfn k()->ptr\n  b0:\n    p = addr t\n    ret p\n",
+        list.join(", ")
+    );
+    let printed = to_air_text(&parse_and_validate(&src).unwrap());
+    let back = parse_and_validate(&printed).unwrap();
+    let want: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(back.data[0].bytes, want);
+
+    let one = |top: &str, body: &str| format!("{top}\nfn k()\n  b0:\n{body}    ret\n");
+    for (top, body, code) in [
+        ("", "    p = addr nothing\n", "ERR_UNDEFINED_DATA"),
+        ("data t:i8 = 1\ndata t:i8 = 2", "", "ERR_DUPLICATE_DATA"),
+        ("data t:ptr = 1", "", "ERR_INVALID_DATA_TYPE"),
+        ("data t:v128 = 1", "", "ERR_INVALID_DATA_TYPE"),
+        ("data t:f16 = 1", "", "ERR_INVALID_DATA_TYPE"),
+        ("data t:i8 = 256", "", "ERR_CONSTANT_OUT_OF_RANGE"),
+        ("data t:i32 = 1.5", "", "ERR_TYPE_MISMATCH"),
+        ("data t:i32 = x", "", "ERR_EXPECTED_NUMBER"),
+        ("data t:i32 1, 2", "", "ERR_UNEXPECTED_TOKEN"),
+        ("data __achainsaw_t:i8 = 1", "", "ERR_RESERVED_NAME"),
+        ("", "    p = stack 0\n", "ERR_INVALID_STACK_SIZE"),
+        ("", "    p = stack 65537\n", "ERR_INVALID_STACK_SIZE"),
+        (
+            "",
+            "    n = cst 8:i64\n    p = stack n\n",
+            "ERR_EXPECTED_NUMBER",
+        ),
+        ("", "    stack 16\n", "ERR_MISSING_DESTINATION"),
+    ] {
+        assert_eq!(err_code(&one(top, body)), code, "{top} / {body}");
+    }
+    // `data` stays a block label and a register name.
+    parse_and_validate(
+        "fn k()->i64\n  b0:\n    jmp data\n  data:\n    data = cst 1:i64\n    ret data\n",
+    )
+    .unwrap();
 }

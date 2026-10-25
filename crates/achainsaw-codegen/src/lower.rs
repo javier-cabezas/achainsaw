@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
     StackSlotData, StackSlotKind, Value as ClifValue,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{FuncId, Module as ClifModule};
+use cranelift_module::{DataDescription, DataId, FuncId, Module as ClifModule};
 use std::collections::HashMap;
 
 /// Width of the vectors Cranelift generates code for.
@@ -403,7 +403,44 @@ fn jump_with(builder: &mut FunctionBuilder, target: ClifBlock, vals: &[ClifValue
 struct Guard {
     base: i64,
     len: i64,
+    /// Bytes at the start of the arena that hold `data`: reads only.
+    readonly: i64,
     fault: ClifBlock,
+}
+
+/// The guard of a write: the arena past its read-only `data`.
+fn writes(guard: Option<Guard>) -> Option<Guard> {
+    guard.map(|g| Guard {
+        base: g.base + g.readonly,
+        len: g.len - g.readonly,
+        readonly: 0,
+        fault: g.fault,
+    })
+}
+
+/// Where a module's `data` lives: a data object of the Cranelift module, or (sandboxed) a
+/// fixed address in the arena's read-only part.
+#[derive(Debug, Clone, Copy)]
+pub enum DataPlace {
+    Object(DataId),
+    Fixed(i64),
+}
+
+/// Defines each of `ir_mod`'s `data` as a read-only object of `module`, `DATA_ALIGN`-aligned.
+pub fn define_data<M: ClifModule>(
+    module: &mut M,
+    ir_mod: &achainsaw_ir::ast::Module,
+) -> Result<HashMap<String, DataPlace>> {
+    let mut places = HashMap::new();
+    for d in &ir_mod.data {
+        let id = module.declare_anonymous_data(false, false)?;
+        let mut desc = DataDescription::new();
+        desc.define(d.bytes.clone().into_boxed_slice());
+        desc.set_align(achainsaw_ir::ast::DATA_ALIGN as u64);
+        module.define_data(id, &desc)?;
+        places.insert(d.name.clone(), DataPlace::Object(id));
+    }
+    Ok(places)
 }
 
 /// Branches to the fault block unless `[ptr, ptr + size)` lies inside the arena or
@@ -1651,12 +1688,13 @@ fn emit_dispatch<M: ClifModule>(
     fuel: Option<(FuelVar, FuncId)>,
 ) -> ClifValue {
     let mut ok = builder.ins().iconst(types::I8, 1);
-    if let Some(g) = guard {
-        let base = c64(builder, g.base);
-        let len = c64(builder, g.len);
-        for (lo, span) in &dispatch.ranges {
-            let (lo, _) = scalar(values, lo);
-            let (span, _) = scalar(values, span);
+    if guard.is_some() {
+        for r in &dispatch.ranges {
+            let g = if r.writes { writes(guard) } else { guard }.expect("a guard");
+            let base = c64(builder, g.base);
+            let len = c64(builder, g.len);
+            let (lo, _) = scalar(values, &r.lo);
+            let (span, _) = scalar(values, &r.span);
             let off = builder.ins().isub(lo, base);
             let room = builder.ins().isub(len, span);
             let small = builder
@@ -1777,6 +1815,8 @@ pub struct LowerConfig {
     /// Float min/max compare and select instead of propagating NaN and ordering signed
     /// zeros (see `CodegenOptions::fast_math`).
     pub fast_math: bool,
+    /// Where each `data` of the module lives (`define_data`, or the sandbox's arena).
+    pub data: HashMap<String, DataPlace>,
 }
 
 #[derive(Debug, Clone)]
@@ -1794,6 +1834,9 @@ pub struct ParConfig {
 pub struct SandboxConfig {
     pub arena_base: i64,
     pub arena_len: i64,
+    /// Bytes at the start of the arena holding the modules' `data`, which only reads may
+    /// touch.
+    pub readonly_len: i64,
     /// `rt_sandbox_fault(addr: i64, size: i64)`.
     pub fault_id: FuncId,
     /// `rt_stack_check() -> i32`, called on function entry.
@@ -1851,6 +1894,7 @@ pub fn lower_function<M: ClifModule>(
         Guard {
             base: sb.arena_base,
             len: sb.arena_len,
+            readonly: sb.readonly_len,
             fault,
         }
     });
@@ -1910,16 +1954,47 @@ pub fn lower_function<M: ClifModule>(
     // Jump from synthetic entry to function's first block
     let first_block_label = &func.blocks[0].label;
     let first_block = *clif_blocks.get(first_block_label).unwrap();
+    // `stack` buffers: one frame slot, or in the sandbox (whose checks admit only the
+    // arena) one arena allocation, freed on return.
+    let (stack_offsets, stack_bytes) = func.stack_layout();
+    let mut stack_base: Option<ClifValue> = None;
+    let mut stack_slot = None;
     if let (Some(sb), Some(trap_block)) = (config.sandbox, fuel_trap_block) {
         let callee = module.declare_func_in_func(sb.stack_check_id, builder.func);
         let call_inst = builder.ins().call(callee, &[]);
         let overflow = builder.inst_results(call_inst)[0];
-        builder
-            .ins()
-            .brif(overflow, trap_block, &[], first_block, &[]);
+        if stack_bytes > 0 {
+            let alloc = builder.create_block();
+            builder.ins().brif(overflow, trap_block, &[], alloc, &[]);
+            builder.switch_to_block(alloc);
+            if let Some(f) = fuel {
+                f.spill(&mut builder);
+            }
+            let callee = module.declare_func_in_func(config.rt_malloc_id, builder.func);
+            let size = c64(&mut builder, stack_bytes as i64);
+            let call_inst = builder.ins().call(callee, &[size]);
+            let base = builder.inst_results(call_inst)[0];
+            if let Some(f) = fuel {
+                f.reload(&mut builder);
+            }
+            stack_base = Some(base);
+            builder.ins().brif(base, first_block, &[], trap_block, &[]);
+        } else {
+            builder
+                .ins()
+                .brif(overflow, trap_block, &[], first_block, &[]);
+        }
     } else {
+        if stack_bytes > 0 {
+            stack_slot = Some(builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                stack_bytes,
+                4,
+            )));
+        }
         builder.ins().jump(first_block, &[]);
     }
+    let mut next_stack = stack_offsets.into_iter();
 
     // Translate each AIR block
     for block in &func.blocks {
@@ -2274,7 +2349,7 @@ pub fn lower_function<M: ClifModule>(
                 } => {
                     let (v, ty) = scalar(&values, val);
                     let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
-                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    emit_atomic_checks(&mut builder, writes(guard), addr, ty.byte_size());
                     let op = match op {
                         AtomicOp::Add => AtomicRmwOp::Add,
                         AtomicOp::Sub => AtomicRmwOp::Sub,
@@ -2307,7 +2382,7 @@ pub fn lower_function<M: ClifModule>(
                     let (e, ty) = scalar(&values, expected);
                     let (n, _) = scalar(&values, new);
                     let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
-                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    emit_atomic_checks(&mut builder, writes(guard), addr, ty.byte_size());
                     let old = builder
                         .ins()
                         .atomic_cas(MemFlagsData::trusted(), addr, e, n);
@@ -2333,7 +2408,7 @@ pub fn lower_function<M: ClifModule>(
                 } => {
                     let (v, ty) = scalar(&values, val);
                     let addr = mem_addr(&mut builder, &values, ptr, index.as_ref(), ty);
-                    emit_atomic_checks(&mut builder, guard, addr, ty.byte_size());
+                    emit_atomic_checks(&mut builder, writes(guard), addr, ty.byte_size());
                     builder.ins().atomic_store(MemFlagsData::trusted(), v, addr);
                 }
                 Instruction::Store {
@@ -2341,6 +2416,7 @@ pub fn lower_function<M: ClifModule>(
                 } => {
                     let (val_parts, val_ty) = parts(&values, val);
                     let ptr_val = mem_addr(&mut builder, &values, ptr, index.as_ref(), val_ty);
+                    let guard = writes(guard);
                     emit_bounds_check_const(&mut builder, guard, ptr_val, access_bytes(val_ty));
                     let flags = if val_ty.is_vector() {
                         user_mem_flags()
@@ -2475,6 +2551,28 @@ pub fn lower_function<M: ClifModule>(
                     let (ptr_val, _) = scalar(&values, ptr);
                     let callee = module.declare_func_in_func(config.rt_free_id, builder.func);
                     builder.ins().call(callee, &[ptr_val]);
+                }
+                Instruction::Stack { dst, .. } => {
+                    let offset = next_stack.next().expect("a stack offset") as i64;
+                    let p = match (stack_base, stack_slot) {
+                        (Some(base), _) => builder.ins().iadd_imm_u(base, offset),
+                        (None, Some(slot)) => {
+                            builder.ins().stack_addr(types::I64, slot, offset as i32)
+                        }
+                        (None, None) => unreachable!("a function with stack has its buffers"),
+                    };
+                    values.insert(dst.clone(), (vec![p], Type::Ptr));
+                }
+                Instruction::Addr { dst, name, .. } => {
+                    let p = match config.data.get(name) {
+                        Some(DataPlace::Fixed(addr)) => c64(&mut builder, *addr),
+                        Some(DataPlace::Object(id)) => {
+                            let gv = module.declare_data_in_func(*id, builder.func);
+                            builder.ins().symbol_value(types::I64, gv)
+                        }
+                        None => return Err(anyhow!("[ERR_UNDEFINED_DATA] No data '{name}'")),
+                    };
+                    values.insert(dst.clone(), (vec![p], Type::Ptr));
                 }
                 Instruction::Select {
                     dst,
@@ -2716,7 +2814,7 @@ pub fn lower_function<M: ClifModule>(
                     let (val_parts, val_ty) = parts(&values, val);
                     emit_masked_store(
                         &mut builder,
-                        guard,
+                        writes(guard),
                         ptr_val,
                         &val_parts,
                         count_val,
@@ -2956,6 +3054,10 @@ pub fn lower_function<M: ClifModule>(
             Terminator::Ret { vals, .. } => {
                 if let Some(f) = fuel {
                     f.spill(&mut builder);
+                }
+                if let Some(base) = stack_base {
+                    let callee = module.declare_func_in_func(config.rt_free_id, builder.func);
+                    builder.ins().call(callee, &[base]);
                 }
                 let ret_parts = flat_args(&values, vals);
                 builder.ins().return_(&ret_parts);

@@ -29,7 +29,7 @@ fn sum(x:ptr, n:i64)->f32
 - **Constants:** `x = cst 5:i32`, or inline in an operand, `add x, 1:i32`; an integer literal of a float type is that float (`cst 0:f32`).
 - **Arithmetic:** `add sub mul div rem and or xor shl shr min max`, and unsigned `udiv urem ushr umin umax`; operands share a type. Compares (`eq ne lt gt le ge`, unsigned `ult ugt ule uge`) give an `i32` 0 or 1, for `br` and `select`.
 - **Math functions:** `y = exp x`, `log`, `tanh`, `sin`, `cos` on f32, and the same on vector lanes (`r = vsin v:f32`): see [Math functions](#math-functions).
-- **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`. Memory that `par` calls share takes [atomic accesses](#atomics).
+- **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`. Read-only tables are `data` declarations (`p = addr name`), and fixed-size scratch buffers live in the function's frame (`p = stack 256`): see [Constant data and stack buffers](#constant-data-and-stack-buffers). Memory that `par` calls share takes [atomic accesses](#atomics).
 - **Casts:** `itof ftoi uitof ftoui sext zext trunc fext ftrunc bitcast`, written `dst = op src:type`.
 - **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
 - **Comments** start with `#`.
@@ -153,6 +153,27 @@ The errors are the measured worst cases over every f32 input, against f64; `crat
 **Inline functions.** `inline fn` marks a helper whose calls are replaced by its body before compiling, on both backends, JIT and AOT (`achainsaw opt` shows the expansion). A straight-line helper merges into the caller's block, so it adds no branches and no fuel checks; inline functions cannot be recursive (`ERR_RECURSIVE_INLINE`). The standard library's quantized matrix kernels are built this way: `qmat_chunk` (1 token), `qmat_chunk4` (4 tokens) and `qmat_chunk8` (8) call the same inline steps (`qmat_w8`/`qmat_w4`/`qmat_w5`/`qmat_w6` unpack two weight vectors, `qmat_dot` and `qmat_dot1` run `vdotu`s, `qmat_accr`/`qmat_accmr` scale and accumulate), so every token's arithmetic is identical by construction, and `llama_decode.air` reads its tables with `load_cfg`, `model_globals` and `layer_weights`. Together with indexed operands, this cut the standard library from 712 to 447 lines of code (`qmat_chunk` 185 to 80, `qmat_chunk4` 335 to 114) and `llama_decode.air` from 718 to 637, without slowing anything down: in the base-vs-head benchmark comparison every kernel is within noise, and Cranelift's quantized GEMVs and prefill got 6–7% faster (its index shifts fold into x86 addressing modes).
 
 **Scalar math.** Rounding to an integral value, `floor`, `ceil`, `round` (halfway away from zero), `roundeven` and `roundz` (toward zero); bit counts `popcnt`, `clz` and `ctz` (the bit width for 0); `copysign a, b` for floats, `rotl`/`rotr` for integers (amount modulo the width); `r = fma a, b, c` with one rounding; `uitof`/`ftoui` unsigned conversions (`ftoui` saturates, negative values and NaN to 0). All are single instructions or exact sequences, bit-identical on both backends and checked against Rust's own operations (`tests/scalar_math.rs`). `quantize_q8` rounds with `vround`, so it now matches llama.cpp's `roundf` exactly at halfway cases. These mnemonics are recognized only right after `=`, so programs that use them as register names still parse.
+
+## Constant data and stack buffers
+
+**Constant data.** A top-level `data` declaration gives the module a read-only table: an element type (`i8`, `i16`, `i32`, `i64`, `f32` or `f64`) and its values, stored little-endian and 64-byte aligned. `p = addr name` gives its address, which code reads like any other memory. A line that ends with a comma continues on the next, and the disassembler prints 16 values per line. [`crc32.air`](../examples/crc32.air) carries its 256-entry lookup table this way:
+
+```air
+data inv_freq:f32 = 1.0, 0.5, 0.25, 0.125,
+    0.0625, 0.03125, 0.015625, 0.0078125
+
+fn freq(i:i64)->f32
+  b0:
+    t = addr inv_freq
+    f = ld t[i]:f32
+    ret f
+```
+
+Integers may be written signed or unsigned (`255` and `-1` are the same `i8`), and an integer of a float type is that float. A program must not write to its data: in the sandbox (MCP `air_run`) a store, atomic, `stm` or `mm` result there is an `ERR_MEMORY_VIOLATION` ("is to read-only data"), and outside it the behavior is undefined (Cranelift places tables in read-only memory, where a write faults; LLVM may assume they never change). The sandbox copies each module's tables into the start of its arena, so they count against its size.
+
+**Stack buffers.** `p = stack n` gives the address of an `n`-byte buffer (a constant from 1 to 65536) in the function's frame, 16-byte aligned, with unspecified contents. Each `stack` instruction is its own buffer: the same one every time it runs during a call, distinct in every call (recursion, each `par` index), and gone when the function returns, so it must not be returned or kept. Pointers to it may be passed to callees and to the calls of a `par` that the function waits for. An inline function's buffers become its caller's. Unlike `alloc`, a buffer costs no call into the runtime and no `free`; [`llama_decode.air`](../examples/kernels/llama_decode.air) keeps its per-task 64-row results in them, and [`histogram.air`](../examples/kernels/histogram.air) its private count tables. Larger or variable-sized buffers still take `alloc`. In the sandbox, whose checks admit only arena memory, a function's buffers come from its arena on entry and go back on return.
+
+`data`, `addr` and `stack` remain valid register and label names.
 
 ## Atomics
 

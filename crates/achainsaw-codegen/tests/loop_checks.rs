@@ -541,10 +541,7 @@ fn dispatch_blocks_count_trips() {
     let module = parse_and_validate(&program(false)).unwrap();
     let mut module = achainsaw_ir::prepare_for_codegen(&module).into_owned();
     let checks = achainsaw_ir::checks::hoist_loop_checks(&mut module);
-    let mut probes = Module {
-        functions: Vec::new(),
-        extern_functions: Vec::new(),
-    };
+    let mut probes = Module::default();
     // (function, units probe, first range's span probe)
     let mut names: HashMap<String, (String, String)> = HashMap::new();
     for f in &module.functions {
@@ -557,7 +554,7 @@ fn dispatch_blocks_count_trips() {
         let (label, d) = fc.dispatch.iter().next().unwrap();
         let block = f.blocks.iter().find(|b| &b.label == label).unwrap();
         let units = probe(f, block, &d.units);
-        let span = d.ranges.first().map(|(_, span)| probe(f, block, span));
+        let span = d.ranges.first().map(|r| probe(f, block, &r.span));
         let span_name = span.as_ref().map_or(String::new(), |s| s.name.clone());
         names.insert(f.name.clone(), (units.name.clone(), span_name));
         probes.functions.push(units);

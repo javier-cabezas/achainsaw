@@ -151,8 +151,8 @@ $ achainsaw run examples/infinite_loop.air --fuel 1000000
 }
 ```
 
-MCP's `air_run` also runs code in a sandbox: memory comes only from `alloc`,
-in an arena of its own, and every access outside it fails. This is a read
+MCP's `air_run` also runs code in a sandbox: memory comes only from `alloc`
+and `stack`, in an arena of its own, and every access outside it fails. This is a read
 100 million floats past a 4 KB buffer:
 
 ```json

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::backend::Backend;
-use crate::lower::push_abi_params;
+use crate::lower::{push_abi_params, DataPlace};
 pub use crate::lower::{to_clif_type, LowerConfig, ParConfig, RtValue, SandboxConfig};
 
 static USER_SYMBOLS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
@@ -79,6 +79,11 @@ pub enum ExecutionStatus {
         addr: usize,
         size: usize,
     },
+    /// Sandboxed code wrote `size` bytes at `addr`, in a module's read-only `data`.
+    ReadOnlyWrite {
+        addr: usize,
+        size: usize,
+    },
     /// Sandboxed code exceeded `SANDBOX_STACK_BYTES` of call stack.
     StackOverflow,
 }
@@ -91,9 +96,12 @@ pub const MIN_SANDBOX_ARENA_BYTES: usize = 4096;
 /// Memory owned by a sandboxed engine. `alloc` bump-allocates from it, and every access
 /// that sandboxed code makes is bounds-checked against `[base, base + len)`. Live
 /// allocations are tracked here, outside the arena, so sandboxed code cannot forge them.
+/// The compiled modules' `data` fills the first `readonly` bytes, which writes may not
+/// touch (code compiled earlier checks writes against the part as it was then).
 struct Arena {
     base: *mut u8,
     layout: Layout,
+    readonly: usize,
     top: usize,
     /// `(offset, size)` of live allocations, in increasing offset order.
     live: Vec<(usize, usize)>,
@@ -113,6 +121,7 @@ impl Arena {
         Ok(Self {
             base,
             layout,
+            readonly: 0,
             top: 0,
             live: Vec::new(),
         })
@@ -123,7 +132,7 @@ impl Arena {
     }
 
     fn reset(&mut self) {
-        self.top = 0;
+        self.top = self.readonly;
         self.live.clear();
     }
 
@@ -131,6 +140,33 @@ impl Arena {
     fn contains(&self, addr: usize, size: usize) -> bool {
         let off = addr.wrapping_sub(self.base as usize);
         size <= self.len() && off <= self.len() - size
+    }
+
+    /// True when `[addr, addr + size)` lies inside the arena past its read-only part.
+    fn writable(&self, addr: usize, size: usize) -> bool {
+        self.contains(addr, size) && addr - self.base as usize >= self.readonly
+    }
+
+    /// Copies a module's `data` into the read-only part, `DATA_ALIGN`-aligned, and returns
+    /// its address; leaves at least `MIN_SANDBOX_ARENA_BYTES` writable. Only called between
+    /// calls (by `compile_module`), when nothing is allocated.
+    fn place_data(&mut self, bytes: &[u8]) -> Result<usize> {
+        // The address is aligned (the arena itself is only 16-byte aligned).
+        let align = achainsaw_ir::ast::DATA_ALIGN;
+        let base = self.base as usize;
+        let start = (base + self.readonly).div_ceil(align) * align - base;
+        let end = start + bytes.len();
+        if end + MIN_SANDBOX_ARENA_BYTES > self.len() {
+            return Err(anyhow!(
+                "[ERR_OUT_OF_MEMORY] The module's data needs {} bytes of the {}-byte sandbox arena",
+                end,
+                self.len()
+            ));
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(start), bytes.len()) };
+        self.readonly = end;
+        self.reset();
+        Ok(self.base as usize + start)
     }
 
     fn alloc(&mut self, size: usize) -> Option<*mut u8> {
@@ -150,9 +186,18 @@ impl Arena {
         let off = (ptr as usize).wrapping_sub(self.base as usize);
         let idx = self.live.iter().rposition(|&(o, _)| o == off)?;
         let (_, size) = self.live.remove(idx);
-        self.top = self.live.last().map_or(0, |&(o, s)| o + s);
+        self.top = self.live.last().map_or(self.readonly, |&(o, s)| o + s);
         Some(size)
     }
+}
+
+/// A sandboxed engine's arena as code compiled now sees it: its bounds, the read-only part
+/// holding `data`, and each of the module's `data` addresses.
+struct ArenaLayout {
+    base: u64,
+    len: u64,
+    readonly: u64,
+    data: HashMap<String, u64>,
 }
 
 // The arena owns its memory; `par` workers share it behind a `Mutex`.
@@ -285,6 +330,9 @@ pub fn check_execution_status() -> Result<()> {
         ExecutionStatus::MisalignedAtomic { addr, size } => Err(anyhow!(
             "[ERR_MEMORY_VIOLATION] Atomic access of {size} bytes at {addr:#x} is not aligned to {size} bytes"
         )),
+        ExecutionStatus::ReadOnlyWrite { addr, size } => Err(anyhow!(
+            "[ERR_MEMORY_VIOLATION] Write of {size} bytes at {addr:#x} is to read-only data"
+        )),
         ExecutionStatus::StackOverflow => Err(anyhow!(
             "[ERR_STACK_OVERFLOW] Execution halted: call stack exceeded {SANDBOX_STACK_BYTES} bytes (unbounded recursion?)"
         )),
@@ -294,11 +342,15 @@ pub fn check_execution_status() -> Result<()> {
 /// Sandbox check failure: records the violation; the caller then unwinds.
 extern "C" fn rt_sandbox_fault(addr: usize, size: usize) {
     let misaligned = achainsaw_ir::ast::MISALIGNED_FAULT as usize;
+    // Only writes are checked against less than the whole arena.
+    let read_only = || with_active_arena(|a| lock(a).contains(addr, size)).unwrap_or(false);
     raise(if size & misaligned != 0 {
         ExecutionStatus::MisalignedAtomic {
             addr,
             size: size & !misaligned,
         }
+    } else if read_only() {
+        ExecutionStatus::ReadOnlyWrite { addr, size }
     } else {
         ExecutionStatus::MemoryViolation { addr, size }
     });
@@ -333,20 +385,27 @@ extern "C" fn rt_sandbox_check_mm(
             .and_then(|e| e.checked_mul(es as usize))
             .unwrap_or(usize::MAX)
     };
+    // C is written: it must miss the read-only data.
     let operands = [
-        (pc, bytes(m, n, 4)),
-        (pa, bytes(m, k, esize)),
-        (pb, bytes(k, n, esize)),
+        (pc, bytes(m, n, 4), true),
+        (pa, bytes(m, k, esize), false),
+        (pb, bytes(k, n, esize), false),
     ];
     let bad = with_active_arena(|arena| {
         let arena = lock(arena);
-        operands
-            .into_iter()
-            .find(|&(p, size)| !arena.contains(p, size))
+        operands.into_iter().find_map(|(p, size, written)| {
+            if !arena.contains(p, size) {
+                Some(ExecutionStatus::MemoryViolation { addr: p, size })
+            } else if written && !arena.writable(p, size) {
+                Some(ExecutionStatus::ReadOnlyWrite { addr: p, size })
+            } else {
+                None
+            }
+        })
     });
     match bad {
-        Some(Some((addr, size))) => {
-            raise(ExecutionStatus::MemoryViolation { addr, size });
+        Some(Some(status)) => {
+            raise(status);
             1
         }
         Some(None) => 0,
@@ -1646,7 +1705,7 @@ impl CraneliftJit {
         ir_mod: &Module,
         fuel_enabled: bool,
         fuel_counter: i64,
-        sandbox: Option<(i64, i64)>,
+        sandbox: Option<&ArenaLayout>,
         fast_math: bool,
         loop_checks: &achainsaw_ir::checks::LoopChecks,
     ) -> Result<Vec<(String, usize, Option<usize>)>> {
@@ -1700,9 +1759,18 @@ impl CraneliftJit {
         }
 
         // 3. Lower each function and its dynamic invocation trampoline
-        let sandbox = sandbox.map(|(arena_base, arena_len)| SandboxConfig {
-            arena_base,
-            arena_len,
+        let data = match sandbox {
+            Some(layout) => layout
+                .data
+                .iter()
+                .map(|(name, &addr)| (name.clone(), DataPlace::Fixed(addr as i64)))
+                .collect(),
+            None => crate::lower::define_data(&mut self.module, ir_mod)?,
+        };
+        let sandbox = sandbox.map(|layout| SandboxConfig {
+            arena_base: layout.base as i64,
+            arena_len: layout.len as i64,
+            readonly_len: layout.readonly as i64,
             fault_id: self.rt_sandbox_fault_id,
             stack_check_id: self.rt_stack_check_id,
             mm_check_id: self.rt_sandbox_check_mm_id,
@@ -1724,6 +1792,7 @@ impl CraneliftJit {
                 fuel_counter_id: ir_mod.uses_par().then_some(self.rt_fuel_counter_id),
             }),
             fast_math,
+            data,
         };
 
         for func in &ir_mod.functions {
@@ -2060,17 +2129,30 @@ impl JitEngine {
             Default::default()
         };
         let ir_mod = &*inlined;
-        let sandbox = self.sandbox.as_ref().map(|arena| {
-            let arena = lock(arena);
-            (arena.base as i64, arena.len() as i64)
-        });
+        // Sandboxed code reads `data` from the arena's read-only part.
+        let sandbox = match self.sandbox.as_ref() {
+            Some(arena) => {
+                let mut arena = lock(arena);
+                let mut data = HashMap::new();
+                for d in &ir_mod.data {
+                    data.insert(d.name.clone(), arena.place_data(&d.bytes)? as u64);
+                }
+                Some(ArenaLayout {
+                    base: arena.base as u64,
+                    len: arena.len() as u64,
+                    readonly: arena.readonly as u64,
+                    data,
+                })
+            }
+            None => None,
+        };
         let fuel_counter = self.fuel.as_ptr() as i64;
         let compiled = match &mut self.codegen {
             Codegen::Cranelift(clif) => clif.compile(
                 ir_mod,
                 self.fuel_enabled,
                 fuel_counter,
-                sandbox,
+                sandbox.as_ref(),
                 self.fast_math,
                 &loop_checks,
             )?,
@@ -2101,10 +2183,12 @@ impl JitEngine {
                     fuel: self.fuel_enabled,
                     fuel_counter: fuel_counter as u64,
                     fuel_stub: llvm_fuel_stub(),
-                    sandbox: sandbox.map(|(base, len)| achainsaw_llvm::SandboxBounds {
-                        base: base as u64,
-                        len: len as u64,
+                    sandbox: sandbox.as_ref().map(|l| achainsaw_llvm::SandboxBounds {
+                        base: l.base,
+                        len: l.len,
+                        readonly: l.readonly,
                     }),
+                    data_addrs: sandbox.as_ref().map(|l| l.data.clone()).unwrap_or_default(),
                     vx: *vx,
                     vector_width: *vector_width,
                     matrix: *matrix,

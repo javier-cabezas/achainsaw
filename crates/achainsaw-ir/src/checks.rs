@@ -63,9 +63,19 @@ pub struct Dispatch {
     /// i64: the fuel the loop takes, its exit included (more than any budget when it does not
     /// end).
     pub units: String,
-    /// Byte ranges `(lo, span)` (ptr, i64) holding every covered access; a span of 0 is
-    /// empty, and one above the sandbox's size (-1 when too large to compute) never fits.
-    pub ranges: Vec<(String, String)>,
+    /// Byte ranges holding every covered access.
+    pub ranges: Vec<Range>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Range {
+    /// ptr: the first byte.
+    pub lo: String,
+    /// i64: the length; 0 is empty, and one above the sandbox's size (-1 when too large to
+    /// compute) never fits.
+    pub span: String,
+    /// A store's range, which must also miss the sandbox's read-only `data`.
+    pub writes: bool,
 }
 
 /// More fuel than any budget: a loop that would not end charges it.
@@ -90,6 +100,7 @@ pub fn hoist_loop_checks(module: &mut Module) -> LoopChecks {
     }
     let mut checks = LoopChecks::default();
     for f in &mut module.functions {
+        crate::loops::hoist_stack_buffers(f);
         let cfg = Cfg::build(f);
         let headers: Vec<String> = (1..f.blocks.len())
             .filter(|&h| cfg.reachable[h] && !natural_loop(&cfg, h).is_empty())
@@ -721,6 +732,7 @@ fn hoist_loop(
         inst: usize,
         place: Place,
         ty: Type,
+        writes: bool,
     }
     let mut accesses: Vec<Access> = Vec::new();
     for &b in &body {
@@ -779,6 +791,10 @@ fn hoist_loop(
                 inst: i,
                 place,
                 ty,
+                writes: matches!(
+                    inst,
+                    Instruction::Store { .. } | Instruction::MaskedStore { .. }
+                ),
             });
         }
     }
@@ -940,7 +956,11 @@ fn hoist_loop(
         } else {
             e.select(&no_trips, &zero, &span)
         };
-        ranges.push((lo, span));
+        ranges.push(Range {
+            lo,
+            span,
+            writes: a.writes,
+        });
     }
     let ok = e.fresh();
     e.out.push(Instruction::AssignConst {

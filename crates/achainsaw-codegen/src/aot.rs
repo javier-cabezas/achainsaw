@@ -153,6 +153,7 @@ impl AotCompiler {
         }
 
         // 3. Lower and define each function
+        let data = crate::lower::define_data(&mut self.module, ir_mod)?;
         let config = LowerConfig {
             fuel_check: None,
             fuel_consume_func_id: None,
@@ -163,6 +164,7 @@ impl AotCompiler {
             sandbox: None,
             par: None,
             fast_math: self.fast_math,
+            data,
         };
 
         for func in &ir_mod.functions {

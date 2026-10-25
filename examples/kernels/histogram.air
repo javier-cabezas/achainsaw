@@ -14,7 +14,7 @@ fn histogram(x:ptr, n:i64, bins:ptr)
 # on its own increments. The tail goes byte by byte into the first table.
 fn hist_chunk(c:i64, x:ptr, n:i64, bins:ptr)
   b0:
-    t0 = alloc 4096
+    t0 = stack 4096
     t1 = add t0, 1024:i64
     t2 = add t0, 2048:i64
     t3 = add t0, 3072:i64
@@ -87,7 +87,6 @@ fn hist_chunk(c:i64, x:ptr, n:i64, bins:ptr)
     b2 = add b, 1:i64
     jmp merge(b2)
   done:
-    free t0
     ret
 
 # Increments the i32 count t[k].

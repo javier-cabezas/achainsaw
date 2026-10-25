@@ -36,8 +36,31 @@ pub fn split_masked_loops(module: &mut Module) -> usize {
     module
         .functions
         .iter_mut()
-        .map(|f| split_function(f, &sigs))
+        .map(|f| {
+            hoist_stack_buffers(f);
+            split_function(f, &sigs)
+        })
         .sum()
+}
+
+/// Moves every `stack` instruction to the top of the entry block, so that passes copying a
+/// loop body never copy one: a `stack` gives the same buffer every time it runs in a call,
+/// so where it runs does not change what it gives, while a copy would be a second buffer.
+/// Needs unique register names (`crate::names::unique_names`).
+pub fn hoist_stack_buffers(f: &mut Function) {
+    let mut hoisted = Vec::new();
+    for block in f.blocks.iter_mut().skip(1) {
+        block.instructions.retain(|inst| {
+            let stack = matches!(inst, Instruction::Stack { .. });
+            if stack {
+                hoisted.push(inst.clone());
+            }
+            !stack
+        });
+    }
+    if !hoisted.is_empty() {
+        f.blocks[0].instructions.splice(0..0, hoisted);
+    }
 }
 
 /// The lanes a masked access covers: `vl lane` lanes of `vx`, or a fixed count.

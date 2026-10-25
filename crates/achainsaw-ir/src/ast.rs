@@ -873,6 +873,21 @@ pub enum Instruction {
         ptr: String,
         span: Span,
     },
+    /// `p = stack 384`: the address of a `size`-byte buffer in the function's frame,
+    /// 16-byte aligned, holding unspecified bytes. Each `stack` instruction is its own
+    /// buffer, the same one every time it runs in a call, and lasts until the function
+    /// returns.
+    Stack {
+        dst: String,
+        size: u32,
+        span: Span,
+    },
+    /// `p = addr table`: the address of the module's `data` named `name`.
+    Addr {
+        dst: String,
+        name: String,
+        span: Span,
+    },
     // Phase 4 Extensions
     Unary {
         op: UnaryOp,
@@ -1062,6 +1077,8 @@ impl Instruction {
             | Instruction::InsertLane { span, .. }
             | Instruction::Alloc { span, .. }
             | Instruction::Free { span, .. }
+            | Instruction::Stack { span, .. }
+            | Instruction::Addr { span, .. }
             | Instruction::Unary { span, .. }
             | Instruction::Cast { span, .. }
             | Instruction::Fma { span, .. }
@@ -1103,6 +1120,8 @@ impl Instruction {
             | Instruction::ExtractLane { dst, .. }
             | Instruction::InsertLane { dst, .. }
             | Instruction::Alloc { dst, .. }
+            | Instruction::Stack { dst, .. }
+            | Instruction::Addr { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
             | Instruction::Cast { dst, .. }
@@ -1146,6 +1165,8 @@ impl Instruction {
             | Instruction::ExtractLane { dst, .. }
             | Instruction::InsertLane { dst, .. }
             | Instruction::Alloc { dst, .. }
+            | Instruction::Stack { dst, .. }
+            | Instruction::Addr { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
             | Instruction::Cast { dst, .. }
@@ -1201,7 +1222,10 @@ impl Instruction {
 
     fn direct_operands(&self) -> Vec<&String> {
         match self {
-            Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
+            Instruction::AssignConst { .. }
+            | Instruction::VLen { .. }
+            | Instruction::Stack { .. }
+            | Instruction::Addr { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
@@ -1264,7 +1288,10 @@ impl Instruction {
     /// register last, as in `operands`).
     pub fn operands_mut(&mut self) -> Vec<&mut String> {
         match self {
-            Instruction::AssignConst { .. } | Instruction::VLen { .. } => vec![],
+            Instruction::AssignConst { .. }
+            | Instruction::VLen { .. }
+            | Instruction::Stack { .. }
+            | Instruction::Addr { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
@@ -1411,6 +1438,20 @@ impl Function {
                 .all(|t| !t.is_vector())
     }
 
+    /// Byte offsets of the function's `stack` buffers in its frame, in instruction order,
+    /// each 16-byte aligned, and their total size: the layout both backends give them.
+    pub fn stack_layout(&self) -> (Vec<u32>, u32) {
+        let mut offsets = Vec::new();
+        let mut total = 0u32;
+        for inst in self.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::Stack { size, .. } = inst {
+                offsets.push(total);
+                total += size.div_ceil(16) * 16;
+            }
+        }
+        (offsets, total)
+    }
+
     /// The single result type, `None` for no result; `Err` with the count for several.
     pub fn single_ret(&self) -> Result<Option<Type>, usize> {
         match self.rets.as_slice() {
@@ -1429,9 +1470,27 @@ pub struct ExternFunction {
     pub span: Span,
 }
 
+/// `data name:ty = v, v, ...`: read-only bytes of the module (the values of type `ty`,
+/// little-endian), 64-byte aligned, whose address `addr name` gives. A write to them is an
+/// error: `ERR_MEMORY_VIOLATION` in the sandbox, a fault otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Data {
+    pub name: String,
+    /// Element type: an integer (i8 to i64) or f32/f64.
+    pub ty: Type,
+    pub bytes: Vec<u8>,
+    pub span: Span,
+}
+
+/// Alignment of every `data` table.
+pub const DATA_ALIGN: usize = 64;
+/// Largest `stack` buffer, in bytes.
+pub const MAX_STACK_BYTES: u32 = 1 << 16;
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Module {
     pub extern_functions: Vec<ExternFunction>,
+    pub data: Vec<Data>,
     pub functions: Vec<Function>,
 }
 
