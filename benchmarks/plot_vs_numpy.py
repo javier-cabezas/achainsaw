@@ -60,7 +60,8 @@ SHORT: dict[str, str] = {
 # Forms of a kernel that benchmark_kernels.py times to compare with it, left out of the
 # figure: one atomic per byte instead of private tables, a work queue instead of `par`,
 # vector gathers instead of scalar loads.
-COMPARISONS: set[str] = {"histogram_atomic", "spmv_queue", "spmv_gather"}
+COMPARISONS: set[str] = {"histogram_atomic", "spmv_queue", "spmv_gather", "spmv_pack",
+                          "spmv_panels"}
 
 THEMES: dict[str, Theme] = {
     "light": Theme(surface="#fcfcfb", primary="#0b0b0b", secondary="#52514e",

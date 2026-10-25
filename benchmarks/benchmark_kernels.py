@@ -838,6 +838,93 @@ def make_cases() -> list[Case]:
     cases.append(spmv_case("spmv", "all cores"))
     cases.append(spmv_case("spmv_queue", "atomic work queue instead of par, all cores"))
     cases.append(spmv_case("spmv_gather", "vgather of x instead of scalar loads, all cores"))
+
+    # The same matrix in spmv_panels' layout: the nonzeros ordered by (task of 1024 rows,
+    # panel of 65536 columns, row), with their columns as u16 offsets in the panel. The
+    # NumPy and PyTorch conversions are a stable sort by task and panel.
+    p_count: int = (sm + 65535) >> 16
+    p_rows: npt.NDArray[np.int64] = np.repeat(np.arange(sm, dtype=np.int64), np.diff(s_rowptr))
+    p_key: npt.NDArray[np.int64] = (p_rows >> 10) * p_count + (s_cols >> 16)
+    p_groups: int = ((sm + 1023) >> 10) * p_count
+
+    def panels_numpy() -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int32],
+                                npt.NDArray[np.int32], U16, F32]:
+        order: npt.NDArray[np.int64] = np.argsort(p_key, kind="stable")
+        key: npt.NDArray[np.int64] = p_key[order]
+        rows: npt.NDArray[np.int64] = p_rows[order]
+        first: npt.NDArray[np.bool_] = np.ones(s_nnz, dtype=np.bool_)
+        first[1:] = (key[1:] != key[:-1]) | (rows[1:] != rows[:-1])
+        at: npt.NDArray[np.int64] = np.flatnonzero(first)
+        grp: npt.NDArray[np.int64] = np.searchsorted(key[at], np.arange(p_groups + 1))
+        start: npt.NDArray[np.int32] = np.append(at, s_nnz).astype(np.int32)
+        return (grp, rows[at].astype(np.int32), start, (s_cols[order] & 0xffff).astype(np.uint16),
+                s_vals[order])
+
+    def panels_torch() -> tuple[Any, Any, Any, Any, Any]:
+        key: Any = tt(p_key)
+        order: Any = torch.sort(key, stable=True).indices
+        k: Any = key[order]
+        rows: Any = tt(p_rows)[order]
+        first: Any = torch.ones(s_nnz, dtype=torch.bool)
+        first[1:] = (k[1:] != k[:-1]) | (rows[1:] != rows[:-1])
+        at: Any = torch.nonzero(first).flatten()
+        grp: Any = torch.searchsorted(k[at], torch.arange(p_groups + 1))
+        start: Any = torch.cat([at, torch.tensor([s_nnz])]).int()
+        return (grp, rows[at].int(), start, (tt(s_cols)[order] & 0xffff).short(),
+                tt(s_vals)[order])
+
+    p_ref: tuple[npt.NDArray[np.int64], npt.NDArray[np.int32], npt.NDArray[np.int32], U16,
+                 F32] = panels_numpy()
+    p_grp: npt.NDArray[np.int64] = np.zeros(p_groups + 1, dtype=np.int64)
+    p_row: npt.NDArray[np.int32] = np.zeros(len(p_ref[1]), dtype=np.int32)
+    p_start: npt.NDArray[np.int32] = np.zeros(len(p_ref[2]), dtype=np.int32)
+    p_cols: U16 = np.zeros(s_nnz, dtype=np.uint16)
+    p_vals: F32 = np.zeros(s_nnz, dtype=np.float32)
+
+    def pack_run(k: achainsaw.Kernel) -> None:
+        npairs: int = k.run("spmv_panels_count", s_rowptr, s_cols, sm, sm, p_grp)
+        k.run("spmv_panels_fill", s_rowptr, s_cols, s_vals, sm, sm, p_grp, p_row, p_start,
+              p_cols, p_vals, npairs)
+
+    def pack_check(out: tuple[Any, ...]) -> float:
+        same: bool = all(np.array_equal(np.asarray(a).view(np.asarray(b).dtype), b)
+                         for a, b in zip(out, p_ref))
+        return float(not same)
+
+    def pack_verify(k: achainsaw.Kernel) -> float:
+        for a in (p_grp, p_row, p_start, p_cols, p_vals):
+            a.fill(0)
+        pack_run(k)
+        return pack_check((p_grp, p_row, p_start, p_cols, p_vals))
+
+    cases.append(Case(
+        name="spmv_pack", file="spmv",
+        label=f"CSR to spmv_panels' layout, {s_nnz / 1e6:.1f}M nonzeros, all cores",
+        run=pack_run, verify=pack_verify, tol=0.0,
+        numpy=panels_numpy, torch=panels_torch,
+        torch_check=lambda out: pack_check(tuple(t.numpy() for t in out)),
+        flops=s_nnz,
+    ))
+
+    def panels_run(k: achainsaw.Kernel) -> None:
+        k.run("spmv_panels", p_grp, p_row, p_start, p_cols, p_vals, s_x, s_y, sm, sm)
+
+    def panels_verify(k: achainsaw.Kernel) -> float:
+        pack_run(k)
+        s_y[:] = np.nan
+        panels_run(k)
+        return rel_err(s_y, spmv_ref)
+
+    cases.append(Case(
+        name="spmv_panels", file="spmv",
+        label="SpMV, the same matrix in column panels (spmv_pack), all cores",
+        run=panels_run, verify=panels_verify, tol=1e-5,
+        # The CSR products, as for spmv.
+        numpy=lambda: np.add.reduceat(s_vals * s_x[s_cols], s_rowptr[:-1]),
+        torch=lambda: torch.mv(t_csr, t_sx),
+        torch_check=lambda out: rel_err(out, spmv_ref),
+        flops=2 * s_nnz,
+    ))
     return cases
 
 
