@@ -52,7 +52,7 @@ fn is_inline_call(inst: &Instruction, bodies: &HashMap<String, Function>) -> boo
 }
 
 /// Every register and label name in `f`, to pick prefixes that collide with none of them.
-fn names_in(f: &Function) -> HashSet<String> {
+pub(crate) fn names_in(f: &Function) -> HashSet<String> {
     let mut names: HashSet<String> = f.params.iter().map(|(p, _)| p.clone()).collect();
     for b in &f.blocks {
         names.insert(b.label.clone());

@@ -653,6 +653,11 @@ impl<'a> Parser<'a> {
                 | "uitof"
                 | "ftoui"
                 | "atomic"
+                | "exp"
+                | "log"
+                | "tanh"
+                | "sin"
+                | "cos"
         )
     }
 

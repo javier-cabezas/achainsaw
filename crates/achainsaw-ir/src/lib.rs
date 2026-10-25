@@ -6,6 +6,7 @@ pub mod diag;
 pub mod inline;
 pub mod lexer;
 pub mod loops;
+pub mod math;
 pub mod names;
 pub mod opt;
 pub mod parser;
@@ -23,10 +24,14 @@ pub use types::Type;
 pub use validator::Validator;
 
 /// A valid module as code generation takes it: shadowed registers renamed apart
-/// (`names`), `inline fn` calls expanded (`inline`), and loops with masked accesses split
-/// into a full-vector copy and the original (`loops`). Borrowed when nothing changes.
+/// (`names`), `inline fn` calls expanded (`inline`), math functions written as the AIR
+/// operations that compute them (`math`), and loops with masked accesses split into a
+/// full-vector copy and the original (`loops`). Borrowed when nothing changes.
 pub fn prepare_for_codegen(module: &Module) -> std::borrow::Cow<'_, Module> {
     let mut prepared = inline::inline_module(module);
+    if math::has_math(&prepared) {
+        math::expand_module(prepared.to_mut());
+    }
     if prepared.functions.iter().any(loops::has_split_candidates) {
         loops::split_masked_loops(prepared.to_mut());
     }

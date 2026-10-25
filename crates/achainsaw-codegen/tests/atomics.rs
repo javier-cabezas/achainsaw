@@ -202,3 +202,38 @@ fn atomics_compile_for_every_target() {
         }
     }
 }
+
+/// The standard library's float atomics under contention: every `par` call adds its index
+/// (an integer, so every order gives the same exact sum) to one f32 and one f64.
+#[test]
+fn std_float_atomic_adds_are_exact_under_contention() {
+    let src = r#"
+use atomic_add_f32, atomic_add_f64
+
+fn add_one(i:i64, p:ptr)
+  b0:
+    f = itof i:f32
+    o = call atomic_add_f32(p, f)
+    q = add p, 8:i64
+    d = itof i:f64
+    o2 = call atomic_add_f64(q, d)
+    ret
+
+fn total(p:ptr, n:i64)
+  b0:
+    par n, add_one(p)
+    ret
+"#;
+    let module = parse_and_validate(src).unwrap_or_else(|d| panic!("{d:?}"));
+    let mut engine = JitEngine::new().unwrap();
+    engine.compile_module(&module).unwrap();
+    let f: extern "C" fn(*mut u64, i64) =
+        unsafe { std::mem::transmute(engine.get_fn_ptr("total").unwrap()) };
+    // Below 2^24, so every partial sum is exact in f32.
+    let n = 4000i64;
+    let mut cells = [0u64; 2];
+    f(cells.as_mut_ptr(), n);
+    let want = (n * (n - 1) / 2) as f64;
+    assert_eq!(f32::from_bits(cells[0] as u32), want as f32);
+    assert_eq!(f64::from_bits(cells[1]), want);
+}

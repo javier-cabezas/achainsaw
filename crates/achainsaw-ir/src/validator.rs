@@ -170,8 +170,12 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
         VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi => {
             &[Type::I16, Type::I32, Type::I64]
         }
-        VUnaryOp::Exp => &[Type::F32],
-        VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => &[Type::F16, Type::BF16, Type::F32],
+        VUnaryOp::Exp | VUnaryOp::Log | VUnaryOp::Tanh | VUnaryOp::Sin | VUnaryOp::Cos => {
+            &[Type::F32]
+        }
+        VUnaryOp::FWidenLo | VUnaryOp::FWidenHi => {
+            &[Type::F16, Type::BF16, Type::F32, Type::I16, Type::I32]
+        }
         VUnaryOp::Abs | VUnaryOp::Neg => ALL_LANES,
         VUnaryOp::Sqrt | VUnaryOp::Rsqrt => &[Type::F32, Type::F64],
         VUnaryOp::Rev => VPERM_LANE_TYPES,
@@ -932,6 +936,16 @@ impl Validator {
                             "ERR_TYPE_MISMATCH",
                             format!(
                                 "'{}' operand must be float (f32 or f64), found '{src_ty}'",
+                                op.as_str()
+                            ),
+                            *span,
+                        ));
+                    }
+                    _ if op.is_math() && src_ty != Type::F32 => {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!(
+                                "'{0}' operand must be f32, found '{src_ty}' (the math functions are f32 only: convert with 'fext'/'ftrunc'; 'v{0}' takes f32 lanes)",
                                 op.as_str()
                             ),
                             *span,
