@@ -6,8 +6,8 @@ math and, when PyTorch is installed, a PyTorch one.
 The AIR kernel runs the whole prompt in one llama_prefill call (8 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
-Q4_0, Q8_0, Q6_K, Q4_K or Q5_K weights with f16 block scales (Q4_K and Q5_K: GGUF's 6-bit
-scales and mins under f16 super-block factors),
+Q4_0, Q8_0, Q6_K, Q4_K, Q5_K or Q4_1 weights with f16 block scales (Q4_K and Q5_K: GGUF's
+6-bit scales and mins under f16 super-block factors; Q4_1: an f16 min per block too),
 activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
 RoPE, attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights
@@ -16,9 +16,9 @@ The kernel compiles with fast_math=True (float min/max as compare and select).
 
 PyTorch (eager, CPU) runs the same model on its weight-only quantized kernels, the path
 torchao uses on CPU, with bf16 activations into each matrix, bf16 attention on a bf16 KV
-cache, and f32 elsewhere. Q4_0
-and Q4_K matrices keep their 4-bit values and 32-blocks (Q4_K's min becomes the int4 kernel's
-zero point, rounded to bf16); Q8_0, Q6_K and Q5_K ones are requantized to int8 with one scale
+cache, and f32 elsewhere. Q4_0,
+Q4_K and Q4_1 matrices keep their 4-bit values and 32-blocks (the min becomes the int4
+kernel's zero point, rounded to bf16); Q8_0, Q6_K and Q5_K ones are requantized to int8 with one scale
 per row, as PyTorch has no per-block int8 kernel, so its tokens can differ a little from the
 kernel's.
 
@@ -134,7 +134,7 @@ def main() -> None:
                         help="prompt for --gguf (default: %(default)r)")
     parser.add_argument("--chat", action="store_true", help="wrap the prompt in the chat format")
     parser.add_argument("--layers", type=int, default=16, help="random model layers")
-    parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k"], default="q4",
+    parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k", "q41"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
     parser.add_argument("--prompt-tokens", type=int,

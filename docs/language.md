@@ -125,7 +125,7 @@ fn gemv_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     ret
 ```
 
-It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU), and `atomic_add_f32` / `atomic_add_f64` for floats that `par` calls share ([Atomics](#atomics)). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
+It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K, Q5_K or Q4_1 matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU), and `atomic_add_f32` / `atomic_add_f64` for floats that `par` calls share ([Atomics](#atomics)). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
 
 **Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts. Each backend's kernels, AMX and SME among them, are in [Backends](backends.md#matrix-multiply-mm).
 
