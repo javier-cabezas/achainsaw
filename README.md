@@ -165,18 +165,18 @@ and `stack`, in an arena of its own, and every access outside it fails. This is 
 
 **A Llama in one file.** [`llama_decode.air`](examples/kernels/llama_decode.air)
 runs a whole Llama-style forward pass in one call: a token in, the next token
-out, with quantized weights (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) read straight from
-a GGUF file. Llama 3.2 1B Instruct, continuing "The capital of France is" on
-a laptop's Ryzen 7 8845HS with 8 threads:
+out, with quantized weights (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K) read straight
+from a GGUF file. Llama 3.2 1B Instruct, continuing "The capital of France is"
+on a laptop's Ryzen 7 8845HS with 8 threads:
 
 ```console
 $ curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
 $ python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 --no-numpy --no-torch
-Llama 3.2 1B Instruct: 16 layers, 0.79 GB of packed weights (qkv q4, o q4, gate_up q4, down q4/q8, lm q6), loaded in 13.6 s
+Llama 3.2 1B Instruct: 16 layers, 0.78 GB of packed weights (qkv q4, o q4, gate_up q4, down q4/q41, lm q6), loaded in 12.7 s
 prompt: 6 tokens; generating up to 32
-  AIR cranelift, 8 thr   prompt   7.42 ms/token ( 134.8 tokens/s), decode   16.24 ms/token    61.6 tokens/s   48.9 GB/s of weights
+  AIR cranelift, 8 thr   prompt   7.41 ms/token ( 134.9 tokens/s), decode   15.63 ms/token    64.0 tokens/s   49.9 GB/s of weights
     ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital'
-  AIR llvm, 8 thr        prompt   3.36 ms/token ( 297.9 tokens/s), decode   15.25 ms/token    65.6 tokens/s   52.1 GB/s of weights
+  AIR llvm, 8 thr        prompt   2.62 ms/token ( 382.3 tokens/s), decode   14.07 ms/token    71.1 tokens/s   55.4 GB/s of weights
     ' Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital'
 ```
 

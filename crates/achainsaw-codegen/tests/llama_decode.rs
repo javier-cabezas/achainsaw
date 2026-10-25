@@ -35,10 +35,11 @@ enum Fmt {
     Q6 = 2,
     Q4K = 3,
     Q5K = 4,
+    Q41 = 5,
 }
 
 impl Fmt {
-    const ALL: [Fmt; 5] = [Fmt::Q4, Fmt::Q8, Fmt::Q6, Fmt::Q4K, Fmt::Q5K];
+    const ALL: [Fmt; 6] = [Fmt::Q4, Fmt::Q8, Fmt::Q6, Fmt::Q4K, Fmt::Q5K, Fmt::Q41];
 
     /// Values per scale.
     fn group(self) -> usize {
@@ -49,26 +50,32 @@ impl Fmt {
         }
     }
 
-    /// Q4_K and Q5_K: unsigned values, a scale and a min per 32-block (6-bit codes times f16
-    /// factors per 256 values).
+    /// Q4_K, Q5_K and Q4_1: unsigned values, a scale and a min per 32-block.
     fn has_min(self) -> bool {
+        matches!(self, Fmt::Q4K | Fmt::Q5K | Fmt::Q41)
+    }
+
+    /// Q4_K and Q5_K: the scales and mins are 6-bit codes times f16 factors per 256 values.
+    fn has_codes(self) -> bool {
         matches!(self, Fmt::Q4K | Fmt::Q5K)
     }
 }
 
-/// A Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix: logical `q` [rows x k] (in -8..=7 for Q4_0,
-/// -32..=31 for Q6_K, 0..=15 for Q4_K, 0..=31 for Q5_K), f16 scales `s` [k/group x rows]
-/// and, for Q4_K and Q5_K, mins `m` [k/32 x rows] (weight s * q - m; both the products of a
-/// 6-bit code and an f16 factor per 256 values, `codes`), plus the kernel's
+/// A Q8_0, Q4_0, Q6_K, Q4_K, Q5_K or Q4_1 matrix: logical `q` [rows x k] (in -8..=7 for
+/// Q4_0, -32..=31 for Q6_K, 0..=15 for Q4_K and Q4_1, 0..=31 for Q5_K), f16 scales `s`
+/// [k/group x rows] and, for Q4_K, Q5_K and Q4_1, mins `m` [k/32 x rows] (weight s * q - m;
+/// f16 for Q4_1, for Q4_K and Q5_K both the products of a 6-bit code and an f16 factor per
+/// 256 values, `codes`), plus the kernel's
 /// packed layout (see `qmat_chunk` in std.air): 64-row chunks with, per 32-block, groups of
 /// 4 consecutive elements of a row in one 32-bit lane: byte (g * 64 + r) * 4 + q holds row
 /// r's element 4g + q plus 128 for Q8_0; for Q4_0 (g < 4) elements 4g + q (low nibble) and
-/// 16 + 4g + q (high nibble), offset by 8 (Q4_K: not offset); for Q6_K those nibbles of the
+/// 16 + 4g + q (high nibble), offset by 8 (Q4_K and Q4_1: not offset); for Q6_K those nibbles of the
 /// low 4 bits of the values offset by 32, then 512 bytes whose byte (g * 64 + r) * 4 + q
 /// (g < 2) holds the high 2 bits of element 8p + 4g + q in bit pair p; for Q5_K the nibbles
 /// of the low 4 bits, then 256 bytes whose byte r * 4 + q holds the top bit of element 4g + q
 /// in bit g and of element 16 + 4g + q in bit 4 + g. The scales follow per chunk: f16 [64]
-/// vectors per block (two for Q6_K), or for Q4_K and Q5_K the codes, [64] u16s per block
+/// vectors per block (two for Q6_K, and for Q4_1 the scales then the mins), or for Q4_K
+/// and Q5_K the codes, [64] u16s per block
 /// (scale code | min code << 8), then the f16 factors, [64] for the scales then [64] for the
 /// mins per 8 blocks.
 struct Mat {
@@ -90,7 +97,7 @@ impl Mat {
             Fmt::Q8 => (127.0, 73.0),
             Fmt::Q4 => (8.0, 4.6),
             Fmt::Q6 => (32.0, 18.5),
-            Fmt::Q4K => (8.0, 4.6),
+            Fmt::Q4K | Fmt::Q41 => (8.0, 4.6),
             Fmt::Q5K => (16.0, 9.2),
         };
         let q: Vec<i8> = (0..rows * k)
@@ -120,7 +127,13 @@ impl Mat {
         // [k/256 x rows] (the last super-block possibly partial).
         let mut m: Vec<f32> = Vec::new();
         let mut codes = (vec![], vec![], vec![], vec![]);
-        if fmt.has_min() {
+        if fmt == Fmt::Q41 {
+            // Q4_1: an f16 min per block near the middle of the values' range times the scale.
+            m = s
+                .iter()
+                .map(|&v| f16(v * qmax * (1.0 + 0.1 * rng.next())))
+                .collect();
+        } else if fmt.has_codes() {
             let ds: Vec<f32> = (0..nb.div_ceil(8) * rows)
                 .map(|_| f16((1.0 + 0.1 * rng.next()) / (63.0 * smax * (k as f32).sqrt())))
                 .collect();
@@ -143,7 +156,7 @@ impl Mat {
         }
         let block_bytes = match fmt {
             Fmt::Q8 => 2048,
-            Fmt::Q4 | Fmt::Q4K => 1024,
+            Fmt::Q4 | Fmt::Q4K | Fmt::Q41 => 1024,
             Fmt::Q6 => 1536,
             Fmt::Q5K => 1280,
         };
@@ -161,7 +174,9 @@ impl Mat {
                     match fmt {
                         Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8 ^ 0x80,
                         Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
-                        Fmt::Q4K => packed_q[at(n / 4, n % 4)] |= (v as u8) << (4 * (t / 16)),
+                        Fmt::Q4K | Fmt::Q41 => {
+                            packed_q[at(n / 4, n % 4)] |= (v as u8) << (4 * (t / 16))
+                        }
                         Fmt::Q5K => {
                             let u = v as u8;
                             packed_q[at(n / 4, n % 4)] |= (u & 15) << (4 * (t / 16));
@@ -183,7 +198,12 @@ impl Mat {
                     .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
                     .collect()
             };
-            if fmt.has_min() {
+            if fmt == Fmt::Q41 {
+                for b in 0..nb {
+                    packed_s.extend(f16_bytes(&s[rows_of(b)]));
+                    packed_s.extend(f16_bytes(&m[rows_of(b)]));
+                }
+            } else if fmt.has_codes() {
                 let (sc, mn, ds, dm) = &codes;
                 for b in 0..nb {
                     for (&c, &n) in sc[rows_of(b)].iter().zip(&mn[rows_of(b)]) {
@@ -347,7 +367,7 @@ impl Model {
                 sin.push(a.sin() as f32);
             }
         }
-        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K and Q5_K rotate across the matrices of a layer
+        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 rotate across the matrices of a layer
         // (Q, K and V each in its own) and across layers, and the LM head is Q6_K.
         let layers = attn_norms
             .into_iter()
@@ -562,7 +582,7 @@ fn llama_decode_matches_reference() {
     check_decode(false);
 }
 
-/// Q4_0, Q8_0, Q6_K, Q4_K and Q5_K matrices mixed within and across layers (Q, K and V in
+/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 matrices mixed within and across layers (Q, K and V in
 /// different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {

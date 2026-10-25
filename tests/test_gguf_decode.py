@@ -1,6 +1,6 @@
 """
 End-to-end test of the GGUF path: writes a tiny Llama GGUF with every tensor type the loader
-handles (Q4_0, Q8_0, Q6_K, Q4_K and Q5_K natively; Q4_1 and F16 re-quantized to Q8_0),
+handles (Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 natively; F16 re-quantized to Q8_0),
 loads it with
 benchmarks/gguf.py and benchmarks/llama_model.py, and checks
   - the dequantizers against the values the file was written from,
@@ -300,7 +300,7 @@ class TestGGUFDecode(unittest.TestCase):
         e: dict[str, Floats] = self.expected
         l0, l1, l2 = m.layers
         self.assertEqual((l0["qkv"].fmt, l0["o"].fmt, l0["gate_up"].fmt, l0["down"].fmt),
-                         ("q4", "q4", "q4", "q8"))
+                         ("q4", "q4", "q4", "q41"))
         self.assertEqual((l1["qkv"].fmt, l1["o"].fmt, l1["gate_up"].fmt, l1["down"].fmt),
                          ("q8+q4+q4", "q6", "q8", "q4"))
         self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, l2["gate_up"].fmt, l2["down"].fmt),
@@ -356,12 +356,8 @@ class TestGGUFDecode(unittest.TestCase):
             else:  # F16 gate re-quantized to Q8_0
                 np.testing.assert_allclose(got_gu, want_gu, atol=np.abs(gate).max() / 100)
             down: Floats = e[p + "ffn_down.weight"]
-            if LAYER_TYPES[i]["ffn_down"] == 2:
-                np.testing.assert_array_equal(weights(layer["down"]), down)
-            else:  # Q4_1 re-quantized to Q8_0: half a step, plus the scale's f16 rounding
-                step: Floats = np.abs(down).reshape(D, -1, 32).max(axis=2) / 127
-                err: Floats = np.abs(weights(layer["down"]) - down).reshape(D, -1, 32).max(axis=2)
-                self.assertTrue(np.all(err <= step * (0.5 + 127 * 2 ** -11) + 1e-12))
+            # Q4_0 and Q4_1 (layer 0): values, scales and mins exact.
+            np.testing.assert_array_equal(weights(layer["down"]), down, err_msg=f"{p}down")
         # Q6_K: values exact, scales d * sc rounded to f16.
         got: Floats = weights(m.lm)
         want_lm: Floats = e["token_embd.weight"]
