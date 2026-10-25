@@ -9,9 +9,8 @@ GGUF tensors are converted as follows:
   Q8_0             -> Q8_0, bit for bit
   Q6_K             -> 6-bit values bit for bit, with one f16 scale per 16 values: the f16
                       rounding of Q6_K's super-block scale times its int8 sub-block scale
-  Q4_K, Q5_K       -> 4- or 5-bit values bit for bit, with an f16 scale and min per 32
-                      values: the f16 roundings of the super-block scale times the 6-bit
-                      sub-block scale, and of the super-block min times the 6-bit min
+  Q4_K, Q5_K       -> bit for bit: 4- or 5-bit values, a 6-bit scale and min per 32
+                      values, and the f16 super-block scale and min they multiply
   anything else    -> dequantized to f32, then Q8_0 as llama.cpp quantizes it (e.g. Q4_1,
                       F16, BF16)
 A fused QKV matrix keeps each part's format (Parts: Q4_K_M files store V as Q6_K in some
@@ -35,9 +34,12 @@ try:
 except ImportError:
     torch = None
 
-from gguf import F32, GGUF, U8, Floats, Ints, Tensor, k_quant_values
+from gguf import F32, GGUF, U8, Floats, Ints, Tensor, k_quant_codes
 
 I8: TypeAlias = npt.NDArray[np.int8]
+# Q4_K and Q5_K scales as GGUF stores them: 6-bit scale and min codes [rows x k/32] and the
+# super-block's f16 scale and min (as f32) [rows x k/256, rounded up].
+KCodes: TypeAlias = tuple[U8, U8, F32, F32]
 # Row selection: a slice or row indices.
 Rows: TypeAlias = slice | npt.NDArray[np.intp]
 
@@ -82,14 +84,15 @@ class Mat:
       Q4_0: q uint8 [rows x k/32 x 16], llama.cpp's nibble bytes: value t of a block is
             (byte t & 15) - 8 and value t + 16 is (byte t >> 4) - 8; sub = 32
       Q6_K: q int8 [rows x k/32 x 32] in -32..31, sub = 16
-      Q4_K, Q5_K: q uint8 [rows x k/32 x 32] in 0..15 or 0..31, sub = 32, and f16 mins `m`
-            [rows x k/32]: weight d * q - m"""
+      Q4_K, Q5_K: q uint8 [rows x k/32 x 32] in 0..15 or 0..31, sub = 32, and mins `m`
+            [rows x k/32]: weight d * q - m, where d and m are the f32 products of GGUF's
+            6-bit codes and f16 super-block factors (`codes`), which the kernel keeps"""
 
     FORMATS: dict[str, int] = {"q8": 0, "q4": 1, "q6": 2, "q4k": 3, "q5k": 4}
 
     # The kernel's layout, from pack().
     packed_q: Ints
-    packed_s: npt.NDArray[np.float16]
+    packed_s: U8
     # For matvec, from prepare_numpy().
     q_blocks: Ints
     s_blocks: F32
@@ -100,11 +103,13 @@ class Mat:
     t_sz: torch.Tensor
     t_s: torch.Tensor
 
-    def __init__(self, fmt: str, q: Ints, d: F32, m: F32 | None = None) -> None:
+    def __init__(self, fmt: str, q: Ints, d: F32, m: F32 | None = None,
+                 codes: KCodes | None = None) -> None:
         self.fmt: str = fmt
         self.q: Ints = q
         self.d: F32 = d
         self.m: F32 | None = m
+        self.codes: KCodes | None = codes
         self.rows: int = q.shape[0]
         self.k: int = q.shape[1] * 32
         self.sub: int = 16 if fmt == "q6" else 32
@@ -112,6 +117,15 @@ class Mat:
     @property
     def has_min(self) -> bool:
         return self.fmt in ("q4k", "q5k")
+
+    @classmethod
+    def k_quant(cls, fmt: str, q: Ints, codes: KCodes) -> Mat:
+        """A Q4_K or Q5_K matrix from its values and GGUF's scale codes and factors."""
+        sc, mn, ds, dm = codes
+        nb: int = sc.shape[1]
+        d: F32 = np.repeat(ds, 8, axis=1)[:, :nb] * sc.astype(np.float32)
+        m: F32 = np.repeat(dm, 8, axis=1)[:, :nb] * mn.astype(np.float32)
+        return cls(fmt, q, d, m, codes)
 
     @classmethod
     def random(cls, rng: np.random.Generator, rows: int, k: int, fmt: str) -> Mat:
@@ -132,11 +146,17 @@ class Mat:
             q = rng.integers(-127, 128, size=(rows, nb, 32), dtype=np.int8)
             scale = 73.0
         # Entries of roughly unit variance times 1/sqrt(k), as in a trained layer.
+        if fmt in ("q4k", "q5k"):
+            # Scale codes near the top of their 6 bits, and mins near the middle of the
+            # values' range, so the weights center on zero.
+            ds: F32 = f16_round(rng.uniform(0.9, 1.1, size=(rows, -(-nb // 8)))
+                                / (63 * scale * np.sqrt(k)))
+            sc: U8 = rng.integers(48, 64, size=(rows, nb), dtype=np.uint8)
+            mn: U8 = np.clip(np.round(sc * rng.uniform(0.8, 1.2, size=sc.shape)), 0,
+                             63).astype(np.uint8)
+            return cls.k_quant(fmt, q, (sc, mn, ds, f16_round(ds * (top / 2))))
         n_scales: int = k // (16 if fmt == "q6" else 32)
         d: F32 = f16_round(rng.uniform(0.75, 1.0, size=(rows, n_scales)) / (scale * np.sqrt(k)))
-        if fmt in ("q4k", "q5k"):
-            # Mins near the middle of the values' range, so the weights center on zero.
-            m = f16_round(d * (top / 2) * rng.uniform(0.8, 1.2, size=d.shape))
         return cls(fmt, q, d, m)
 
     @classmethod
@@ -151,11 +171,13 @@ class Mat:
             return cls("q6", *_q6_k_values(t.blocks()))
         if t.type_name in ("Q4_K", "Q5_K"):
             b = t.blocks()
-            q, sc, mn = k_quant_values(b.reshape(-1, b.shape[2]),
-                                       4 if t.type_name == "Q4_K" else 5)
+            q, ds, dm, sc, mn = k_quant_codes(b.reshape(-1, b.shape[2]),
+                                              4 if t.type_name == "Q4_K" else 5)
             nb: int = t.cols // 32
-            return cls("q4k" if t.type_name == "Q4_K" else "q5k", q.reshape(t.rows, nb, 32),
-                       f16_round(sc).reshape(t.rows, nb), f16_round(mn).reshape(t.rows, nb))
+            return cls.k_quant("q4k" if t.type_name == "Q4_K" else "q5k",
+                               q.reshape(t.rows, nb, 32),
+                               (sc.reshape(t.rows, nb), mn.reshape(t.rows, nb),
+                                ds.reshape(t.rows, nb // 8), dm.reshape(t.rows, nb // 8)))
         q8: I8 = np.empty((t.rows, t.cols // 32, 32), dtype=np.int8)
         d = np.empty((t.rows, t.cols // 32), dtype=np.float32)
         step: int = 8192
@@ -181,7 +203,12 @@ class Mat:
         return Mat("q8", *quantize_rows(self.dequantize()))
 
     def take(self, rows: Rows) -> Mat:
-        return Mat(self.fmt, self.q[rows], self.d[rows], None if self.m is None else self.m[rows])
+        codes: KCodes | None = None
+        if self.codes is not None:
+            sc, mn, ds, dm = self.codes
+            codes = (sc[rows], mn[rows], ds[rows], dm[rows])
+        return Mat(self.fmt, self.q[rows], self.d[rows], None if self.m is None else self.m[rows],
+                   codes)
 
     @staticmethod
     def concat(mats: list[Mat]) -> Mat:
@@ -189,8 +216,12 @@ class Mat:
         if len({m.fmt for m in mats}) > 1:
             mats = [m.to_q8() for m in mats]
         mins: list[F32] = [x.m for x in mats if x.m is not None]
+        codes: list[KCodes] = [x.codes for x in mats if x.codes is not None]
         return Mat(mats[0].fmt, np.concatenate([x.q for x in mats]),
-                   np.concatenate([x.d for x in mats]), np.concatenate(mins) if mins else None)
+                   np.concatenate([x.d for x in mats]), np.concatenate(mins) if mins else None,
+                   (np.concatenate([x[0] for x in codes]), np.concatenate([x[1] for x in codes]),
+                    np.concatenate([x[2] for x in codes]), np.concatenate([x[3] for x in codes]))
+                   if codes else None)
 
     def drop_values(self) -> None:
         """Frees the unpacked weights once the packed copy is all that is needed."""
@@ -221,7 +252,8 @@ class Mat:
         (g * 64 + j) * 4 + q holds the high 2 bits of values 8p + 4g + q in bit pair p; for
         Q5_K the low 4 bits as nibbles, then a 256-byte plane whose byte j * 4 + q holds the
         top bits of values 4g + q (bit g) and 16 + 4g + q (bit 4 + g). Then the f16 scales
-        [k/sub x 64]; for Q4_K and Q5_K, scale then min per block."""
+        [k/sub x 64]; for Q4_K and Q5_K, the 6-bit codes [k/32 x 64] as u16s (scale code | min
+        code << 8), then the f16 super-block scales and mins [k/256 x 2 x 64]."""
         c: int = self.rows // 64
         nb: int = self.k // 32
 
@@ -252,11 +284,21 @@ class Mat:
             # Q8_0 stored unsigned: each int8 value + 128 (its top bit flipped).
             q = lanes(self.q.view(np.uint8) ^ np.uint8(0x80), 32)
         self.packed_q = np.ascontiguousarray(q)
+        if self.codes is not None:
+            scode, mcode, ds, dm = self.codes
+            codes: npt.NDArray[np.uint16] = (scode.astype(np.uint16) | (
+                mcode.astype(np.uint16) << np.uint16(8))).reshape(c, 64, nb)
+            factors: npt.NDArray[np.float16] = np.stack([ds, dm], axis=2).reshape(
+                c, 64, -1).astype(np.float16)
+            self.packed_s = np.ascontiguousarray(np.concatenate(
+                [np.ascontiguousarray(codes.transpose(0, 2, 1)).reshape(c, -1).view(np.uint8),
+                 np.ascontiguousarray(factors.transpose(0, 2, 1)).reshape(c, -1).view(np.uint8)],
+                axis=1))
+            return
         per: int = 32 // self.sub
         sc: F32 = self.d.reshape(c, 64, nb * per)
-        if self.m is not None:
-            sc = np.stack([self.d, self.m], axis=2).reshape(c, 64, nb * 2)
-        self.packed_s = np.ascontiguousarray(sc.transpose(0, 2, 1).astype(np.float16))
+        self.packed_s = np.ascontiguousarray(
+            sc.transpose(0, 2, 1).astype(np.float16)).view(np.uint8)
 
     def words(self) -> list[int]:
         """The part's 4 words for qmat_chunk: weights, scales, format, chunks."""
