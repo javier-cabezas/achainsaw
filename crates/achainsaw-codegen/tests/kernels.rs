@@ -1131,3 +1131,147 @@ fn spmv_matches_reference() {
         }
     }
 }
+
+#[test]
+fn spmv_panels_match_reference() {
+    type Count = extern "C" fn(*const i64, *const i32, i64, i64, *mut i64) -> i64;
+    type Fill = extern "C" fn(
+        *const i64,
+        *const i32,
+        *const f32,
+        i64,
+        i64,
+        *const i64,
+        *mut i32,
+        *mut i32,
+        *mut u16,
+        *mut f32,
+        i64,
+    );
+    type Panels = extern "C" fn(
+        *const i64,
+        *const i32,
+        *const i32,
+        *const u16,
+        *const f32,
+        *const f32,
+        *mut f32,
+        i64,
+        i64,
+    );
+    let mut rng = Rng(71);
+    for (level, engine) in engines("spmv") {
+        let ptr = |name| engine.get_fn_ptr(name).unwrap();
+        let count: Count = unsafe { std::mem::transmute(ptr("spmv_panels_count")) };
+        let fill: Fill = unsafe { std::mem::transmute(ptr("spmv_panels_fill")) };
+        let panels: Panels = unsafe { std::mem::transmute(ptr("spmv_panels")) };
+        // No rows, one task, several tasks with a partial last one; one to four panels, the
+        // last one partial or whole.
+        for (m, n) in [
+            (0usize, 1usize),
+            (1, 5),
+            (5, 70000),
+            (1000, 200_000),
+            (2049, 131072),
+        ] {
+            // Row lengths 0 (empty rows) to 3, with every 97th row long; columns in any order.
+            let lens: Vec<usize> = (0..m)
+                .map(|r| if r % 97 == 3 { 1031 } else { r % 4 })
+                .collect();
+            let mut rowptr = vec![0i64];
+            for l in &lens {
+                rowptr.push(rowptr.last().unwrap() + *l as i64);
+            }
+            let nnz = *rowptr.last().unwrap() as usize;
+            let cols: Vec<i32> = (0..nnz)
+                .map(|_| ((rng.next() + 2.0) / 4.0 * n as f32) as i32 % n as i32)
+                .collect();
+            let vals = rng.vec(nnz);
+            let x = rng.vec(n);
+
+            // The layout: by task of 1024 rows, panel of 65536 columns, row, then CSR order.
+            let (tasks, np) = (m.div_ceil(1024), n.div_ceil(65536));
+            let (mut grp, mut prow, mut start) = (vec![0i64], vec![], vec![]);
+            let (mut pcols, mut pvals) = (vec![], vec![]);
+            for t in 0..tasks {
+                for p in 0..np {
+                    for r in t * 1024..m.min(t * 1024 + 1024) {
+                        let row = rowptr[r] as usize..rowptr[r + 1] as usize;
+                        let mut first = true;
+                        for j in row.filter(|&j| cols[j] as usize >> 16 == p) {
+                            if first {
+                                prow.push(r as i32);
+                                start.push(pcols.len() as i32);
+                                first = false;
+                            }
+                            pcols.push(cols[j] as u16);
+                            pvals.push(vals[j]);
+                        }
+                    }
+                    grp.push(prow.len() as i64);
+                }
+            }
+            start.push(nnz as i32);
+
+            let ctx = format!("m={m} n={n} at {level}");
+            let mut got_grp = vec![-1i64; tasks * np + 1];
+            let npairs = count(
+                rowptr.as_ptr(),
+                cols.as_ptr(),
+                m as i64,
+                n as i64,
+                got_grp.as_mut_ptr(),
+            );
+            assert_eq!(
+                (npairs as usize, &got_grp),
+                (prow.len(), &grp),
+                "count {ctx}"
+            );
+            let mut got_prow = vec![-1i32; prow.len()];
+            let mut got_start = vec![-1i32; start.len()];
+            let mut got_cols = vec![0xffffu16; nnz];
+            let mut got_vals = vec![f32::NAN; nnz];
+            fill(
+                rowptr.as_ptr(),
+                cols.as_ptr(),
+                vals.as_ptr(),
+                m as i64,
+                n as i64,
+                got_grp.as_ptr(),
+                got_prow.as_mut_ptr(),
+                got_start.as_mut_ptr(),
+                got_cols.as_mut_ptr(),
+                got_vals.as_mut_ptr(),
+                npairs,
+            );
+            assert_eq!((&got_prow, &got_start), (&prow, &start), "pairs {ctx}");
+            assert_eq!(got_cols, pcols, "columns {ctx}");
+            assert!(
+                got_vals
+                    .iter()
+                    .zip(&pvals)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "values {ctx}"
+            );
+
+            let mut y = vec![f32::NAN; m];
+            panels(
+                grp.as_ptr(),
+                prow.as_ptr(),
+                start.as_ptr(),
+                pcols.as_ptr(),
+                pvals.as_ptr(),
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                m as i64,
+                n as i64,
+            );
+            for r in 0..m {
+                let (a, b) = (rowptr[r] as usize, rowptr[r + 1] as usize);
+                let terms = (a..b).map(|j| vals[j] as f64 * x[cols[j] as usize] as f64);
+                let scale: f64 = terms.clone().map(f64::abs).sum();
+                close(y[r] as f64, terms.sum(), scale, &format!("row {r} {ctx}"));
+            }
+        }
+    }
+}

@@ -142,3 +142,300 @@ inline fn term(k:i64, cols:ptr, vals:ptr, x:ptr, acc:f32)->f32
     v = ld vals[k]:f32
     r = fma v, xv, acc
     ret r
+
+# SpMV on column panels: the matrix of spmv in a layout that reads 20% fewer bytes, made
+# once by spmv_panels_count and spmv_panels_fill. The columns are split into panels of 65536
+# (x is 256 KB of each), and the rows into tasks of 1024. The nonzeros are ordered by task,
+# then panel, then row, with their columns as u16 offsets in the panel (pcols); a pair is a
+# row's nonzeros in one panel, start[i] .. start[i + 1] in row prow[i] (both i32), and the
+# pairs of task t and panel p are grp[t * panels + p] .. grp[t * panels + p + 1] (i64). Each
+# task zeroes its rows of y and adds each panel's pairs, so its reads of x stay in one
+# panel at a time. n is the number of columns, x's length.
+fn spmv_panels(grp:ptr, prow:ptr, start:ptr, pcols:ptr, pvals:ptr, x:ptr, y:ptr, m:i64, n:i64)
+  b0:
+    tasks = call panel_tasks(m)
+    panels = call panel_count(n)
+    par tasks, spmv_panels_task(grp, prow, start, pcols, pvals, x, y, m, panels)
+    ret
+
+fn spmv_panels_task(t:i64, grp:ptr, prow:ptr, start:ptr, pcols:ptr, pvals:ptr, x:ptr, y:ptr, m:i64, panels:i64)
+  b0:
+    z = cst 0.0:f32
+    first, end = call panel_rows(t, m)
+    jmp zero(first)
+  zero(zr:i64):
+    z_more = lt zr, end
+    br z_more, zero_body, panels_init
+  zero_body:
+    st y[zr], z
+    zr2 = add zr, 1:i64
+    jmp zero(zr2)
+  panels_init:
+    g0 = mul t, panels
+    jmp panel(0:i64)
+  panel(p:i64):
+    p_more = lt p, panels
+    br p_more, panel_init, done
+  panel_init:
+    xoff = shl p, 18:i64
+    xp = add x, xoff
+    g = add g0, p
+    g1 = add g, 1:i64
+    i0 = ld grp[g]:i64
+    i1 = ld grp[g1]:i64
+    p1 = add p, 1:i64
+    k_first32 = ld start[i0]:i32
+    k_first = sext k_first32:i64
+    jmp pairs(i0, k_first)
+  pairs(i:i64, k0:i64):
+    i_more = lt i, i1
+    br i_more, pair_init, panel_next
+  pair_init:
+    r32 = ld prow[i]:i32
+    r = sext r32:i64
+    i2 = add i, 1:i64
+    k1n = ld start[i2]:i32
+    k1 = sext k1n:i64
+    jmp quads(k0, z, z, z, z)
+  quads(k:i64, a0:f32, a1:f32, a2:f32, a3:f32):
+    k4 = add k, 4:i64
+    full = le k4, k1
+    br full, quad_body, quad_sum
+  quad_body:
+    a0n = call term16(k, pcols, pvals, xp, a0)
+    ka = add k, 1:i64
+    a1n = call term16(ka, pcols, pvals, xp, a1)
+    kb = add k, 2:i64
+    a2n = call term16(kb, pcols, pvals, xp, a2)
+    kc = add k, 3:i64
+    a3n = call term16(kc, pcols, pvals, xp, a3)
+    jmp quads(k4, a0n, a1n, a2n, a3n)
+  quad_sum:
+    a01 = add a0, a1
+    a23 = add a2, a3
+    s = add a01, a23
+    jmp singles(k, s)
+  singles(j:i64, acc:f32):
+    j_more = lt j, k1
+    br j_more, single_body, pair_done
+  single_body:
+    acc2 = call term16(j, pcols, pvals, xp, acc)
+    j2 = add j, 1:i64
+    jmp singles(j2, acc2)
+  pair_done:
+    prev = ld y[r]:f32
+    total = add prev, acc
+    st y[r], total
+    jmp pairs(i2, k1)
+  panel_next:
+    jmp panel(p1)
+  done:
+    ret
+
+# The first step of the conversion from CSR (rowptr, cols as spmv takes them; n columns):
+# writes grp (panel_tasks(m) * panels + 1 i64s, panels = (n + 65535) / 65536) and returns the
+# number of pairs, the lengths of prow and start (that plus one) for spmv_panels_fill. The
+# nonzeros keep their order within a pair, so the rows need not be sorted, and there must
+# be fewer than 2^31 of them.
+fn spmv_panels_count(rowptr:ptr, cols:ptr, m:i64, n:i64, grp:ptr)->i64
+  b0:
+    tasks = call panel_tasks(m)
+    panels = call panel_count(n)
+    st grp, 0:i64
+    par tasks, panels_count_task(rowptr, cols, m, panels, grp)
+    groups = mul tasks, panels
+    jmp scan(0:i64, 0:i64)
+  scan(g:i64, acc:i64):
+    more = lt g, groups
+    br more, scan_body, done
+  scan_body:
+    g1 = add g, 1:i64
+    c = ld grp[g1]:i64
+    acc2 = add acc, c
+    st grp[g1], acc2
+    jmp scan(g1, acc2)
+  done:
+    ret acc
+
+# Task t's number of pairs in each panel, into grp[t * panels + 1 ..]: a row starts a pair
+# in a panel when it is not the row last seen there.
+fn panels_count_task(t:i64, rowptr:ptr, cols:ptr, m:i64, panels:i64, grp:ptr)
+  b0:
+    first, end = call panel_rows(t, m)
+    g0 = mul t, panels
+    goff = shl g0, 3:i64
+    gp0 = add grp, goff
+    gp = add gp0, 8:i64
+    bytes = shl panels, 3:i64
+    last = alloc bytes
+    jmp init(0:i64)
+  init(p:i64):
+    p_more = lt p, panels
+    br p_more, init_body, rows(first)
+  init_body:
+    st last[p], -1:i64
+    st gp[p], 0:i64
+    p1 = add p, 1:i64
+    jmp init(p1)
+  rows(r:i64):
+    r_more = lt r, end
+    br r_more, row_init, done
+  row_init:
+    k0 = ld rowptr[r]:i64
+    r1 = add r, 1:i64
+    k1 = ld rowptr[r1]:i64
+    jmp nz(k0)
+  nz(k:i64):
+    k_more = lt k, k1
+    br k_more, nz_body, rows(r1)
+  nz_body:
+    c = ld cols[k]:i32
+    cp = ushr c, 16:i32
+    q = zext cp:i64
+    l = ld last[q]:i64
+    k2 = add k, 1:i64
+    new = ne l, r
+    br new, new_pair, nz(k2)
+  new_pair:
+    st last[q], r
+    cnt = ld gp[q]:i64
+    cnt2 = add cnt, 1:i64
+    st gp[q], cnt2
+    jmp nz(k2)
+  done:
+    free last
+    ret
+
+# The second step: with grp from spmv_panels_count and npairs its result, writes prow and
+# start (npairs and npairs + 1 i32s), pcols (i16) and pvals (f32), as many as cols and vals.
+fn spmv_panels_fill(rowptr:ptr, cols:ptr, vals:ptr, m:i64, n:i64, grp:ptr, prow:ptr, start:ptr, pcols:ptr, pvals:ptr, npairs:i64)
+  b0:
+    tasks = call panel_tasks(m)
+    panels = call panel_count(n)
+    par tasks, panels_fill_task(rowptr, cols, vals, m, panels, grp, prow, start, pcols, pvals)
+    nnz = ld rowptr[m]:i64
+    nnz32 = trunc nnz:i32
+    st start[npairs], nnz32
+    ret
+
+# Task t's nonzeros go to the slots rowptr[first] .. rowptr[end], panel by panel: a count of
+# each panel's nonzeros gives where its slots start, then each nonzero goes to the next slot
+# of its panel, and starts a pair when its row is not the one last seen there.
+fn panels_fill_task(t:i64, rowptr:ptr, cols:ptr, vals:ptr, m:i64, panels:i64, grp:ptr, prow:ptr, start:ptr, pcols:ptr, pvals:ptr)
+  b0:
+    first, end = call panel_rows(t, m)
+    g0 = mul t, panels
+    goff = shl g0, 3:i64
+    gp = add grp, goff
+    bytes = shl panels, 3:i64
+    state = mul bytes, 3:i64
+    slot = alloc state
+    pair = add slot, bytes
+    last = add pair, bytes
+    jmp init(0:i64)
+  init(p:i64):
+    p_more = lt p, panels
+    br p_more, init_body, count_rows
+  init_body:
+    st slot[p], 0:i64
+    i0 = ld gp[p]:i64
+    st pair[p], i0
+    st last[p], -1:i64
+    p1 = add p, 1:i64
+    jmp init(p1)
+  count_rows:
+    kf = ld rowptr[first]:i64
+    ke = ld rowptr[end]:i64
+    jmp count(kf)
+  count(c_k:i64):
+    c_more = lt c_k, ke
+    br c_more, count_body, offsets(0:i64, kf)
+  count_body:
+    cc = ld cols[c_k]:i32
+    ccp = ushr cc, 16:i32
+    cq = zext ccp:i64
+    cn = ld slot[cq]:i64
+    cn2 = add cn, 1:i64
+    st slot[cq], cn2
+    c_k2 = add c_k, 1:i64
+    jmp count(c_k2)
+  offsets(o:i64, at:i64):
+    o_more = lt o, panels
+    br o_more, offsets_body, rows(first)
+  offsets_body:
+    on = ld slot[o]:i64
+    st slot[o], at
+    at2 = add at, on
+    o2 = add o, 1:i64
+    jmp offsets(o2, at2)
+  rows(r:i64):
+    r_more = lt r, end
+    br r_more, row_init, done
+  row_init:
+    k0 = ld rowptr[r]:i64
+    r1 = add r, 1:i64
+    k1 = ld rowptr[r1]:i64
+    r32 = trunc r:i32
+    jmp nz(k0)
+  nz(k:i64):
+    k_more = lt k, k1
+    br k_more, nz_body, rows(r1)
+  nz_body:
+    c = ld cols[k]:i32
+    v = ld vals[k]:f32
+    cp = ushr c, 16:i32
+    q = zext cp:i64
+    s = ld slot[q]:i64
+    c16 = trunc c:i16
+    st pcols[s], c16
+    st pvals[s], v
+    s2 = add s, 1:i64
+    st slot[q], s2
+    l = ld last[q]:i64
+    k2 = add k, 1:i64
+    new = ne l, r
+    br new, new_pair, nz(k2)
+  new_pair:
+    st last[q], r
+    i = ld pair[q]:i64
+    st prow[i], r32
+    s32 = trunc s:i32
+    st start[i], s32
+    i2 = add i, 1:i64
+    st pair[q], i2
+    jmp nz(k2)
+  done:
+    free slot
+    ret
+
+# The number of tasks of spmv_panels for m rows, one per 1024.
+inline fn panel_tasks(m:i64)->i64
+  b0:
+    m1 = add m, 1023:i64
+    t = ushr m1, 10:i64
+    ret t
+
+# Rows [first, end) of task t.
+inline fn panel_rows(t:i64, m:i64)->(i64, i64)
+  b0:
+    first = shl t, 10:i64
+    e = add first, 1024:i64
+    end = min e, m
+    ret first, end
+
+# The number of 65536-column panels for n columns.
+inline fn panel_count(n:i64)->i64
+  b0:
+    n1 = add n, 65535:i64
+    p = ushr n1, 16:i64
+    ret p
+
+# acc + pvals[k] * xp[pcols[k]] for a u16 column offset, one rounding.
+inline fn term16(k:i64, pcols:ptr, pvals:ptr, xp:ptr, acc:f32)->f32
+  b0:
+    c = ld pcols[k]:i16
+    cw = zext c:i64
+    xv = ld xp[cw]:f32
+    v = ld pvals[k]:f32
+    r = fma v, xv, acc
+    ret r
