@@ -172,6 +172,7 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     | Instruction::VShift { dst, src, .. }
                     | Instruction::VNarrow { dst, lo: src, .. } => (dst, types.get(src).copied()),
                     Instruction::MaskedLoad { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::VGather { dst, idx, .. } => (dst, types.get(idx).copied()),
                     Instruction::Alloc { dst, .. }
                     | Instruction::Stack { dst, .. }
                     | Instruction::Addr { dst, .. } => (dst, Some(Type::Ptr)),
@@ -1166,6 +1167,7 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::Alloc { .. }
                 | Instruction::Free { .. }
                 | Instruction::MaskedLoad { .. }
+                | Instruction::VGather { .. }
                 | Instruction::MaskedStore { .. }
                 | Instruction::MatMul { .. }
                 | Instruction::Par { .. } => true,

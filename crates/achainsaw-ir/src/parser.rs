@@ -988,6 +988,28 @@ impl<'a> Parser<'a> {
             });
         }
 
+        if name == "vgather" {
+            let ptr = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let idx = self.parse_operand(instructions, None)?;
+            let count = if self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+                Some(self.parse_count_operand(instructions)?)
+            } else {
+                None
+            };
+            let lane = self.parse_lane_suffix("vgather p, idx, n:f32")?;
+            self.expect_eol()?;
+            return Ok(Instruction::VGather {
+                dst,
+                ptr,
+                idx,
+                count,
+                lane,
+                span,
+            });
+        }
+
         if name == "ldm" {
             let (ptr, index) = self.parse_mem_ref(instructions)?;
             self.expect_type_colon(&format!(

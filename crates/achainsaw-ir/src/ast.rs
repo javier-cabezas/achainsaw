@@ -1034,6 +1034,19 @@ pub enum Instruction {
         lane: Type,
         span: Span,
     },
+    /// `v = vgather p, idx:f32`: lane `i` of the result is the element `p[idx[i]]` of type
+    /// `lane`. The index vector `idx` has signed lanes of the same width (i32 for `f32` and
+    /// `i32`, i64 for `f64` and `i64`), scaled by the element size, and gives the result's
+    /// vector type. With a count, `vgather p, idx, n:f32` reads only the first
+    /// `min(max(n, 0), lanes)` lanes and zeroes the rest.
+    VGather {
+        dst: String,
+        ptr: String,
+        idx: String,
+        count: Option<String>,
+        lane: Type,
+        span: Span,
+    },
     /// Tail-masked store: `stm p, v, n:f32` writes only the first `min(max(n, 0), lanes)` lanes.
     MaskedStore {
         ptr: String,
@@ -1096,6 +1109,7 @@ impl Instruction {
             | Instruction::VDot { span, .. }
             | Instruction::VLen { span, .. }
             | Instruction::MaskedLoad { span, .. }
+            | Instruction::VGather { span, .. }
             | Instruction::MaskedStore { span, .. }
             | Instruction::MatMul { span, .. } => *span,
         }
@@ -1141,7 +1155,8 @@ impl Instruction {
             | Instruction::AtomicRmw { dst, .. }
             | Instruction::AtomicCas { dst, .. }
             | Instruction::AtomicLoad { dst, .. }
-            | Instruction::MaskedLoad { dst, .. } => Some(dst),
+            | Instruction::MaskedLoad { dst, .. }
+            | Instruction::VGather { dst, .. } => Some(dst),
             Instruction::Call { dsts, .. } => match dsts.as_slice() {
                 [d] => Some(d),
                 _ => None,
@@ -1186,7 +1201,8 @@ impl Instruction {
             | Instruction::AtomicRmw { dst, .. }
             | Instruction::AtomicCas { dst, .. }
             | Instruction::AtomicLoad { dst, .. }
-            | Instruction::MaskedLoad { dst, .. } => vec![dst],
+            | Instruction::MaskedLoad { dst, .. }
+            | Instruction::VGather { dst, .. } => vec![dst],
             Instruction::Call { dsts, .. } => dsts.iter_mut().collect(),
             Instruction::Store { .. }
             | Instruction::AtomicStore { .. }
@@ -1269,6 +1285,9 @@ impl Instruction {
                 acc: a, a: b, b: c, ..
             } => vec![a, b, c],
             Instruction::MaskedLoad { ptr, count, .. } => vec![ptr, count],
+            Instruction::VGather {
+                ptr, idx, count, ..
+            } => [ptr, idx].into_iter().chain(count.as_ref()).collect(),
             Instruction::MaskedStore {
                 ptr, val, count, ..
             } => vec![ptr, val, count],
@@ -1355,6 +1374,9 @@ impl Instruction {
             | Instruction::VDot {
                 acc: a, a: b, b: c, ..
             } => vec![a, b, c],
+            Instruction::VGather {
+                ptr, idx, count, ..
+            } => [ptr, idx].into_iter().chain(count.as_mut()).collect(),
             Instruction::MaskedLoad {
                 ptr, count, index, ..
             } => [ptr, count]

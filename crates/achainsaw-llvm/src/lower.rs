@@ -2035,6 +2035,19 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let v = self.call1(f, &args)?;
                 st.values.insert(dst.clone(), (self.to_canon(v, *ty)?, *ty));
             }
+            Instruction::VGather {
+                dst,
+                ptr,
+                idx,
+                count,
+                lane,
+                ..
+            } => {
+                let (iv, vty) = self.val(st, idx);
+                let n = count.as_ref().map(|c| self.int(st, c));
+                let v = self.gather(st, self.int(st, ptr), iv, vty, n, *lane)?;
+                st.values.insert(dst.clone(), (v, vty));
+            }
             Instruction::MaskedStore {
                 ptr,
                 index,
@@ -3105,6 +3118,125 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(self
             .intr("llvm.smin", &[t], &[n, lanes.into()])?
             .into_int_value())
+    }
+
+    /// Splats the scalar `x` into the vector type `vt` (fixed or scalable).
+    fn splat_into(
+        &self,
+        x: BasicValueEnum<'ctx>,
+        vt: BasicTypeEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        Ok(match vt {
+            BasicTypeEnum::VectorType(vt) => {
+                let one = b.build_insert_element(vt.get_poison(), x, self.c32(0), "")?;
+                let zeros = self.i32().vec_type(vt.get_size()).const_zero();
+                b.build_shuffle_vector(one, vt.get_poison(), zeros, "")?
+                    .into()
+            }
+            BasicTypeEnum::ScalableVectorType(vt) => {
+                let one = b.build_insert_element(vt.get_poison(), x, self.c32(0), "")?;
+                let zeros = self.i32().scalable_vec_type(vt.get_size()).const_zero();
+                b.build_shuffle_vector(one, vt.get_poison(), zeros, "")?
+                    .into()
+            }
+            other => unreachable!("{other:?}"),
+        })
+    }
+
+    /// `vgather p, idx[, n]:lane` as `llvm.masked.gather` (AVX2/AVX-512 `vgather*`, SVE
+    /// `ld1w`/`ld1d` with vector offsets). In the sandbox every read lane is checked, and
+    /// the fault reports the first lane out of bounds, as Cranelift's lane-by-lane checks do.
+    fn gather(
+        &self,
+        st: &FnState<'ctx>,
+        base: IntValue<'ctx>,
+        iv: BasicValueEnum<'ctx>,
+        vty: Type,
+        count: Option<IntValue<'ctx>>,
+        lane: Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let size = lane.byte_size() as i64;
+        let idx_lane = if size == 4 { Type::I32 } else { Type::I64 };
+        let lanes = self.lanes_min(vty, lane);
+        let scalable = self.scalable(vty);
+        let wide_t = self.vec_of(self.i64().into(), lanes, scalable);
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let ptrs_t: BasicTypeEnum = if scalable {
+            ptr_t.scalable_vec_type(lanes).into()
+        } else {
+            ptr_t.vec_type(lanes).into()
+        };
+        // `getelementptr lane, ptr base, <idx>`: the index lanes as they are, which SVE
+        // reads as sign-extended 32-bit offsets (`[x0, z.s, sxtw #2]`).
+        let idx = self.as_lanes(iv, vty, idx_lane)?;
+        let base_ptr = self.int_ptr(base)?;
+        // SAFETY: a valid builder positioned in a block, and values of this context.
+        let ptrs = unsafe {
+            let mut index = [idx.as_value_ref()];
+            BasicValueEnum::new(inkwell::llvm_sys::core::LLVMBuildGEP2(
+                b.as_mut_ptr(),
+                inkwell::types::AsTypeRef::as_type_ref(&self.scalar_type(lane)),
+                base_ptr.as_value_ref(),
+                index.as_mut_ptr(),
+                1,
+                c"".as_ptr(),
+            ))
+        };
+        let n = match count {
+            Some(c) => self.clamp_count(c, self.lanes_value(vty, lane)?)?,
+            None => self.lanes_value(vty, lane)?,
+        };
+        let mask = self.lane_mask(n, vty, lane)?;
+
+        if let (Some(sb), Some((fault, addr_phi, size_phi)), false) =
+            (self.opts.sandbox, st.fault, st.covered)
+        {
+            let (lo, len) = Self::arena(sb, false);
+            let addrs = b.build_cast(InstructionOpcode::PtrToInt, ptrs, wide_t, "")?;
+            let los = self.splat_into(self.c64(lo).into(), wide_t)?;
+            let rooms = self.splat_into(self.c64(len - size).into(), wide_t)?;
+            let off = anyi2!(addrs, los, |x, y| b.build_int_sub(x, y, "")?);
+            let out = anyi2!(off, rooms, |x, y| b.build_int_compare(
+                IntPredicate::UGT,
+                x,
+                y,
+                ""
+            )?);
+            let bad = anyi2!(out, mask, |x, y| b.build_and(x, y, "")?);
+            let any = self
+                .intr("llvm.vector.reduce.or", &[bad.get_type()], &[bad])?
+                .into_int_value();
+            let report = self.ctx.append_basic_block(st.func, "gather.fault");
+            let pass = self.ctx.append_basic_block(st.func, "gather.inbounds");
+            b.build_conditional_branch(any, report, pass)?;
+            b.position_at_end(report);
+            let first = self
+                .intr(
+                    "llvm.experimental.cttz.elts",
+                    &[self.i64().into(), bad.get_type()],
+                    &[bad, self.i1().const_int(1, false).into()],
+                )?
+                .into_int_value();
+            let addr = vec1!(addrs, |x| b.build_extract_element(x, first, "")?).into_int_value();
+            let size_v = self.c64(size);
+            b.build_unconditional_branch(fault)?;
+            addr_phi.add_incoming(&[(&addr, report)]);
+            size_phi.add_incoming(&[(&size_v, report)]);
+            b.position_at_end(pass);
+        }
+
+        let vt = self.lane_vec(vty, lane);
+        let f = self.intrinsic("llvm.masked.gather", &[vt, ptrs_t]);
+        let mut args: Vec<BasicValueEnum> = vec![ptrs];
+        if f.count_params() == 4 {
+            args.push(self.c32(1).into());
+        }
+        args.push(mask);
+        args.push(vt.const_zero());
+        let v = self.call1(f, &args)?;
+        self.to_canon(v, vty)
     }
 
     /// Mask with the first `n` lanes of `ty` set (`llvm.get.active.lane.mask`, which

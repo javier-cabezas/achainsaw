@@ -1094,7 +1094,7 @@ fn spmv_matches_reference() {
     type Spmv = extern "C" fn(*const i64, *const i32, *const f32, *const f32, *mut f32, i64);
     let mut rng = Rng(67);
     for (level, engine) in engines("spmv") {
-        for func in ["spmv", "spmv_queue"] {
+        for func in ["spmv", "spmv_queue", "spmv_gather"] {
             let k: Spmv = unsafe { std::mem::transmute(engine.get_fn_ptr(func).unwrap()) };
             for m in [1usize, 5, 64, 65, 1000] {
                 // Row lengths 0 (empty rows) to 3, with every 97th row long.

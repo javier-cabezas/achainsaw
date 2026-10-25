@@ -837,6 +837,7 @@ def make_cases() -> list[Case]:
 
     cases.append(spmv_case("spmv", "all cores"))
     cases.append(spmv_case("spmv_queue", "atomic work queue instead of par, all cores"))
+    cases.append(spmv_case("spmv_gather", "vgather of x instead of scalar loads, all cores"))
     return cases
 
 

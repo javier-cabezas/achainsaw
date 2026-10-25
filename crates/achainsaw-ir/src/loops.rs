@@ -4,7 +4,8 @@
 //! When every iteration with `n - i` at least a vector's lanes would load and store whole
 //! vectors anyway, [`split_masked_loops`] puts a copy of the loop in front of it. The copy runs
 //! while a guard checked on every iteration shows `n - i` is at least the lanes of each masked
-//! access that depends on it, and plain `ld`/`st` replace those accesses there. When the guard
+//! access that depends on it, and plain `ld`/`st` replace those accesses there (a `vgather`
+//! with a count is a masked access too, and loses its count there). When the guard
 //! fails, the original loop runs the remaining iterations, tail included. Each iteration does
 //! what it did before, so results are unchanged, on every backend; only fuel use differs (the
 //! guard is a block of its own).
@@ -97,7 +98,9 @@ fn candidate_headers(f: &Function) -> Vec<String> {
         b.instructions.iter().any(|i| {
             matches!(
                 i,
-                Instruction::MaskedLoad { .. } | Instruction::MaskedStore { .. }
+                Instruction::MaskedLoad { .. }
+                    | Instruction::MaskedStore { .. }
+                    | Instruction::VGather { count: Some(_), .. }
             )
         })
     };
@@ -269,6 +272,17 @@ fn split_loop(f: &mut Function, header: &str, sigs: &Signatures, serial: &mut us
                     val, count, lane, ..
                 } => {
                     let Some(&ty) = types().get(val.as_str()) else {
+                        continue;
+                    };
+                    (count, lanes_of(ty, *lane))
+                }
+                Instruction::VGather {
+                    idx,
+                    count: Some(count),
+                    lane,
+                    ..
+                } => {
+                    let Some(&ty) = types().get(idx.as_str()) else {
                         continue;
                     };
                     (count, lanes_of(ty, *lane))
@@ -713,6 +727,21 @@ fn unmasked(inst: &Instruction) -> Instruction {
             ptr: ptr.clone(),
             index: unit(index, *lane),
             val: val.clone(),
+            span: *span,
+        },
+        Instruction::VGather {
+            dst,
+            ptr,
+            idx,
+            lane,
+            span,
+            ..
+        } => Instruction::VGather {
+            dst: dst.clone(),
+            ptr: ptr.clone(),
+            idx: idx.clone(),
+            count: None,
+            lane: *lane,
             span: *span,
         },
         other => other.clone(),

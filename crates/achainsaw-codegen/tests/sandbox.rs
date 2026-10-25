@@ -511,3 +511,76 @@ fn atomics_are_checked_for_bounds_and_alignment() {
     expect_misaligned(&e, "cas_i32", &i64s(&[2]));
     expect_misaligned(&e, "st_i16", &i64s(&[1]));
 }
+
+/// `vgather` from a 2 KB table at the start of the arena, with indices 0 except lanes 3 and 9.
+const GATHER: &str = r#"
+fn base()->ptr
+  b0:
+    t = alloc 2048:i64
+    ret t
+
+fn gather2(a:i32, b:i32, n:i64)->f32
+  b0:
+    t = alloc 2048:i64
+    v0 = splat 0:i32:v512
+    v1 = inslane v0, a, 3:i32
+    v2 = inslane v1, b, 9:i32
+    g = vgather t, v2, n:f32
+    s = vsum g:f32
+    ret s
+
+fn gather_all(a:i32)->f32
+  b0:
+    t = alloc 2048:i64
+    v0 = splat 0:i32:v128
+    v1 = inslane v0, a, 2:i32
+    g = vgather t, v1:f32
+    s = vsum g:f32
+    ret s
+"#;
+
+#[test]
+fn gathers_are_checked_lane_by_lane() {
+    let e = sandboxed(GATHER);
+    let base = match call(&e, "base", &[]).unwrap() {
+        Some(RtValue::Ptr(p)) => p,
+        other => panic!("{other:?}"),
+    };
+    let run = |a: i32, b: i32, n: i64| {
+        call(
+            &e,
+            "gather2",
+            &[RtValue::I32(a), RtValue::I32(b), RtValue::I64(n)],
+        )
+    };
+    let violation_at = |r: Result<Option<RtValue>, String>, offset: i64, what: &str| {
+        let err = r.expect_err(what);
+        assert!(err.contains("ERR_MEMORY_VIOLATION"), "{what}: {err}");
+        assert_eq!(
+            get_execution_status(),
+            ExecutionStatus::MemoryViolation {
+                addr: (base as i64 + offset) as usize,
+                size: 4
+            },
+            "{what}"
+        );
+    };
+    // Anywhere in the arena, even past the table.
+    assert!(run(1, 1023, 16).is_ok());
+    violation_at(run(1024, 0, 16), 4096, "one element past the arena");
+    violation_at(run(0, -1, 16), -4, "one element before it");
+    // The first lane out of bounds is reported, not the lowest address.
+    violation_at(run(2000, 1500, 16), 8000, "two lanes out");
+    violation_at(
+        run(i32::MAX, 0, 16),
+        4 * i32::MAX as i64,
+        "the largest index",
+    );
+    // Lanes past the count are not read, so not checked.
+    assert!(run(0, 5000, 9).is_ok());
+    assert!(run(5000, 5000, 3).is_ok());
+    violation_at(run(0, 5000, 10), 20000, "the count's last lane");
+    let r = call(&e, "gather_all", &[RtValue::I32(-5)]);
+    violation_at(r, -20, "every lane of an uncounted gather");
+    assert!(call(&e, "gather_all", &[RtValue::I32(3)]).is_ok());
+}
