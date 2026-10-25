@@ -268,6 +268,7 @@ impl<'a> Parser<'a> {
 
     pub fn parse_module(&mut self) -> Result<Module, Diagnostic> {
         let mut extern_functions = Vec::new();
+        let mut data = Vec::new();
         let mut functions = Vec::new();
         let mut uses = Vec::new();
         self.skip_newlines();
@@ -284,6 +285,8 @@ impl<'a> Parser<'a> {
                     self.advance();
                 }
                 self.expect_eol()?;
+            } else if self.at_data() {
+                data.push(self.parse_data()?);
             } else if self.peek_kind() == &TokenKind::ExtFn {
                 extern_functions.push(self.parse_extern_function()?);
             } else if self.peek_kind() == &TokenKind::Fn {
@@ -297,7 +300,7 @@ impl<'a> Parser<'a> {
                 return Err(Diagnostic::error(
                     "ERR_UNEXPECTED_TOKEN",
                     format!(
-                        "Expected 'fn', 'inline fn', 'extfn' or 'use', found {:?}",
+                        "Expected 'fn', 'inline fn', 'extfn', 'data' or 'use', found {:?}",
                         self.peek_kind()
                     ),
                     self.peek().span,
@@ -308,10 +311,104 @@ impl<'a> Parser<'a> {
 
         let mut module = Module {
             extern_functions,
+            data,
             functions,
         };
         crate::stdlib::link(&mut module, &uses)?;
         Ok(module)
+    }
+
+    /// Whether the next tokens start a `data` declaration (`data name:...`; a block labeled
+    /// `data` is `data:` or `data(`).
+    fn at_data(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(s) if s == "data")
+            && self.peek_at(1).is_some_and(|k| name_of(k).is_some())
+    }
+
+    /// `data name:ty = v, v, ...`; a line that ends with a comma continues on the next.
+    fn parse_data(&mut self) -> Result<Data, Diagnostic> {
+        let start = self.advance().span;
+        let (name, _) = self.expect_ident()?;
+        self.expect_type_colon(&format!(
+            "data needs its element type: `data {name}:f32 = 1.0, 2.0`"
+        ))?;
+        let ty_span = self.peek().span;
+        let ty = self.parse_type()?;
+        if !matches!(
+            ty,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64
+        ) {
+            return Err(Diagnostic::error(
+                "ERR_INVALID_DATA_TYPE",
+                format!("data '{name}' has element type '{ty}'; use i8, i16, i32, i64, f32 or f64"),
+                ty_span,
+            )
+            .with_context(serde_json::json!({ "target": name, "type": ty.as_str() })));
+        }
+        self.expect(TokenKind::Equal)?;
+        let mut bytes = Vec::new();
+        let mut end: Span;
+        loop {
+            let tok = self.peek().clone();
+            let value = match &tok.kind {
+                TokenKind::IntLit(n) => int_literal(*n, ty),
+                TokenKind::FloatLit(f) if ty.is_float() => Constant::Float(*f),
+                TokenKind::Ident(w) if ty.is_float() && w == "inf" => {
+                    Constant::Float(f64::INFINITY)
+                }
+                TokenKind::Ident(w) if ty.is_float() && w == "nan" => Constant::Float(f64::NAN),
+                TokenKind::FloatLit(_) => {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("data '{name}' holds '{ty}' values; a float literal does not fit"),
+                        tok.span,
+                    ))
+                }
+                other => {
+                    return Err(Diagnostic::error(
+                        "ERR_EXPECTED_NUMBER",
+                        format!("Expected a number in data '{name}', found {other:?}"),
+                        tok.span,
+                    ))
+                }
+            };
+            self.advance();
+            end = tok.span;
+            match value {
+                Constant::Int(n) => {
+                    if !ty.int_literal_fits(n) {
+                        return Err(Diagnostic::error(
+                            "ERR_CONSTANT_OUT_OF_RANGE",
+                            format!("Constant {n} does not fit in type '{ty}'"),
+                            tok.span,
+                        )
+                        .with_context(serde_json::json!({ "value": n, "type": ty.as_str() })));
+                    }
+                    bytes.extend_from_slice(&n.to_le_bytes()[..ty.byte_size()]);
+                }
+                Constant::Float(f) if ty == Type::F32 => {
+                    bytes.extend_from_slice(&(f as f32).to_le_bytes())
+                }
+                Constant::Float(f) => bytes.extend_from_slice(&f.to_le_bytes()),
+            }
+            if self.peek_kind() != &TokenKind::Comma {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+        }
+        self.expect_eol()?;
+        Ok(Data {
+            name,
+            ty,
+            bytes,
+            span: Span {
+                start: start.start,
+                end: end.end,
+                line: start.line,
+                column: start.column,
+            },
+        })
     }
 
     /// Whether the next tokens are `inline fn`.
@@ -380,6 +477,7 @@ impl<'a> Parser<'a> {
             && self.peek_kind() != &TokenKind::ExtFn
             && self.peek_kind() != &TokenKind::Eof
             && !self.at_inline_fn()
+            && !self.at_data()
         {
             blocks.push(self.parse_block()?);
             self.skip_newlines();
@@ -658,6 +756,8 @@ impl<'a> Parser<'a> {
                 | "tanh"
                 | "sin"
                 | "cos"
+                | "stack"
+                | "addr"
         )
     }
 
@@ -1309,6 +1409,48 @@ impl<'a> Parser<'a> {
                 if name == "atomic" {
                     return self.parse_atomic(dst, dst_span, instructions);
                 }
+                if name == "stack" {
+                    let size = match self.peek_kind().clone() {
+                        TokenKind::IntLit(n) => {
+                            self.advance();
+                            n
+                        }
+                        other => {
+                            return Err(Diagnostic::error(
+                                "ERR_EXPECTED_NUMBER",
+                                format!(
+                                    "stack takes its size in bytes as a number: `{dst} = stack 256`, found {other:?}"
+                                ),
+                                self.peek().span,
+                            ))
+                        }
+                    };
+                    if !(1..=MAX_STACK_BYTES as i64).contains(&size) {
+                        return Err(Diagnostic::error(
+                            "ERR_INVALID_STACK_SIZE",
+                            format!(
+                                "stack size {size} is outside 1..={MAX_STACK_BYTES} bytes; use alloc for larger buffers"
+                            ),
+                            dst_span,
+                        )
+                        .with_context(serde_json::json!({ "value": size, "max": MAX_STACK_BYTES })));
+                    }
+                    self.expect_eol()?;
+                    return Ok(Instruction::Stack {
+                        dst,
+                        size: size as u32,
+                        span: dst_span,
+                    });
+                }
+                if name == "addr" {
+                    let (name, _) = self.expect_ident()?;
+                    self.expect_eol()?;
+                    return Ok(Instruction::Addr {
+                        dst,
+                        name,
+                        span: dst_span,
+                    });
+                }
                 if let Some(op) = UnaryOp::from_str_opt(&name) {
                     let src = self.parse_operand(instructions, None)?;
                     self.expect_eol()?;
@@ -1372,7 +1514,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(Diagnostic::error(
                 "ERR_EXPECTED_RVALUE",
-                format!("Expected cst, ld, call, alloc, splat, extlane, select, cast, unary, binary op, or vector op after '=', found {:?}", self.peek_kind()),
+                format!("Expected cst, ld, call, alloc, stack, addr, splat, extlane, select, cast, unary, binary op, or vector op after '=', found {:?}", self.peek_kind()),
                 self.peek().span,
             )),
         }
@@ -1413,6 +1555,8 @@ const OPERATIONS: &[&str] = &[
     "ld",
     "call",
     "alloc",
+    "stack",
+    "addr",
     "splat",
     "extlane",
     "select",

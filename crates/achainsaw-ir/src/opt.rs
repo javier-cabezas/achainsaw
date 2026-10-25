@@ -172,7 +172,9 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     | Instruction::VShift { dst, src, .. }
                     | Instruction::VNarrow { dst, lo: src, .. } => (dst, types.get(src).copied()),
                     Instruction::MaskedLoad { dst, ty, .. } => (dst, Some(*ty)),
-                    Instruction::Alloc { dst, .. } => (dst, Some(Type::Ptr)),
+                    Instruction::Alloc { dst, .. }
+                    | Instruction::Stack { dst, .. }
+                    | Instruction::Addr { dst, .. } => (dst, Some(Type::Ptr)),
                     Instruction::Binary {
                         op, dst, lhs, rhs, ..
                     } => {
@@ -1135,6 +1137,9 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 Instruction::Cast { dst, .. } => used.contains(dst),
                 Instruction::VectorReduce { dst, .. } => used.contains(dst),
                 Instruction::Splat { dst, .. } => used.contains(dst),
+                Instruction::Stack { dst, .. } | Instruction::Addr { dst, .. } => {
+                    used.contains(dst)
+                }
                 Instruction::ExtractLane { dst, .. } => used.contains(dst),
                 Instruction::VBinary { dst, .. }
                 | Instruction::VFma { dst, .. }

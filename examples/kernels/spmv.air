@@ -23,10 +23,9 @@ fn spmv_block(blk:i64, rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
 # take blocks of 64 rows from a shared counter with `atomic add` until none are left.
 fn spmv_queue(rowptr:ptr, cols:ptr, vals:ptr, x:ptr, y:ptr, m:i64)
   b0:
-    next = alloc 8
+    next = stack 8
     st next, 0:i64
     par 64, spmv_worker(next, rowptr, cols, vals, x, y, m)
-    free next
     ret
 
 # Takes the next block of rows until the counter passes m.

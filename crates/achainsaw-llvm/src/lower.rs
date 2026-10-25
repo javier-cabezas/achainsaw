@@ -49,6 +49,9 @@ pub fn trampoline_name(func: &str) -> String {
 pub struct SandboxBounds {
     pub base: u64,
     pub len: u64,
+    /// Bytes at the start of the arena holding the modules' `data`, which writes may not
+    /// touch.
+    pub readonly: u64,
 }
 
 /// Matrix engines `mm` may use.
@@ -132,6 +135,9 @@ pub struct LowerOptions {
     pub int8_dot: Int8Dot,
     /// Loops that pay for their checks on entry (`achainsaw_ir::checks`).
     pub loop_checks: achainsaw_ir::checks::LoopChecks,
+    /// Sandboxed JIT code: the address of each `data` in the arena's read-only part.
+    /// Otherwise each `data` is a private constant global.
+    pub data_addrs: HashMap<String, u64>,
 }
 
 /// LLVM intrinsic of a scalar rounding op.
@@ -233,6 +239,24 @@ pub fn lower_module<'ctx>(
     opts: &LowerOptions,
 ) -> Result<LModule<'ctx>> {
     let module = ctx.create_module("achainsaw");
+    let mut data = HashMap::new();
+    if opts.sandbox.is_none() || opts.aot {
+        for d in &air.data {
+            let bytes: Vec<_> = d
+                .bytes
+                .iter()
+                .map(|&x| ctx.i8_type().const_int(x as u64, false))
+                .collect();
+            let init = ctx.i8_type().const_array(&bytes);
+            let g = module.add_global(init.get_type(), None, &format!("data.{}", d.name));
+            g.set_initializer(&init);
+            g.set_constant(true);
+            g.set_linkage(Linkage::Private);
+            g.set_unnamed_addr(true);
+            g.set_alignment(achainsaw_ir::ast::DATA_ALIGN as u32);
+            data.insert(d.name.clone(), g);
+        }
+    }
     let lw = ModuleLowerer {
         ctx,
         module: &module,
@@ -241,6 +265,7 @@ pub fn lower_module<'ctx>(
         // `par` workers count fuel in their own counters.
         dynamic_fuel: air.uses_par(),
         vnni_bias: Default::default(),
+        data,
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
@@ -297,6 +322,8 @@ struct ModuleLowerer<'a, 'ctx> {
     /// operand in one block (a weight vector for several tokens) share it, as they would an
     /// unfrozen XOR, since LLVM does not merge separate `freeze`s.
     vnni_bias: std::cell::RefCell<HashMap<(usize, usize), BasicValueEnum<'ctx>>>,
+    /// The constant global of each `data` (none in sandboxed code: `LowerOptions::data_addrs`).
+    data: HashMap<String, inkwell::values::GlobalValue<'ctx>>,
 }
 
 /// One AIR register: its LLVM value and AIR type.
@@ -318,6 +345,10 @@ struct FnState<'ctx> {
     covered: bool,
     /// The `i1` lanes and lane type of each `vcmp` result, for the `vsel`s that take it.
     masks: HashMap<String, (BasicValueEnum<'ctx>, Type)>,
+    /// The function's `stack` buffers: their base (i64; an arena allocation in sandboxed
+    /// code, freed on return, otherwise an `alloca`), and each one's offset, in order.
+    stack: Option<IntValue<'ctx>>,
+    stack_offsets: std::vec::IntoIter<u32>,
 }
 
 /// Fuel counter of a function: kept in a stack slot that LLVM promotes to a register between
@@ -939,22 +970,32 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     // Runtime checks
     // ---------------------------------------------------------------------------------
 
+    /// The arena's `(base, len)` an access is checked against: past the read-only `data`
+    /// for a write.
+    fn arena(sb: SandboxBounds, writes: bool) -> (i64, i64) {
+        let skip = if writes { sb.readonly } else { 0 };
+        ((sb.base + skip) as i64, (sb.len - skip) as i64)
+    }
+
     /// Branches to the fault block unless `[addr, addr + size)` is inside the sandbox arena
-    /// or `size` is 0, leaving the builder in the passing block.
+    /// (past its read-only `data` for a write) or `size` is 0, leaving the builder in the
+    /// passing block.
     fn bounds_check(
         &self,
         st: &FnState<'ctx>,
         addr: IntValue<'ctx>,
         size: IntValue<'ctx>,
+        writes: bool,
     ) -> Result<()> {
         let (Some(sb), Some((fault, addr_phi, size_phi)), false) =
             (self.opts.sandbox, st.fault, st.covered)
         else {
             return Ok(());
         };
+        let (base, len) = Self::arena(sb, writes);
         let b = &self.builder;
-        let off = b.build_int_sub(addr, self.c64(sb.base as i64), "")?;
-        let room = b.build_int_sub(self.c64(sb.len as i64), size, "")?;
+        let off = b.build_int_sub(addr, self.c64(base), "")?;
+        let room = b.build_int_sub(self.c64(len), size, "")?;
         let fits = b.build_int_compare(IntPredicate::ULE, off, room, "")?;
         let empty = b.build_int_compare(IntPredicate::EQ, size, self.c64(0), "")?;
         let ok = b.build_or(fits, empty, "")?;
@@ -969,8 +1010,14 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
 
     /// Sandbox checks of an atomic access of `size` bytes at `addr`: in bounds, and aligned
     /// to `size` (a misaligned one reports its size with `MISALIGNED_FAULT` set).
-    fn atomic_checks(&self, st: &FnState<'ctx>, addr: IntValue<'ctx>, size: u64) -> Result<()> {
-        self.bounds_check(st, addr, self.c64(size as i64))?;
+    fn atomic_checks(
+        &self,
+        st: &FnState<'ctx>,
+        addr: IntValue<'ctx>,
+        size: u64,
+        writes: bool,
+    ) -> Result<()> {
+        self.bounds_check(st, addr, self.c64(size as i64), writes)?;
         let (Some(_), Some((fault, addr_phi, size_phi)), true) =
             (self.opts.sandbox, st.fault, size > 1)
         else {
@@ -1019,11 +1066,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let b = &self.builder;
         let mut ok = self.i1().const_int(1, false);
         if let (Some(sb), false) = (self.opts.sandbox, self.opts.aot) {
-            let base = self.c64(sb.base as i64);
-            let len = self.c64(sb.len as i64);
-            for (lo, span) in &d.ranges {
-                let lo = self.int(st, lo);
-                let span = self.int(st, span);
+            for r in &d.ranges {
+                let (base, len) = Self::arena(sb, r.writes);
+                let base = self.c64(base);
+                let len = self.c64(len);
+                let lo = self.int(st, &r.lo);
+                let span = self.int(st, &r.span);
                 let off = b.build_int_sub(lo, base, "")?;
                 let room = b.build_int_sub(len, span, "")?;
                 let small = b.build_int_compare(IntPredicate::ULE, span, len, "")?;
@@ -1213,6 +1261,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             fuel: None,
             covered: false,
             masks: HashMap::new(),
+            stack: None,
+            stack_offsets: Vec::new().into_iter(),
         };
         for (i, (name, ty)) in func.params.iter().enumerate() {
             st.values
@@ -1242,9 +1292,36 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             self.reload_fuel(&st)?;
         }
         let first = st.blocks[&func.blocks[0].label].0;
+        // `stack` buffers: one `alloca`, or in the sandbox (whose checks admit only the arena)
+        // one arena allocation, freed on return.
+        let (offsets, stack_bytes) = func.stack_layout();
+        st.stack_offsets = offsets.into_iter();
         if self.opts.sandbox.is_some() && !self.opts.aot {
-            self.check_hook(&st, RT_STACK_CHECK, &[], first)?;
+            if stack_bytes > 0 {
+                let alloc = self.ctx.append_basic_block(f, "stack");
+                self.check_hook(&st, RT_STACK_CHECK, &[], alloc)?;
+                b.position_at_end(alloc);
+                self.spill_fuel(&st)?;
+                let base = self
+                    .call1(self.malloc_fn(), &[self.c64(stack_bytes as i64).into()])?
+                    .into_int_value();
+                self.reload_fuel(&st)?;
+                let none = b.build_int_compare(IntPredicate::EQ, base, self.c64(0), "")?;
+                b.build_conditional_branch(none, st.trap.expect("trap block"), first)?;
+                st.stack = Some(base);
+            } else {
+                self.check_hook(&st, RT_STACK_CHECK, &[], first)?;
+            }
         } else {
+            if stack_bytes > 0 {
+                let ty = self.ctx.i8_type().array_type(stack_bytes);
+                let slot = b.build_alloca(ty, "stack")?;
+                slot.as_instruction()
+                    .expect("an alloca")
+                    .set_alignment(16)
+                    .map_err(|e| anyhow!("{e}"))?;
+                st.stack = Some(b.build_ptr_to_int(slot, self.i64(), "stack")?);
+            }
             b.build_unconditional_branch(first)?;
         }
 
@@ -1443,6 +1520,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             }
             Terminator::Ret { vals, .. } => {
                 self.spill_fuel(st)?;
+                if let (Some(base), Some(_), false) = (st.stack, self.opts.sandbox, self.opts.aot) {
+                    self.call(self.free_fn(), &[base.into()])?;
+                }
                 match vals.as_slice() {
                     [] => {
                         b.build_return(None)?;
@@ -1496,7 +1576,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *ty)?;
                 let bytes = self.access_bytes(*ty)?;
-                self.bounds_check(st, addr, bytes)?;
+                self.bounds_check(st, addr, bytes, false)?;
                 let v = self.load_ptr(self.air_type(*ty), p)?;
                 st.values.insert(dst.clone(), (v, *ty));
             }
@@ -1506,7 +1586,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (v, vty) = self.val(st, val);
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), vty)?;
                 let bytes = self.access_bytes(vty)?;
-                self.bounds_check(st, addr, bytes)?;
+                self.bounds_check(st, addr, bytes, true)?;
                 self.store_ptr(v, p)?;
             }
             Instruction::AtomicRmw {
@@ -1519,7 +1599,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (v, ty) = self.val(st, val);
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
-                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64, true)?;
                 let op = match op {
                     AtomicOp::Add => AtomicRMWBinOp::Add,
                     AtomicOp::Sub => AtomicRMWBinOp::Sub,
@@ -1551,7 +1631,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (e, ty) = self.val(st, expected);
                 let n = self.val(st, new).0;
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
-                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64, true)?;
                 let pair = b.build_cmpxchg(
                     p,
                     e,
@@ -1570,7 +1650,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 ..
             } => {
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *ty)?;
-                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64, false)?;
                 let v = b.build_load(self.air_type(*ty), p, "")?;
                 let inst = v.as_instruction_value().unwrap();
                 inst.set_alignment(ty.byte_size() as u32)
@@ -1584,7 +1664,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (v, ty) = self.val(st, val);
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), ty)?;
-                self.atomic_checks(st, addr, ty.byte_size() as u64)?;
+                self.atomic_checks(st, addr, ty.byte_size() as u64, true)?;
                 let inst = b.build_store(p, v)?;
                 inst.set_alignment(ty.byte_size() as u32)
                     .map_err(|e| anyhow!("{e}"))?;
@@ -1723,6 +1803,20 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             Instruction::Free { ptr, .. } => {
                 let p = self.val(st, ptr).0;
                 self.call(self.free_fn(), &[p])?;
+            }
+            Instruction::Stack { dst, .. } => {
+                let offset = st.stack_offsets.next().expect("a stack offset");
+                let base = st.stack.expect("a function with stack has its buffers");
+                let p = b.build_int_add(base, self.c64(offset as i64), "")?;
+                st.values.insert(dst.clone(), (p.into(), Type::Ptr));
+            }
+            Instruction::Addr { dst, name, .. } => {
+                let p = match (self.data.get(name), self.opts.data_addrs.get(name)) {
+                    (Some(g), _) => b.build_ptr_to_int(g.as_pointer_value(), self.i64(), "")?,
+                    (None, Some(&a)) => self.c64(a as i64),
+                    (None, None) => return Err(anyhow!("[ERR_UNDEFINED_DATA] No data '{name}'")),
+                };
+                st.values.insert(dst.clone(), (p.into(), Type::Ptr));
             }
             Instruction::Unary { op, dst, src, .. } => {
                 let (s, sty) = self.val(st, src);
@@ -1928,7 +2022,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *lane)?;
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(*ty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
-                self.bounds_check(st, addr, bytes)?;
+                self.bounds_check(st, addr, bytes, false)?;
                 let vt = self.lane_vec(*ty, *lane);
                 let mask = self.lane_mask(n, *ty, *lane)?;
                 let f = self.intrinsic("llvm.masked.load", &[vt, p.get_type().into()]);
@@ -1953,7 +2047,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (v, vty) = self.val(st, val);
                 let n = self.clamp_count(self.int(st, count), self.lanes_value(vty, *lane)?)?;
                 let bytes = b.build_int_mul(n, self.c64(lane.byte_size() as i64), "")?;
-                self.bounds_check(st, addr, bytes)?;
+                self.bounds_check(st, addr, bytes, true)?;
                 let lanes = self.as_lanes(v, vty, *lane)?;
                 let mask = self.lane_mask(n, vty, *lane)?;
                 let f = self.intrinsic(

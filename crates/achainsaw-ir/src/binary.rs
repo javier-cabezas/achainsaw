@@ -50,7 +50,15 @@ pub fn to_air_text(module: &Module) -> String {
         }
         out.push('\n');
     }
-    if !module.extern_functions.is_empty() && !module.functions.is_empty() {
+    if !module.extern_functions.is_empty()
+        && !(module.data.is_empty() && module.functions.is_empty())
+    {
+        out.push('\n');
+    }
+    for d in &module.data {
+        push_data(&mut out, d);
+    }
+    if !module.data.is_empty() && !module.functions.is_empty() {
         out.push('\n');
     }
     for (f_idx, func) in module.functions.iter().enumerate() {
@@ -253,6 +261,12 @@ pub fn to_air_text(module: &Module) -> String {
                     Instruction::Free { ptr, .. } => {
                         out.push_str("free ");
                         out.push_str(ptr);
+                    }
+                    Instruction::Stack { dst, size, .. } => {
+                        out.push_str(&format!("{dst} = stack {size}"));
+                    }
+                    Instruction::Addr { dst, name, .. } => {
+                        out.push_str(&format!("{dst} = addr {name}"));
                     }
                     Instruction::Select {
                         dst,
@@ -489,6 +503,77 @@ pub fn to_air_text(module: &Module) -> String {
 }
 
 /// `p`, `p[i]` or `p[i:unit]`.
+/// Values per line of a printed `data` declaration.
+const DATA_PER_LINE: usize = 16;
+
+/// `data name:ty = v, v, ...`, `DATA_PER_LINE` values per line.
+fn push_data(out: &mut String, d: &Data) {
+    out.push_str(&format!("data {}:{} =", d.name, d.ty));
+    let size = d.ty.byte_size().max(1);
+    let values: Vec<String> = d.bytes.chunks(size).map(|c| data_value(d.ty, c)).collect();
+    for (i, line) in values.chunks(DATA_PER_LINE).enumerate() {
+        if i > 0 {
+            out.push_str(",\n   ");
+        }
+        out.push(' ');
+        out.push_str(&line.join(", "));
+    }
+    out.push('\n');
+}
+
+/// One little-endian `data` value as AIR text: integers signed, floats in their type's
+/// shortest digits, which read back to the same value (NaN payloads aside).
+fn data_value(ty: Type, bytes: &[u8]) -> String {
+    let mut wide = [0u8; 8];
+    wide[..bytes.len()].copy_from_slice(bytes);
+    let bits = u64::from_le_bytes(wide);
+    match ty {
+        Type::F32 => {
+            let f = f32::from_bits(bits as u32);
+            float_literal(f.is_nan(), f.is_infinite(), f < 0.0, f.abs() as f64, || {
+                (f.to_string(), format!("{f:e}"))
+            })
+        }
+        Type::F64 => {
+            let f = f64::from_bits(bits);
+            float_literal(f.is_nan(), f.is_infinite(), f < 0.0, f.abs(), || {
+                (f.to_string(), format!("{f:e}"))
+            })
+        }
+        _ => {
+            let shift = 64 - 8 * bytes.len() as u32;
+            (((bits << shift) as i64) >> shift).to_string()
+        }
+    }
+}
+
+/// Plain notation (`plain`, with a `.0` added to whole numbers) for moderate magnitudes,
+/// exponent notation (`exp`) for tiny and huge ones, whose plain digits run long.
+fn float_literal(
+    nan: bool,
+    inf: bool,
+    negative: bool,
+    magnitude: f64,
+    digits: impl Fn() -> (String, String),
+) -> String {
+    if nan {
+        return "nan".into();
+    }
+    if inf {
+        return if negative { "-inf" } else { "inf" }.into();
+    }
+    let (plain, exp) = digits();
+    if magnitude == 0.0 || (1e-4..1e16).contains(&magnitude) {
+        if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        }
+    } else {
+        exp
+    }
+}
+
 fn mem_ref(ptr: &str, index: &Option<Index>) -> String {
     match index {
         None => ptr.to_string(),
@@ -553,6 +638,9 @@ impl BinaryEncoder {
                 self.intern(p_name);
             }
         }
+        for d in &module.data {
+            self.intern(&d.name);
+        }
         for func in &module.functions {
             self.intern(&func.name);
             for (p_name, _) in &func.params {
@@ -567,7 +655,10 @@ impl BinaryEncoder {
                     for dst in inst.dsts() {
                         self.intern(dst);
                     }
-                    if let Instruction::Call { func, .. } | Instruction::Par { func, .. } = inst {
+                    if let Instruction::Call { func, .. }
+                    | Instruction::Par { func, .. }
+                    | Instruction::Addr { name: func, .. } = inst
+                    {
                         self.intern(func);
                     }
                     for reg in inst.operands() {
@@ -657,7 +748,19 @@ impl BinaryEncoder {
             }
         }
 
-        // 4. Functions
+        // 4. Data: name, element type, byte count, bytes.
+        self.buf
+            .extend_from_slice(&(module.data.len() as u32).to_le_bytes());
+        for d in &module.data {
+            self.buf
+                .extend_from_slice(&self.string_map[&d.name].to_le_bytes());
+            self.buf.push(encode_type(d.ty));
+            self.buf
+                .extend_from_slice(&(d.bytes.len() as u32).to_le_bytes());
+            self.buf.extend_from_slice(&d.bytes);
+        }
+
+        // 5. Functions
         self.buf
             .extend_from_slice(&(module.functions.len() as u32).to_le_bytes());
         for func in &module.functions {
@@ -1019,6 +1122,15 @@ impl BinaryEncoder {
                 self.buf.push(0x36);
                 self.push_regs(&[ptr, val]);
             }
+            Instruction::Stack { dst, size, .. } => {
+                self.buf.push(0x37);
+                self.push_regs(&[dst]);
+                self.buf.extend_from_slice(&size.to_le_bytes());
+            }
+            Instruction::Addr { dst, name, .. } => {
+                self.buf.push(0x38);
+                self.push_regs(&[dst, name]);
+            }
             Instruction::InsertLane {
                 dst,
                 vec,
@@ -1264,7 +1376,24 @@ impl<'a> BinaryDecoder<'a> {
             });
         }
 
-        // 5. Functions
+        // 5. Data
+        let data_count = self.read_u32()?;
+        let mut data = Vec::with_capacity(self.safe_capacity(data_count));
+        for _ in 0..data_count {
+            let name = self.read_string()?;
+            let ty = decode_type(self.read_u8()?)
+                .ok_or_else(|| self.err("Invalid data type code in AIRB"))?;
+            let len = self.read_u32()? as usize;
+            let bytes = self.read_bytes(len)?.to_vec();
+            data.push(Data {
+                name,
+                ty,
+                bytes,
+                span: Span::default(),
+            });
+        }
+
+        // 6. Functions
         let func_count = self.read_u32()?;
         let mut functions = Vec::with_capacity(self.safe_capacity(func_count));
 
@@ -1334,6 +1463,7 @@ impl<'a> BinaryDecoder<'a> {
 
         Ok(Module {
             extern_functions,
+            data,
             functions,
         })
     }
@@ -1721,6 +1851,16 @@ impl<'a> BinaryDecoder<'a> {
                 ptr: self.read_string()?,
                 index: None,
                 val: self.read_string()?,
+                span,
+            }),
+            0x37 => Ok(Instruction::Stack {
+                dst: self.read_string()?,
+                size: self.read_u32()?,
+                span,
+            }),
+            0x38 => Ok(Instruction::Addr {
+                dst: self.read_string()?,
+                name: self.read_string()?,
                 span,
             }),
             0x32 => {

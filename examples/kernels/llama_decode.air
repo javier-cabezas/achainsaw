@@ -410,7 +410,7 @@ fn merge_quant(hp:ptr, splits:i64, hd:i64, hq:i64, xq:ptr, dx:ptr)
 fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
   b0:
     w = vl f32
-    tmp = alloc 256:i64
+    tmp = stack 256
     call qmat_chunk(c, mat, xq, dx, tmp, k)
     h_off = mul c, 256:i64
     hc = add h, h_off
@@ -427,16 +427,15 @@ fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
     j2 = add j, w
     jmp add_loop(j2)
   done:
-    free tmp
     ret
 
 # MLP rows 64c..64c+63: gate and up chunks, SwiGLU, then Q8 quantization for the down
 # projection (two 32-blocks per task).
 fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
   b0:
-    g = alloc 256:i64
-    u = alloc 256:i64
-    a = alloc 256:i64
+    g = stack 256
+    u = stack 256
+    a = stack 256
     cg = mul c, 2:i64
     cu = add cg, 1:i64
     call qmat_chunk(cg, mat, xq, dx, g, k)
@@ -447,15 +446,12 @@ fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
     d_off = mul c, 32:i64
     adx_c = add adx, d_off
     call quantize_q8(a, aq_c, adx_c, 64:i64)
-    free a
-    free u
-    free g
     ret
 
 # LM head rows 64c..64c+63, keeping only the best logit (first on ties) and its token.
 fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
   b0:
-    tmp = alloc 256:i64
+    tmp = stack 256
     call qmat_chunk(c, mat, xq, dx, tmp, k)
     first = ld tmp:f32
     jmp scan(1:i64, first, 0:i64)
@@ -474,7 +470,6 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
     base = mul c, 64:i64
     tok = add base, bj
     st best_idx[c], tok
-    free tmp
     ret
 
 # Prefill: n prompt tokens (i64 [n] at `tokens`) at positions pos .. pos + n - 1, with the
@@ -873,7 +868,7 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
     tmp_sz = mul n, 256:i64
     g = alloc tmp_sz
     u = alloc tmp_sz
-    a = alloc 256:i64
+    a = stack 256
     cg = mul c, 2:i64
     cu = add cg, 1:i64
     call qmat_batch(cg, mat, xq, dx, g, k, n, xs)
@@ -900,7 +895,6 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
     s2 = add s, 1:i64
     jmp toks(s2)
   done:
-    free a
     free u
     free g
     ret

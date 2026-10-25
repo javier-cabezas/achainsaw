@@ -17,13 +17,12 @@ fn q4_gemm(wq:ptr, scales:ptr, x:ptr, y:ptr, m:i64, k:i64, n:i64)
     par n, quant_token(x, xq, dx, k)
     # The matrix as qmat_batch takes it, one part: weights, scales, format (1: Q4_0), chunks.
     chunks = udiv m, 64:i64
-    mat = alloc 32:i64
+    mat = stack 32
     st mat, wq
     st mat[1], scales
     st mat[2], 1:i64
     st mat[3], chunks
     par chunks, q4_gemm_chunk(mat, xq, dx, y, m, k, n)
-    free mat
     free dx
     free xq
     ret
