@@ -7,6 +7,10 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     open-pull-requests-limit: 10
+    # Cranelift releases change its instruction lowering and ISLE rules, which the
+    # backend's performance and exact results depend on: it is updated by hand.
+    ignore:
+      - dependency-name: "cranelift-*"
 
   - package-ecosystem: "github-actions"
     directory: "/"

@@ -642,6 +642,14 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                     out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
                 }
             }
+            // `achainsaw_ir::math` defines them; `tests/math.rs` checks its accuracy.
+            VUnaryOp::Log | VUnaryOp::Tanh | VUnaryOp::Sin | VUnaryOp::Cos => {
+                let f = achainsaw_ir::math::MathFn::of_vunary(op).unwrap();
+                for i in 0..n {
+                    let r = achainsaw_ir::math::eval(f, get_f32(a, i));
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
             VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi => {
                 let narrow = op.source_lane(l);
                 let base = if op.is_low_half() { 0 } else { n };
@@ -657,6 +665,21 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 let base = if op.is_low_half() { 0 } else { n };
                 for i in 0..n {
                     let r = get_f32(a, base + i) as f64;
+                    out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            // Signed integers, exactly: i16 to f32, i32 to f64.
+            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi if l == Type::I16 => {
+                let base = if op.is_low_half() { 0 } else { n };
+                for i in 0..n {
+                    let r = get_int(a, l, base + i) as f32;
+                    out[i * 4..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            VUnaryOp::FWidenLo | VUnaryOp::FWidenHi if l == Type::I32 => {
+                let base = if op.is_low_half() { 0 } else { n };
+                for i in 0..n {
+                    let r = get_int(a, l, base + i) as f64;
                     out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
                 }
             }

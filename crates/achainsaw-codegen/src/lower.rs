@@ -1,5 +1,5 @@
 use achainsaw_ir::ast::{
-    vexp, AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Terminator, UnaryOp,
+    AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Terminator, UnaryOp,
     VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp, MISALIGNED_FAULT,
 };
 use achainsaw_ir::types::Type;
@@ -536,7 +536,7 @@ fn flat_args(values: &Values, names: &[String]) -> Vec<ClifValue> {
         .collect()
 }
 
-/// `VUnary` on the 128-bit parts of a vector. Conversions and `vexp` work part by part;
+/// `VUnary` on the 128-bit parts of a vector. Conversions work part by part;
 /// widening reads the low or high half of the parts, each source part giving two results.
 fn vunary_parts(
     builder: &mut FunctionBuilder,
@@ -545,7 +545,10 @@ fn vunary_parts(
     src: &[ClifValue],
 ) -> Parts {
     match op {
-        VUnaryOp::Itof | VUnaryOp::Uitof | VUnaryOp::Ftoi | VUnaryOp::Ftoui | VUnaryOp::Exp => src
+        VUnaryOp::Exp | VUnaryOp::Log | VUnaryOp::Tanh | VUnaryOp::Sin | VUnaryOp::Cos => {
+            unreachable!("{op:?} is expanded by achainsaw_ir::math before code generation")
+        }
+        VUnaryOp::Itof | VUnaryOp::Uitof | VUnaryOp::Ftoi | VUnaryOp::Ftoui => src
             .iter()
             .map(|&p| {
                 let x = as_lanes(builder, p, op.source_lane(lane));
@@ -570,8 +573,7 @@ fn vunary_parts(
                         r
                     }
                     VUnaryOp::Ftoi => builder.ins().fcvt_to_sint_sat(to, x),
-                    VUnaryOp::Ftoui => builder.ins().fcvt_to_uint_sat(to, x),
-                    _ => vexp_f32x4(builder, x),
+                    _ => builder.ins().fcvt_to_uint_sat(to, x),
                 };
                 to_part(builder, r)
             })
@@ -783,50 +785,6 @@ fn vzip_parts(
     all.chunks(2)
         .map(|pair| shuffle_lanes(builder, pair[0], pair[1], lane, |j| 2 * j + odd))
         .collect()
-}
-
-/// `vexp` on four f32 lanes: e^clamp(x, -87, 88) by the fixed sequence AIR defines (also in
-/// the LLVM backend, so results are bit-identical): n = round(x log2 e) by adding and
-/// subtracting 1.5 * 2^23, r = x - n ln2 with ln2 in two parts, the Cephes expf polynomial
-/// p(r) by FMAs, and 2^n built from the bits of the rounded sum.
-fn vexp_f32x4(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
-    let fsplat = |b: &mut FunctionBuilder, v: f32| {
-        let c = b.ins().f32const(v);
-        b.ins().splat(types::F32X4, c)
-    };
-    let lo = fsplat(builder, vexp::CLAMP_LO);
-    let hi = fsplat(builder, vexp::CLAMP_HI);
-    let below = builder.ins().fcmp(FloatCC::LessThan, x, lo);
-    let below = to_part(builder, below);
-    let x = builder.ins().bitselect(below, lo, x);
-    let above = builder.ins().fcmp(FloatCC::GreaterThan, x, hi);
-    let above = to_part(builder, above);
-    let x = builder.ins().bitselect(above, hi, x);
-    let log2e = fsplat(builder, vexp::LOG2E);
-    let magic = fsplat(builder, vexp::MAGIC);
-    let t = builder.ins().fmul(x, log2e);
-    let tm = builder.ins().fadd(t, magic);
-    let n = builder.ins().fsub(tm, magic);
-    let ln2_hi = fsplat(builder, vexp::NEG_LN2_HI);
-    let ln2_lo = fsplat(builder, vexp::LN2_LO);
-    let r = builder.ins().fma(n, ln2_hi, x);
-    let r = builder.ins().fma(n, ln2_lo, r);
-    let mut q = fsplat(builder, vexp::POLY[0]);
-    for &c in &vexp::POLY[1..] {
-        let c = fsplat(builder, c);
-        q = builder.ins().fma(q, r, c);
-    }
-    let r2 = builder.ins().fmul(r, r);
-    let one = fsplat(builder, 1.0);
-    let rp = builder.ins().fadd(r, one);
-    let p = builder.ins().fma(q, r2, rp);
-    let bits = builder.ins().bitcast(types::I32X4, bitcast_flags(), tm);
-    let bias = builder.ins().iconst(types::I32, vexp::EXP_BIAS as i64);
-    let bias = builder.ins().splat(types::I32X4, bias);
-    let e = builder.ins().iadd(bits, bias);
-    let e = builder.ins().ishl_imm_u(e, 23);
-    let scale = builder.ins().bitcast(types::F32X4, bitcast_flags(), e);
-    builder.ins().fmul(p, scale)
 }
 
 /// Combines two lane values for a horizontal reduction.
@@ -2563,6 +2521,15 @@ pub fn lower_function<M: ClifModule>(
                         UnaryOp::Popcnt => builder.ins().popcnt(src_val),
                         UnaryOp::Clz => builder.ins().clz(src_val),
                         UnaryOp::Ctz => builder.ins().ctz(src_val),
+                        UnaryOp::Exp
+                        | UnaryOp::Log
+                        | UnaryOp::Tanh
+                        | UnaryOp::Sin
+                        | UnaryOp::Cos => {
+                            unreachable!(
+                                "{op:?} is expanded by achainsaw_ir::math before code generation"
+                            )
+                        }
                     };
                     values.insert(dst.clone(), (vec![res], src_ty));
                 }

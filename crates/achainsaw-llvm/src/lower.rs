@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use achainsaw_ir::ast::{
-    vexp, AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Module, Terminator,
+    AtomicOp, BinaryOp, CastOp, Constant, Function, Index, Instruction, Module, Terminator,
     UnaryOp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, VectorReduceOp,
 };
 use achainsaw_ir::types::Type;
@@ -316,6 +316,8 @@ struct FnState<'ctx> {
     fuel: Option<Fuel<'ctx>>,
     /// The instruction being lowered is an access a loop dispatch checked as a range.
     covered: bool,
+    /// The `i1` lanes and lane type of each `vcmp` result, for the `vsel`s that take it.
+    masks: HashMap<String, (BasicValueEnum<'ctx>, Type)>,
 }
 
 /// Fuel counter of a function: kept in a stack slot that LLVM promotes to a register between
@@ -1210,6 +1212,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             fault,
             fuel: None,
             covered: false,
+            masks: HashMap::new(),
         };
         for (i, (name, ty)) in func.params.iter().enumerate() {
             st.values
@@ -1743,6 +1746,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                         };
                         self.intr(name, &[t], &[s, self.i1().const_zero().into()])?
                     }
+                    (op, _) if op.is_math() => {
+                        unreachable!(
+                            "{op:?} is expanded by achainsaw_ir::math before code generation"
+                        )
+                    }
                     (rounding, _) => self.intr(round_intrinsic(*rounding), &[t], &[s])?,
                 };
                 st.values.insert(dst.clone(), (r, sty));
@@ -1820,8 +1828,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (l, vty) = self.val(st, lhs);
                 let r = self.val(st, rhs).0;
-                let res = self.vcmp(*op, *lane, vty, l, r)?;
+                let (res, bits) = self.vcmp(*op, *lane, vty, l, r)?;
                 st.values.insert(dst.clone(), (res, vty));
+                st.masks.insert(dst.clone(), (bits, *lane));
             }
             Instruction::VSelect {
                 dst,
@@ -1832,6 +1841,17 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             } => {
                 let (m, vty) = self.val(st, mask);
                 let (t, e) = (self.val(st, then_val).0, self.val(st, else_val).0);
+                // A compare's lanes are all ones or all zeros, so selecting lanes by its
+                // `i1`s gives the same bits as the bitwise select. LLVM keeps the lane type
+                // then; the bitwise form, followed by float ops on the result, crashes LLVM
+                // 22's VectorCombine on SVE (a scalable bitcast to another lane size).
+                if let Some(&(bits, lane)) = st.masks.get(mask) {
+                    let x = self.as_lanes(t, vty, lane)?;
+                    let y = self.as_lanes(e, vty, lane)?;
+                    let r = self.vselect(bits, x, y)?;
+                    st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
+                    return Ok(());
+                }
                 let mt = vec2!(m, t, |x, y| b.build_and(x, y, "")?);
                 let nm = vec1!(m, |x| b.build_not(x, "")?);
                 let me = vec2!(nm, e, |x, y| b.build_and(x, y, "")?);
@@ -2456,6 +2476,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         self.to_canon(res, vty)
     }
 
+    /// The compare as all-ones lanes in canonical form, and as its `i1` lanes.
     fn vcmp(
         &self,
         op: VCmpOp,
@@ -2463,7 +2484,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         vty: Type,
         l: BasicValueEnum<'ctx>,
         r: BasicValueEnum<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>> {
+    ) -> Result<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>)> {
         let b = &self.builder;
         let x = self.as_lanes(l, vty, lane)?;
         let y = self.as_lanes(r, vty, lane)?;
@@ -2509,7 +2530,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 .into(),
             other => unreachable!("{other:?}"),
         };
-        self.to_canon(m, vty)
+        Ok((self.to_canon(m, vty)?, bits))
     }
 
     /// `vftoi` f32 -> i32, saturating with NaN to 0 (`llvm.fptosi.sat`). AArch64 has that
@@ -2573,7 +2594,9 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let rt = self.lane_vec(vty, lane);
                 self.intr("llvm.fptoui.sat", &[rt, x.get_type()], &[x])?
             }
-            VUnaryOp::Exp => self.vexp(x)?,
+            VUnaryOp::Exp | VUnaryOp::Log | VUnaryOp::Tanh | VUnaryOp::Sin | VUnaryOp::Cos => {
+                unreachable!("{op:?} is expanded by achainsaw_ir::math before code generation")
+            }
             VUnaryOp::Abs if lane.is_float() => self.intr("llvm.fabs", &[x.get_type()], &[x])?,
             // `false`: the minimum integer gives itself rather than poison.
             VUnaryOp::Abs => self.intr(
@@ -2979,57 +3002,6 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             BasicValueEnum::ScalableVectorValue(m) => b.build_select(m, then_v, else_v, "")?,
             other => unreachable!("vector mask expected, found {other:?}"),
         })
-    }
-
-    /// `vexp` on f32 lanes: the same operation sequence and constants as the Cranelift
-    /// backend (`achainsaw_ir::ast::vexp`), so results are bit-identical.
-    fn vexp(&self, x: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>> {
-        let b = &self.builder;
-        let shape = Self::shape_of(x);
-        let f = |v: f32| self.splat_const(self.ctx.f32_type().const_float(v as f64).into(), shape);
-        let fma = |a: BasicValueEnum<'ctx>, m: BasicValueEnum<'ctx>, c: BasicValueEnum<'ctx>| {
-            self.intr("llvm.fma", &[a.get_type()], &[a, m, c])
-        };
-        let (lo, hi) = (f(vexp::CLAMP_LO)?, f(vexp::CLAMP_HI)?);
-        let below = vec2!(x, lo, |a, c| b.build_float_compare(
-            FloatPredicate::OLT,
-            a,
-            c,
-            ""
-        )?);
-        let x = self.vselect(below, lo, x)?;
-        let above = vec2!(x, hi, |a, c| b.build_float_compare(
-            FloatPredicate::OGT,
-            a,
-            c,
-            ""
-        )?);
-        let x = self.vselect(above, hi, x)?;
-        let (log2e, magic) = (f(vexp::LOG2E)?, f(vexp::MAGIC)?);
-        let t = anyf2!(x, log2e, |a, c| b.build_float_mul(a, c, "")?);
-        let tm = anyf2!(t, magic, |a, c| b.build_float_add(a, c, "")?);
-        let n = anyf2!(tm, magic, |a, c| b.build_float_sub(a, c, "")?);
-        let r = fma(n, f(vexp::NEG_LN2_HI)?, x)?;
-        let r = fma(n, f(vexp::LN2_LO)?, r)?;
-        let mut q = f(vexp::POLY[0])?;
-        for &c in &vexp::POLY[1..] {
-            q = fma(q, r, f(c)?)?;
-        }
-        let r2 = anyf2!(r, r, |a, c| b.build_float_mul(a, c, "")?);
-        let one = f(1.0)?;
-        let rp = anyf2!(r, one, |a, c| b.build_float_add(a, c, "")?);
-        let p = fma(q, r2, rp)?;
-        let int_ty = self.shaped(self.i32().into(), shape);
-        let bits = self.bitcast(tm, int_ty)?;
-        let bias = self.splat_const(
-            self.i32().const_int(vexp::EXP_BIAS as u64, true).into(),
-            shape,
-        )?;
-        let e = anyi2!(bits, bias, |a, c| b.build_int_add(a, c, "")?);
-        let sh = self.splat_const(self.i32().const_int(23, false).into(), shape)?;
-        let e = anyi2!(e, sh, |a, c| b.build_left_shift(a, c, "")?);
-        let scale = self.bitcast(e, x.get_type())?;
-        Ok(anyf2!(p, scale, |a, c| b.build_float_mul(a, c, "")?))
     }
 
     /// `min(max(count, 0), lanes)`.

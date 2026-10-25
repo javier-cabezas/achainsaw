@@ -335,7 +335,8 @@ impl<'a> Lexer<'a> {
                 | "vziplo" | "vziphi" | "vunziplo" | "vunziphi" | "vdup" | "vdot" | "vdotu"
                 | "vfloor" | "vceil" | "vround" | "vroundeven" | "vroundz" | "vcopysign"
                 | "vumin" | "vumax" | "vult" | "vugt" | "vule" | "vuge" | "vuwidenlo"
-                | "vuwidenhi" | "vuitof" | "vftoui" | "inslane" => TokenKind::VOp(ident),
+                | "vuwidenhi" | "vuitof" | "vftoui" | "inslane" | "vlog" | "vtanh" | "vsin"
+                | "vcos" => TokenKind::VOp(ident),
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
                 | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "min" | "max" | "umin" | "umax"
                 | "udiv" | "urem" | "ushr" | "ult" | "ugt" | "ule" | "uge" => TokenKind::Op(ident),

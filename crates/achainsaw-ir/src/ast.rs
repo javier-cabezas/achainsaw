@@ -311,10 +311,15 @@ pub enum UnaryOp {
     Popcnt,
     Clz,
     Ctz,
+    Exp,
+    Log,
+    Tanh,
+    Sin,
+    Cos,
 }
 
 impl UnaryOp {
-    pub const ALL: [UnaryOp; 11] = [
+    pub const ALL: [UnaryOp; 16] = [
         UnaryOp::Sqrt,
         UnaryOp::Neg,
         UnaryOp::Abs,
@@ -326,6 +331,11 @@ impl UnaryOp {
         UnaryOp::Popcnt,
         UnaryOp::Clz,
         UnaryOp::Ctz,
+        UnaryOp::Exp,
+        UnaryOp::Log,
+        UnaryOp::Tanh,
+        UnaryOp::Sin,
+        UnaryOp::Cos,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -345,6 +355,11 @@ impl UnaryOp {
             UnaryOp::Popcnt => "popcnt",
             UnaryOp::Clz => "clz",
             UnaryOp::Ctz => "ctz",
+            UnaryOp::Exp => "exp",
+            UnaryOp::Log => "log",
+            UnaryOp::Tanh => "tanh",
+            UnaryOp::Sin => "sin",
+            UnaryOp::Cos => "cos",
         }
     }
 
@@ -359,6 +374,11 @@ impl UnaryOp {
     /// Bit counts of an integer.
     pub fn is_bit_count(&self) -> bool {
         matches!(self, UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz)
+    }
+
+    /// The f32 math functions of `crate::math`.
+    pub fn is_math(&self) -> bool {
+        crate::math::MathFn::of_unary(*self).is_some()
     }
 }
 
@@ -416,10 +436,13 @@ impl CastOp {
 /// i32, saturating, NaN to 0; `:i64` from f64), `vuitof` / `vftoui` the same with unsigned
 /// integers (negative floats and NaN to 0), `w = vwidenlo v:i16` / `vwidenhi` (sign-extends
 /// the low / high half of the narrower lanes; `vuwidenlo` / `vuwidenhi` zero-extend),
-/// `e = vexp v:f32` (e^x with a fixed algorithm, so bit-identical everywhere).
+/// `e = vexp v:f32` (e^x; also `vlog`, `vtanh`, `vsin`, `vcos`, f32 only: see `crate::math`,
+/// which writes them as fixed sequences of vector ops, so bit-identical everywhere).
 /// The exception is `w = vfwidenlo v:f16` / `vfwidenhi` (also `:bf16`, and `:f32` to f64):
 /// the result is the wider float, so the suffix names the float lanes whose low / high half
-/// is widened (exactly; a NaN stays a NaN, its payload unspecified).
+/// is widened (exactly; a NaN stays a NaN, its payload unspecified). Integer lanes widen to
+/// floats too, signed and exactly: `:i16` to f32, `:i32` to f64 (`vwidenlo` then `vitof`,
+/// which `crate::math` writes them as).
 /// `vabs` and `vneg` wrap on integers (`vabs` of the minimum is the minimum) and clear or flip
 /// the sign bit of floats; `vsqrt` is IEEE's correctly rounded square root and `vrsqrt` is
 /// `1 / vsqrt(x)` (two roundings, not a hardware estimate, so results are identical
@@ -447,11 +470,15 @@ pub enum VUnaryOp {
     UWidenHi,
     Uitof,
     Ftoui,
+    Log,
+    Tanh,
+    Sin,
+    Cos,
 }
 
 impl VUnaryOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VUnaryOp; 21] = [
+    pub const ALL: [VUnaryOp; 25] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
@@ -473,6 +500,10 @@ impl VUnaryOp {
         VUnaryOp::UWidenHi,
         VUnaryOp::Uitof,
         VUnaryOp::Ftoui,
+        VUnaryOp::Log,
+        VUnaryOp::Tanh,
+        VUnaryOp::Sin,
+        VUnaryOp::Cos,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -502,6 +533,10 @@ impl VUnaryOp {
             VUnaryOp::UWidenHi => "vuwidenhi",
             VUnaryOp::Uitof => "vuitof",
             VUnaryOp::Ftoui => "vftoui",
+            VUnaryOp::Log => "vlog",
+            VUnaryOp::Tanh => "vtanh",
+            VUnaryOp::Sin => "vsin",
+            VUnaryOp::Cos => "vcos",
         }
     }
 
@@ -528,10 +563,10 @@ impl VUnaryOp {
     }
 
     /// Lane type of the result for the op's suffix `lane` (the suffix itself, except for
-    /// `vfwiden*`, whose suffix names the source: f64 from f32, else f32).
+    /// `vfwiden*`, whose suffix names the source: f64 from f32 or i32, else f32).
     pub fn result_lane(&self, lane: Type) -> Type {
         match (self, lane) {
-            (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, Type::F32) => Type::F64,
+            (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, Type::F32 | Type::I32) => Type::F64,
             (VUnaryOp::FWidenLo | VUnaryOp::FWidenHi, _) => Type::F32,
             _ => lane,
         }
@@ -557,7 +592,9 @@ impl VUnaryOp {
                 VUnaryOp::WidenLo | VUnaryOp::WidenHi | VUnaryOp::UWidenLo | VUnaryOp::UWidenHi,
                 _,
             ) => Type::I32,
-            (VUnaryOp::Exp, _) => Type::F32,
+            (VUnaryOp::Exp | VUnaryOp::Log | VUnaryOp::Tanh | VUnaryOp::Sin | VUnaryOp::Cos, _) => {
+                Type::F32
+            }
             (
                 VUnaryOp::Abs
                 | VUnaryOp::Neg

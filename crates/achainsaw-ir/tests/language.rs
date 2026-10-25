@@ -1,5 +1,5 @@
 //! Indexed memory operands, functions with several results, `inline fn`, and the scalar
-//! rounding / bit-count / rotation / copysign / fma / unsigned-conversion ops: syntax,
+//! rounding / bit-count / rotation / copysign / fma / unsigned-conversion / math ops: syntax,
 //! validation, inlining, and text and AIRB round trips; atomic accesses.
 
 use achainsaw_ir::inline::inline_module;
@@ -328,4 +328,74 @@ fn k(p:ptr, i:i64, v:i32, w:i8)->i64
         "ERR_MISSING_DESTINATION"
     );
     assert_eq!(err_code(&one("    a = atomic ld p\n")), "ERR_EXPECTED_TYPE");
+}
+
+#[test]
+fn math_functions_round_trip_and_type_rules() {
+    let src = r#"
+fn k(x:f32, p:ptr)->f32
+  b0:
+    a = exp x
+    b = log a
+    c = tanh b
+    d = sin c
+    e = cos d
+    v = ld p:vx
+    va = vexp v:f32
+    vb = vlog va:f32
+    vc = vtanh vb:f32
+    vd = vsin vc:f32
+    ve = vcos vd:f32
+    st p, ve
+    exp = add e, 1.0:f32
+    log = mul exp, exp
+    ret log
+"#;
+    let text = round_trips(src);
+    for line in [
+        "a = exp x",
+        "e = cos d",
+        "vb = vlog va:f32",
+        "ve = vcos vd:f32",
+        "log = mul exp, exp",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let one = |body: &str| {
+        format!("fn k(p:ptr, x:f64, y:i32, f:f32)\n  b0:\n    v = ld p:v128\n{body}    ret\n")
+    };
+    // f32 only, in both forms; the vector forms take vectors.
+    for (bad, code) in [
+        ("    r = exp x\n", "ERR_TYPE_MISMATCH"),
+        ("    r = sin y\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vlog v:f64\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vsin v:i32\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vtanh f:f32\n", "ERR_TYPE_MISMATCH"),
+    ] {
+        assert_eq!(err_code(&one(bad)), code, "{bad}");
+    }
+    assert_eq!(err_code(&one("    exp f\n")), "ERR_MISSING_DESTINATION");
+}
+
+/// `prepare_for_codegen` writes every math instruction as plain AIR that validates.
+#[test]
+fn math_functions_expand_to_valid_air() {
+    let src = r#"
+fn k(x:f32, p:ptr)->f32
+  b0:
+    a = exp x
+    b = log a
+    c = tanh b
+    d = sin c
+    e = cos d
+    v = ld p:vx
+    w = vcos v:f32
+    st p, w
+    ret e
+"#;
+    let module = parse_and_validate(src).unwrap();
+    let prepared = achainsaw_ir::prepare_for_codegen(&module);
+    let text = to_air_text(&prepared);
+    assert!(!achainsaw_ir::math::has_math(&prepared), "{text}");
+    parse_and_validate(&text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
 }

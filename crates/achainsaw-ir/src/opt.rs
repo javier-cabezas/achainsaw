@@ -39,14 +39,7 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
     };
     total_stats.loops_split = crate::loops::split_masked_loops(module);
 
-    let mut sigs: Signatures = HashMap::new();
-    for ext in &module.extern_functions {
-        sigs.insert(ext.name.clone(), ext.ret_type.into_iter().collect());
-    }
-    for func in &module.functions {
-        sigs.insert(func.name.clone(), func.rets.clone());
-    }
-
+    let sigs = signatures(module);
     for func in &mut module.functions {
         let stats = optimize_function_with(func, &sigs);
         total_stats.constants_folded += stats.constants_folded;
@@ -58,6 +51,18 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
     }
 
     total_stats
+}
+
+/// The result types of every function and external function, by name.
+pub(crate) fn signatures(module: &Module) -> Signatures {
+    let mut sigs: Signatures = HashMap::new();
+    for ext in &module.extern_functions {
+        sigs.insert(ext.name.clone(), ext.ret_type.into_iter().collect());
+    }
+    for func in &module.functions {
+        sigs.insert(func.name.clone(), func.rets.clone());
+    }
+    sigs
 }
 
 /// Optimizes a single IR function to a fixpoint.
@@ -775,6 +780,10 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
                     UnaryOp::RoundEven => f.round_ties_even(),
                     UnaryOp::RoundZ => f.trunc(),
                     UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz => return None,
+                    // The runtime's exact sequence (`math::eval`), so folding changes nothing.
+                    UnaryOp::Exp | UnaryOp::Log | UnaryOp::Tanh | UnaryOp::Sin | UnaryOp::Cos => {
+                        crate::math::eval(crate::math::MathFn::of_unary(op)?, f)
+                    }
                 };
                 Some((Constant::Float(res as f64), Type::F32))
             } else {
@@ -794,6 +803,9 @@ fn fold_unary_op(op: UnaryOp, c: &Constant, ty: Type) -> Option<(Constant, Type)
                     UnaryOp::RoundEven => f.round_ties_even(),
                     UnaryOp::RoundZ => f.trunc(),
                     UnaryOp::Popcnt | UnaryOp::Clz | UnaryOp::Ctz => return None,
+                    UnaryOp::Exp | UnaryOp::Log | UnaryOp::Tanh | UnaryOp::Sin | UnaryOp::Cos => {
+                        return None
+                    }
                 };
                 Some((Constant::Float(res), Type::F64))
             }

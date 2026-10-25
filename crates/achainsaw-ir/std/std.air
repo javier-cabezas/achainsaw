@@ -1636,3 +1636,35 @@ fn attn_merge(hp:ptr, splits:i64, rowb:i64, hd:i64, oh:ptr)
     jmp scale_cols(f2)
   done:
     ret
+
+# Adds x to the f32 at p, which other `par` calls may update at the same time, and returns
+# the value it replaced. p must be 4-byte aligned. A `cas` loop on the bits: it retries
+# while another call changes the value between its read and its swap.
+inline fn atomic_add_f32(p:ptr, x:f32)->f32
+  b0:
+    jmp retry
+  retry:
+    bits = atomic ld p:i32
+    old = bitcast bits:f32
+    sum = add old, x
+    new = bitcast sum:i32
+    seen = atomic cas p, bits, new
+    swapped = eq seen, bits
+    br swapped, done, retry
+  done:
+    ret old
+
+# atomic_add_f32 for the f64 at p (8-byte aligned).
+inline fn atomic_add_f64(p:ptr, x:f64)->f64
+  b0:
+    jmp retry
+  retry:
+    bits = atomic ld p:i64
+    old = bitcast bits:f64
+    sum = add old, x
+    new = bitcast sum:i64
+    seen = atomic cas p, bits, new
+    swapped = eq seen, bits
+    br swapped, done, retry
+  done:
+    ret old

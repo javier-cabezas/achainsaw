@@ -28,6 +28,7 @@ fn sum(x:ptr, n:i64)->f32
 - **Terminators:** each block ends with one: `jmp b(args)`, `br cond, then(args), else(args)`, `ret v`, `ret a, b` or `ret`.
 - **Constants:** `x = cst 5:i32`, or inline in an operand, `add x, 1:i32`; an integer literal of a float type is that float (`cst 0:f32`).
 - **Arithmetic:** `add sub mul div rem and or xor shl shr min max`, and unsigned `udiv urem ushr umin umax`; operands share a type. Compares (`eq ne lt gt le ge`, unsigned `ult ugt ule uge`) give an `i32` 0 or 1, for `br` and `select`.
+- **Math functions:** `y = exp x`, `log`, `tanh`, `sin`, `cos` on f32, and the same on vector lanes (`r = vsin v:f32`): see [Math functions](#math-functions).
 - **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`. Memory that `par` calls share takes [atomic accesses](#atomics).
 - **Casts:** `itof ftoi uitof ftoui sext zext trunc fext ftrunc bitcast`, written `dst = op src:type`.
 - **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
@@ -58,14 +59,14 @@ Vectors are untyped bit containers; every vector op names the lane type it works
 | Select | `r = vsel m, a, b` takes bits of `a` where `m` is 1, else `b` | n/a |
 | Reduce | `s = vsum v:f32` (`vmaxr`, `vminr`) | Any |
 | Convert | `f = vitof v:f32` (i32 lanes to f32, or i64 to f64 with `:f64`), `i = vftoi v:i32` (f32 to i32, or f64 to i64 with `:i64`; saturating, NaN to 0); `vuitof` and `vftoui` read and write unsigned integers (`vftoui` takes negative values and NaN to 0). Like scalar casts, the suffix is the result lane type. Cranelift converts f64 to i64 one lane at a time, since x86 has no packed instruction for it | `vitof`, `vuitof`: f32, f64; `vftoi`, `vftoui`: i32, i64 |
-| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes, `vuwidenlo` / `vuwidenhi` zero-extend them; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half. Floats: `w = vfwidenlo v:f32` / `vfwidenhi` give f64 lanes (the suffix names the source, as for f16), `n = vnarrow a, b:f32` rounds f64 lanes to f32 (nearest-even, as `ftrunc`) | widen: i16, i32, i64; narrow: i8, i16, f32 |
+| Widen / narrow | `w = vwidenlo v:i16` / `vwidenhi` sign-extend the low / high half of the half-width lanes, `vuwidenlo` / `vuwidenhi` zero-extend them; `n = vnarrow a, b:i8` saturates both operands' lanes, `a`'s into the low half and `b`'s into the high half. Floats: `w = vfwidenlo v:f32` / `vfwidenhi` give f64 lanes (the suffix names the source, as for f16), `n = vnarrow a, b:f32` rounds f64 lanes to f32 (nearest-even, as `ftrunc`). Integers to floats: `w = vfwidenlo v:i16` / `vfwidenhi` convert the low / high half of the i16 lanes to f32, and `:i32` to f64, signed and exactly; they are `vwidenlo` then `vitof` (no CPU converts them in one instruction), and i8 lanes take a `vwidenlo` first | widen: i16, i32, i64; narrow: i8, i16, f32; `vfwidenlo`/`vfwidenhi` from integers: i16, i32 |
 | Half-precision floats | `w = vfwidenlo v:f16` / `vfwidenhi` convert the low / high half of the 16-bit float lanes to f32 (the suffix names the source; also `:bf16`); `n = vnarrow a, b:f16` converts f32 lanes to f16 or bf16, rounding to nearest-even like `ftrunc`. Exact and identical on both backends except NaN payloads; LLVM uses F16C or AArch64's `fcvtl`/`fcvtn` where available. `vl`, `ldm` and `stm` count f16/bf16 lanes too | f16, bf16 |
 | Shift | `r = vshl v, s:i32` (`vshr` arithmetic, `vushr` logical) by a scalar amount, or by a vector of `v`'s type that gives each lane its own amount; amounts are taken modulo the lane width. On LLVM, per-lane amounts are one variable shift on NEON and SVE, on AVX-512 for every lane size, and on AVX2 for 32- and 64-bit lanes (other lanes take a short sequence); Cranelift has no variable vector shift and shifts each lane separately | i8 to i64 |
 | Absolute value / negate | `r = vabs v:i32`, `vneg`: integers wrap (`vabs` of the minimum is the minimum); floats clear or flip the sign bit, NaNs included | i8 to f64 |
 | Square root | `r = vsqrt v:f32` (correctly rounded), `vrsqrt` computes `1 / vsqrt(v)` with two roundings, never a hardware estimate, so results are identical on every CPU | f32, f64 |
 | Rounding | `r = vfloor v:f32`, `vceil`, `vround` (halfway cases away from zero, as C's `round`), `vroundeven` (to even), `vroundz` (toward zero) | f32, f64 |
 | Copy sign | `r = vcopysign a, b:f32`: `a`'s magnitude with `b`'s sign bit | f32, f64 |
-| Exponential | `e = vexp v:f32`: e^x within 2 ulp on [-87, 88], inputs clamped to that range, NaN propagated; a fixed algorithm, so results are bit-identical on every backend | f32 |
+| Math functions | `e = vexp v:f32`, `vlog`, `vtanh`, `vsin`, `vcos`: the [math functions](#math-functions) on each lane | f32 |
 | Extract | `e = extlane v, 7:f32` | Index checked against the width (`vx`: its guaranteed 128 bits) |
 | Insert | `r = inslane v, x, 7:f32`: `v` with lane 7 replaced by the scalar `x` (of the lane type) | i8 to f64; index checked as for `extlane` |
 | Broadcast a lane | `r = vdup v, 3:f32` puts lane 3 of `v` in every lane | Any, including f16/bf16; index checked as for `extlane` |
@@ -119,9 +120,22 @@ fn gemv_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, y:ptr, k:i64)
     ret
 ```
 
-It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
+It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 activations), `qmat_chunk` (64 output rows of a Q8_0, Q4_0, Q6_K, Q4_K or Q5_K matrix, which may be stored in parts of different formats), `rope_half`, `exp_shift` (softmax numerators) and `silu_mul` (SwiGLU), and `atomic_add_f32` / `atomic_add_f64` for floats that `par` calls share ([Atomics](#atomics)). `achainsaw std` lists them with their documentation and `achainsaw std <name>` prints one's source; MCP clients have the `air_std` tool.
 
 **Matrix multiply:** `mm pc, pa, pb, m, n, k:bf16` computes `C[m x n] += A[m x k] * B[k x n]` on row-major, contiguous matrices. `A`/`B` hold `bf16`, `f16`, or `f32` elements with an `f32` `C`, or `i8` elements with an `i32` `C` (exact, wrapping). Float accumulation order is implementation-defined, so results agree across backends within rounding error rather than bit for bit. Under a fuel budget, `mm` costs one unit per 1024 multiply-adds, charged before it starts. Each backend's kernels, AMX and SME among them, are in [Backends](backends.md#matrix-multiply-mm).
+
+## Math functions
+
+`y = exp x`, `log`, `tanh`, `sin` and `cos` take an f32, and `vexp`, `vlog`, `vtanh`, `vsin` and `vcos` the f32 lanes of a vector (`r = vsin v:f32`). Each is a fixed sequence of AIR operations: Cephes' f32 polynomials evaluated by FMAs, with the exponent and quadrant handled by bit operations, and no libm call. The sequence is written once, in `achainsaw_ir::math`, and replaces the instruction before code generation, so the scalar and vector forms give the same bits on both backends and every target, and the optimizer folds a function of a constant to that same value.
+
+| Function | Largest error | Special values and range |
+|---|---|---|
+| `exp` | 1.26 ulp on [-87, 88] | The input is clamped to [-87, 88] first, so `exp` of a smaller input is e^-87 (1.6e-38, not 0) and of a larger one e^88 (1.7e38, not inf). NaN gives NaN |
+| `log` | 0.83 ulp | log(±0) = -inf, log(+inf) = +inf; negative inputs and NaN give NaN. The bound holds for subnormal inputs too |
+| `tanh` | 1.36 ulp | Keeps the sign of zero; ±inf gives ±1, NaN gives NaN |
+| `sin`, `cos` | 2.07 ulp (`sin`) and 1.81 ulp (`cos`) for \|x\| ≤ 2^20; up to 53 ulp toward 2^22 | NaN for \|x\| > 2^22 (4194304), where the quadrant can no longer be rounded exactly, and for ±inf and NaN; sin(-0) = -0 |
+
+The errors are the measured worst cases over every f32 input, against f64; `crates/achainsaw-ir/tests/math.rs` checks them on a sample. They are f32 only: `fext` and `ftrunc` convert f64 values.
 
 ## Memory operands, several results and inline functions
 
@@ -153,7 +167,7 @@ It holds the building blocks the example kernels share: `quantize_q8` (Q8_0 acti
 
 Every atomic access is sequentially consistent: all threads see them in one order, and a value stored with `st` before an `atomic st` is visible to a thread whose `atomic ld` reads that store. `par` returns only after every call has finished, so the caller reads results with plain `ld`. There is no separate fence. The address must be aligned to the integer's size; in the sandbox (MCP `air_run`), a misaligned atomic is an `ERR_MEMORY_VIOLATION`, and outside it the hardware may fault. Atomics take indexed operands like `ld` and `st` (`atomic add hist[b], 1:i64` adds to `hist + 8b`), and `atomic` remains a valid register name elsewhere.
 
-Floats have no atomic arithmetic; update their bits with a `cas` loop, which retries when another call changed the value in between:
+Floats have no atomic arithmetic. The standard library's `atomic_add_f32` and `atomic_add_f64` (`use atomic_add_f32`, then `old = call atomic_add_f32(total, x)`; inline functions, so no call is made) update the bits with a `cas` loop, which retries when another call changed the value in between; written out, for other operations:
 
 ```air
 # total += x for an f32 total that other par calls update too
