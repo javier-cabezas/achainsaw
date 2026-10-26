@@ -68,6 +68,8 @@ fn k(pa:ptr, po:ptr)->f64
     uh = vunziphi ul, zh:f16
     dp = vdup uh, 15:i16
     st po, dp
+    tb = vtbl dp, a:i8
+    st po, tb
     dt = vdot c, a, b:i8
     st po, dt
     du = vdotu c, a, b:i8
@@ -291,8 +293,21 @@ fn permutation_and_unary_rules() {
     // The result has the operand's vector type.
     assert!(parse_and_validate("fn k(p:ptr)->f32\n  b0:\n    a = ld p:v512\n    r = vdup a, 15:f32\n    e = extlane r, 0:f32\n    ret e\n").is_ok());
     // The new mnemonics are still ordinary register names.
-    let src = "fn k(vdup:i32, vziplo:i32)->i32\n  b0:\n    vrev = add vdup, vziplo\n    vabs = mul vrev, vdup\n    ret vabs\n";
+    let src = "fn k(vdup:i32, vziplo:i32)->i32\n  b0:\n    vrev = add vdup, vziplo\n    vabs = mul vrev, vdup\n    vtbl = sub vabs, vrev\n    ret vtbl\n";
     assert!(parse_and_validate(src).is_ok());
+    // vtbl looks up bytes: i8 lanes only.
+    assert!(parse_and_validate(&one("    r = vtbl a, b:i8\n")).is_ok());
+    for bad in [
+        "r = vtbl a, b:i16",
+        "r = vtbl a, b:f32",
+        "r = vtbl a, b:bf16",
+    ] {
+        assert_eq!(
+            err_code(&one(&format!("    {bad}\n"))),
+            "ERR_INVALID_LANE_TYPE",
+            "{bad}"
+        );
+    }
 }
 
 #[test]

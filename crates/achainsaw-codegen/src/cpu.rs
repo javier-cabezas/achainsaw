@@ -607,7 +607,7 @@ impl CpuFeatures {
         };
         achainsaw_llvm::ByteShuffle {
             x86_bits,
-            arm_tbl: self.arch == Arch::Aarch64,
+            arm_tbl: self.arch == Arch::Aarch64 && self.has(F::Neon),
         }
     }
 
@@ -952,9 +952,13 @@ pub fn llvm_aot_target(
                     let _ = builder.enable(cpu);
                     let mut set = enabled_cranelift_features(&builder, arch)?.with_prerequisites();
                     // Cranelift's presets do not track F16C, which x86-64-v3 and every AVX2
-                    // CPU have (it decides LLVM's f16 vector conversions).
+                    // CPU have (it decides LLVM's f16 vector conversions), nor AVX512BW,
+                    // which every CPU with AVX512VL and AVX512DQ has (512-bit `vtbl`).
                     if set.has(F::Avx2) {
                         set.enable(F::F16c);
+                    }
+                    if set.has(F::Avx512vl) && set.has(F::Avx512dq) {
+                        set.enable(F::Avx512bw);
                     }
                     set
                 }
@@ -1484,5 +1488,34 @@ mod tests {
             report["backends"]["cranelift"]["vector_bits"],
             CRANELIFT_VECTOR_BITS
         );
+    }
+
+    /// x86 presets with AVX-512 have AVX512BW, which Cranelift's presets do not track: `vtbl`
+    /// takes 512-bit `pshufb` there, and the arm targets take NEON `tbl` unless it is off.
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn llvm_byte_shuffle_follows_the_target() {
+        let target = |triple: &str, cpu: &str, features: &str| crate::aot::AotTarget {
+            triple: Some(triple.into()),
+            cpu: Some(cpu.into()),
+            features: (!features.is_empty()).then(|| features.into()),
+        };
+        let x86 = "x86_64-unknown-linux-gnu";
+        for (cpu, bits) in [
+            ("x86-64", 0),
+            ("x86-64-v2", 128),
+            ("x86-64-v3", 256),
+            ("x86-64-v4", 512),
+            ("skylake-avx512", 512),
+            ("znver4", 512),
+        ] {
+            let (_, set) = llvm_aot_target(&target(x86, cpu, "")).unwrap();
+            assert_eq!(set.llvm_byte_shuffle().x86_bits, bits, "{cpu}");
+        }
+        let arm = "aarch64-unknown-linux-gnu";
+        let (_, set) = llvm_aot_target(&target(arm, "generic", "")).unwrap();
+        assert!(set.llvm_byte_shuffle().arm_tbl);
+        let (_, set) = llvm_aot_target(&target(arm, "generic", "-neon")).unwrap();
+        assert!(!set.llvm_byte_shuffle().arm_tbl);
     }
 }
