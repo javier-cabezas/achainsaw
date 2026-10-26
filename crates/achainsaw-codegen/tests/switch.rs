@@ -407,6 +407,14 @@ fn switch_round_trips_and_folds() {
         unsafe { e.call_typed("f", &[]) }.unwrap(),
         Some(RtValue::I64(2))
     );
+    // A switch without cases is a jump to its default.
+    let src = "fn g(x:i64)->i64\n  b0:\n    switch x, a(x)\n  a(v:i64):\n    ret v\n";
+    let mut m = parse_and_validate(src).unwrap();
+    achainsaw_ir::opt::optimize_module(&mut m);
+    assert!(m.functions[0]
+        .blocks
+        .iter()
+        .all(|b| !matches!(b.terminator, Terminator::Switch { .. })));
 }
 
 /// x86-64 and AArch64 objects (SVE too) on Cranelift and, with the `llvm` feature, LLVM.

@@ -957,7 +957,7 @@ fn substitute_terminator_operands(term: &mut Terminator, substitutions: &HashMap
 /// Folds conditional branches with known constant conditions:
 /// `br cst_1, then, else -> jmp then`
 /// `br cst_0, then, else -> jmp else`
-/// and a `switch` on a constant to a `jmp` to its case (or default).
+/// and a `switch` on a constant, or with no cases, to a `jmp` to its case (or default).
 fn run_branch_folding_pass(func: &mut Function) -> usize {
     let mut folded = 0;
 
@@ -1013,7 +1013,14 @@ fn run_branch_folding_pass(func: &mut Function) -> usize {
             span,
         } = &block.terminator
         {
-            if let (Some(Constant::Int(v)), Some(&b)) = (constants.get(val), bits.get(val)) {
+            if cases.is_empty() {
+                block.terminator = Terminator::Jmp {
+                    target: default.clone(),
+                    args: default_args.clone(),
+                    span: *span,
+                };
+                folded += 1;
+            } else if let (Some(Constant::Int(v)), Some(&b)) = (constants.get(val), bits.get(val)) {
                 let v = crate::validator::wrap_to_bits(*v, b);
                 let (target, args) = cases
                     .iter()
