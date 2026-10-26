@@ -244,6 +244,7 @@ fn llvm_aot_options(
         matrix: features.llvm_matrix_units(),
         native_f16: features.llvm_native_f16(),
         int8_dot: features.llvm_int8_dot(),
+        byte_shuffle: features.llvm_byte_shuffle(),
         fast_math: options.fast_math,
         ..Default::default()
     };

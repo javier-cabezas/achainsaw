@@ -448,6 +448,7 @@ fn int_bin(op: VBinOp, lane: Type, a: i64, b: i64) -> i64 {
         VBinOp::Umin => unsigned(lane, a).min(unsigned(lane, b)) as i64,
         VBinOp::Umax => unsigned(lane, a).max(unsigned(lane, b)) as i64,
         VBinOp::Div | VBinOp::Copysign => unreachable!("float-only, rejected by the validator"),
+        VBinOp::Tbl => unreachable!("not lane-wise; see `reference`"),
     };
     lane.wrap_int(r)
 }
@@ -517,6 +518,12 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             for i in 0..n {
                 let r = f64_bin(op, get_f64(a, i), get_f64(b, i));
                 out[i * 8..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+            }
+        }
+        Kernel::Bin(VBinOp::Tbl, _, _) => {
+            // Byte i: byte idx[i] & 15 of the table's first 16 bytes.
+            for i in 0..n {
+                out[i] = a[(b[i] & 15) as usize];
             }
         }
         Kernel::Bin(op, l, _) => {
