@@ -45,11 +45,11 @@ KCodes: TypeAlias = tuple[U8, U8, F32, F32]
 Rows: TypeAlias = slice | npt.NDArray[np.intp]
 
 
-def quantize(x: npt.ArrayLike) -> tuple[F32, Floats]:
+def quantize(x: npt.ArrayLike, block: int = 32) -> tuple[F32, Floats]:
     """Q8_0 quantization as the kernel's quantize_q8 and llama.cpp's quantize_row_q8_0 do:
-    per 32 values, d = max|x| / 127 and q = round(x / d), halves away from zero, in f32.
+    per `block` values, d = max|x| / 127 and q = round(x / d), halves away from zero, in f32.
     Returns (q as float32, d)."""
-    blocks: F32 = np.asarray(x, dtype=np.float32).reshape(-1, 32)
+    blocks: F32 = np.asarray(x, dtype=np.float32).reshape(-1, block)
     d: Floats = np.abs(blocks).max(axis=1) / np.float32(127.0)
     with np.errstate(divide="ignore"):
         inv: F32 = np.where(d > 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
@@ -466,6 +466,14 @@ def _q6_k_values(blocks: U8) -> tuple[I8, F32]:
     return q.reshape(rows, nsb * 8, 32), scales.reshape(rows, nsb * 16)
 
 
+def q8_round(x: F32) -> F32:
+    """Each row of x rounded to int8 over one scale (quantize with the row as its block) and
+    back: the values of the kernel's int8 KV cache and attention queries."""
+    q, d = quantize(x, x.shape[-1])
+    r: F32 = (q.reshape(-1, x.shape[-1]) * d[:, None]).astype(np.float32)
+    return r.reshape(x.shape)
+
+
 def bf16_round(x: npt.ArrayLike) -> F32:
     """x rounded to bfloat16 (nearest even), as f32: the values the kernel's KV cache holds."""
     b: npt.NDArray[np.uint64] = np.ascontiguousarray(x, dtype=np.float32).view(
@@ -499,9 +507,11 @@ class Model:
 
     def __init__(self, cfg: tuple[int, int, int, int, int, int, int, int], embd: F32,
                  norm_out: F32, lm: Mat, cos: F32, sin: F32, layers: list[Layer], eps: float,
-                 numpy: bool = False, use_torch: bool = False) -> None:
+                 numpy: bool = False, use_torch: bool = False, kv_q8: bool = False) -> None:
         d, nl, nh, nkv, hd, f, vocab, max_ctx = cfg
-        self.cfg: npt.NDArray[np.int64] = np.array(cfg, dtype=np.int64)
+        # The kernel's cfg: the shapes, then the KV cache's format (0 bf16, 1 int8).
+        self.cfg: npt.NDArray[np.int64] = np.array(cfg + (int(kv_q8),), dtype=np.int64)
+        self.kv_q8: bool = kv_q8
         self.d: int = d
         self.nh: int = nh
         self.nkv: int = nkv
@@ -545,7 +555,7 @@ class Model:
     @classmethod
     def random(cls, d: int, layers: int, heads: int, kv_heads: int, head_dim: int, ffn: int,
                vocab: int, max_ctx: int, fmt: str = "q8", numpy: bool = False,
-               use_torch: bool = False) -> Model:
+               use_torch: bool = False, kv_q8: bool = False) -> Model:
         rng: np.random.Generator = np.random.default_rng(0)
         ls: list[Layer] = []
         for _ in range(layers):
@@ -561,11 +571,11 @@ class Model:
         return cls((d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx),
                    rng.standard_normal((vocab, d), dtype=np.float32),
                    rng.uniform(0.8, 1.2, d).astype(np.float32),
-                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy, use_torch)
+                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy, use_torch, kv_q8)
 
     @classmethod
     def from_gguf(cls, path: str | GGUF, max_ctx: int, numpy: bool = False,
-                  use_torch: bool = False) -> Model:
+                  use_torch: bool = False, kv_q8: bool = False) -> Model:
         g: GGUF = path if isinstance(path, GGUF) else GGUF(path)
         m: dict[str, Any] = g.meta
         t: dict[str, Tensor] = g.tensors
@@ -621,7 +631,7 @@ class Model:
             ))
         eps: float = m.get("llama.attention.layer_norm_rms_epsilon", 1e-5)
         model: Model = cls((d, nl, nh, nkv, hd, f, vocab, max_ctx), embd, norm(
-            "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch)
+            "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch, kv_q8)
         model.formats = {n: sorted({l[n].fmt for l in layers}) for n in MATS}
         model.formats["lm"] = [lm.fmt]
         return model
@@ -641,23 +651,40 @@ class Model:
         """Positions per KV head in the kernel's cache: max_ctx rounded up to K's tiles."""
         return -(-self.max_ctx // 32) * 32
 
+    @property
+    def cache_rb(self) -> int:
+        """Bytes per position of a KV head's K or V: hd bf16 values, or hd int8 values and
+        an f32 scale."""
+        return self.hd + 4 if self.kv_q8 else 2 * self.hd
+
     def new_cache(self) -> npt.NDArray[np.uint16]:
-        """The kernel's KV cache (raw u16 bits of bf16 values): per layer, K then V, each
-        nkv x cache_ctx x hd values. V is [nkv x cache_ctx x hd]; K is in tiles of 32
-        positions, [nkv x cache_ctx / 32 x hd x 32]."""
-        return np.zeros(len(self.layers) * 2 * self.nkv * self.cache_ctx * self.hd,
+        """The kernel's KV cache, as u16 words: per layer, K then V, each nkv x cache_ctx
+        positions of cache_rb bytes, in tiles of 32 positions. bf16: V is [nkv x cache_ctx x
+        hd], K [nkv x cache_ctx / 32 x hd x 32]. int8: each tile holds the values, K's plus
+        128 as [hd / 4 x 32 x 4] and V's as [32 x hd], then an f32 scale per position."""
+        return np.zeros(len(self.layers) * 2 * self.nkv * self.cache_ctx * self.cache_rb // 2,
                         dtype=np.uint16)
 
-    def cache_kv(self, cache: npt.NDArray[np.uint16]
-                 ) -> tuple[npt.NDArray[np.uint16], npt.NDArray[np.uint16]]:
-        """K and V of a kernel cache, each [layers x nkv x cache_ctx x hd]."""
-        planes: npt.NDArray[np.uint16] = cache.reshape(len(self.layers), 2, self.nkv,
-                                                       self.cache_ctx, self.hd)
-        k: npt.NDArray[np.uint16] = (
-            planes[:, 0].reshape(len(self.layers), self.nkv, self.cache_ctx // 32, self.hd, 32)
-            .transpose(0, 1, 2, 4, 3).reshape(len(self.layers), self.nkv, self.cache_ctx,
-                                              self.hd))
-        return k, planes[:, 1]
+    def cache_kv(self, cache: npt.NDArray[np.uint16]) -> tuple[F32, F32]:
+        """K and V of a kernel cache as f32 values, each [layers x nkv x cache_ctx x hd]."""
+        nl: int = len(self.layers)
+        hd: int = self.hd
+        tiles: int = self.cache_ctx // 32
+        if not self.kv_q8:
+            bits: npt.NDArray[np.uint32] = cache.astype(np.uint32) << np.uint32(16)
+            planes: F32 = bits.view(np.float32).reshape(nl, 2, self.nkv, self.cache_ctx, hd)
+            k: F32 = planes[:, 0].reshape(nl, self.nkv, tiles, hd, 32).transpose(
+                0, 1, 2, 4, 3).reshape(nl, self.nkv, self.cache_ctx, hd)
+            return k, planes[:, 1]
+        t: U8 = cache.view(np.uint8).reshape(nl, 2, self.nkv, tiles, 32 * (hd + 4))
+        scales: F32 = np.ascontiguousarray(t[..., 32 * hd:]).view(np.float32)  # [.., 32]
+        kq: Ints = (t[:, 0, ..., :32 * hd] ^ np.uint8(0x80)).view(np.int8).reshape(
+            nl, self.nkv, tiles, hd // 4, 32, 4).transpose(0, 1, 2, 4, 3, 5).reshape(
+            nl, self.nkv, tiles, 32, hd)
+        vq: Ints = t[:, 1, ..., :32 * hd].view(np.int8).reshape(nl, self.nkv, tiles, 32, hd)
+        kv: list[F32] = [(q * scales[:, i, ..., None]).astype(np.float32).reshape(
+            nl, self.nkv, self.cache_ctx, hd) for i, q in enumerate((kq, vq))]
+        return kv[0], kv[1]
 
     # NumPy forward pass of the same model (needs numpy=True at construction).
     def norm(self, h: Floats, w: F32) -> Floats:
@@ -673,7 +700,7 @@ class Model:
         return np.concatenate([a * c - b * s, b * c + a * s], axis=-1)
 
     def numpy_cache(self) -> list[tuple[F32, F32]]:
-        # f32 arrays holding bf16 values, as the kernel's cache does.
+        # f32 arrays holding bf16 (or int8 times scale) values, as the kernel's cache does.
         return [(np.zeros((self.max_ctx, self.nkv, self.hd), np.float32),
                  np.zeros((self.max_ctx, self.nkv, self.hd), np.float32)) for _ in self.layers]
 
@@ -686,8 +713,16 @@ class Model:
             kc, vc = cache[l]
             qkv: F32 = layer["qkv"].matvec(self.norm(h, layer["attn_norm"]))
             q: F32 = self.rope(qkv[:nh * hd].reshape(nh, hd), pos)
-            kc[pos] = bf16_round(self.rope(qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), pos))
-            vc[pos] = bf16_round(qkv[(nh + nkv) * hd:].reshape(nkv, hd))
+            k: F32 = self.rope(qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), pos)
+            v: F32 = qkv[(nh + nkv) * hd:].reshape(nkv, hd)
+            if self.kv_q8:
+                # int8 K and V per position, and queries per head (attn_split_q8).
+                q = q8_round(q)
+                kc[pos] = q8_round(k)
+                vc[pos] = q8_round(v)
+            else:
+                kc[pos] = bf16_round(k)
+                vc[pos] = bf16_round(v)
             keys: F32 = np.repeat(kc[:pos + 1], nh // nkv, axis=1)       # [t, nh, hd]
             vals: F32 = np.repeat(vc[:pos + 1], nh // nkv, axis=1)
             scores: F32 = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(hd))

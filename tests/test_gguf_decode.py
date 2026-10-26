@@ -377,7 +377,12 @@ class TestGGUFDecode(unittest.TestCase):
                          "<|begin_of_text|> cat<|eot_id|>")
 
     def test_kernel_matches_numpy(self) -> None:
-        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
+        for kv_q8 in (False, True):
+            with self.subTest(kv_q8=kv_q8):
+                self.check_kernel_matches_numpy(kv_q8)
+
+    def check_kernel_matches_numpy(self, kv_q8: bool) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True, kv_q8=kv_q8)
         with open(os.path.join(ROOT, "examples", "kernels", "llama_decode.air"),
                   encoding="utf-8") as f:
             src: str = f.read()
@@ -392,19 +397,24 @@ class TestGGUFDecode(unittest.TestCase):
                 got: int = k.run("llama_decode", m.table, m.cfg, cache, token, pos, h,
                                  float(m.eps))
                 want: int = m.numpy_step(np_cache, token, pos)
-                # The KV cache holds bf16 values; NumPy's f32 K and V can round to the
-                # neighboring bf16 value where they sit at a rounding boundary.
-                planes: tuple[npt.NDArray[np.uint16], ...] = m.cache_kv(cache)
+                # The KV cache holds bf16 (or int8) values; NumPy's f32 K and V can round
+                # to the neighboring value where they sit at a rounding boundary: one bf16
+                # step, or one step of the position's int8 scale.
+                planes: tuple[F32, F32] = m.cache_kv(cache)
                 for l, (kc, vc) in enumerate(np_cache):
                     for kv, ref in enumerate((kc[pos], vc[pos])):
-                        bits: Ints = planes[kv][l, :, pos, :].astype(np.uint32) << 16
-                        np.testing.assert_allclose(bits.view(np.float32), ref, rtol=2.0 ** -7,
-                                                   err_msg=f"{be} cache l={l} pos {pos}")
+                        got_kv: F32 = planes[kv][l, :, pos, :]
+                        msg: str = f"{be} cache l={l} pos {pos} kv_q8={kv_q8}"
+                        if kv_q8:
+                            step: Floats = np.abs(ref).max(axis=1, keepdims=True) / 127
+                            self.assertTrue(np.all(np.abs(got_kv - ref) <= 1.01 * step), msg)
+                        else:
+                            np.testing.assert_allclose(got_kv, ref, rtol=2.0 ** -7, err_msg=msg)
                 # Such a step can flip an int8 quantization of a later attention output,
                 # which moves the hidden state by up to about 0.5% of its scale.
                 scale: float = float(np.abs(m.last_h).max())
                 np.testing.assert_allclose(h, m.last_h, atol=1e-2 * scale,
-                                           err_msg=f"{be} pos {pos}")
+                                           err_msg=f"{be} pos {pos} kv_q8={kv_q8}")
                 top: F32 = np.sort(m.last_logits)[-2:]
                 if top[1] - top[0] > 1e-3 * np.abs(m.last_logits).max():
                     self.assertEqual(got, want, f"{be} token at pos {pos}")
@@ -415,8 +425,13 @@ class TestGGUFDecode(unittest.TestCase):
     def test_prefill_matches_decode(self) -> None:
         # llama_prefill over a prompt leaves exactly the cache and hidden state, and predicts
         # the token, that llama_decode does one token at a time. 13 tokens run a tile of 8, one
-        # of 4 and a single token through every layer's formats.
-        m: Model = Model.from_gguf(self.gguf, max_ctx=16)
+        # of 4 and a single token through every layer's formats, with each cache format.
+        for kv_q8 in (False, True):
+            with self.subTest(kv_q8=kv_q8):
+                self.check_prefill_matches_decode(kv_q8)
+
+    def check_prefill_matches_decode(self, kv_q8: bool) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=16, kv_q8=kv_q8)
         with open(os.path.join(ROOT, "examples", "kernels", "llama_decode.air"),
                   encoding="utf-8") as f:
             src: str = f.read()
