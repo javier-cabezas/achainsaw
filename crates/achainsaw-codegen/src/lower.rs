@@ -996,6 +996,54 @@ fn vbinary_part(
         (VBinOp::Div, _) => builder.ins().fdiv(a, b),
         (VBinOp::Copysign, _) => copysign(builder, a, b),
         (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
+        // Takes the table from the first part (`vtbl_part`).
+        (VBinOp::Tbl, _) => unreachable!(),
+    };
+    to_part(builder, res)
+}
+
+/// Whether `vtbl` can use Cranelift's `swizzle`: AArch64 `tbl`, x86 `pshufb` (SSSE3).
+fn native_swizzle(isa: &dyn cranelift_codegen::isa::TargetIsa) -> bool {
+    match isa.triple().architecture {
+        target_lexicon::Architecture::Aarch64(_) => true,
+        target_lexicon::Architecture::X86_64 => isa
+            .isa_flags()
+            .iter()
+            .any(|f| f.name == "has_ssse3" && f.as_bool() == Some(true)),
+        _ => false,
+    }
+}
+
+/// `vtbl` on a 128-bit part: byte i is byte `idx[i] & 15` of the table part `t`. With
+/// `swizzle` one instruction after the mask; without it (x86 before SSSE3), each of the 16
+/// table bytes is selected where the index equals its position.
+fn vtbl_part(
+    builder: &mut FunctionBuilder,
+    native: bool,
+    t: ClifValue,
+    idx: ClifValue,
+) -> ClifValue {
+    let t = as_lanes(builder, t, Type::I8);
+    let x = as_lanes(builder, idx, Type::I8);
+    let ty = builder.func.dfg.value_type(x);
+    let k15 = builder.ins().iconst(types::I8, 15);
+    let m15 = builder.ins().splat(ty, k15);
+    let x = builder.ins().band(x, m15);
+    let res = if native {
+        builder.ins().swizzle(t, x)
+    } else {
+        let zero = builder.ins().iconst(types::I8, 0);
+        let mut acc = builder.ins().splat(ty, zero);
+        for j in 0..16u8 {
+            let kj = builder.ins().iconst(types::I8, j as i64);
+            let sj = builder.ins().splat(ty, kj);
+            let hit = builder.ins().icmp(IntCC::Equal, x, sj);
+            let tj = builder.ins().extractlane(t, j);
+            let vj = builder.ins().splat(ty, tj);
+            let pick = builder.ins().band(hit, vj);
+            acc = builder.ins().bor(acc, pick);
+        }
+        acc
     };
     to_part(builder, res)
 }
@@ -2787,15 +2835,23 @@ pub fn lower_function<M: ClifModule>(
                     let (l_parts, vec_ty) = parts(&values, lhs);
                     let (r_parts, _) = parts(&values, rhs);
                     let mut out = Vec::with_capacity(l_parts.len());
-                    for (l, r) in l_parts.into_iter().zip(r_parts) {
-                        out.push(vbinary_part(
-                            &mut builder,
-                            *op,
-                            *lane,
-                            config.fast_math,
-                            l,
-                            r,
-                        ));
+                    if *op == VBinOp::Tbl {
+                        // The table is the first 16 bytes, for every part.
+                        let native = native_swizzle(module.isa());
+                        for r in r_parts {
+                            out.push(vtbl_part(&mut builder, native, l_parts[0], r));
+                        }
+                    } else {
+                        for (l, r) in l_parts.into_iter().zip(r_parts) {
+                            out.push(vbinary_part(
+                                &mut builder,
+                                *op,
+                                *lane,
+                                config.fast_math,
+                                l,
+                                r,
+                            ));
+                        }
                     }
                     values.insert(dst.clone(), (out, vec_ty));
                 }

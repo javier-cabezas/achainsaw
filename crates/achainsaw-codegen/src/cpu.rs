@@ -592,6 +592,25 @@ impl CpuFeatures {
         }
     }
 
+    /// Byte table lookups LLVM `vtbl` may use with these features.
+    #[cfg(feature = "llvm")]
+    pub fn llvm_byte_shuffle(&self) -> achainsaw_llvm::ByteShuffle {
+        let x86 = self.arch == Arch::X86_64;
+        let x86_bits = if x86 && self.has(F::Avx512bw) {
+            512
+        } else if x86 && self.has(F::Avx2) {
+            256
+        } else if x86 && self.has(F::Ssse3) {
+            128
+        } else {
+            0
+        };
+        achainsaw_llvm::ByteShuffle {
+            x86_bits,
+            arm_tbl: self.arch == Arch::Aarch64,
+        }
+    }
+
     /// Whether these features convert f16 <-> f32 vectors in hardware: x86 F16C, or any
     /// AArch64 (FCVTL/FCVTN are baseline).
     #[cfg(feature = "llvm")]

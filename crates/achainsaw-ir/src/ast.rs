@@ -123,7 +123,8 @@ impl BinaryOp {
 }
 
 /// Lane-wise vector binary op: `r = vadd a, b:f32`. `vumin`/`vumax` compare integer lanes
-/// as unsigned.
+/// as unsigned. `vtbl t, idx:i8` looks up a 16-entry table: byte i of the result is byte
+/// `idx[i] & 15` of `t` (its first 16 bytes, whatever the width).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VBinOp {
     Add,
@@ -138,11 +139,12 @@ pub enum VBinOp {
     Copysign,
     Umin,
     Umax,
+    Tbl,
 }
 
 impl VBinOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VBinOp; 12] = [
+    pub const ALL: [VBinOp; 13] = [
         VBinOp::Add,
         VBinOp::Sub,
         VBinOp::Mul,
@@ -155,6 +157,7 @@ impl VBinOp {
         VBinOp::Copysign,
         VBinOp::Umin,
         VBinOp::Umax,
+        VBinOp::Tbl,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -175,6 +178,7 @@ impl VBinOp {
             VBinOp::Copysign => "vcopysign",
             VBinOp::Umin => "vumin",
             VBinOp::Umax => "vumax",
+            VBinOp::Tbl => "vtbl",
         }
     }
 

@@ -79,6 +79,17 @@ pub struct Int8Dot {
     pub arm_i8mm: bool,
 }
 
+/// Byte table lookups (`vtbl`) the target has: x86 `pshufb` (SSSE3, AVX2, AVX512BW) or
+/// AArch64 `tbl` (NEON, and SVE's with scalable `vx`). Without one, `vtbl` looks up each
+/// lane on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteShuffle {
+    /// Widest x86 `pshufb` in bits: 512 with AVX512BW, 256 with AVX2, 128 with SSSE3, else 0.
+    pub x86_bits: u32,
+    /// AArch64: NEON `tbl`.
+    pub arm_tbl: bool,
+}
+
 /// Shape of `vx` for one compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VxShape {
@@ -133,6 +144,8 @@ pub struct LowerOptions {
     pub native_f16: bool,
     /// Int8 dot products for `vdot`; without one, `vdot` widens and adds.
     pub int8_dot: Int8Dot,
+    /// Byte table lookups for `vtbl`.
+    pub byte_shuffle: ByteShuffle,
     /// Loops that pay for their checks on entry (`achainsaw_ir::checks`).
     pub loop_checks: achainsaw_ir::checks::LoopChecks,
     /// Sandboxed JIT code: the address of each `data` in the arena's read-only part.
@@ -2579,8 +2592,92 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
             (VBinOp::Copysign, _) => self.intr("llvm.copysign", &[t], &[x, y])?,
             (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
+            (VBinOp::Tbl, _) => return self.vtbl(vty, x, y),
         };
         self.to_canon(res, vty)
+    }
+
+    /// `vtbl t, idx:i8`: byte i is byte `idx[i] & 15` of `t`'s first 16 bytes. SVE's `tbl`
+    /// indexes the whole vector, so masked indices reach those bytes directly; fixed vectors
+    /// take NEON `tbl` per 128 bits, or x86 `pshufb` (which looks up within each 128-bit
+    /// lane) on the table repeated across its width, else one lookup per lane.
+    fn vtbl(
+        &self,
+        vty: Type,
+        t: BasicValueEnum<'ctx>,
+        x: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let bld = &self.builder;
+        let i8t = self.ctx.i8_type();
+        let m15 = self.splat_const(i8t.const_int(15, false).into(), Self::shape_of(x))?;
+        let x = vec2!(x, m15, |a, c| bld.build_and(a, c, "")?);
+        if self.scalable(vty) {
+            let r = self.intr("llvm.aarch64.sve.tbl", &[x.get_type()], &[t, x])?;
+            return self.to_canon(r, vty);
+        }
+        let (t, x) = (t.into_vector_value(), x.into_vector_value());
+        let bits = self.vec_bits(vty);
+        let bs = self.opts.byte_shuffle;
+        let piece = if bs.arm_tbl {
+            128
+        } else if bs.x86_bits > 0 {
+            bs.x86_bits.min(bits)
+        } else {
+            bits
+        };
+        // The table's 16 bytes, repeated to `n` lanes.
+        let table = |n: u32| -> Result<inkwell::values::VectorValue<'ctx>> {
+            let mask: Vec<_> = (0..n).map(|i| self.c32(i % 16)).collect();
+            Ok(bld.build_shuffle_vector(t, t, VectorType::const_vector(&mask), "")?)
+        };
+        let n = piece / 8;
+        let tp = table(n)?;
+        let part_ty = i8t.vec_type(n);
+        let mut out: BasicValueEnum<'ctx> = x.get_type().const_zero().into();
+        for i in 0..bits / piece {
+            let xp: BasicValueEnum<'ctx> = if piece == bits {
+                x.into()
+            } else {
+                self.intr(
+                    "llvm.vector.extract",
+                    &[part_ty.into(), x.get_type().into()],
+                    &[x.into(), self.c64((i * n) as i64).into()],
+                )?
+            };
+            let r = if bs.arm_tbl {
+                self.intr(
+                    "llvm.aarch64.neon.tbl1",
+                    &[part_ty.into()],
+                    &[tp.into(), xp],
+                )?
+            } else if bs.x86_bits > 0 {
+                let name = match piece {
+                    128 => "llvm.x86.ssse3.pshuf.b.128",
+                    256 => "llvm.x86.avx2.pshuf.b",
+                    _ => "llvm.x86.avx512.pshuf.b.512",
+                };
+                self.intr(name, &[], &[tp.into(), xp])?
+            } else {
+                let xv = xp.into_vector_value();
+                let mut r = part_ty.const_zero();
+                for j in 0..n {
+                    let k = bld.build_extract_element(xv, self.c32(j), "")?;
+                    let e = bld.build_extract_element(t, k.into_int_value(), "")?;
+                    r = bld.build_insert_element(r, e, self.c32(j), "")?;
+                }
+                r.into()
+            };
+            out = if piece == bits {
+                r
+            } else {
+                self.intr(
+                    "llvm.vector.insert",
+                    &[out.get_type(), part_ty.into()],
+                    &[out, r, self.c64((i * n) as i64).into()],
+                )?
+            };
+        }
+        self.to_canon(out, vty)
     }
 
     /// The compare as all-ones lanes in canonical form, and as its `i1` lanes.

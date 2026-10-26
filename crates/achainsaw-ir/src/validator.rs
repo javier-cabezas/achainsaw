@@ -122,6 +122,7 @@ pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
         VBinOp::Min | VBinOp::Max => &[I8, I16, I32, F32, F64],
         VBinOp::Umin | VBinOp::Umax => &[I8, I16, I32],
         VBinOp::Copysign => &[F32, F64],
+        VBinOp::Tbl => &[I8],
     }
 }
 
