@@ -947,40 +947,9 @@ fn substitute_terminator_operands(term: &mut Terminator, substitutions: &HashMap
     if substitutions.is_empty() {
         return;
     }
-    match term {
-        Terminator::Jmp { args, .. } => {
-            for arg in args {
-                if let Some(new_a) = substitutions.get(arg) {
-                    *arg = new_a.clone();
-                }
-            }
-        }
-        Terminator::Br {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => {
-            if let Some(new_c) = substitutions.get(cond) {
-                *cond = new_c.clone();
-            }
-            for arg in then_args {
-                if let Some(new_a) = substitutions.get(arg) {
-                    *arg = new_a.clone();
-                }
-            }
-            for arg in else_args {
-                if let Some(new_a) = substitutions.get(arg) {
-                    *arg = new_a.clone();
-                }
-            }
-        }
-        Terminator::Ret { vals, .. } => {
-            for v in vals {
-                if let Some(new_v) = substitutions.get(v) {
-                    *v = new_v.clone();
-                }
-            }
+    for reg in term.operands_mut() {
+        if let Some(new_reg) = substitutions.get(reg.as_str()) {
+            *reg = new_reg.clone();
         }
     }
 }
@@ -988,14 +957,20 @@ fn substitute_terminator_operands(term: &mut Terminator, substitutions: &HashMap
 /// Folds conditional branches with known constant conditions:
 /// `br cst_1, then, else -> jmp then`
 /// `br cst_0, then, else -> jmp else`
+/// and a `switch` on a constant, or with no cases, to a `jmp` to its case (or default).
 fn run_branch_folding_pass(func: &mut Function) -> usize {
     let mut folded = 0;
 
     let mut constants: HashMap<String, Constant> = HashMap::new();
+    // Integer constants' widths, for comparing them with switch cases.
+    let mut bits: HashMap<String, u32> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::AssignConst { dst, val, .. } = inst {
+            if let Instruction::AssignConst { dst, val, ty, .. } = inst {
                 constants.insert(dst.clone(), val.clone());
+                if let Some(b) = ty.int_bits() {
+                    bits.insert(dst.clone(), b);
+                }
             }
         }
     }
@@ -1030,6 +1005,35 @@ fn run_branch_folding_pass(func: &mut Function) -> usize {
                 }
             }
         }
+        if let Terminator::Switch {
+            val,
+            default,
+            default_args,
+            cases,
+            span,
+        } = &block.terminator
+        {
+            if cases.is_empty() {
+                block.terminator = Terminator::Jmp {
+                    target: default.clone(),
+                    args: default_args.clone(),
+                    span: *span,
+                };
+                folded += 1;
+            } else if let (Some(Constant::Int(v)), Some(&b)) = (constants.get(val), bits.get(val)) {
+                let v = crate::validator::wrap_to_bits(*v, b);
+                let (target, args) = cases
+                    .iter()
+                    .find(|c| crate::validator::wrap_to_bits(c.value, b) == v)
+                    .map_or((default, default_args), |c| (&c.target, &c.args));
+                block.terminator = Terminator::Jmp {
+                    target: target.clone(),
+                    args: args.clone(),
+                    span: *span,
+                };
+                folded += 1;
+            }
+        }
     }
 
     folded
@@ -1051,19 +1055,8 @@ fn run_dead_block_elimination(func: &mut Function) -> usize {
     while let Some(label) = worklist.pop() {
         if reachable.insert(label.clone()) {
             if let Some(block) = block_map.get(&label) {
-                match &block.terminator {
-                    Terminator::Jmp { target, .. } => {
-                        worklist.push(target.clone());
-                    }
-                    Terminator::Br {
-                        then_block,
-                        else_block,
-                        ..
-                    } => {
-                        worklist.push(then_block.clone());
-                        worklist.push(else_block.clone());
-                    }
-                    Terminator::Ret { .. } => {}
+                for (target, _) in block.terminator.edges() {
+                    worklist.push(target.clone());
                 }
             }
         }
@@ -1091,30 +1084,7 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
             }
 
             // Terminator
-            match &block.terminator {
-                Terminator::Jmp { args, .. } => {
-                    for a in args {
-                        used.insert(a.clone());
-                    }
-                }
-                Terminator::Br {
-                    cond,
-                    then_args,
-                    else_args,
-                    ..
-                } => {
-                    used.insert(cond.clone());
-                    for a in then_args {
-                        used.insert(a.clone());
-                    }
-                    for a in else_args {
-                        used.insert(a.clone());
-                    }
-                }
-                Terminator::Ret { vals, .. } => {
-                    used.extend(vals.iter().cloned());
-                }
-            }
+            used.extend(block.terminator.operands().into_iter().cloned());
         }
 
         // Remove pure instructions whose destination is NOT in `used`.

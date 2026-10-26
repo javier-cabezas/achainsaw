@@ -116,17 +116,5 @@ fn resolve(r: &mut String, scope: &HashMap<String, String>) {
 
 /// The registers a terminator reads.
 pub(crate) fn terminator_operands_mut(t: &mut Terminator) -> Vec<&mut String> {
-    match t {
-        Terminator::Jmp { args, .. } => args.iter_mut().collect(),
-        Terminator::Br {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => std::iter::once(cond)
-            .chain(then_args.iter_mut())
-            .chain(else_args.iter_mut())
-            .collect(),
-        Terminator::Ret { vals, .. } => vals.iter_mut().collect(),
-    }
+    t.operands_mut()
 }

@@ -1531,6 +1531,30 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let e = self.edge(st, else_block, else_args)?;
                 b.build_conditional_branch(c, t, e)?;
             }
+            Terminator::Switch {
+                val,
+                default,
+                default_args,
+                cases,
+                ..
+            } => {
+                if !free {
+                    self.fuel_check(st)?;
+                }
+                let v = self.int(st, val);
+                let ty = v.get_type();
+                let other = self.edge(st, default, default_args)?;
+                let arms = cases
+                    .iter()
+                    .map(|c| {
+                        Ok((
+                            ty.const_int(c.value as u64, false),
+                            self.edge(st, &c.target, &c.args)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                b.build_switch(v, other, &arms)?;
+            }
             Terminator::Ret { vals, .. } => {
                 self.spill_fuel(st)?;
                 if let (Some(base), Some(_), false) = (st.stack, self.opts.sandbox, self.opts.aot) {

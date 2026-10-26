@@ -256,28 +256,11 @@ fn parse_tests(
 
 /// The argument lists of `t`'s edges into `target`.
 fn edge_args<'t>(t: &'t Terminator, target: &str) -> Vec<&'t Vec<String>> {
-    match t {
-        Terminator::Jmp {
-            target: to, args, ..
-        } if to == target => vec![args],
-        Terminator::Br {
-            then_block,
-            then_args,
-            else_block,
-            else_args,
-            ..
-        } => {
-            let mut v = Vec::new();
-            if then_block == target {
-                v.push(then_args);
-            }
-            if else_block == target {
-                v.push(else_args);
-            }
-            v
-        }
-        _ => Vec::new(),
-    }
+    t.edges()
+        .into_iter()
+        .filter(|(to, _)| *to == target)
+        .map(|(_, args)| args)
+        .collect()
 }
 
 /// Emits the dispatch block's instructions, naming registers `{prefix}_d{n}`.

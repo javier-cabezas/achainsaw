@@ -12,7 +12,7 @@ use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, Block as ClifBlock, ConstantData, FuncRef, InstBuilder, MemFlagsData,
     StackSlotData, StackSlotKind, Value as ClifValue,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Module as ClifModule};
 use std::collections::HashMap;
 
@@ -3185,6 +3185,48 @@ pub fn lower_function<M: ClifModule>(
                 builder
                     .ins()
                     .brif(cond_val, then_target, &then_vals, else_target, &else_vals);
+            }
+            Terminator::Switch {
+                val,
+                default,
+                cases,
+                ..
+            } => {
+                if let (Some((_, exhausted)), Some(f), Some(trap_block), false) =
+                    (config.fuel_check, fuel, fuel_trap_block, free(&block.label))
+                {
+                    emit_fuel_check(&mut builder, module, f, exhausted, trap_block);
+                }
+                // One block per edge, which passes its arguments; `Switch` picks jump tables
+                // or compare trees for the case values (unsigned keys of the value's width).
+                let (v, ty) = scalar(&values, val);
+                let bits = ty.int_bits().unwrap_or(64);
+                let mask = if bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
+                let edges: Vec<(cranelift_codegen::ir::Block, &String, &Vec<String>)> = block
+                    .terminator
+                    .edges()
+                    .into_iter()
+                    .map(|(t, a)| (builder.create_block(), t, a))
+                    .collect();
+                let mut sw = Switch::new();
+                for (c, (b, _, _)) in cases.iter().zip(&edges[1..]) {
+                    sw.set_entry((c.value as u64 & mask) as u128, *b);
+                }
+                sw.emit(&mut builder, v, edges[0].0);
+                debug_assert_eq!(edges[0].1, default);
+                for (b, target, args) in edges {
+                    builder.switch_to_block(b);
+                    let target_block = *clif_blocks.get(target).unwrap();
+                    let arg_vals: Vec<BlockArg> = flat_args(&values, args)
+                        .into_iter()
+                        .map(BlockArg::Value)
+                        .collect();
+                    builder.ins().jump(target_block, &arg_vals);
+                }
             }
             Terminator::Ret { vals, .. } => {
                 if let Some(f) = fuel {

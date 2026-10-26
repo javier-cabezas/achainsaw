@@ -1,7 +1,7 @@
 //! Control-flow graph analysis for AIR functions: reachability, reverse post-order,
 //! immediate dominators (Cooper-Harvey-Kennedy) and DFS retreating edges.
 
-use crate::ast::{Function, Terminator};
+use crate::ast::Function;
 use std::collections::{HashMap, HashSet};
 
 pub const UNDEF: usize = usize::MAX;
@@ -36,15 +36,12 @@ impl Cfg {
         let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, block) in func.blocks.iter().enumerate() {
-            let targets: Vec<&str> = match &block.terminator {
-                Terminator::Jmp { target, .. } => vec![target.as_str()],
-                Terminator::Br {
-                    then_block,
-                    else_block,
-                    ..
-                } => vec![then_block.as_str(), else_block.as_str()],
-                Terminator::Ret { .. } => vec![],
-            };
+            let targets: Vec<&str> = block
+                .terminator
+                .edges()
+                .into_iter()
+                .map(|(t, _)| t.as_str())
+                .collect();
             for t in targets {
                 if let Some(&j) = index.get(t) {
                     succs[i].push(j);

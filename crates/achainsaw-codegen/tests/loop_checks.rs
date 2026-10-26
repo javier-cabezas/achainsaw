@@ -96,6 +96,36 @@ fn steps@(n:i64)->i64
   done:
     ret k
 
+# A switch in the body: every case takes as many branches, so the loop is rewritten.
+fn state@(x:ptr, n:i64)->i64
+  entry:
+    jmp head(0:i64, 1:i64)
+  head(i:i64, a:i64):
+{PRE}
+    c = lt i, {N}
+    br c, body, done
+  body:
+    v = ld x[i]:i64
+    k = and v, 3:i64
+    switch k, s3, 0: s0, 1: s1, 2: s2
+  s0:
+    a0 = add a, v
+    jmp next(a0)
+  s1:
+    a1 = mul a, 3:i64
+    jmp next(a1)
+  s2:
+    a2 = xor a, v
+    jmp next(a2)
+  s3:
+    a3 = sub a, 7:i64
+    jmp next(a3)
+  next(an:i64):
+    i2 = add i, 1:i64
+    jmp head(i2, an)
+  done:
+    ret a
+
 # An inner loop, entered once per row; the outer loop keeps its checks.
 fn rows@(x:ptr, m:i64, n:i64)->i64
   entry:
@@ -367,6 +397,7 @@ fn loops_with_known_trip_counts_are_rewritten() {
     let checks = achainsaw_ir::checks::hoist_loop_checks(&mut module);
     for f in [
         "sum", "fill", "peek", "sumv", "steps", "rows", "bsum", "msum", "relu", "psum", "fsum",
+        "state",
     ] {
         assert!(checks.function(f).is_some(), "{f} was not rewritten");
         let twin = format!("{f}_ref");
@@ -396,6 +427,7 @@ fn rewritten_loops_use_the_same_fuel() {
             ("skew", vec![ptr(&x), RtValue::I64(n as i64)]),
             ("psum", vec![ptr(&x), RtValue::I64(n as i64)]),
             ("fsum", vec![ptr(&x), RtValue::I64(n as i64)]),
+            ("state", vec![ptr(&x), RtValue::I64(n as i64)]),
             (
                 "rows",
                 vec![ptr(&x), RtValue::I64(3), RtValue::I64(n as i64 / 3)],
@@ -438,6 +470,22 @@ fn loops_that_run_out_of_fuel_stop_where_they_did() {
         assert_eq!(got, want, "budget {budget}");
         assert_eq!(ours, theirs, "budget {budget}");
     }
+}
+
+/// A loop with a switch in its body, under every budget up to the one that finishes it: the
+/// rewritten loop charges each switch as one branch, as the original does, so both stop at
+/// the same point with the same fuel left.
+#[test]
+fn loops_with_a_switch_use_the_same_fuel() {
+    let e = engine(None);
+    let n = 24;
+    let x: Vec<i64> = (0..n as i64).map(|i| i * 5 + i / 3).collect();
+    let args = [ptr(&x), RtValue::I64(n as i64)];
+    for budget in 0..5 * n as u64 + 8 {
+        let got = run(&e, "state", &args, budget);
+        assert_eq!(got, run(&e, "state_ref", &args, budget), "budget {budget}");
+    }
+    assert!(run(&e, "state", &args, 5 * n as u64 + 8).0.is_ok());
 }
 
 /// Sandboxed loops that leave the arena fail as they did, at the same access, also when the

@@ -501,6 +501,25 @@ pub fn to_air_text(module: &Module) -> String {
                         out.push(')');
                     }
                 }
+                Terminator::Switch {
+                    val,
+                    default,
+                    default_args,
+                    cases,
+                    ..
+                } => {
+                    let target = |label: &str, args: &[String]| {
+                        if args.is_empty() {
+                            label.to_string()
+                        } else {
+                            format!("{label}({})", args.join(", "))
+                        }
+                    };
+                    out.push_str(&format!("switch {val}, {}", target(default, default_args)));
+                    for c in cases {
+                        out.push_str(&format!(", {}: {}", c.value, target(&c.target, &c.args)));
+                    }
+                }
                 Terminator::Ret { vals, .. } => {
                     out.push_str("ret");
                     if !vals.is_empty() {
@@ -706,6 +725,15 @@ impl BinaryEncoder {
                     Terminator::Ret { vals, .. } => {
                         for v in vals {
                             self.intern(v);
+                        }
+                    }
+                    Terminator::Switch { val, .. } => {
+                        self.intern(val);
+                        for (target, args) in block.terminator.edges() {
+                            self.intern(target);
+                            for a in args {
+                                self.intern(a);
+                            }
                         }
                     }
                 }
@@ -1258,6 +1286,30 @@ impl BinaryEncoder {
                 for v in vals {
                     self.buf
                         .extend_from_slice(&self.string_map[v].to_le_bytes());
+                }
+            }
+            Terminator::Switch { val, cases, .. } => {
+                // The value, the default edge, the case count, then each case's value and
+                // edge (an edge: target, argument count, arguments).
+                self.buf.push(0x13);
+                self.buf
+                    .extend_from_slice(&self.string_map[val].to_le_bytes());
+                let edges = term.edges();
+                let edge = |enc: &mut Self, (target, args): (&String, &Vec<String>)| {
+                    enc.buf
+                        .extend_from_slice(&enc.string_map[target].to_le_bytes());
+                    enc.buf
+                        .extend_from_slice(&(args.len() as u32).to_le_bytes());
+                    for a in args {
+                        enc.buf.extend_from_slice(&enc.string_map[a].to_le_bytes());
+                    }
+                };
+                edge(self, edges[0]);
+                self.buf
+                    .extend_from_slice(&(cases.len() as u32).to_le_bytes());
+                for (c, e) in cases.iter().zip(&edges[1..]) {
+                    self.buf.extend_from_slice(&c.value.to_le_bytes());
+                    edge(self, *e);
                 }
             }
         }
@@ -1980,6 +2032,17 @@ impl<'a> BinaryDecoder<'a> {
             .ok_or_else(|| self.err("Invalid vector type in AIRB"))
     }
 
+    /// A branch edge: its target and arguments.
+    fn read_edge(&mut self) -> Result<(String, Vec<String>), Diagnostic> {
+        let target = self.read_string()?;
+        let count = self.read_u32()?;
+        let mut args = Vec::with_capacity(self.safe_capacity(count));
+        for _ in 0..count {
+            args.push(self.read_string()?);
+        }
+        Ok((target, args))
+    }
+
     fn decode_terminator(&mut self) -> Result<Terminator, Diagnostic> {
         let tag = self.read_u8()?;
         let span = Span::default();
@@ -2023,6 +2086,28 @@ impl<'a> BinaryDecoder<'a> {
                     vals.push(self.read_string()?);
                 }
                 Ok(Terminator::Ret { vals, span })
+            }
+            0x13 => {
+                let val = self.read_string()?;
+                let (default, default_args) = self.read_edge()?;
+                let count = self.read_u32()?;
+                let mut cases = Vec::with_capacity(self.safe_capacity(count));
+                for _ in 0..count {
+                    let value = self.read_i64()?;
+                    let (target, args) = self.read_edge()?;
+                    cases.push(SwitchCase {
+                        value,
+                        target,
+                        args,
+                    });
+                }
+                Ok(Terminator::Switch {
+                    val,
+                    default,
+                    default_args,
+                    cases,
+                    span,
+                })
             }
             _ => Err(self.err(format!("Unknown terminator opcode tag 0x{tag:02X} in AIRB"))),
         }

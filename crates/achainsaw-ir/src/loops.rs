@@ -150,15 +150,7 @@ pub(crate) fn natural_loop(cfg: &Cfg, h: usize) -> Vec<usize> {
 }
 
 pub(crate) fn targets(t: &Terminator) -> Vec<&String> {
-    match t {
-        Terminator::Jmp { target, .. } => vec![target],
-        Terminator::Br {
-            then_block,
-            else_block,
-            ..
-        } => vec![then_block, else_block],
-        Terminator::Ret { .. } => vec![],
-    }
+    t.edges().into_iter().map(|(target, _)| target).collect()
 }
 
 /// Facts that make `count >= lanes`, if there are any.
@@ -749,17 +741,8 @@ fn unmasked(inst: &Instruction) -> Instruction {
 }
 
 pub(crate) fn retarget(t: &mut Terminator, map: &dyn Fn(&str) -> String) {
-    match t {
-        Terminator::Jmp { target, .. } => *target = map(target),
-        Terminator::Br {
-            then_block,
-            else_block,
-            ..
-        } => {
-            *then_block = map(then_block);
-            *else_block = map(else_block);
-        }
-        Terminator::Ret { .. } => {}
+    for (target, _) in t.edges_mut() {
+        *target = map(target);
     }
 }
 
@@ -774,40 +757,15 @@ pub(crate) fn add_exit_args(
         return;
     }
     let extra = || params.iter().map(|(v, _)| arg(v)).collect::<Vec<_>>();
-    match t {
-        Terminator::Jmp { target, args, .. } if target == exit => args.extend(extra()),
-        Terminator::Br {
-            then_block,
-            then_args,
-            else_block,
-            else_args,
-            ..
-        } => {
-            if then_block == exit {
-                then_args.extend(extra());
-            }
-            if else_block == exit {
-                else_args.extend(extra());
-            }
+    for (target, args) in t.edges_mut() {
+        if target == exit {
+            args.extend(extra());
         }
-        _ => {}
     }
 }
 
 fn terminator_reads(t: &Terminator) -> Vec<&String> {
-    match t {
-        Terminator::Jmp { args, .. } => args.iter().collect(),
-        Terminator::Br {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => std::iter::once(cond)
-            .chain(then_args)
-            .chain(else_args)
-            .collect(),
-        Terminator::Ret { vals, .. } => vals.iter().collect(),
-    }
+    t.operands()
 }
 
 pub(crate) fn all_names(f: &Function) -> HashSet<String> {
