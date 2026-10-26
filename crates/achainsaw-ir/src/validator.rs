@@ -436,16 +436,13 @@ impl Validator {
 
         // Branch targets must exist, and nothing may branch back to the entry block.
         for block in &func.blocks {
-            let targets: Vec<(&String, Span)> = match &block.terminator {
-                Terminator::Jmp { target, span, .. } => vec![(target, *span)],
-                Terminator::Br {
-                    then_block,
-                    else_block,
-                    span,
-                    ..
-                } => vec![(then_block, *span), (else_block, *span)],
-                Terminator::Ret { .. } => vec![],
-            };
+            let span = block.terminator.span();
+            let targets: Vec<(&String, Span)> = block
+                .terminator
+                .edges()
+                .into_iter()
+                .map(|(t, _)| (t, span))
+                .collect();
             for (target, span) in targets {
                 if !block_params.contains_key(target.as_str()) {
                     return Err(Diagnostic::error(
@@ -1740,6 +1737,59 @@ impl Validator {
                     }
                 }
             }
+            Terminator::Switch {
+                val,
+                default,
+                default_args,
+                cases,
+                span,
+            } => {
+                let ty = self.check_reg(ctx, val, scope, *span)?;
+                let Some(bits) = ty.int_bits().filter(|_| ty != Type::Ptr) else {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("Switch value '{val}' must be an integer, found '{ty}'"),
+                        *span,
+                    ));
+                };
+                // A case is a value of the switched type, written signed or unsigned
+                // (-128..=255 for i8); two cases may not name the same value.
+                let (lo, hi) = switch_case_range(bits);
+                let mut seen: HashMap<i64, i64> = HashMap::new();
+                for c in cases {
+                    if c.value < lo || c.value > hi {
+                        return Err(Diagnostic::error(
+                            "ERR_INVALID_SWITCH_CASE",
+                            format!(
+                                "Switch case {} is outside the range of '{ty}' ({lo} to {hi})",
+                                c.value
+                            ),
+                            *span,
+                        )
+                        .with_context(
+                            serde_json::json!({ "case": c.value, "type": ty.to_string() }),
+                        ));
+                    }
+                    let key = wrap_to_bits(c.value, bits);
+                    if let Some(first) = seen.insert(key, c.value) {
+                        return Err(Diagnostic::error(
+                            "ERR_INVALID_SWITCH_CASE",
+                            format!(
+                                "Switch cases {first} and {} are the same '{ty}' value",
+                                c.value
+                            ),
+                            *span,
+                        )
+                        .with_context(
+                            serde_json::json!({ "case": c.value, "type": ty.to_string() }),
+                        ));
+                    }
+                }
+                self.check_target_args(ctx, default, default_args, scope, *span, "Switch")?;
+                for c in cases {
+                    self.check_target_args(ctx, &c.target, &c.args, scope, *span, "Switch")?;
+                }
+            }
         }
         Ok(())
     }
@@ -1933,22 +1983,29 @@ fn check_name(func: &Function, cfg: &Cfg, name: &str, defs: &[DefSite]) -> Resul
 }
 
 fn terminator_reads(t: &Terminator, name: &str) -> bool {
-    match t {
-        Terminator::Jmp { args, .. } => args.iter().any(|a| a == name),
-        Terminator::Br {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => cond == name || then_args.iter().chain(else_args).any(|a| a == name),
-        Terminator::Ret { vals, .. } => vals.iter().any(|a| a == name),
-    }
+    t.operands().into_iter().any(|a| a == name)
 }
 
 fn terminator_span(t: &Terminator) -> Span {
-    match t {
-        Terminator::Jmp { span, .. }
-        | Terminator::Br { span, .. }
-        | Terminator::Ret { span, .. } => *span,
+    t.span()
+}
+
+/// The case values a `switch` on an integer of `bits` bits accepts: its signed and unsigned
+/// ranges together.
+pub fn switch_case_range(bits: u32) -> (i64, i64) {
+    if bits >= 64 {
+        (i64::MIN, i64::MAX)
+    } else {
+        (-(1i64 << (bits - 1)), (1i64 << bits) - 1)
+    }
+}
+
+/// `v`'s low `bits` bits, sign-extended: the value a `switch` on that type compares.
+pub fn wrap_to_bits(v: i64, bits: u32) -> i64 {
+    if bits >= 64 {
+        v
+    } else {
+        let s = 64 - bits;
+        (v << s) >> s
     }
 }

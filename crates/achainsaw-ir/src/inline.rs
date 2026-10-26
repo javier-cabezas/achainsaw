@@ -208,20 +208,7 @@ fn substitute(f: &mut Function, subst: &HashMap<String, String>) {
                 fix(r);
             }
         }
-        match &mut b.terminator {
-            Terminator::Jmp { args, .. } => args.iter_mut().for_each(fix),
-            Terminator::Br {
-                cond,
-                then_args,
-                else_args,
-                ..
-            } => {
-                fix(cond);
-                then_args.iter_mut().for_each(fix);
-                else_args.iter_mut().for_each(fix);
-            }
-            Terminator::Ret { vals, .. } => vals.iter_mut().for_each(fix),
-        }
+        b.terminator.operands_mut().into_iter().for_each(fix);
     }
 }
 
@@ -296,6 +283,16 @@ impl<'a> Expansion<'a> {
                 args: regs(vals),
                 span: *span,
             },
+            Terminator::Switch { .. } => {
+                let mut t = b.terminator.clone();
+                for r in t.operands_mut() {
+                    *r = self.reg(r);
+                }
+                for (target, _) in t.edges_mut() {
+                    *target = self.label(target);
+                }
+                t
+            }
         };
         Block {
             label: self.label(&b.label),

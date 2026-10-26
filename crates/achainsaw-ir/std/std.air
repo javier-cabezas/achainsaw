@@ -66,22 +66,8 @@ fn qmat_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64)
     sb = add sc, sb_off
     sd = call qmat_ksup(sc, nb, b)
     d, c_lo, c_hi = call qmat_block(dx, b, bias)
-    # One strip loop per format, chosen once per block.
-    odd = and fmt, 1:i64
-    is_n = eq odd, 1:i64
-    br is_n, nib, wide
-  nib:
-    is_q4 = eq fmt, 1:i64
-    br is_q4, q4(0:i64), nib2
-  nib2:
-    is_k4 = eq fmt, 3:i64
-    br is_k4, k4(0:i64), a4(0:i64)
-  wide:
-    is_q8 = eq fmt, 0:i64
-    br is_q8, q8(0:i64), wide2
-  wide2:
-    is_q6 = eq fmt, 2:i64
-    br is_q6, q6(0:i64), k5(0:i64)
+    # One strip loop per format, chosen once per block (Q5_K, format 4, is the default).
+    switch fmt, k5(0:i64), 0: q8(0:i64), 1: q4(0:i64), 2: q6(0:i64), 3: k4(0:i64), 5: a4(0:i64)
   q8(jq8:i64):
     m_q8 = lt jq8, 64:i64
     br m_q8, q8_body, block_next
@@ -186,22 +172,8 @@ fn qmat_chunk4(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     d1, l1, h1 = call qmat_block(dx1, b, bias)
     d2, l2, h2 = call qmat_block(dx2, b, bias)
     d3, l3, h3 = call qmat_block(dx3, b, bias)
-    # One strip loop per format, chosen once per block.
-    odd = and fmt, 1:i64
-    is_n = eq odd, 1:i64
-    br is_n, nib, wide
-  nib:
-    is_q4 = eq fmt, 1:i64
-    br is_q4, q4(0:i64), nib2
-  nib2:
-    is_k4 = eq fmt, 3:i64
-    br is_k4, k4(0:i64), a4(0:i64)
-  wide:
-    is_q8 = eq fmt, 0:i64
-    br is_q8, q8(0:i64), wide2
-  wide2:
-    is_q6 = eq fmt, 2:i64
-    br is_q6, q6(0:i64), k5(0:i64)
+    # One strip loop per format, chosen once per block (Q5_K, format 4, is the default).
+    switch fmt, k5(0:i64), 0: q8(0:i64), 1: q4(0:i64), 2: q6(0:i64), 3: k4(0:i64), 5: a4(0:i64)
   q8(jq8:i64):
     m_q8 = lt jq8, 64:i64
     br m_q8, q8_body, block_next
@@ -332,21 +304,8 @@ fn qmat_chunk8(c:i64, mat:ptr, xq:ptr, dx:ptr, dst:ptr, k:i64, xs:i64)
     tab_sz = mul nb, 384:i64
     tab = alloc tab_sz
     zf = splat 0.0:f32:vx
-    # One strip loop per format, chosen once per chunk.
-    odd = and fmt, 1:i64
-    is_n = eq odd, 1:i64
-    br is_n, nib, wide
-  nib:
-    is_q4 = eq fmt, 1:i64
-    br is_q4, q4(0:i64), nib2
-  nib2:
-    is_k4 = eq fmt, 3:i64
-    br is_k4, k4(0:i64), a4(0:i64)
-  wide:
-    is_q8 = eq fmt, 0:i64
-    br is_q8, q8(0:i64), wide2
-  wide2:
-    br is_q6, q6(0:i64), k5(0:i64)
+    # One strip loop per format, chosen once per chunk (Q5_K, format 4, is the default).
+    switch fmt, k5(0:i64), 0: q8(0:i64), 1: q4(0:i64), 2: q6(0:i64), 3: k4(0:i64), 5: a4(0:i64)
   q8(jq8:i64):
     more_q8 = lt jq8, 64:i64
     br more_q8, q8_blocks(0:i64, zf, zf, zf, zf, zf, zf, zf, zf), done

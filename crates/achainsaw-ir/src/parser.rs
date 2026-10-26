@@ -568,10 +568,18 @@ impl<'a> Parser<'a> {
                     self.expect_eol()?;
                     break Terminator::Ret { vals, span };
                 }
+                // `switch` is contextual: followed by `=`, it is a register name.
+                TokenKind::Ident(w)
+                    if w == "switch" && self.peek_at(1) != Some(&TokenKind::Equal) =>
+                {
+                    break self.parse_switch(&mut instructions)?;
+                }
                 TokenKind::Eof => {
                     return Err(Diagnostic::error(
                         "ERR_MISSING_TERMINATOR",
-                        format!("Block '{label}' ends without a terminator (jmp, br or ret)"),
+                        format!(
+                            "Block '{label}' ends without a terminator (jmp, br, switch or ret)"
+                        ),
                         self.peek().span,
                     ));
                 }
@@ -589,6 +597,51 @@ impl<'a> Parser<'a> {
             instructions,
             terminator,
             span: label_span,
+        })
+    }
+
+    /// `switch v, other(args), 0: a(args), 3: b(args)`: the switched value, the default
+    /// target, then `value: target` cases (integer literals, negative ones included).
+    fn parse_switch(
+        &mut self,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Terminator, Diagnostic> {
+        let span = self.advance().span;
+        let val = self.parse_operand(instructions, Some(Type::I64))?;
+        self.expect(TokenKind::Comma)?;
+        let (default, _) = self.expect_ident()?;
+        let default_args = self.parse_optional_paren_operands(instructions)?;
+        let mut cases = Vec::new();
+        while self.peek_kind() == &TokenKind::Comma {
+            self.advance();
+            let TokenKind::IntLit(value) = self.peek_kind().clone() else {
+                return Err(Diagnostic::error(
+                    "ERR_UNEXPECTED_TOKEN",
+                    format!(
+                        "Expected a switch case 'value: target', found {:?}",
+                        self.peek_kind()
+                    ),
+                    self.peek().span,
+                )
+                .with_context(serde_json::json!({ "example": "switch v, other, 0: a, 1: b(x)" })));
+            };
+            self.advance();
+            self.expect(TokenKind::Colon)?;
+            let (target, _) = self.expect_ident()?;
+            let args = self.parse_optional_paren_operands(instructions)?;
+            cases.push(SwitchCase {
+                value,
+                target,
+                args,
+            });
+        }
+        self.expect_eol()?;
+        Ok(Terminator::Switch {
+            val,
+            default,
+            default_args,
+            cases,
+            span,
         })
     }
 

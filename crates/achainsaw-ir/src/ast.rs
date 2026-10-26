@@ -1423,6 +1423,134 @@ pub enum Terminator {
     },
     /// `ret`, `ret v` or `ret a, b` (as many values as the function returns).
     Ret { vals: Vec<String>, span: Span },
+    /// `switch v, other(args), 0: a(args), 3: b(args)`: jumps to the case whose value equals
+    /// the integer `v`, or to `default` when none does. Case values are distinct.
+    Switch {
+        val: String,
+        default: String,
+        default_args: Vec<String>,
+        cases: Vec<SwitchCase>,
+        span: Span,
+    },
+}
+
+/// One case of a `switch`: `value: target(args)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwitchCase {
+    pub value: i64,
+    pub target: String,
+    pub args: Vec<String>,
+}
+
+impl Terminator {
+    pub fn span(&self) -> Span {
+        match self {
+            Terminator::Jmp { span, .. }
+            | Terminator::Br { span, .. }
+            | Terminator::Ret { span, .. }
+            | Terminator::Switch { span, .. } => *span,
+        }
+    }
+
+    /// Each edge to another block: its target and arguments, in order (`br`: then, else;
+    /// `switch`: the default, then the cases).
+    pub fn edges(&self) -> Vec<(&String, &Vec<String>)> {
+        match self {
+            Terminator::Jmp { target, args, .. } => vec![(target, args)],
+            Terminator::Br {
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                ..
+            } => vec![(then_block, then_args), (else_block, else_args)],
+            Terminator::Ret { .. } => vec![],
+            Terminator::Switch {
+                default,
+                default_args,
+                cases,
+                ..
+            } => std::iter::once((default, default_args))
+                .chain(cases.iter().map(|c| (&c.target, &c.args)))
+                .collect(),
+        }
+    }
+
+    /// `edges`, mutably.
+    pub fn edges_mut(&mut self) -> Vec<(&mut String, &mut Vec<String>)> {
+        match self {
+            Terminator::Jmp { target, args, .. } => vec![(target, args)],
+            Terminator::Br {
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                ..
+            } => vec![(then_block, then_args), (else_block, else_args)],
+            Terminator::Ret { .. } => vec![],
+            Terminator::Switch {
+                default,
+                default_args,
+                cases,
+                ..
+            } => std::iter::once((default, default_args))
+                .chain(cases.iter_mut().map(|c| (&mut c.target, &mut c.args)))
+                .collect(),
+        }
+    }
+
+    /// Every register the terminator reads: the condition or switched value, then the
+    /// edges' arguments (or the returned values).
+    pub fn operands(&self) -> Vec<&String> {
+        match self {
+            Terminator::Jmp { args, .. } => args.iter().collect(),
+            Terminator::Br {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => std::iter::once(cond)
+                .chain(then_args)
+                .chain(else_args)
+                .collect(),
+            Terminator::Ret { vals, .. } => vals.iter().collect(),
+            Terminator::Switch {
+                val,
+                default_args,
+                cases,
+                ..
+            } => std::iter::once(val)
+                .chain(default_args)
+                .chain(cases.iter().flat_map(|c| &c.args))
+                .collect(),
+        }
+    }
+
+    /// `operands`, mutably.
+    pub fn operands_mut(&mut self) -> Vec<&mut String> {
+        match self {
+            Terminator::Jmp { args, .. } => args.iter_mut().collect(),
+            Terminator::Br {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => std::iter::once(cond)
+                .chain(then_args.iter_mut())
+                .chain(else_args.iter_mut())
+                .collect(),
+            Terminator::Ret { vals, .. } => vals.iter_mut().collect(),
+            Terminator::Switch {
+                val,
+                default_args,
+                cases,
+                ..
+            } => std::iter::once(val)
+                .chain(default_args.iter_mut())
+                .chain(cases.iter_mut().flat_map(|c| c.args.iter_mut()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
