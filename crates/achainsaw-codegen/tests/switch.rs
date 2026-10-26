@@ -371,7 +371,8 @@ fn switch_is_validated() {
 
 #[test]
 fn switch_stays_a_register_name() {
-    let src = "fn f(x:i64)->i64\n  b0:\n    switch = add x, 1:i64\n    switch switch, a(switch)\n  a(v:i64):\n    ret v\n";
+    // As a destination, alone or the first of several, and as the switched value.
+    let src = "fn pair(x:i64)->(i64, i64)\n  b0:\n    ret x, x\n\nfn f(x:i64)->i64\n  b0:\n    switch, y = call pair(x)\n    switch = add switch, 1:i64\n    switch switch, a(switch)\n  a(v:i64):\n    ret v\n";
     let m = parse_and_validate(src).unwrap_or_else(|d| panic!("{d:?}"));
     let mut e = JitEngine::new().unwrap();
     e.compile_module(&m).unwrap();

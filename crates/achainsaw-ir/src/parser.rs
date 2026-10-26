@@ -568,9 +568,14 @@ impl<'a> Parser<'a> {
                     self.expect_eol()?;
                     break Terminator::Ret { vals, span };
                 }
-                // `switch` is contextual: followed by `=`, it is a register name.
+                // `switch` is contextual: followed by `=` or by `,` (the first of several
+                // destinations), it is a register name.
                 TokenKind::Ident(w)
-                    if w == "switch" && self.peek_at(1) != Some(&TokenKind::Equal) =>
+                    if w == "switch"
+                        && !matches!(
+                            self.peek_at(1),
+                            Some(TokenKind::Equal | TokenKind::Comma)
+                        ) =>
                 {
                     break self.parse_switch(&mut instructions)?;
                 }
