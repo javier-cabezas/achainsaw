@@ -2631,7 +2631,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             Ok(bld.build_shuffle_vector(t, t, VectorType::const_vector(&mask), "")?)
         };
         let n = piece / 8;
-        let tp = table(n)?;
+        // The per-lane lookups read `t` itself, so only the shuffles take the repeated table.
+        let tp = if bs.arm_tbl || bs.x86_bits > 0 {
+            Some(table(n)?)
+        } else {
+            None
+        };
         let part_ty = i8t.vec_type(n);
         let mut out: BasicValueEnum<'ctx> = x.get_type().const_zero().into();
         for i in 0..bits / piece {
@@ -2644,13 +2649,13 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                     &[x.into(), self.c64((i * n) as i64).into()],
                 )?
             };
-            let r = if bs.arm_tbl {
+            let r = if let (Some(tp), true) = (tp, bs.arm_tbl) {
                 self.intr(
                     "llvm.aarch64.neon.tbl1",
                     &[part_ty.into()],
                     &[tp.into(), xp],
                 )?
-            } else if bs.x86_bits > 0 {
+            } else if let Some(tp) = tp {
                 let name = match piece {
                     128 => "llvm.x86.ssse3.pshuf.b.128",
                     256 => "llvm.x86.avx2.pshuf.b",
