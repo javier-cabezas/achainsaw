@@ -10,11 +10,7 @@ Measured on Llama 3.2 1B Instruct with 8 threads on a Ryzen 7 8845HS (see
 follows the bytes read per token; prefill is bound by the int8 dot products
 and the scaling of their sums.
 
-1. **An int8 KV cache, as an option.** At 8192 tokens of context, decode
-   runs at 51.9 tokens/s against 67.4 at 512: the difference is attention
-   over the bf16 cache. int8 would halve its reads, and with `vdot` its
-   arithmetic too, at some cost in accuracy.
-2. **Prefill on Cranelift.** Cranelift prefills at 93–172 tokens/s against
+1. **Prefill on Cranelift.** Cranelift prefills at 93–172 tokens/s against
    LLVM's 486–1036 (contexts of 64 to 8192 tokens): its vectors are 128
    bits, and it runs tiles of 4 tokens instead of 8.
 

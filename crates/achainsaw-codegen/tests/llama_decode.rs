@@ -295,6 +295,17 @@ fn bf16_round(v: f64) -> f64 {
     half::bf16::from_f32(v as f32).to_f64()
 }
 
+/// A row rounded to int8 over d = max |x| / 127 and back, as the kernel's int8 KV cache and
+/// attention queries hold it (f32 arithmetic, halves away from zero).
+fn q8_round(x: &[f64]) -> Vec<f64> {
+    let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+    let d = xf.iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
+    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+    xf.iter()
+        .map(|&v| (v * id).round() as f64 * d as f64)
+        .collect()
+}
+
 /// x quantized per 32-block as the kernel's `quantize_q8` does (f32 arithmetic).
 fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
     let mut xq = vec![0i8; x.len()];
@@ -330,6 +341,8 @@ struct Model {
     f: usize,
     vocab: usize,
     max_ctx: usize,
+    /// An int8 KV cache (cfg's format 1) instead of bf16.
+    kv_q8: bool,
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
@@ -404,6 +417,7 @@ impl Model {
             f,
             vocab,
             max_ctx,
+            kv_q8: false,
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
@@ -443,20 +457,48 @@ impl Model {
         }
     }
 
-    /// u16s in the kernel's KV cache: per layer K then V, each nkv x cache_ctx x hd, with
-    /// cache_ctx = max_ctx rounded up to K's tiles of 32 positions.
-    fn cache_len(&self) -> usize {
-        self.layers.len() * 2 * self.nkv * self.max_ctx.div_ceil(32) * 32 * self.hd
+    /// Bytes per position of a KV head's K or V: hd bf16 values, or hd int8 values and an
+    /// f32 scale.
+    fn cache_rb(&self) -> usize {
+        if self.kv_q8 {
+            self.hd + 4
+        } else {
+            2 * self.hd
+        }
     }
 
-    /// Where the kernel's cache holds value e of KV head g at position pos of layer l, in K
-    /// (tiles of 32 positions, each [hd x 32]) and in V ([nkv][cache_ctx][hd]).
-    fn cache_at(&self, l: usize, g: usize, pos: usize, e: usize) -> (usize, usize) {
+    /// u16s in the kernel's KV cache: per layer K then V, each nkv x cache_ctx positions of
+    /// `cache_rb` bytes, with cache_ctx = max_ctx rounded up to tiles of 32 positions.
+    fn cache_len(&self) -> usize {
+        self.layers.len() * 2 * self.nkv * self.max_ctx.div_ceil(32) * 32 * self.cache_rb() / 2
+    }
+
+    /// Value e of KV head g at position pos of layer l in the kernel's cache, in K and in V.
+    /// bf16: K in tiles of 32 positions, each [hd x 32], V [nkv][cache_ctx][hd]. int8: tiles
+    /// of 32 positions for both, the values (K plus 128, [hd/4][32][4]; V [32][hd]) then 32
+    /// f32 scales.
+    fn cache_value(&self, cache: &[u16], l: usize, g: usize, pos: usize, e: usize) -> (f64, f64) {
         let ctx = self.max_ctx.div_ceil(32) * 32;
-        let plane = self.nkv * ctx * self.hd;
-        let k = l * 2 * plane + (g * ctx + pos / 32 * 32) * self.hd + e * 32 + pos % 32;
-        let v = l * 2 * plane + plane + (g * ctx + pos) * self.hd + e;
-        (k, v)
+        let (hd, rb) = (self.hd, self.cache_rb());
+        let plane = self.nkv * ctx * rb;
+        let tile = l * 2 * plane + (g * ctx + pos / 32 * 32) * rb;
+        let (vtile, col) = (tile + plane, pos % 32);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(cache.as_ptr() as *const u8, cache.len() * 2) };
+        if self.kv_q8 {
+            let scale = |t: usize| {
+                let at = t + 32 * hd + 4 * col;
+                f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as f64
+            };
+            let k = (bytes[tile + e / 4 * 128 + 4 * col + e % 4] ^ 0x80) as i8;
+            let v = bytes[vtile + col * hd + e] as i8;
+            (k as f64 * scale(tile), v as f64 * scale(vtile))
+        } else {
+            let bf = |at: usize| {
+                half::bf16::from_bits(u16::from_le_bytes([bytes[at], bytes[at + 1]])).to_f64()
+            };
+            (bf(tile + 64 * e + 2 * col), bf(vtile + 2 * (col * hd + e)))
+        }
     }
 
     /// One decode step; `cache[l]` is (K, V), each [max_ctx][nkv][hd] holding bf16 values.
@@ -477,16 +519,25 @@ impl Model {
             let mut q = qkv[..nh * hd].to_vec();
             for head in q.chunks_mut(hd) {
                 self.rope(head, pos);
+                if self.kv_q8 {
+                    head.copy_from_slice(&q8_round(head));
+                }
             }
             for g in 0..nkv {
                 let mut k = qkv[(nh + g) * hd..(nh + g + 1) * hd].to_vec();
                 self.rope(&mut k, pos);
                 let v = &qkv[(nh + nkv + g) * hd..(nh + nkv + g + 1) * hd];
                 let at = (pos * nkv + g) * hd;
-                for j in 0..hd {
-                    kc[at + j] = bf16_round(k[j]);
-                    vc[at + j] = bf16_round(v[j]);
-                }
+                let (kr, vr): (Vec<f64>, Vec<f64>) = if self.kv_q8 {
+                    (q8_round(&k), q8_round(v))
+                } else {
+                    (
+                        k.iter().map(|&x| bf16_round(x)).collect(),
+                        v.iter().map(|&x| bf16_round(x)).collect(),
+                    )
+                };
+                kc[at..at + hd].copy_from_slice(&kr);
+                vc[at..at + hd].copy_from_slice(&vr);
             }
             let mut attn = vec![0f32; nh * hd];
             for hq in 0..nh {
@@ -555,6 +606,7 @@ impl Model {
             self.f,
             self.vocab,
             self.max_ctx,
+            self.kv_q8 as usize,
         ]
         .map(|v| v as i64)
         .to_vec();
@@ -579,17 +631,25 @@ fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
 
 #[test]
 fn llama_decode_matches_reference() {
-    check_decode(false);
+    check_decode(false, false);
 }
 
-/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 matrices mixed within and across layers (Q, K and V in
-/// different formats), and a Q6_K LM head.
+/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 matrices mixed within and across layers (Q, K and V
+/// in different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {
-    check_decode(true);
+    check_decode(true, false);
 }
 
-fn check_decode(mixed: bool) {
+/// The int8 KV cache (cfg's format 1), against the reference rounding K, V and the attention
+/// queries to int8 per row.
+#[test]
+fn llama_decode_int8_cache_matches_reference() {
+    check_decode(false, true);
+    check_decode(true, true);
+}
+
+fn check_decode(mixed: bool, kv_q8: bool) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -597,7 +657,8 @@ fn check_decode(mixed: bool) {
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     // d=128, 2 layers, 4 q heads over 2 KV heads of 64, MLP 256, vocab 512, context 8.
-    let model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
+    let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
+    model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
     let modes = host_levels()
@@ -608,13 +669,14 @@ fn check_decode(mixed: bool) {
         engine.set_fast_math(fast);
         engine.compile_module(&module).unwrap();
         let level = format!(
-            "{level}{}{}",
+            "{level}{}{}{}",
             if fast { " fast_math" } else { "" },
-            if mixed { " mixed formats" } else { "" }
+            if mixed { " mixed formats" } else { "" },
+            if kv_q8 { " int8 cache" } else { "" }
         );
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
-        // bf16 bits, as `Model::cache_at` lays them out.
+        // As `Model::cache_value` reads it.
         let mut cache = vec![0u16; model.cache_len()];
         let mut ref_cache = vec![(vec![0f64; plane], vec![0f64; plane]); model.layers.len()];
         let mut token = 7usize;
@@ -638,22 +700,27 @@ fn check_decode(mixed: bool) {
                     "h[{i}] at pos {pos}, {level}: got {got}, want {want} (scale {scale})"
                 );
             }
-            let bf = |b: u16| half::bf16::from_bits(b).to_f64();
             for (l, (kr, vr)) in ref_cache.iter().enumerate() {
+                let row = pos * model.nkv * model.hd;
+                // A bf16 step, or for int8 one step of the row's scale.
+                let tol = |r: &[f64], g: usize, w: f64| {
+                    let r = &r[row + g * model.hd..row + (g + 1) * model.hd];
+                    if kv_q8 {
+                        1.01 * r.iter().fold(0f64, |a, v| a.max(v.abs())) / 127.0
+                    } else {
+                        1e-2 * (1.0 + w.abs())
+                    }
+                };
                 for j in 0..model.nkv * model.hd {
                     let (g, e) = (j / model.hd, j % model.hd);
-                    let (k_at, v_at) = model.cache_at(l, g, pos, e);
-                    let (k, v) = (bf(cache[k_at]), bf(cache[v_at]));
-                    let (kw, vw) = (
-                        kr[pos * model.nkv * model.hd + j],
-                        vr[pos * model.nkv * model.hd + j],
-                    );
+                    let (k, v) = model.cache_value(&cache, l, g, pos, e);
+                    let (kw, vw) = (kr[row + j], vr[row + j]);
                     assert!(
-                        (k - kw).abs() <= 1e-2 * (1.0 + kw.abs()),
+                        (k - kw).abs() <= tol(kr, g, kw),
                         "K l={l} pos {pos} [{j}] {level}: {k} vs {kw}"
                     );
                     assert!(
-                        (v - vw).abs() <= 1e-2 * (1.0 + vw.abs()),
+                        (v - vw).abs() <= tol(vr, g, vw),
                         "V l={l} pos {pos} [{j}] {level}: {v} vs {vw}"
                     );
                 }
@@ -681,7 +748,8 @@ type Prefill =
 
 /// `llama_prefill` over a prompt gives exactly what `llama_decode` gives token by token:
 /// the same KV cache bits, final hidden state bits and next token, whether the prompt goes
-/// in one call (a 4-token tile and a remainder) or in pieces starting past position 0.
+/// in one call (a 4-token tile and a remainder) or in pieces starting past position 0, with
+/// either cache format.
 #[test]
 fn llama_prefill_matches_decode_exactly() {
     let src = std::fs::read_to_string(concat!(
@@ -696,16 +764,20 @@ fn llama_prefill_matches_decode_exactly() {
         .map(|_| (rng.next().abs() * 511.0) as i64)
         .collect();
     let short = vec![7, 300, 42, 511, 0, 99];
-    // (mixed formats, prompt, context length, ways to split the prompt into prefill calls)
-    type Case<'a> = (bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 4] = [
-        (false, &short, 8, &[&[6], &[1, 5]]),
-        (true, &short, 8, &[&[6], &[1, 5]]),
-        (false, &long, 530, &[&[530], &[255, 2, 273]]),
-        (true, &long, 530, &[&[300, 230]]),
+    // (mixed formats, int8 cache, prompt, context length, ways to split the prompt into
+    // prefill calls)
+    type Case<'a> = (bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
+    let cases: [Case; 6] = [
+        (false, false, &short, 8, &[&[6], &[1, 5]]),
+        (true, false, &short, 8, &[&[6], &[1, 5]]),
+        (false, false, &long, 530, &[&[530], &[255, 2, 273]]),
+        (true, false, &long, 530, &[&[300, 230]]),
+        (true, true, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, &long, 530, &[&[530], &[255, 2, 273]]),
     ];
-    for &(mixed, prompt, max_ctx, all_pieces) in &cases {
-        let model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
+    for &(mixed, kv_q8, prompt, max_ctx, all_pieces) in &cases {
+        let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
+        model.kv_q8 = kv_q8;
         let (table, cfg, _parts) = model.tables();
         let cache_len = model.cache_len();
         for (level, features) in host_levels() {
@@ -715,7 +787,11 @@ fn llama_prefill_matches_decode_exactly() {
                 unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
             let prefill: Prefill =
                 unsafe { std::mem::transmute(engine.get_fn_ptr("llama_prefill").unwrap()) };
-            let ctx = format!("{level}{}", if mixed { " mixed formats" } else { "" });
+            let ctx = format!(
+                "{level}{}{}",
+                if mixed { " mixed formats" } else { "" },
+                if kv_q8 { " int8 cache" } else { "" }
+            );
 
             let mut cache = vec![0u16; cache_len];
             let mut h = vec![f32::NAN; model.d];
@@ -772,13 +848,25 @@ fn llama_prefill_matches_decode_exactly() {
 /// split; `gqa_attention`'s test checks the splits' arithmetic itself to 1e-4.
 #[test]
 fn llama_long_context_matches_reference() {
+    check_long_context(false);
+}
+
+/// The same with the int8 cache: each K and V value rounds over its position's scale, from
+/// f32 in the kernel and f64 in the reference, with the same flips at rounding boundaries.
+#[test]
+fn llama_long_context_int8_cache_matches_reference() {
+    check_long_context(true);
+}
+
+fn check_long_context(kv_q8: bool) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
     ))
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
-    let model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
+    let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
+    model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
     let mut rng = Rng(23);

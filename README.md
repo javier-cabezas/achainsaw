@@ -194,7 +194,8 @@ each length, then 64 generated tokens:
 It prints the same text as llama.cpp, a prefill leaves exactly the state that
 decoding the prompt token by token would, and its decode reads weights at
 about the memory's bandwidth. [docs/llama.md](docs/llama.md) explains how,
-with the numbers for K-quant files and against PyTorch.
+with the numbers for K-quant files, an int8 KV cache (14% faster decode at
+8192 tokens) and against PyTorch.
 
 **Kernels against NumPy and PyTorch.** [`examples/kernels/`](examples/kernels)
 holds 22 kernels for LLM inference, vector search and more: quantized GEMV

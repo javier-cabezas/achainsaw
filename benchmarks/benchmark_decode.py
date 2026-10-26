@@ -8,7 +8,9 @@ then each decode step (embedding, every layer, final norm, LM head and greedy ar
 llama_decode call. Both implementations use the same data types and arithmetic:
 Q4_0, Q8_0, Q6_K, Q4_K, Q5_K or Q4_1 weights with f16 block scales (Q4_K and Q5_K: GGUF's
 6-bit scales and mins under f16 super-block factors; Q4_1: an f16 min per block too),
-activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache, f32 for everything else (embedding, norms,
+activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache
+(or with --kv-cache int8, int8 K and V with an f32 scale per position, and int8 queries for
+the scores), f32 for everything else (embedding, norms,
 RoPE, attention). They share the same weights (NumPy reads them block-major), so they should
 predict the same tokens. NumPy has no int8 matrix product, so it widens the integer weights
 to f32 in each call and runs the block dots as a batched f32 BLAS matmul (exact here).
@@ -41,8 +43,9 @@ kernel's.
 
 llama.cpp runs its own `llama-bench` (3 repetitions) with the same thread count: prefill of a
 prompt of the same length, then the same number of generated tokens after a context of that
-length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is bf16) and has its own
-kernels and rounding, so only its speed is compared.
+length (`--n-depth`). It keeps its KV cache in f16 (the kernel's is bf16), or with
+--kv-cache int8 in Q8_0 (`-ctk q8_0 -ctv q8_0`, with flash attention, which a quantized V
+cache needs), and has its own kernels and rounding, so only its speed is compared.
 
 NumPy and PyTorch run the prompt one token at a time. The prompt speed is the prefill time per prompt
 token (for the AIR kernel, the mean of 3 more llama_prefill calls after the one that starts the
@@ -110,12 +113,16 @@ def generate(step: Callable[[int, int], int], prompt_ids: list[int], n_new: int,
 
 
 def llama_bench(path: str, gguf: str, prompt_tokens: int, gen_tokens: int,
-                threads: int) -> tuple[float | None, float, str]:
+                threads: int, kv_q8: bool = False) -> tuple[float | None, float, str]:
     """llama.cpp's own benchmark on the same GGUF file: prefill of `prompt_tokens` tokens,
     then `gen_tokens` generated after a context of that length (its --n-depth), as the AIR
-    kernel decodes after the prompt. Returns (prompt tokens/s, decode tokens/s, commit)."""
+    kernel decodes after the prompt; with kv_q8, on a Q8_0 KV cache. Returns (prompt
+    tokens/s, decode tokens/s, commit)."""
+    cache: list[str] = ["-ctk", "q8_0", "-ctv", "q8_0", "-fa", "1"] if kv_q8 else []
+
     def run(*extra: str) -> dict[str, Any]:
-        cmd: list[str] = [path, "-m", gguf, "-t", str(threads), "-r", "3", "-o", "json", *extra]
+        cmd: list[str] = [path, "-m", gguf, "-t", str(threads), "-r", "3", "-o", "json",
+                          *cache, *extra]
         out: str = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
         result: dict[str, Any] = json.loads(out)[0]
         return result
@@ -137,6 +144,8 @@ def main() -> None:
     parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k", "q41"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
+    parser.add_argument("--kv-cache", choices=["bf16", "int8"], default="bf16",
+                        help="the kernel's KV cache format (default: bf16)")
     parser.add_argument("--prompt-tokens", type=int,
                         help="prompt length in random tokens (default: 16 for the random model; "
                              "with --gguf it replaces --prompt, and generation ignores "
@@ -153,6 +162,7 @@ def main() -> None:
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args: argparse.Namespace = parser.parse_args()
     use_torch: bool = torch is not None and not args.no_torch
+    kv_q8: bool = args.kv_cache == "int8"
     if args.llama_bench and not args.gguf:
         parser.error("--llama-bench needs --gguf")
 
@@ -173,7 +183,8 @@ def main() -> None:
             stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>")
                     if t in tok.ids}
         model: Model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
-                                       numpy=not args.no_numpy, use_torch=use_torch)
+                                       numpy=not args.no_numpy, use_torch=use_torch,
+                                       kv_q8=kv_q8)
         name: str = g.meta.get("general.name", os.path.basename(args.gguf))
         formats: str = ", ".join(f"{k} {'/'.join(v)}" for k, v in model.formats.items())
         print(f"{name}: {len(model.layers)} layers, {model.weight_bytes() / 1e9:.2f} GB of "
@@ -184,7 +195,8 @@ def main() -> None:
             0, 128256, max(args.prompt_tokens or 16, 1))]
         model = Model.random(d=2048, layers=args.layers, heads=32, kv_heads=8, head_dim=64,
                              ffn=8192, vocab=128256, max_ctx=len(prompt_ids) + args.tokens + 1,
-                             fmt=args.weights, numpy=not args.no_numpy, use_torch=use_torch)
+                             fmt=args.weights, numpy=not args.no_numpy, use_torch=use_torch,
+                             kv_q8=kv_q8)
         print(f"Llama 3.2 1B shapes, random weights, {args.layers} layers, "
               f"{args.weights.upper()}_0 {model.weight_bytes() / 1e9:.2f} GB "
               f"(built in {time.perf_counter() - t0:.1f} s); prompt of {len(prompt_ids)} "
@@ -269,7 +281,7 @@ def main() -> None:
     if args.llama_bench:
         threads: int = args.threads or os.cpu_count() or 1
         pp_ts, tg_ts, commit = llama_bench(args.llama_bench, args.gguf, len(prompt_ids),
-                                           args.tokens, threads)
+                                           args.tokens, threads, kv_q8)
         # Its own prefill and decode rates, as the AIR rows report theirs.
         prompt_s = len(prompt_ids) / pp_ts if pp_ts else 0.0
         report(f"llama.cpp, {threads} thr", prompt_s, [1.0 / tg_ts], "llama.cpp")
