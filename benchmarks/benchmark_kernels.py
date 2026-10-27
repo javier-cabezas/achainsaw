@@ -25,6 +25,13 @@ per-block int8 kernel).
     python benchmarks/benchmark_kernels.py --quick          # short run (CI)
     python benchmarks/benchmark_kernels.py --json out.json  # machine-readable results
     python benchmarks/benchmark_kernels.py --no-torch       # skip the PyTorch baseline
+    python benchmarks/benchmark_kernels.py --cold-weights   # GEMV weights from memory (CI)
+
+The quantized GEMVs' 4096x4096 weights (8 and 16 MB) fit in many CPUs' last-level cache, where
+their speed depends on how the pages happen to map onto the cache: separate runs differ by
+a third or more. --cold-weights cycles them through copies that exceed any last-level cache,
+so each call streams its weights from memory, as decode does: slower, but within about 15%
+from run to run, which is what the CI comparison (perf_compare.py) needs.
 
 Exits non-zero if any kernel, or a PyTorch baseline, disagrees with the reference.
 """
@@ -32,12 +39,13 @@ Exits non-zero if any kernel, or a PyTorch baseline, disagrees with the referenc
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, NotRequired, TypeAlias, TypedDict
 
 import numpy as np
@@ -177,7 +185,21 @@ def tt(x: npt.NDArray[Any]) -> Any:
     return torch.from_numpy(x) if torch is not None else None
 
 
-def make_cases() -> list[Case]:
+# Bytes of weight copies the quantized GEMVs cycle through with --cold-weights: more than
+# any last-level cache.
+COLD_BYTES: int = 256 << 20
+
+
+def cycled(w: npt.NDArray[Any], cold: bool) -> Callable[[], npt.NDArray[Any]]:
+    """`w`, or with `cold` the next of enough copies of it to exceed COLD_BYTES."""
+    if not cold:
+        return lambda: w
+    copies: list[npt.NDArray[Any]] = [w] + [w.copy() for _ in range(COLD_BYTES // w.nbytes)]
+    it: Iterator[npt.NDArray[Any]] = itertools.cycle(copies)
+    return lambda: next(it)
+
+
+def make_cases(cold_weights: bool = False) -> list[Case]:
     """Each case: name, label, kernel source, args builder, verify(kernel) -> max error,
     tolerance, NumPy baseline, PyTorch baseline with its check(result) -> error (and its own
     tolerance where its types differ), and the work per call (for GFLOP/s)."""
@@ -676,9 +698,10 @@ def make_cases() -> list[Case]:
         k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q8_ref)) / np.max(np.abs(q8_ref)))
 
+    q8_next: Callable[[], npt.NDArray[Any]] = cycled(q_packed, cold_weights)
     cases.append(Case(
         name="q8_gemv", label=f"Q8_0 GEMV, all cores ({qm}x{qk})",
-        run=lambda k: k.run("q8_gemv", q_packed, s_packed, qx, qy, qm, qk),
+        run=lambda k: k.run("q8_gemv", q8_next(), s_packed, qx, qy, qm, qk),
         verify=verify_q8, tol=1e-5, numpy=lambda: np_q8_gemv(q_blocks, qs, qx),
         torch=lambda: torch.ops.aten._weight_int8pack_mm(tx_bf16[None], t_w8, t_s8),
         torch_check=lambda out: rel_err(out, q8_ref_t), torch_tol=1e-2,
@@ -722,9 +745,10 @@ def make_cases() -> list[Case]:
         k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk)
         return float(np.max(np.abs(qy - q4_ref)) / np.max(np.abs(q4_ref)))
 
+    q4_next: Callable[[], npt.NDArray[Any]] = cycled(q4_packed, cold_weights)
     cases.append(Case(
         name="q4_gemv", label=f"Q4_0 GEMV, all cores ({qm}x{qk})",
-        run=lambda k: k.run("q4_gemv", q4_packed, q4s_packed, qx, qy, qm, qk),
+        run=lambda k: k.run("q4_gemv", q4_next(), q4s_packed, qx, qy, qm, qk),
         verify=verify_q4, tol=1e-5, numpy=lambda: np_q8_gemv(q4_blocks, q4s, qx),
         torch=lambda: torch.ops.aten._weight_int4pack_mm_for_cpu(tx_bf16[None], t_p4, 32,
                                                                  t_sz4),
@@ -954,6 +978,9 @@ def main() -> None:
                         help="skip timing NumPy (results still verified against it)")
     parser.add_argument("--no-torch", action="store_true",
                         help="skip the PyTorch baseline (skipped anyway without PyTorch)")
+    parser.add_argument("--cold-weights", action="store_true",
+                        help="cycle the quantized GEMVs through weight copies larger than any "
+                             "last-level cache, so each call reads them from memory")
     args: argparse.Namespace = parser.parse_args()
     use_torch: bool = torch is not None and not args.no_torch
 
@@ -961,7 +988,7 @@ def main() -> None:
     backends: list[str] = available if args.backends == "all" else args.backends.split(",")
     levels: list[str | None] = isa_levels(args.isa)
     budget: float = 0.02 if args.quick else 0.3
-    cases: list[Case] = make_cases()
+    cases: list[Case] = make_cases(args.cold_weights)
     original_cap: str | None = achainsaw.get_isa_cap()
 
     print("=" * 96)
