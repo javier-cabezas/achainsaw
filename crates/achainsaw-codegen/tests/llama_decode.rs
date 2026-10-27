@@ -36,10 +36,24 @@ enum Fmt {
     Q4K = 3,
     Q5K = 4,
     Q41 = 5,
+    Iq4 = 6,
 }
 
+/// IQ4_NL's codebook (llama.cpp's kvalues_iq4nl): the value of each 4-bit code.
+const IQ4_NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
 impl Fmt {
-    const ALL: [Fmt; 6] = [Fmt::Q4, Fmt::Q8, Fmt::Q6, Fmt::Q4K, Fmt::Q5K, Fmt::Q41];
+    const ALL: [Fmt; 7] = [
+        Fmt::Q4,
+        Fmt::Q8,
+        Fmt::Q6,
+        Fmt::Q4K,
+        Fmt::Q5K,
+        Fmt::Q41,
+        Fmt::Iq4,
+    ];
 
     /// Values per scale.
     fn group(self) -> usize {
@@ -99,9 +113,14 @@ impl Mat {
             Fmt::Q6 => (32.0, 18.5),
             Fmt::Q4K | Fmt::Q41 => (8.0, 4.6),
             Fmt::Q5K => (16.0, 9.2),
+            Fmt::Iq4 => (8.0, 60.0),
         };
         let q: Vec<i8> = (0..rows * k)
             .map(|_| {
+                if fmt == Fmt::Iq4 {
+                    // A random code's codebook value.
+                    return IQ4_NL[((rng.next() + 1.0) * 8.0).clamp(0.0, 15.0) as usize];
+                }
                 let v = ((rng.next() * qmax).floor() as i32).clamp(-qmax as i32, qmax as i32 - 1);
                 // Q4_K and Q5_K values are unsigned: 0 .. 2 qmax.
                 (if fmt.has_min() { v + qmax as i32 } else { v }) as i8
@@ -156,7 +175,7 @@ impl Mat {
         }
         let block_bytes = match fmt {
             Fmt::Q8 => 2048,
-            Fmt::Q4 | Fmt::Q4K | Fmt::Q41 => 1024,
+            Fmt::Q4 | Fmt::Q4K | Fmt::Q41 | Fmt::Iq4 => 1024,
             Fmt::Q6 => 1536,
             Fmt::Q5K => 1280,
         };
@@ -174,6 +193,10 @@ impl Mat {
                     match fmt {
                         Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8 ^ 0x80,
                         Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
+                        Fmt::Iq4 => {
+                            let code = IQ4_NL.iter().position(|&c| c == v).unwrap() as u8;
+                            packed_q[at(n / 4, n % 4)] |= code << (4 * (t / 16))
+                        }
                         Fmt::Q4K | Fmt::Q41 => {
                             packed_q[at(n / 4, n % 4)] |= (v as u8) << (4 * (t / 16))
                         }
@@ -380,7 +403,7 @@ impl Model {
                 sin.push(a.sin() as f32);
             }
         }
-        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 rotate across the matrices of a layer
+        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 and IQ4_NL rotate across the matrices of a layer
         // (Q, K and V each in its own) and across layers, and the LM head is Q6_K.
         let layers = attn_norms
             .into_iter()
@@ -634,7 +657,7 @@ fn llama_decode_matches_reference() {
     check_decode(false, false);
 }
 
-/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K and Q4_1 matrices mixed within and across layers (Q, K and V
+/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 and IQ4_NL matrices mixed within and across layers (Q, K and V
 /// in different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {
