@@ -10,6 +10,8 @@ same as a change to the compiler:
   benchmark_kernels.py   every kernel on every backend (NumPy timing skipped)
   benchmark_decode.py    llama_decode.air on a 4-layer random Q4_0 model: a 64-token prefill
                          (when the script has --prompt-tokens) and decode
+The quantized GEMVs read their weights from memory (benchmark_kernels.py --cold-weights) when
+both sides' scripts have that flag, since cache-resident weights make runs differ by a third.
 The sides alternate for --rounds rounds, in ABBA order to cancel drift, each run in a fresh
 process. Every (benchmark, backend) keeps its best time over the rounds: noise only ever
 adds time, and a process can be unlucky as a whole (memory layout), so the minimum is the
@@ -50,17 +52,24 @@ def supports(script: str, flag: str, env: dict[str, str]) -> bool:
     return flag in out.stdout
 
 
-def run_side(root: str, workdir: str, tag: str, skipped: set[str]) -> Times:
+def kernels_script(root: str) -> str:
+    return os.path.join(root, "benchmarks", "benchmark_kernels.py")
+
+
+def run_side(root: str, workdir: str, tag: str, skipped: set[str], cold: bool) -> Times:
     """One round of benchmarks for the checkout at `root`: {(benchmark, backend): us}.
-    Benchmarks this side's scripts cannot run are added to `skipped`."""
+    Benchmarks this side's scripts cannot run are added to `skipped`. With `cold` (both
+    sides have the flag), the quantized GEMVs read their weights from memory."""
     env: dict[str, str] = side_env(root)
     times: Times = {}
-    kernels: str = os.path.join(root, "benchmarks", "benchmark_kernels.py")
+    kernels: str = kernels_script(root)
     out: str = os.path.join(workdir, f"{tag}-kernels.json")
     cmd: list[str] = [sys.executable, kernels, "--json", out]
     for flag in ("--no-numpy", "--no-torch"):
         if supports(kernels, flag, env):
             cmd.append(flag)
+    if cold:
+        cmd.append("--cold-weights")
     res: subprocess.CompletedProcess[str] = subprocess.run(cmd, env=env, capture_output=True,
                                                            text=True, cwd=root)
     if res.returncode != 0:
@@ -118,13 +127,17 @@ def main() -> None:
                              "head": os.path.abspath(args.head)}
     best: dict[str, Times] = {"base": {}, "head": {}}
     skipped: set[str] = set()
+    # Cache-resident GEMV weights make runs differ by a third, so both sides read them from
+    # memory when both scripts can; otherwise neither does, so the two stay comparable.
+    cold: bool = all(supports(kernels_script(r), "--cold-weights", side_env(r))
+                     for r in sides.values())
     with tempfile.TemporaryDirectory() as workdir:
         for rnd in range(args.rounds):
             order: list[str] = ["base", "head"] if rnd % 2 == 0 else ["head", "base"]
             for side in order:
                 t0: float = time.perf_counter()
                 try:
-                    times: Times = run_side(sides[side], workdir, side, skipped)
+                    times: Times = run_side(sides[side], workdir, side, skipped, cold)
                 except RuntimeError as e:
                     print(f"[{side}] {e}", file=sys.stderr)
                     if side == "head":
@@ -161,6 +174,8 @@ def main() -> None:
     rows.sort(key=lambda r: -(r[3] or 0))
 
     lines: list[str] = [f"### Performance: head vs base (best of {args.rounds} runs each)", "",
+                        ("Quantized GEMVs read their weights from memory (`--cold-weights`)."
+                         if cold else "Quantized GEMVs run on cache-resident weights."), "",
                         "| Benchmark | Backend | Base | Head | Head / base | |",
                         "|---|---|---|---|---|---|"]
     for (name, backend), b, h, rel, status in rows:
