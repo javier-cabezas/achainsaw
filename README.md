@@ -165,8 +165,8 @@ and `stack`, in an arena of its own, and every access outside it fails. This is 
 
 **A Llama in one file.** [`llama_decode.air`](examples/kernels/llama_decode.air)
 runs a whole Llama-style forward pass in one call: a token in, the next token
-out, with quantized weights (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K) read straight
-from a GGUF file. Llama 3.2 1B Instruct, continuing "The capital of France is"
+out, with quantized weights (Q4_0, Q4_1, IQ4_NL, Q8_0, Q4_K, Q5_K, Q6_K) read
+straight from a GGUF file. Llama 3.2 1B Instruct, continuing "The capital of France is"
 on a laptop's Ryzen 7 8845HS with 8 threads:
 
 ```console
