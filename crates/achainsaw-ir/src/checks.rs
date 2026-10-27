@@ -521,6 +521,7 @@ fn hoist_loop(
             matches!(
                 i,
                 Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
                     | Instruction::Alloc { .. }
                     | Instruction::Free { .. }
                     | Instruction::MatMul { .. }

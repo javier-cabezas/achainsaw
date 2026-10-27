@@ -12,6 +12,8 @@ pub struct OptimizationStats {
     pub dead_blocks_removed: usize,
     /// Calls to `inline fn`s replaced by their bodies.
     pub calls_inlined: usize,
+    /// `call_indirect`s through a handle known in their function, made direct calls.
+    pub calls_devirtualized: usize,
     /// Loops given a full-vector copy for their masked accesses (`crate::loops`).
     pub loops_split: usize,
     pub iterations: usize,
@@ -25,6 +27,7 @@ impl OptimizationStats {
             + self.dead_instructions_removed
             + self.dead_blocks_removed
             + self.calls_inlined
+            + self.calls_devirtualized
     }
 }
 
@@ -37,6 +40,12 @@ pub fn optimize_module(module: &mut Module) -> OptimizationStats {
         calls_inlined: crate::inline::inline_in_place(module),
         ..Default::default()
     };
+    if crate::indirect::uses_handles(module) {
+        total_stats.calls_devirtualized = crate::indirect::devirtualize(module);
+        if total_stats.calls_devirtualized > 0 {
+            total_stats.calls_inlined += crate::inline::inline_in_place(module);
+        }
+    }
     total_stats.loops_split = crate::loops::split_masked_loops(module);
 
     let sigs = signatures(module);
@@ -145,6 +154,14 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     }
                     continue;
                 }
+                if let Instruction::CallIndirect { dsts, rets, .. } = inst {
+                    for (d, ty) in dsts.iter().zip(rets) {
+                        if types.insert(d.clone(), *ty).is_none() {
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
                 let (dst, ty) = match inst {
                     Instruction::AssignConst { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Load { dst, ty, .. } | Instruction::AtomicLoad { dst, ty, .. } => {
@@ -176,6 +193,7 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     Instruction::Alloc { dst, .. }
                     | Instruction::Stack { dst, .. }
                     | Instruction::Addr { dst, .. } => (dst, Some(Type::Ptr)),
+                    Instruction::FnRef { dst, .. } => (dst, Some(Type::I64)),
                     Instruction::Binary {
                         op, dst, lhs, rhs, ..
                     } => {
@@ -1108,9 +1126,9 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 Instruction::Cast { dst, .. } => used.contains(dst),
                 Instruction::VectorReduce { dst, .. } => used.contains(dst),
                 Instruction::Splat { dst, .. } => used.contains(dst),
-                Instruction::Stack { dst, .. } | Instruction::Addr { dst, .. } => {
-                    used.contains(dst)
-                }
+                Instruction::Stack { dst, .. }
+                | Instruction::Addr { dst, .. }
+                | Instruction::FnRef { dst, .. } => used.contains(dst),
                 Instruction::ExtractLane { dst, .. } => used.contains(dst),
                 Instruction::VBinary { dst, .. }
                 | Instruction::VFma { dst, .. }
@@ -1134,6 +1152,7 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::AtomicLoad { .. }
                 | Instruction::AtomicStore { .. }
                 | Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
                 | Instruction::Alloc { .. }
                 | Instruction::Free { .. }
                 | Instruction::MaskedLoad { .. }

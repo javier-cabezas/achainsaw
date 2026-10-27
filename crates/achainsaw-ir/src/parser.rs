@@ -816,7 +816,56 @@ impl<'a> Parser<'a> {
                 | "cos"
                 | "stack"
                 | "addr"
+                | "fnref"
+                | "call_indirect"
         )
+    }
+
+    /// After `call_indirect`: `h(args)`, then `->ty`, `->(ty, ...)` or nothing.
+    fn parse_call_indirect(
+        &mut self,
+        dsts: Vec<String>,
+        span: Span,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Instruction, Diagnostic> {
+        let (handle, _) = self.expect_ident()?;
+        let args = self.parse_paren_operands(instructions)?;
+        let mut rets = Vec::new();
+        if self.peek_kind() == &TokenKind::Arrow {
+            self.advance();
+            if self.peek_kind() == &TokenKind::LParen {
+                self.advance();
+                loop {
+                    rets.push(self.parse_type()?);
+                    if self.peek_kind() != &TokenKind::Comma {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect(TokenKind::RParen)?;
+            } else {
+                rets.push(self.parse_type()?);
+            }
+        }
+        if !dsts.is_empty() && rets.is_empty() {
+            return Err(Diagnostic::error(
+                "ERR_EXPECTED_RESULT_TYPE",
+                format!(
+                    "call_indirect assigns {} but declares no result type: write `{} = call_indirect {handle}(...)->i64`",
+                    dsts.join(", "),
+                    dsts.join(", ")
+                ),
+                span,
+            ));
+        }
+        self.expect_eol()?;
+        Ok(Instruction::CallIndirect {
+            dsts,
+            handle,
+            args,
+            rets,
+            span,
+        })
     }
 
     /// Parses an atomic access after `dst = atomic` (or the store after `atomic`).
@@ -1227,6 +1276,14 @@ impl<'a> Parser<'a> {
             return Ok(Instruction::Free { ptr, span });
         }
 
+        // `call_indirect h(args)` without results; followed by `=` or `,` it is a register.
+        if matches!(&first_tok.kind, TokenKind::Ident(name) if name == "call_indirect")
+            && !matches!(self.peek_at(1), Some(TokenKind::Equal | TokenKind::Comma))
+        {
+            let span = self.advance().span;
+            return self.parse_call_indirect(Vec::new(), span, instructions);
+        }
+
         // Check if call without dst: call func(args...)
         if first_tok.kind == TokenKind::Call {
             let span = self.advance().span;
@@ -1252,7 +1309,7 @@ impl<'a> Parser<'a> {
                 "ERR_MISSING_DESTINATION",
                 format!(
                     "'{dst}' needs a destination register: write 'r = {dst} ...' (only st, \
-                     atomic st, stm, mm, free, call and par stand alone)"
+                     atomic st, stm, mm, free, call, call_indirect and par stand alone)"
                 ),
                 dst_span,
             )
@@ -1265,11 +1322,15 @@ impl<'a> Parser<'a> {
                 dsts.push(self.expect_ident()?.0);
             }
             self.expect(TokenKind::Equal)?;
+            if matches!(self.peek_kind(), TokenKind::Ident(n) if n == "call_indirect") {
+                self.advance();
+                return self.parse_call_indirect(dsts, dst_span, instructions);
+            }
             if self.peek_kind() != &TokenKind::Call {
                 return Err(Diagnostic::error(
                     "ERR_EXPECTED_RVALUE",
                     format!(
-                        "Only 'call' assigns several registers ({}), found {:?}",
+                        "Only 'call' and 'call_indirect' assign several registers ({}), found {:?}",
                         dsts.join(", "),
                         self.peek_kind()
                     ),
@@ -1530,6 +1591,18 @@ impl<'a> Parser<'a> {
                         name,
                         span: dst_span,
                     });
+                }
+                if name == "fnref" {
+                    let (func, _) = self.expect_ident()?;
+                    self.expect_eol()?;
+                    return Ok(Instruction::FnRef {
+                        dst,
+                        func,
+                        span: dst_span,
+                    });
+                }
+                if name == "call_indirect" {
+                    return self.parse_call_indirect(vec![dst], dst_span, instructions);
                 }
                 if let Some(op) = UnaryOp::from_str_opt(&name) {
                     let src = self.parse_operand(instructions, None)?;

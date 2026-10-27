@@ -38,6 +38,7 @@ pub const RT_STACK_CHECK: &str = "__achainsaw_rt_stack_check";
 pub const RT_SANDBOX_CHECK_MM: &str = "__achainsaw_rt_sandbox_check_mm";
 pub const RT_PAR_FOR: &str = "__achainsaw_rt_par_for";
 pub const RT_FUEL_COUNTER: &str = "__achainsaw_rt_fuel_counter";
+pub const RT_BAD_INDIRECT_CALL: &str = "__achainsaw_rt_bad_indirect_call";
 
 /// Name of the scalar host-call trampoline generated for `func`.
 pub fn trampoline_name(func: &str) -> String {
@@ -279,6 +280,7 @@ pub fn lower_module<'ctx>(
         dynamic_fuel: air.uses_par(),
         vnni_bias: Default::default(),
         data,
+        handles: Default::default(),
     };
     lw.declare_runtime();
     for ext in &air.extern_functions {
@@ -290,6 +292,9 @@ pub fn lower_module<'ctx>(
         let fn_ty = lw.fn_type(&func.params, &func.rets);
         let f = module.add_function(&func.name, fn_ty, Some(Linkage::External));
         lw.add_target_attributes(f);
+    }
+    if achainsaw_ir::indirect::uses_handles(air) {
+        lw.define_handle_table(air);
     }
     let mut mm_dtypes = Vec::new();
     for inst in air
@@ -337,6 +342,11 @@ struct ModuleLowerer<'a, 'ctx> {
     vnni_bias: std::cell::RefCell<HashMap<(usize, usize), BasicValueEnum<'ctx>>>,
     /// The constant global of each `data` (none in sandboxed code: `LowerOptions::data_addrs`).
     data: HashMap<String, inkwell::values::GlobalValue<'ctx>>,
+    /// The function handle table (`define_handle_table`), when the module uses handles.
+    handles: std::cell::OnceCell<(
+        inkwell::values::GlobalValue<'ctx>,
+        achainsaw_ir::indirect::HandleTable,
+    )>,
 }
 
 /// One AIR register: its LLVM value and AIR type.
@@ -586,6 +596,34 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         decl(RT_SANDBOX_CHECK_MM, i32t.fn_type(&[i64t.into(); 7], false));
         decl(RT_PAR_FOR, i32t.fn_type(&[i64t.into(); 4], false));
         decl(RT_FUEL_COUNTER, i64t.fn_type(&[], false));
+        decl(RT_BAD_INDIRECT_CALL, void.fn_type(&[i64t.into()], false));
+    }
+
+    /// The module's function handle table: a private constant `[n x {ptr, i64}]`, each
+    /// function's address and signature id in handle order (`achainsaw_ir::indirect`).
+    fn define_handle_table(&self, air: &Module) {
+        let table = achainsaw_ir::indirect::HandleTable::new(air);
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let entry_ty = self
+            .ctx
+            .struct_type(&[ptr_ty.into(), self.i64().into()], false);
+        let entries: Vec<_> = table
+            .entries
+            .iter()
+            .map(|(name, sig)| {
+                let f = self.module.get_function(name).expect("function declared");
+                entry_ty.const_named_struct(&[
+                    f.as_global_value().as_pointer_value().into(),
+                    self.c64(*sig as i64).into(),
+                ])
+            })
+            .collect();
+        let init = entry_ty.const_array(&entries);
+        let g = self.module.add_global(init.get_type(), None, "handles");
+        g.set_initializer(&init);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        let _ = self.handles.set((g, table));
     }
 
     fn runtime_fn(&self, name: &str) -> FunctionValue<'ctx> {
@@ -1353,6 +1391,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let calls_out = matches!(
                     inst,
                     Instruction::Call { .. }
+                        | Instruction::CallIndirect { .. }
                         | Instruction::Alloc { .. }
                         | Instruction::Free { .. }
                         | Instruction::MatMul { .. }
@@ -1408,6 +1447,110 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
 
     fn val(&self, st: &FnState<'ctx>, name: &str) -> (BasicValueEnum<'ctx>, Type) {
         st.values[name]
+    }
+
+    /// `call_indirect`: entry `h - 1` of the handle table, if in range, with the call's
+    /// signature id, is the function to call; otherwise JIT code reports the handle and
+    /// takes zero results, and AOT code (no runtime) traps.
+    fn call_indirect(
+        &self,
+        st: &mut FnState<'ctx>,
+        dsts: &[String],
+        handle: &str,
+        args: &[String],
+        rets: &[Type],
+    ) -> Result<()> {
+        let b = &self.builder;
+        let (g, table) = self
+            .handles
+            .get()
+            .ok_or_else(|| anyhow!("call_indirect without a handle table"))?;
+        let h = self.int(st, handle);
+        let arg_types: Vec<Type> = args.iter().map(|a| st.values[a].1).collect();
+        let want = table.signature_id(&arg_types, rets);
+        let n = table.entries.len() as i64;
+        let cur = b.get_insert_block().expect("lowering inside a block");
+        let check = self.ctx.insert_basic_block_after(cur, "ind.check");
+        let call = self.ctx.insert_basic_block_after(check, "ind.call");
+        let bad = self.ctx.insert_basic_block_after(call, "ind.bad");
+        let merge = self.ctx.insert_basic_block_after(bad, "ind.merge");
+        let idx = b.build_int_sub(h, self.c64(1), "")?;
+        let in_range = b.build_int_compare(IntPredicate::ULT, idx, self.c64(n), "")?;
+        b.build_conditional_branch(in_range, check, bad)?;
+
+        b.position_at_end(check);
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let entry_ty = self
+            .ctx
+            .struct_type(&[ptr_ty.into(), self.i64().into()], false);
+        let arr_ty = entry_ty.array_type(n as u32);
+        let zero = self.i32().const_zero();
+        // SAFETY: idx < n, checked above.
+        let sig_p = unsafe {
+            b.build_in_bounds_gep(
+                arr_ty,
+                g.as_pointer_value(),
+                &[zero, idx, self.i32().const_int(1, false)],
+                "",
+            )?
+        };
+        let sig = b.build_load(self.i64(), sig_p, "")?.into_int_value();
+        let ok = b.build_int_compare(IntPredicate::EQ, sig, self.c64(want as i64), "")?;
+        b.build_conditional_branch(ok, call, bad)?;
+
+        b.position_at_end(call);
+        let fn_p =
+            unsafe { b.build_in_bounds_gep(arr_ty, g.as_pointer_value(), &[zero, idx, zero], "")? };
+        let fp = b.build_load(ptr_ty, fn_p, "")?.into_pointer_value();
+        let params: Vec<(String, Type)> = arg_types.iter().map(|t| (String::new(), *t)).collect();
+        let fn_ty = self.fn_type(&params, rets);
+        let argv: Vec<BasicMetadataValueEnum> =
+            args.iter().map(|a| st.values[a].0.into()).collect();
+        let cs = b.build_indirect_call(fn_ty, fp, &argv, "")?;
+        cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+        let result = cs.try_as_basic_value().basic();
+        let call_end = b.get_insert_block().expect("lowering inside a block");
+        b.build_unconditional_branch(merge)?;
+
+        b.position_at_end(bad);
+        if self.opts.aot {
+            self.call(self.intrinsic("llvm.trap", &[]), &[])?;
+            b.build_unreachable()?;
+        } else {
+            self.call(self.runtime_fn(RT_BAD_INDIRECT_CALL), &[h.into()])?;
+            b.build_unconditional_branch(merge)?;
+        }
+
+        b.position_at_end(merge);
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let v: BasicValueEnum<'ctx> = if self.opts.aot {
+            result
+        } else {
+            let phi = b.build_phi(result.get_type(), "")?;
+            let zero_v: BasicValueEnum<'ctx> = match result.get_type() {
+                BasicTypeEnum::IntType(t) => t.const_zero().into(),
+                BasicTypeEnum::FloatType(t) => t.const_zero().into(),
+                BasicTypeEnum::VectorType(t) => t.const_zero().into(),
+                BasicTypeEnum::ScalableVectorType(t) => t.const_zero().into(),
+                BasicTypeEnum::StructType(t) => t.const_zero().into(),
+                BasicTypeEnum::PointerType(t) => t.const_null().into(),
+                BasicTypeEnum::ArrayType(t) => t.const_zero().into(),
+            };
+            phi.add_incoming(&[(&result, call_end), (&zero_v, bad)]);
+            phi.as_basic_value()
+        };
+        if let [d] = dsts {
+            st.values.insert(d.clone(), (v, rets[0]));
+        } else {
+            let agg = v.into_struct_value();
+            for (i, (d, t)) in dsts.iter().zip(rets).enumerate() {
+                let x = b.build_extract_value(agg, i as u32, "")?;
+                st.values.insert(d.clone(), (x, *t));
+            }
+        }
+        Ok(())
     }
 
     fn int(&self, st: &FnState<'ctx>, name: &str) -> IntValue<'ctx> {
@@ -1847,6 +1990,22 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let p = b.build_int_add(base, self.c64(offset as i64), "")?;
                 st.values.insert(dst.clone(), (p.into(), Type::Ptr));
             }
+            Instruction::FnRef { dst, func, .. } => {
+                let h = self
+                    .handles
+                    .get()
+                    .and_then(|(_, t)| t.handle(func))
+                    .ok_or_else(|| anyhow!("fnref of '{func}' without its handle"))?;
+                st.values
+                    .insert(dst.clone(), (self.c64(h).into(), Type::I64));
+            }
+            Instruction::CallIndirect {
+                dsts,
+                handle,
+                args,
+                rets,
+                ..
+            } => self.call_indirect(st, dsts, handle, args, rets)?,
             Instruction::Addr { dst, name, .. } => {
                 let p = match (self.data.get(name), self.opts.data_addrs.get(name)) {
                     (Some(g), _) => b.build_ptr_to_int(g.as_pointer_value(), self.i64(), "")?,

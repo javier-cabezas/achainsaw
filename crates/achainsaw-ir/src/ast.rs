@@ -892,6 +892,24 @@ pub enum Instruction {
         name: String,
         span: Span,
     },
+    /// `h = fnref f`: the handle of the module's function `f`, an `i64` that
+    /// `call_indirect` calls (1 + the function's index in the module; 0 is never a handle).
+    FnRef {
+        dst: String,
+        func: String,
+        span: Span,
+    },
+    /// `r = call_indirect h(a, b)->i64`, `q, r = call_indirect h(x)->(i64, i64)` or
+    /// `call_indirect h(x)`: calls the function whose handle is `h`, which must take the
+    /// arguments' types and return `rets`. Otherwise nothing is called, the results are
+    /// zero, and the run reports `ERR_BAD_INDIRECT_CALL`.
+    CallIndirect {
+        dsts: Vec<String>,
+        handle: String,
+        args: Vec<String>,
+        rets: Vec<Type>,
+        span: Span,
+    },
     // Phase 4 Extensions
     Unary {
         op: UnaryOp,
@@ -1096,6 +1114,8 @@ impl Instruction {
             | Instruction::Free { span, .. }
             | Instruction::Stack { span, .. }
             | Instruction::Addr { span, .. }
+            | Instruction::FnRef { span, .. }
+            | Instruction::CallIndirect { span, .. }
             | Instruction::Unary { span, .. }
             | Instruction::Cast { span, .. }
             | Instruction::Fma { span, .. }
@@ -1122,7 +1142,7 @@ impl Instruction {
     /// Registers defined by this instruction (several for a call of a function returning
     /// several values).
     pub fn dsts(&self) -> Vec<&str> {
-        if let Instruction::Call { dsts, .. } = self {
+        if let Instruction::Call { dsts, .. } | Instruction::CallIndirect { dsts, .. } = self {
             return dsts.iter().map(String::as_str).collect();
         }
         self.dst().into_iter().collect()
@@ -1140,6 +1160,7 @@ impl Instruction {
             | Instruction::Alloc { dst, .. }
             | Instruction::Stack { dst, .. }
             | Instruction::Addr { dst, .. }
+            | Instruction::FnRef { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
             | Instruction::Cast { dst, .. }
@@ -1161,10 +1182,12 @@ impl Instruction {
             | Instruction::AtomicLoad { dst, .. }
             | Instruction::MaskedLoad { dst, .. }
             | Instruction::VGather { dst, .. } => Some(dst),
-            Instruction::Call { dsts, .. } => match dsts.as_slice() {
-                [d] => Some(d),
-                _ => None,
-            },
+            Instruction::Call { dsts, .. } | Instruction::CallIndirect { dsts, .. } => {
+                match dsts.as_slice() {
+                    [d] => Some(d),
+                    _ => None,
+                }
+            }
             Instruction::Store { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
@@ -1186,6 +1209,7 @@ impl Instruction {
             | Instruction::Alloc { dst, .. }
             | Instruction::Stack { dst, .. }
             | Instruction::Addr { dst, .. }
+            | Instruction::FnRef { dst, .. }
             | Instruction::Select { dst, .. }
             | Instruction::Unary { dst, .. }
             | Instruction::Cast { dst, .. }
@@ -1207,7 +1231,9 @@ impl Instruction {
             | Instruction::AtomicLoad { dst, .. }
             | Instruction::MaskedLoad { dst, .. }
             | Instruction::VGather { dst, .. } => vec![dst],
-            Instruction::Call { dsts, .. } => dsts.iter_mut().collect(),
+            Instruction::Call { dsts, .. } | Instruction::CallIndirect { dsts, .. } => {
+                dsts.iter_mut().collect()
+            }
             Instruction::Store { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
@@ -1245,7 +1271,11 @@ impl Instruction {
             Instruction::AssignConst { .. }
             | Instruction::VLen { .. }
             | Instruction::Stack { .. }
-            | Instruction::Addr { .. } => vec![],
+            | Instruction::Addr { .. }
+            | Instruction::FnRef { .. } => vec![],
+            Instruction::CallIndirect { handle, args, .. } => {
+                std::iter::once(handle).chain(args).collect()
+            }
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
@@ -1314,7 +1344,8 @@ impl Instruction {
             Instruction::AssignConst { .. }
             | Instruction::VLen { .. }
             | Instruction::Stack { .. }
-            | Instruction::Addr { .. } => vec![],
+            | Instruction::Addr { .. }
+            | Instruction::FnRef { .. } => vec![],
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
@@ -1348,6 +1379,9 @@ impl Instruction {
                 .chain(index.as_mut().map(|ix| &mut ix.reg))
                 .collect(),
             Instruction::Call { args, .. } => args.iter_mut().collect(),
+            Instruction::CallIndirect { handle, args, .. } => {
+                std::iter::once(handle).chain(args.iter_mut()).collect()
+            }
             Instruction::Par { count, args, .. } => {
                 std::iter::once(count).chain(args.iter_mut()).collect()
             }

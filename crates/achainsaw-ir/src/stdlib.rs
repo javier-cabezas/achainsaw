@@ -91,13 +91,15 @@ pub fn source_of(name: &str) -> Option<String> {
     Some(lines[first..end].join("\n") + "\n")
 }
 
-/// Functions that `f` calls or runs with `par`.
+/// Functions that `f` calls, runs with `par` or takes the handle of.
 fn callees(f: &Function) -> impl Iterator<Item = &str> {
     f.blocks
         .iter()
         .flat_map(|b| &b.instructions)
         .filter_map(|i| match i {
-            Instruction::Call { func, .. } | Instruction::Par { func, .. } => Some(func.as_str()),
+            Instruction::Call { func, .. }
+            | Instruction::Par { func, .. }
+            | Instruction::FnRef { func, .. } => Some(func.as_str()),
             _ => None,
         })
 }

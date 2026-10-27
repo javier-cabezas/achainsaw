@@ -165,6 +165,14 @@ impl AotCompiler {
             par: None,
             fast_math: self.fast_math,
             data,
+            // No runtime in an object: a bad indirect call traps.
+            handles: crate::lower::define_handle_table(&mut self.module, ir_mod, &func_ids)?.map(
+                |(table, entries)| crate::lower::HandleConfig {
+                    table,
+                    entries,
+                    bad_call_id: None,
+                },
+            ),
         };
 
         for func in &ir_mod.functions {
