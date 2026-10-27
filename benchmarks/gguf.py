@@ -41,6 +41,7 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
     12: ("Q4_K", 256, 144),
     13: ("Q5_K", 256, 176),
     14: ("Q6_K", 256, 210),
+    20: ("IQ4_NL", 32, 18),
     30: ("BF16", 1, 2),
 }
 
@@ -110,6 +111,20 @@ def _deq_q4_1(b: U8) -> F32:
     qs: U8 = b[:, 4:20]
     q: F32 = np.concatenate([qs & 15, qs >> 4], axis=1).astype(np.float32)
     return q * d + m
+
+
+# IQ4_NL's codebook (llama.cpp's kvalues_iq4nl): the value of each 4-bit code.
+IQ4_NL_VALUES: npt.NDArray[np.int8] = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.int8)
+
+
+def _deq_iq4_nl(b: U8) -> F32:
+    """32 values per block: an f16 scale, then 16 bytes of codes as Q4_0's (byte t holds values
+    t and t + 16), each value the scale times the code's codebook entry."""
+    d: F32 = _f16(b[:, 0:2])
+    qs: U8 = b[:, 2:18]
+    codes: Ints = np.concatenate([qs & 15, qs >> 4], axis=1)
+    return IQ4_NL_VALUES[codes].astype(np.float32) * d
 
 
 def _deq_q8_0(b: U8) -> F32:
@@ -185,8 +200,8 @@ def _deq_k(bits: int) -> Callable[[U8], F32]:
 
 
 _DEQUANT: dict[str, Callable[[U8], F32]] = {
-    "Q4_0": _deq_q4_0, "Q4_1": _deq_q4_1, "Q8_0": _deq_q8_0, "Q4_K": _deq_k(4),
-    "Q5_K": _deq_k(5), "Q6_K": _deq_q6_k}
+    "Q4_0": _deq_q4_0, "Q4_1": _deq_q4_1, "Q8_0": _deq_q8_0, "IQ4_NL": _deq_iq4_nl,
+    "Q4_K": _deq_k(4), "Q5_K": _deq_k(5), "Q6_K": _deq_q6_k}
 
 
 class GGUF:

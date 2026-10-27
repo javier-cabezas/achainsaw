@@ -6,8 +6,9 @@ math and, when PyTorch is installed, a PyTorch one.
 The AIR kernel runs the whole prompt in one llama_prefill call (8 tokens per weight load),
 then each decode step (embedding, every layer, final norm, LM head and greedy argmax) in one
 llama_decode call. Both implementations use the same data types and arithmetic:
-Q4_0, Q8_0, Q6_K, Q4_K, Q5_K or Q4_1 weights with f16 block scales (Q4_K and Q5_K: GGUF's
-6-bit scales and mins under f16 super-block factors; Q4_1: an f16 min per block too),
+Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 or IQ4_NL weights with f16 block scales (Q4_K and Q5_K:
+GGUF's 6-bit scales and mins under f16 super-block factors; Q4_1: an f16 min per block too;
+IQ4_NL: 4-bit codes into a 16-value int8 codebook),
 activations quantized to int8 per 32-block on the fly, exact integer block dots, a bf16 KV cache
 (or with --kv-cache int8, int8 K and V with an f32 scale per position, and int8 queries for
 the scores), f32 for everything else (embedding, norms,
@@ -141,7 +142,7 @@ def main() -> None:
                         help="prompt for --gguf (default: %(default)r)")
     parser.add_argument("--chat", action="store_true", help="wrap the prompt in the chat format")
     parser.add_argument("--layers", type=int, default=16, help="random model layers")
-    parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k", "q41"], default="q4",
+    parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k", "q41", "iq4"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
     parser.add_argument("--kv-cache", choices=["bf16", "int8"], default="bf16",
