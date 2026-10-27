@@ -947,7 +947,7 @@ fn q4_gemm_matches_q4_gemv() {
 }
 
 /// The standard library's token tiles, `qmat_chunk8` and `qmat_chunk4`, give every token
-/// exactly `qmat_chunk`'s results, for each weight format and for a matrix of six parts in
+/// exactly `qmat_chunk`'s results, for each weight format and for a matrix of seven parts in
 /// different formats, at every level with and without `fast_math`. They are called directly:
 /// `qmat_batch` runs `qmat_chunk8` only with vectors of 256 bits or more.
 #[test]
@@ -958,14 +958,14 @@ fn qmat_tiles_match_single_tokens() {
     type One = extern "C" fn(i64, *const u64, *const i8, *const u8, *mut f32, i64);
     type Tile = extern "C" fn(i64, *const u64, *const i8, *const u8, *mut f32, i64, i64);
     // Bytes of weights per 32-block of a chunk, and f16 scale vectors per block, by format.
-    const BLOCK: [usize; 6] = [2048, 1024, 1536, 1024, 1280, 1024];
-    const SCALES: [usize; 6] = [1, 1, 2, 2, 2, 2];
+    const BLOCK: [usize; 7] = [2048, 1024, 1536, 1024, 1280, 1024, 1024];
+    const SCALES: [usize; 7] = [1, 1, 2, 2, 2, 2, 1];
     let (k, n) = (96usize, 8usize);
     let nb = k / 32;
     let mut rng = Rng(91);
-    let matrices: Vec<Vec<i64>> = (0..6)
+    let matrices: Vec<Vec<i64>> = (0..7)
         .map(|f| vec![f])
-        .chain([vec![3, 2, 5, 4, 0, 1]])
+        .chain([vec![3, 2, 6, 5, 4, 0, 1]])
         .collect();
     // Every byte is a valid weight in every format, so the weights are random bytes.
     let parts: Vec<Vec<(Vec<u8>, Vec<u16>)>> = matrices
