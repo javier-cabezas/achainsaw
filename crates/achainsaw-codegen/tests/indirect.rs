@@ -487,27 +487,41 @@ fn bad_indirect_calls_give_zeros_and_report() {
 }
 
 /// A `par` through a handle uses exactly the fuel of the same `par` called directly (one
-/// unit per index plus the body's branches; the handle's checks take none), and runs out
-/// at the same point.
+/// unit per index plus the body's branches; the handle's checks take none). With the whole
+/// pool, totals under an ample budget; with one thread (the same runtime path, but
+/// deterministic: which of several workers exhausts a tight budget, and how much is left
+/// over, depends on scheduling), the same stopping point under budgets that run out.
 #[test]
 fn par_through_a_handle_uses_the_fuel_of_a_direct_par() {
     use achainsaw_codegen::{get_remaining_fuel, set_execution_fuel};
-    let mut e = engine(false);
-    e.set_fuel(Some(u64::MAX >> 2));
-    let h = int(&e, "sqk_handle", &[]);
-    let run = |h: i64, budget: u64| {
-        set_execution_fuel(Some(budget));
-        let r = call(
-            &e,
-            "par_sum",
-            &[RtValue::I64(h), RtValue::I64(50), RtValue::I64(1)],
-        );
-        let left = get_remaining_fuel();
-        set_execution_fuel(None);
-        (r.map_err(|err| err.contains("ERR_OUT_OF_FUEL")), left)
-    };
-    for budget in [1u64 << 30, 40, 120, 200, 260] {
-        assert_eq!(run(h, budget), run(0, budget), "budget {budget}");
+    for threads in [None, Some(1)] {
+        let mut e = engine(false);
+        e.set_fuel(Some(u64::MAX >> 2));
+        e.set_threads(threads);
+        let h = int(&e, "sqk_handle", &[]);
+        let run = |h: i64, budget: u64| {
+            set_execution_fuel(Some(budget));
+            let r = call(
+                &e,
+                "par_sum",
+                &[RtValue::I64(h), RtValue::I64(50), RtValue::I64(1)],
+            );
+            let left = get_remaining_fuel();
+            set_execution_fuel(None);
+            (r.map_err(|err| err.contains("ERR_OUT_OF_FUEL")), left)
+        };
+        let budgets: &[u64] = if threads.is_none() {
+            &[1 << 30]
+        } else {
+            &[1 << 30, 40, 120, 200, 260]
+        };
+        for &budget in budgets {
+            assert_eq!(
+                run(h, budget),
+                run(0, budget),
+                "budget {budget}, threads {threads:?}"
+            );
+        }
     }
 }
 
