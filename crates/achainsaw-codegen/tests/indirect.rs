@@ -307,6 +307,18 @@ fn par_local(n:i64)->i64
     free out
     ret v
 
+# Handles named like mnemonics, in every position.
+fn par_mnemonic(n:i64)->i64
+  b0:
+    b = mul n, 8:i64
+    out = alloc b
+    min = call sqk_handle()
+    par n, call_indirect min(out, 2:i64)
+    last = sub n, 1:i64
+    v = ld out[last]:i64
+    free out
+    ret v
+
 # par through a handle of another signature (sq: no index-first, a result): runs nothing.
 fn par_wrong(n:i64)->i64
   b0:
@@ -403,6 +415,7 @@ fn check(e: &JitEngine) {
         assert_eq!(int(e, "par_sum", &[0, n, 3]), want, "direct par, n = {n}");
     }
     assert_eq!(int(e, "par_local", &[10]), 82);
+    assert_eq!(int(e, "par_mnemonic", &[10]), 83);
     // Handles are 1 + the function's index in the module.
     assert_eq!(int(e, "handle_value", &[0]), 1);
     assert_eq!(int(e, "handle_value", &[9]), 20);
