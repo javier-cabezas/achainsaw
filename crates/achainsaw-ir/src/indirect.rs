@@ -45,6 +45,14 @@ impl HandleTable {
             .map(|i| i as i64 + 1)
     }
 
+    /// The id `par n, call_indirect h(args)` checks for: `(i64, args...)` and no results.
+    pub fn par_signature_id(&self, args: &[Type]) -> u32 {
+        let params: Vec<Type> = std::iter::once(Type::I64)
+            .chain(args.iter().copied())
+            .collect();
+        self.signature_id(&params, &[])
+    }
+
     /// The id a call with these types checks for: no function's id when none has them.
     pub fn signature_id(&self, params: &[Type], rets: &[Type]) -> u32 {
         self.ids
@@ -60,7 +68,9 @@ pub fn uses_handles(module: &Module) -> bool {
         f.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
             matches!(
                 i,
-                Instruction::FnRef { .. } | Instruction::CallIndirect { .. }
+                Instruction::FnRef { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::ParIndirect { .. }
             )
         })
     })
@@ -101,6 +111,32 @@ pub fn devirtualize(module: &mut Module) -> usize {
         let types = crate::opt::infer_reg_types(f, &rets);
         for b in &mut f.blocks {
             for inst in &mut b.instructions {
+                if let Instruction::ParIndirect {
+                    count,
+                    handle,
+                    args,
+                    span,
+                } = inst
+                {
+                    let Some(target) = refs.get(handle.as_str()) else {
+                        continue;
+                    };
+                    let (params, have) = &sigs[target];
+                    let arg_types: Option<Vec<Type>> = std::iter::once(Some(Type::I64))
+                        .chain(args.iter().map(|a| types.get(a).copied()))
+                        .collect();
+                    if arg_types.as_ref() != Some(params) || !have.is_empty() {
+                        continue;
+                    }
+                    *inst = Instruction::Par {
+                        count: std::mem::take(count),
+                        func: target.clone(),
+                        args: std::mem::take(args),
+                        span: *span,
+                    };
+                    replaced += 1;
+                    continue;
+                }
                 let Instruction::CallIndirect {
                     dsts,
                     handle,

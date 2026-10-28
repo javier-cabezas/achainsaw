@@ -271,6 +271,17 @@ pub fn to_air_text(module: &Module) -> String {
                     Instruction::FnRef { dst, func, .. } => {
                         out.push_str(&format!("{dst} = fnref {func}"));
                     }
+                    Instruction::ParIndirect {
+                        count,
+                        handle,
+                        args,
+                        ..
+                    } => {
+                        out.push_str(&format!(
+                            "par {count}, call_indirect {handle}({})",
+                            args.join(", ")
+                        ));
+                    }
                     Instruction::CallIndirect {
                         dsts,
                         handle,
@@ -1217,6 +1228,21 @@ impl BinaryEncoder {
                 self.buf.push(0x3B);
                 self.push_regs(&[dst, func]);
             }
+            Instruction::ParIndirect {
+                count,
+                handle,
+                args,
+                ..
+            } => {
+                self.buf.push(0x3D);
+                self.push_regs(&[count, handle]);
+                self.buf
+                    .extend_from_slice(&(args.len() as u32).to_le_bytes());
+                for a in args {
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
+                }
+            }
             Instruction::CallIndirect {
                 dsts,
                 handle,
@@ -2019,6 +2045,21 @@ impl<'a> BinaryDecoder<'a> {
                 name: self.read_string()?,
                 span,
             }),
+            0x3D => {
+                let count = self.read_string()?;
+                let handle = self.read_string()?;
+                let arg_count = self.read_u32()?;
+                let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
+                for _ in 0..arg_count {
+                    args.push(self.read_string()?);
+                }
+                Ok(Instruction::ParIndirect {
+                    count,
+                    handle,
+                    args,
+                    span,
+                })
+            }
             0x3B => Ok(Instruction::FnRef {
                 dst: self.read_string()?,
                 func: self.read_string()?,

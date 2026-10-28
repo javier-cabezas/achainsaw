@@ -1159,7 +1159,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VGather { .. }
                 | Instruction::MaskedStore { .. }
                 | Instruction::MatMul { .. }
-                | Instruction::Par { .. } => true,
+                | Instruction::Par { .. }
+                | Instruction::ParIndirect { .. } => true,
             });
             pass_removed += before_len - block.instructions.len();
         }

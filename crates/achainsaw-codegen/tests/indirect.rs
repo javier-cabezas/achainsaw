@@ -1,5 +1,5 @@
-//! Function handles (`fnref`) and indirect calls (`call_indirect`) on the backend selected by
-//! `ACHAINSAW_BACKEND`: results of every scalar type, several results and vectors, handles
+//! Function handles (`fnref`), indirect calls (`call_indirect`) and `par` through a handle on
+//! the backend selected by `ACHAINSAW_BACKEND`: results of every scalar type, several results and vectors, handles
 //! kept in memory (a dispatch table built at run time), calls through handles that fail
 //! their checks (out of range, another signature) giving zeros and `ERR_BAD_INDIRECT_CALL`,
 //! fuel, the sandbox (including recursion through handles), devirtualization, validation,
@@ -247,6 +247,77 @@ fn wrong_ret(k:i64, x:i64)->i64
     r = call_indirect h(x)->i32
     w = sext r:i64
     ret w
+
+# A par body: out[i] = i * i + k.
+fn sqk(i:i64, out:ptr, k:i64)
+  b0:
+    a = mul i, i
+    v = add a, k
+    st out[i], v
+    ret
+
+fn sqk_handle()->i64
+  b0:
+    h = fnref sqk
+    ret h
+
+# sum of out[0 .. n) after a par over sqk, through its handle (h) or directly (h = 0).
+fn par_sum(h:i64, n:i64, k:i64)->i64
+  b0:
+    b = mul n, 8:i64
+    out = alloc b
+    jmp zero(0:i64)
+  zero(z:i64):
+    zm = lt z, n
+    br zm, zero_body, run
+  zero_body:
+    st out[z], 0:i64
+    z2 = add z, 1:i64
+    jmp zero(z2)
+  run:
+    direct = eq h, 0:i64
+    br direct, run_direct, run_handle
+  run_direct:
+    par n, sqk(out, k)
+    jmp sum(0:i64, 0:i64)
+  run_handle:
+    par n, call_indirect h(out, k)
+    jmp sum(0:i64, 0:i64)
+  sum(i:i64, s:i64):
+    more = lt i, n
+    br more, sum_body, done
+  sum_body:
+    v = ld out[i]:i64
+    s2 = add s, v
+    i2 = add i, 1:i64
+    jmp sum(i2, s2)
+  done:
+    free out
+    ret s
+
+# The same body through a known handle: a direct par before code generation.
+fn par_local(n:i64)->i64
+  b0:
+    b = mul n, 8:i64
+    out = alloc b
+    h = fnref sqk
+    par n, call_indirect h(out, 1:i64)
+    last = sub n, 1:i64
+    v = ld out[last]:i64
+    free out
+    ret v
+
+# par through a handle of another signature (sq: no index-first, a result): runs nothing.
+fn par_wrong(n:i64)->i64
+  b0:
+    h = call handle_of(0:i64)
+    b = mul n, 8:i64
+    out = alloc b
+    st out, 42:i64
+    par n, call_indirect h(out, 1:i64)
+    v = ld out:i64
+    free out
+    ret v
 "#;
 
 fn engine(sandbox: bool) -> JitEngine {
@@ -321,6 +392,17 @@ fn check(e: &JitEngine) {
         assert_eq!(int(e, "table_loop", &[n]), want, "table_loop({n})");
     }
     assert_eq!(int(e, "fib", &[15]), fib(15));
+    let h = int(e, "sqk_handle", &[]);
+    for n in [0i64, 1, 7, 1000] {
+        let want: i64 = (0..n).map(|i| i * i + 3).sum();
+        assert_eq!(
+            int(e, "par_sum", &[h, n, 3]),
+            want,
+            "par through a handle, n = {n}"
+        );
+        assert_eq!(int(e, "par_sum", &[0, n, 3]), want, "direct par, n = {n}");
+    }
+    assert_eq!(int(e, "par_local", &[10]), 82);
     // Handles are 1 + the function's index in the module.
     assert_eq!(int(e, "handle_value", &[0]), 1);
     assert_eq!(int(e, "handle_value", &[9]), 20);
@@ -369,6 +451,14 @@ fn bad_indirect_calls_give_zeros_and_report() {
             let err = call(&e, name, &[RtValue::I64(k), RtValue::I64(3)]).unwrap_err();
             assert!(err.contains("ERR_BAD_INDIRECT_CALL"), "{name}({k}): {err}");
         }
+        // par through a mismatched or bad handle runs no index.
+        let err = call(&e, "par_wrong", &[RtValue::I64(5)]).unwrap_err();
+        assert!(err.contains("ERR_BAD_INDIRECT_CALL"), "par_wrong: {err}");
+        for h in [-1i64, 999] {
+            let args = [RtValue::I64(h), RtValue::I64(4), RtValue::I64(1)];
+            let err = call(&e, "par_sum", &args).unwrap_err();
+            assert!(err.contains("ERR_BAD_INDIRECT_CALL"), "par_sum({h}): {err}");
+        }
         // The engine keeps working.
         assert_eq!(int(&e, "call_i64", &[0, 6]), 36);
     }
@@ -381,6 +471,31 @@ fn bad_indirect_calls_give_zeros_and_report() {
     assert_eq!(raw(0, 3), 7);
     assert!(achainsaw_codegen::check_execution_status().is_err());
     achainsaw_codegen::reset_execution_status();
+}
+
+/// A `par` through a handle uses exactly the fuel of the same `par` called directly (one
+/// unit per index plus the body's branches; the handle's checks take none), and runs out
+/// at the same point.
+#[test]
+fn par_through_a_handle_uses_the_fuel_of_a_direct_par() {
+    use achainsaw_codegen::{get_remaining_fuel, set_execution_fuel};
+    let mut e = engine(false);
+    e.set_fuel(Some(u64::MAX >> 2));
+    let h = int(&e, "sqk_handle", &[]);
+    let run = |h: i64, budget: u64| {
+        set_execution_fuel(Some(budget));
+        let r = call(
+            &e,
+            "par_sum",
+            &[RtValue::I64(h), RtValue::I64(50), RtValue::I64(1)],
+        );
+        let left = get_remaining_fuel();
+        set_execution_fuel(None);
+        (r.map_err(|err| err.contains("ERR_OUT_OF_FUEL")), left)
+    };
+    for budget in [1u64 << 30, 40, 120, 200, 260] {
+        assert_eq!(run(h, budget), run(0, budget), "budget {budget}");
+    }
 }
 
 #[test]
@@ -401,6 +516,20 @@ fn known_handles_become_direct_calls() {
     };
     assert_eq!(indirect("local"), 0);
     assert_eq!(indirect("call_i64"), 1);
+    let par_indirect = |name: &str| {
+        prepared
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::ParIndirect { .. }))
+            .count()
+    };
+    assert_eq!(par_indirect("par_local"), 0);
+    assert_eq!(par_indirect("par_sum"), 1);
     // A known handle of another signature stays indirect, and fails at run time.
     let src = "fn f(x:i64)->i64\n  b0:\n    ret x\n\nfn g(x:i32)->i32\n  b0:\n    h = fnref f\n    r = call_indirect h(x)->i32\n    ret r\n";
     let m = parse_and_validate(src).unwrap();
@@ -456,6 +585,18 @@ fn fnref_and_call_indirect_are_validated() {
         rejected(&f("    r = call_indirect x(undef)->i64\n")),
         "ERR_UNDEFINED_REG"
     );
+    assert_eq!(
+        rejected(&f("    par y, call_indirect x(p)\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        rejected(&f("    par x, call_indirect y(p)\n")),
+        "ERR_TYPE_MISMATCH"
+    );
+    assert_eq!(
+        rejected(&f("    v = splat x:v128\n    par x, call_indirect x(v)\n")),
+        "ERR_PAR_SIGNATURE"
+    );
     // Accepted: results ignored, several results, no results; the mnemonics as names.
     for ok in [
         f("    h = fnref k\n    call_indirect h(x)->i64\n"),
@@ -478,6 +619,7 @@ fn indirect_calls_round_trip_through_airb() {
         "{text}"
     );
     assert!(text.contains("call_indirect h(p, x)\n"), "{text}");
+    assert!(text.contains("par n, call_indirect h(out, k)\n"), "{text}");
     parse_and_validate(&text).unwrap_or_else(|d| panic!("{d:?}"));
 }
 

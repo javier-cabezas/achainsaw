@@ -599,22 +599,40 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         decl(RT_BAD_INDIRECT_CALL, void.fn_type(&[i64t.into()], false));
     }
 
-    /// The module's function handle table: a private constant `[n x {ptr, i64}]`, each
-    /// function's address and signature id in handle order (`achainsaw_ir::indirect`).
+    /// The type of a handle table entry: the function, its signature id, and its scalar
+    /// trampoline (null without one, and in AOT code), which `par` through a handle runs.
+    fn handle_entry_type(&self) -> inkwell::types::StructType<'ctx> {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        self.ctx
+            .struct_type(&[ptr_ty.into(), self.i64().into(), ptr_ty.into()], false)
+    }
+
+    /// The module's function handle table: a private constant array of entries
+    /// (`handle_entry_type`) in handle order (`achainsaw_ir::indirect`).
     fn define_handle_table(&self, air: &Module) {
         let table = achainsaw_ir::indirect::HandleTable::new(air);
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
-        let entry_ty = self
-            .ctx
-            .struct_type(&[ptr_ty.into(), self.i64().into()], false);
+        let entry_ty = self.handle_entry_type();
         let entries: Vec<_> = table
             .entries
             .iter()
             .map(|(name, sig)| {
                 let f = self.module.get_function(name).expect("function declared");
+                let has_tramp = air
+                    .functions
+                    .iter()
+                    .any(|g| &g.name == name && g.has_trampoline());
+                let tramp = if has_tramp && !self.opts.aot {
+                    self.trampoline_fn(name)
+                        .as_global_value()
+                        .as_pointer_value()
+                } else {
+                    ptr_ty.const_null()
+                };
                 entry_ty.const_named_struct(&[
                     f.as_global_value().as_pointer_value().into(),
                     self.c64(*sig as i64).into(),
+                    tramp.into(),
                 ])
             })
             .collect();
@@ -1396,6 +1414,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                         | Instruction::Free { .. }
                         | Instruction::MatMul { .. }
                         | Instruction::Par { .. }
+                        | Instruction::ParIndirect { .. }
                 );
                 if calls_out {
                     self.spill_fuel(&st)?;
@@ -1449,6 +1468,74 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         st.values[name]
     }
 
+    /// Checks handle `h` against signature id `want`: branches to `bad` unless they pass,
+    /// and leaves the builder in a new block where they do. Returns the table's type and the
+    /// entry's index there.
+    fn handle_check(
+        &self,
+        st: &FnState<'ctx>,
+        h: IntValue<'ctx>,
+        want: u32,
+        bad: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<(inkwell::types::ArrayType<'ctx>, IntValue<'ctx>)> {
+        let b = &self.builder;
+        let (g, table) = self
+            .handles
+            .get()
+            .ok_or_else(|| anyhow!("indirect call without a handle table"))?;
+        let n = table.entries.len() as i64;
+        let check = self.ctx.append_basic_block(st.func, "ind.check");
+        let pass = self.ctx.append_basic_block(st.func, "ind.pass");
+        let idx = b.build_int_sub(h, self.c64(1), "")?;
+        let in_range = b.build_int_compare(IntPredicate::ULT, idx, self.c64(n), "")?;
+        b.build_conditional_branch(in_range, check, bad)?;
+        b.position_at_end(check);
+        let arr_ty = self.handle_entry_type().array_type(n as u32);
+        let sig_p = self.handle_field(arr_ty, g.as_pointer_value(), idx, 1)?;
+        let sig = b.build_load(self.i64(), sig_p, "")?.into_int_value();
+        let ok = b.build_int_compare(IntPredicate::EQ, sig, self.c64(want as i64), "")?;
+        b.build_conditional_branch(ok, pass, bad)?;
+        b.position_at_end(pass);
+        Ok((arr_ty, idx))
+    }
+
+    /// The address of field `k` of table entry `idx` (in range).
+    fn handle_field(
+        &self,
+        arr_ty: inkwell::types::ArrayType<'ctx>,
+        table: PointerValue<'ctx>,
+        idx: IntValue<'ctx>,
+        k: u64,
+    ) -> Result<PointerValue<'ctx>> {
+        let zero = self.i32().const_zero();
+        // SAFETY: idx < the table's length, checked by handle_check.
+        Ok(unsafe {
+            self.builder.build_in_bounds_gep(
+                arr_ty,
+                table,
+                &[zero, idx, self.i32().const_int(k, false)],
+                "",
+            )?
+        })
+    }
+
+    /// Where a check failed: JIT code reports the handle and continues at `next`; AOT code
+    /// (no runtime) traps.
+    fn handle_failed(
+        &self,
+        h: IntValue<'ctx>,
+        next: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<()> {
+        if self.opts.aot {
+            self.call(self.intrinsic("llvm.trap", &[]), &[])?;
+            self.builder.build_unreachable()?;
+        } else {
+            self.call(self.runtime_fn(RT_BAD_INDIRECT_CALL), &[h.into()])?;
+            self.builder.build_unconditional_branch(next)?;
+        }
+        Ok(())
+    }
+
     /// `call_indirect`: entry `h - 1` of the handle table, if in range, with the call's
     /// signature id, is the function to call; otherwise JIT code reports the handle and
     /// takes zero results, and AOT code (no runtime) traps.
@@ -1468,39 +1555,11 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         let h = self.int(st, handle);
         let arg_types: Vec<Type> = args.iter().map(|a| st.values[a].1).collect();
         let want = table.signature_id(&arg_types, rets);
-        let n = table.entries.len() as i64;
-        let cur = b.get_insert_block().expect("lowering inside a block");
-        let check = self.ctx.insert_basic_block_after(cur, "ind.check");
-        let call = self.ctx.insert_basic_block_after(check, "ind.call");
-        let bad = self.ctx.insert_basic_block_after(call, "ind.bad");
-        let merge = self.ctx.insert_basic_block_after(bad, "ind.merge");
-        let idx = b.build_int_sub(h, self.c64(1), "")?;
-        let in_range = b.build_int_compare(IntPredicate::ULT, idx, self.c64(n), "")?;
-        b.build_conditional_branch(in_range, check, bad)?;
-
-        b.position_at_end(check);
+        let bad = self.ctx.append_basic_block(st.func, "ind.bad");
+        let merge = self.ctx.append_basic_block(st.func, "ind.merge");
+        let (arr_ty, idx) = self.handle_check(st, h, want, bad)?;
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
-        let entry_ty = self
-            .ctx
-            .struct_type(&[ptr_ty.into(), self.i64().into()], false);
-        let arr_ty = entry_ty.array_type(n as u32);
-        let zero = self.i32().const_zero();
-        // SAFETY: idx < n, checked above.
-        let sig_p = unsafe {
-            b.build_in_bounds_gep(
-                arr_ty,
-                g.as_pointer_value(),
-                &[zero, idx, self.i32().const_int(1, false)],
-                "",
-            )?
-        };
-        let sig = b.build_load(self.i64(), sig_p, "")?.into_int_value();
-        let ok = b.build_int_compare(IntPredicate::EQ, sig, self.c64(want as i64), "")?;
-        b.build_conditional_branch(ok, call, bad)?;
-
-        b.position_at_end(call);
-        let fn_p =
-            unsafe { b.build_in_bounds_gep(arr_ty, g.as_pointer_value(), &[zero, idx, zero], "")? };
+        let fn_p = self.handle_field(arr_ty, g.as_pointer_value(), idx, 0)?;
         let fp = b.build_load(ptr_ty, fn_p, "")?.into_pointer_value();
         let params: Vec<(String, Type)> = arg_types.iter().map(|t| (String::new(), *t)).collect();
         let fn_ty = self.fn_type(&params, rets);
@@ -1513,13 +1572,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         b.build_unconditional_branch(merge)?;
 
         b.position_at_end(bad);
-        if self.opts.aot {
-            self.call(self.intrinsic("llvm.trap", &[]), &[])?;
-            b.build_unreachable()?;
-        } else {
-            self.call(self.runtime_fn(RT_BAD_INDIRECT_CALL), &[h.into()])?;
-            b.build_unconditional_branch(merge)?;
-        }
+        self.handle_failed(h, merge)?;
 
         b.position_at_end(merge);
         // Results the call does not assign (or a function without results) need no phi.
@@ -1551,6 +1604,55 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 st.values.insert(d.clone(), (x, *t));
             }
         }
+        Ok(())
+    }
+
+    /// `par n, call_indirect h(args)`: after `handle_check` with `(i64, args)` and no
+    /// results, JIT code hands the entry's trampoline to `RT_PAR_FOR` (`par_with`) and AOT
+    /// code calls the function in a serial loop.
+    fn par_indirect(
+        &self,
+        st: &FnState<'ctx>,
+        count: &str,
+        handle: &str,
+        args: &[String],
+    ) -> Result<()> {
+        let b = &self.builder;
+        let (g, table) = self
+            .handles
+            .get()
+            .ok_or_else(|| anyhow!("par through a handle without a handle table"))?;
+        let n = self.int(st, count);
+        let h = self.int(st, handle);
+        let arg_types: Vec<Type> = args.iter().map(|a| st.values[a].1).collect();
+        let want = table.par_signature_id(&arg_types);
+        let bad = self.ctx.append_basic_block(st.func, "ind.bad");
+        let done = self.ctx.append_basic_block(st.func, "ind.done");
+        let (arr_ty, idx) = self.handle_check(st, h, want, bad)?;
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        if self.opts.aot {
+            let fn_p = self.handle_field(arr_ty, g.as_pointer_value(), idx, 0)?;
+            let fp = b.build_load(ptr_ty, fn_p, "")?.into_pointer_value();
+            let params: Vec<(String, Type)> = std::iter::once(Type::I64)
+                .chain(arg_types.iter().copied())
+                .map(|t| (String::new(), t))
+                .collect();
+            let fn_ty = self.fn_type(&params, &[]);
+            self.serial_par_with(st, n, args, |argv| {
+                let cs = b.build_indirect_call(fn_ty, fp, argv, "")?;
+                cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+                Ok(())
+            })?;
+        } else {
+            let t_p = self.handle_field(arr_ty, g.as_pointer_value(), idx, 2)?;
+            let tramp = b.build_load(ptr_ty, t_p, "")?.into_pointer_value();
+            let tramp = b.build_ptr_to_int(tramp, self.i64(), "")?;
+            self.par_with(st, n, tramp, args)?;
+        }
+        b.build_unconditional_branch(done)?;
+        b.position_at_end(bad);
+        self.handle_failed(h, done)?;
+        b.position_at_end(done);
         Ok(())
     }
 
@@ -2007,6 +2109,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 rets,
                 ..
             } => self.call_indirect(st, dsts, handle, args, rets)?,
+            Instruction::ParIndirect {
+                count,
+                handle,
+                args,
+                ..
+            } => self.par_indirect(st, count, handle, args)?,
             Instruction::Addr { dst, name, .. } => {
                 let p = match (self.data.get(name), self.opts.data_addrs.get(name)) {
                     (Some(g), _) => b.build_ptr_to_int(g.as_pointer_value(), self.i64(), "")?,
@@ -2298,13 +2406,30 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         Ok(())
     }
 
-    /// `par n, f(args)`: packs the arguments in trampoline layout (slot 0 is the index,
-    /// set by the runtime) and hands `f`'s trampoline to `RT_PAR_FOR`.
+    /// `par n, f(args)`: hands `f`'s trampoline to `RT_PAR_FOR` (`par_with`).
     fn par(
         &self,
         st: &FnState<'ctx>,
         n: IntValue<'ctx>,
         func: &str,
+        args: &[String],
+    ) -> Result<()> {
+        let tramp = self.trampoline_fn(func);
+        let tramp = self.builder.build_ptr_to_int(
+            tramp.as_global_value().as_pointer_value(),
+            self.i64(),
+            "",
+        )?;
+        self.par_with(st, n, tramp, args)
+    }
+
+    /// Runs trampoline `tramp` for every index below `n` through `RT_PAR_FOR`, with the
+    /// arguments in trampoline layout (slot 0 is the index, set by the runtime).
+    fn par_with(
+        &self,
+        st: &FnState<'ctx>,
+        n: IntValue<'ctx>,
+        tramp: IntValue<'ctx>,
         args: &[String],
     ) -> Result<()> {
         let b = &self.builder;
@@ -2332,9 +2457,6 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             let slot = unsafe { b.build_gep(self.i64(), buf, &[self.c64(j as i64 + 1)], "")? };
             b.build_store(slot, raw)?;
         }
-        let tramp = self.trampoline_fn(func);
-        let tramp =
-            b.build_ptr_to_int(tramp.as_global_value().as_pointer_value(), self.i64(), "")?;
         let buf = b.build_ptr_to_int(buf, self.i64(), "")?;
         let hook_args = [tramp, buf, self.c64(slots as i64), n].map(|v| v.into());
         if st.trap.is_some() {
@@ -2356,11 +2478,26 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         func: &str,
         args: &[String],
     ) -> Result<()> {
-        let b = &self.builder;
         let callee = self
             .module
             .get_function(func)
             .ok_or_else(|| anyhow!("Unknown function '{func}' in par"))?;
+        self.serial_par_with(st, n, args, |argv| {
+            let cs = self.builder.build_call(callee, argv, "")?;
+            cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+            Ok(())
+        })
+    }
+
+    /// A counted loop over `i` in `0..n`, `call(i, args)` in its body.
+    fn serial_par_with(
+        &self,
+        st: &FnState<'ctx>,
+        n: IntValue<'ctx>,
+        args: &[String],
+        call: impl Fn(&[BasicMetadataValueEnum<'ctx>]) -> Result<()>,
+    ) -> Result<()> {
+        let b = &self.builder;
         let pre = b.get_insert_block().unwrap();
         let header = self.ctx.append_basic_block(st.func, "par.header");
         let body = self.ctx.append_basic_block(st.func, "par.body");
@@ -2380,8 +2517,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             args.iter()
                 .map(|a| BasicMetadataValueEnum::from(st.values[a].0)),
         );
-        let cs = b.build_call(callee, &argv, "")?;
-        cs.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindNoTail);
+        call(&argv)?;
         let next = b.build_int_add(iv, self.c64(1), "")?;
         i.add_incoming(&[(&next, b.get_insert_block().unwrap())]);
         b.build_unconditional_branch(header)?;

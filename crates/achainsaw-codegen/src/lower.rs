@@ -508,22 +508,29 @@ pub fn define_data<M: ClifModule>(
     Ok(places)
 }
 
-/// Defines `ir_mod`'s function handle table, when it uses handles: 16 bytes per function in
-/// handle order, its address then its signature id (`achainsaw_ir::indirect`). The table is
-/// the runtime's, not the program's: sandboxed code reaches it only through
-/// `call_indirect`'s checked loads.
+/// Bytes per entry of a handle table: the function's address, its signature id, and its
+/// scalar trampoline's address (0 without one), which `par` through a handle runs.
+pub const HANDLE_ENTRY_BYTES: i64 = 24;
+
+/// Defines `ir_mod`'s function handle table, when it uses handles: an entry per function in
+/// handle order (`HANDLE_ENTRY_BYTES`; signature ids from `achainsaw_ir::indirect`). The
+/// table is the runtime's, not the program's: sandboxed code reaches it only through the
+/// checked loads of `call_indirect` and `par`. `trampolines` (JIT) gives the functions'
+/// trampolines.
 pub fn define_handle_table<M: ClifModule>(
     module: &mut M,
     ir_mod: &achainsaw_ir::ast::Module,
     func_ids: &HashMap<String, FuncId>,
+    trampolines: Option<&HashMap<String, FuncId>>,
 ) -> Result<Option<(DataId, achainsaw_ir::indirect::HandleTable)>> {
     if !achainsaw_ir::indirect::uses_handles(ir_mod) {
         return Ok(None);
     }
     let entries = achainsaw_ir::indirect::HandleTable::new(ir_mod);
-    let mut bytes = vec![0u8; 16 * entries.entries.len().max(1)];
+    let size = HANDLE_ENTRY_BYTES as usize;
+    let mut bytes = vec![0u8; size * entries.entries.len().max(1)];
     for (i, (_, sig)) in entries.entries.iter().enumerate() {
-        bytes[16 * i + 8..16 * i + 16].copy_from_slice(&(*sig as u64).to_le_bytes());
+        bytes[size * i + 8..size * i + 16].copy_from_slice(&(*sig as u64).to_le_bytes());
     }
     let id = module.declare_anonymous_data(false, false)?;
     let mut desc = DataDescription::new();
@@ -531,10 +538,48 @@ pub fn define_handle_table<M: ClifModule>(
     desc.set_align(16);
     for (i, (name, _)) in entries.entries.iter().enumerate() {
         let f = module.declare_func_in_data(func_ids[name], &mut desc);
-        desc.write_function_addr(16 * i as u32, f);
+        desc.write_function_addr((size * i) as u32, f);
+        if let Some(t) = trampolines.and_then(|t| t.get(name)) {
+            let tr = module.declare_func_in_data(*t, &mut desc);
+            desc.write_function_addr((size * i + 16) as u32, tr);
+        }
     }
     module.define_data(id, &desc)?;
     Ok(Some((id, entries)))
+}
+
+/// Checks handle `h` against signature id `want`: leaves the builder in a block where
+/// they pass, with the address of `h`'s table entry, and returns the block where they fail
+/// (empty, for the caller to fill).
+fn emit_handle_check<M: ClifModule>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    hc: &HandleConfig,
+    h: ClifValue,
+    want: u32,
+) -> (ClifValue, cranelift_codegen::ir::Block) {
+    let n = hc.entries.entries.len() as i64;
+    let check = builder.create_block();
+    let pass = builder.create_block();
+    let bad = builder.create_block();
+    let idx = builder.ins().iadd_imm_s(h, -1);
+    let in_range = builder.ins().icmp_imm_u(IntCC::UnsignedLessThan, idx, n);
+    builder.ins().brif(in_range, check, &[], bad, &[]);
+    builder.switch_to_block(check);
+    let gv = module.declare_data_in_func(hc.table, builder.func);
+    let base = builder.ins().symbol_value(types::I64, gv);
+    let off = builder.ins().imul_imm_s(idx, HANDLE_ENTRY_BYTES);
+    let entry = builder.ins().iadd(base, off);
+    let sig = builder.ins().load(
+        types::I64,
+        MemFlagsData::trusted().with_readonly(),
+        entry,
+        8,
+    );
+    let ok = builder.ins().icmp_imm_u(IntCC::Equal, sig, want as i64);
+    builder.ins().brif(ok, pass, &[], bad, &[]);
+    builder.switch_to_block(pass);
+    (entry, bad)
 }
 
 /// Zero of each part of a value of type `ty`.
@@ -1955,6 +2000,36 @@ fn emit_serial_par(
     builder.switch_to_block(done);
 }
 
+/// `emit_serial_par` through a function address: `fp(i, args)` for `i` in `0..n`.
+fn emit_serial_par_indirect(
+    builder: &mut FunctionBuilder,
+    sig: cranelift_codegen::ir::SigRef,
+    fp: ClifValue,
+    n: ClifValue,
+    args: &[ClifValue],
+) {
+    let header = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let body = builder.create_block();
+    let done = builder.create_block();
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(header, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(header);
+    let i = builder.block_params(header)[0];
+    let more = builder.ins().icmp(IntCC::SignedLessThan, i, n);
+    builder.ins().brif(more, body, &[], done, &[]);
+
+    builder.switch_to_block(body);
+    let mut call_args = vec![i];
+    call_args.extend_from_slice(args);
+    builder.ins().call_indirect(sig, fp, &call_args);
+    let next = builder.ins().iadd_imm_s(i, 1);
+    builder.ins().jump(header, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(done);
+}
+
 pub struct LowerConfig {
     /// Inline fuel check at every branch: the address of the engine's i64 fuel counter
     /// (decremented in place) and `rt_fuel_exhausted() -> i32`, called when it reaches zero.
@@ -2202,6 +2277,7 @@ pub fn lower_function<M: ClifModule>(
                     | Instruction::Free { .. }
                     | Instruction::MatMul { .. }
                     | Instruction::Par { .. }
+                    | Instruction::ParIndirect { .. }
             );
             if let (true, Some(f)) = (calls_out, fuel) {
                 f.spill(&mut builder);
@@ -2760,11 +2836,6 @@ pub fn lower_function<M: ClifModule>(
                     let (h, _) = scalar(&values, handle);
                     let arg_types: Vec<Type> = args.iter().map(|a| values[a].1).collect();
                     let want = hc.entries.signature_id(&arg_types, rets);
-                    let n = hc.entries.entries.len() as i64;
-                    // Entry h - 1, if in range, with the call's signature id: its function.
-                    let check = builder.create_block();
-                    let call = builder.create_block();
-                    let bad = builder.create_block();
                     let merge = builder.create_block();
                     let mut ret_parts = Vec::new();
                     for &t in rets.iter() {
@@ -2777,19 +2848,8 @@ pub fn lower_function<M: ClifModule>(
                             ret_parts.push(builder.append_block_param(merge, clif));
                         }
                     }
-                    let idx = builder.ins().iadd_imm_s(h, -1);
-                    let in_range = builder.ins().icmp_imm_u(IntCC::UnsignedLessThan, idx, n);
-                    builder.ins().brif(in_range, check, &[], bad, &[]);
-                    builder.switch_to_block(check);
-                    let gv = module.declare_data_in_func(hc.table, builder.func);
-                    let base = builder.ins().symbol_value(types::I64, gv);
-                    let off = builder.ins().imul_imm_s(idx, 16);
-                    let entry = builder.ins().iadd(base, off);
+                    let (entry, bad) = emit_handle_check(&mut builder, module, hc, h, want);
                     let flags = MemFlagsData::trusted().with_readonly();
-                    let sig = builder.ins().load(types::I64, flags, entry, 8);
-                    let ok = builder.ins().icmp_imm_u(IntCC::Equal, sig, want as i64);
-                    builder.ins().brif(ok, call, &[], bad, &[]);
-                    builder.switch_to_block(call);
                     let fp = builder.ins().load(types::I64, flags, entry, 0);
                     let mut csig = module.make_signature();
                     for &t in &arg_types {
@@ -2833,6 +2893,84 @@ pub fn lower_function<M: ClifModule>(
                         values.insert(d.clone(), (ret_parts[at..at + k].to_vec(), t));
                         at += k;
                     }
+                }
+                Instruction::ParIndirect {
+                    count,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    let hc = config
+                        .handles
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("par through a handle without a handle table"))?;
+                    let (n, _) = scalar(&values, count);
+                    let (h, _) = scalar(&values, handle);
+                    let arg_types: Vec<Type> = args.iter().map(|a| values[a].1).collect();
+                    let want = hc.entries.par_signature_id(&arg_types);
+                    let done = builder.create_block();
+                    let (entry, bad) = emit_handle_check(&mut builder, module, hc, h, want);
+                    let flags = MemFlagsData::trusted().with_readonly();
+                    match &config.par {
+                        // AOT: a serial loop of calls through the address.
+                        None => {
+                            let fp = builder.ins().load(types::I64, flags, entry, 0);
+                            let mut csig = module.make_signature();
+                            csig.params.push(AbiParam::new(types::I64));
+                            for &t in &arg_types {
+                                push_abi_params(&mut csig.params, t);
+                            }
+                            let sigref = builder.import_signature(csig);
+                            let arg_vals = flat_args(&values, args);
+                            emit_serial_par_indirect(&mut builder, sigref, fp, n, &arg_vals);
+                        }
+                        // JIT: the runtime runs the entry's trampoline, as for `par`.
+                        Some(par) => {
+                            let tramp = builder.ins().load(types::I64, flags, entry, 16);
+                            let slots = 1 + args.len();
+                            let buf = builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                (slots * 8) as u32,
+                                3,
+                            ));
+                            for (j, arg) in args.iter().enumerate() {
+                                let (v, ty) = scalar(&values, arg);
+                                let raw = pack_u64(&mut builder, v, ty);
+                                builder.ins().stack_store(
+                                    types::I64,
+                                    raw,
+                                    buf,
+                                    ((j + 1) * 8) as i32,
+                                );
+                            }
+                            let buf_addr = builder.ins().stack_addr(types::I64, buf, 0);
+                            let slots = builder.ins().iconst(types::I64, slots as i64);
+                            let callee = module.declare_func_in_func(par.par_for_id, builder.func);
+                            let call_inst =
+                                builder.ins().call(callee, &[tramp, buf_addr, slots, n]);
+                            if let Some(trap) = fuel_trap_block {
+                                let failed = builder.inst_results(call_inst)[0];
+                                let cont = builder.create_block();
+                                builder.ins().brif(failed, trap, &[], cont, &[]);
+                                builder.switch_to_block(cont);
+                            }
+                        }
+                    }
+                    builder.ins().jump(done, &[]);
+                    builder.switch_to_block(bad);
+                    match hc.bad_call_id {
+                        Some(id) => {
+                            let hook = module.declare_func_in_func(id, builder.func);
+                            builder.ins().call(hook, &[h]);
+                            builder.ins().jump(done, &[]);
+                        }
+                        None => {
+                            builder
+                                .ins()
+                                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                        }
+                    }
+                    builder.switch_to_block(done);
                 }
                 Instruction::Addr { dst, name, .. } => {
                     let p = match config.data.get(name) {
