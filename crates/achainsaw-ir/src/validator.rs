@@ -485,7 +485,8 @@ impl Validator {
                 def_blocks.entry(name.as_str()).or_insert(&block.label);
             }
             for inst in &block.instructions {
-                if let Some(dst) = inst.dst() {
+                // Every destination, those of a call with several results too.
+                for dst in inst.dsts() {
                     def_blocks.entry(dst).or_insert(&block.label);
                 }
             }

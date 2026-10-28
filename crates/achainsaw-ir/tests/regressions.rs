@@ -288,3 +288,12 @@ fn test_repro_diagnostics_name_the_fix() {
     assert_eq!(op.error_code, "ERR_UNKNOWN_OP");
     assert_eq!(op.context.expect("context")["did_you_mean"], "div");
 }
+
+/// A result of a call with several results, used where its definition does not dominate,
+/// is reported as such (the dominance pre-pass records every destination).
+#[test]
+fn multi_result_use_outside_its_dominance_is_non_dominating() {
+    let code = "fn pair(x:i64)->(i64, i64)\n  b0:\n    ret x, x\n\nfn f(x:i64)->i64\n  b0:\n    c = gt x, 0:i64\n    br c, a, b\n  a:\n    p, q = call pair(x)\n    jmp done\n  b:\n    jmp done\n  done:\n    ret p\n";
+    let err = parse_and_validate(code).unwrap_err();
+    assert_eq!(err.error_code, "ERR_NON_DOMINATING_USE");
+}

@@ -150,6 +150,21 @@ fn call_v128(k:i64, x:f32)->f64
     r = call_indirect h(v)->f64
     ret r
 
+# Results declared but not assigned (one, then two): the calls still run, then put stores.
+fn call_discard(x:i64)->i64
+  b0:
+    h = call handle_of(0:i64)
+    d = call handle_of(5:i64)
+    g = call handle_of(8:i64)
+    p = alloc 8:i64
+    st p, 0:i64
+    call_indirect h(x)->i64
+    call_indirect d(x, 3:i64)->(i64, i64)
+    call_indirect g(p, x)
+    v = ld p:i64
+    free p
+    ret v
+
 fn call_void(k:i64, x:i64)->i64
   b0:
     h = call handle_of(k)
@@ -271,6 +286,7 @@ fn check(e: &JitEngine) {
         assert_eq!(int(e, "call_i64", &[2, x]), 2 * x, "twice({x})");
         assert_eq!(int(e, "local", &[x]), x.wrapping_mul(x), "local({x})");
         assert_eq!(int(e, "call_void", &[8, x]), x, "put({x})");
+        assert_eq!(int(e, "call_discard", &[x]), x, "call_discard({x})");
     }
     match call(e, "call_f32", &[RtValue::I64(3), RtValue::F32(5.0)]) {
         Ok(Some(RtValue::F32(v))) => assert_eq!(v, 2.5),
@@ -307,7 +323,7 @@ fn check(e: &JitEngine) {
     assert_eq!(int(e, "fib", &[15]), fib(15));
     // Handles are 1 + the function's index in the module.
     assert_eq!(int(e, "handle_value", &[0]), 1);
-    assert_eq!(int(e, "handle_value", &[9]), 19);
+    assert_eq!(int(e, "handle_value", &[9]), 20);
 }
 
 #[test]
@@ -337,7 +353,7 @@ fn bad_indirect_calls_give_zeros_and_report() {
         let e = engine(sandbox);
         // Not a handle: 0, negative, past the table; then valid handles of another
         // signature (arguments, results).
-        for h in [0i64, -1, 25, 1 << 40, i64::MIN] {
+        for h in [0i64, -1, 26, 1 << 40, i64::MIN] {
             let err = call(&e, "raw", &[RtValue::I64(h), RtValue::I64(3)]).unwrap_err();
             assert!(
                 err.contains("ERR_BAD_INDIRECT_CALL") && err.contains(&h.to_string()),

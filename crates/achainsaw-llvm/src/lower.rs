@@ -1522,7 +1522,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         }
 
         b.position_at_end(merge);
-        let Some(result) = result else {
+        // Results the call does not assign (or a function without results) need no phi.
+        let (Some(result), false) = (result, dsts.is_empty()) else {
             return Ok(());
         };
         let v: BasicValueEnum<'ctx> = if self.opts.aot {
