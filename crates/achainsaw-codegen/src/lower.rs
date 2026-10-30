@@ -814,6 +814,10 @@ fn vunary_parts(
                 to_part(builder, r)
             })
             .collect(),
+        VUnaryOp::Popcnt | VUnaryOp::Clz | VUnaryOp::Ctz => src
+            .iter()
+            .map(|&p| vbitcount_part(builder, op, lane, p))
+            .collect(),
         VUnaryOp::Rev => {
             let m = 16 / lane.byte_size();
             src.iter()
@@ -924,6 +928,92 @@ fn round_away(builder: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
     } else {
         builder.ins().select(c, up, t)
     }
+}
+
+/// `vpopcnt`, `vclz` and `vctz` on a 128-bit part. Cranelift counts bits only in i8x16
+/// lanes (AVX512-BITALG `vpopcntb`, SSSE3 `pshufb` lookups, AArch64 `cnt`), so wider lanes
+/// add their bytes' counts with shifts. Leading zeros are the zero bits of `x` smeared right
+/// (each bit below its top set bit set), trailing zeros the set bits of `!x & (x - 1)`.
+fn vbitcount_part(
+    builder: &mut FunctionBuilder,
+    op: VUnaryOp,
+    lane: Type,
+    p: ClifValue,
+) -> ClifValue {
+    let bits = lane.bit_width().unwrap() as i64;
+    let x = as_lanes(builder, p, lane);
+    let x = match op {
+        VUnaryOp::Clz => {
+            let mut s = x;
+            let mut k = 1;
+            while k < bits {
+                let t = builder.ins().ushr_imm_u(s, k);
+                s = builder.ins().bor(s, t);
+                k *= 2;
+            }
+            builder.ins().bnot(s)
+        }
+        VUnaryOp::Ctz => {
+            let m1 = builder.ins().iconst(lane_int_type(lane), -1);
+            let m1 = builder.ins().splat(lane_vec_type(lane), m1);
+            let below = builder.ins().iadd(x, m1);
+            builder.ins().band_not(below, x)
+        }
+        _ => x,
+    };
+    let bytes = as_lanes(builder, x, Type::I8);
+    let counts = builder.ins().popcnt(bytes);
+    let mut s = as_lanes(builder, counts, lane);
+    if bits > 8 {
+        // The low byte of each lane accumulates the counts of all its bytes.
+        let mut k = 8;
+        while k < bits {
+            let t = builder.ins().ushr_imm_u(s, k);
+            s = builder.ins().iadd(s, t);
+            k *= 2;
+        }
+        let m = builder.ins().iconst(lane_int_type(lane), 0xff);
+        let m = builder.ins().splat(lane_vec_type(lane), m);
+        s = builder.ins().band(s, m);
+    }
+    to_part(builder, s)
+}
+
+/// `vmulhi`/`vumulhi` on a 128-bit part: the high half of each lane's double-width product.
+/// Cranelift has no vector multiply-high, so the products are formed in widened lanes. An
+/// i16 product shifted down by 16 fits i16 (u16 when unsigned), so narrowing it saturates
+/// nothing; the high words of i32 products (i64 lanes) are picked by a shuffle.
+fn vmulhi_part(
+    builder: &mut FunctionBuilder,
+    unsigned: bool,
+    lane: Type,
+    a: ClifValue,
+    b: ClifValue,
+) -> ClifValue {
+    let wide = |builder: &mut FunctionBuilder, high: bool| {
+        let (x, y) = match (unsigned, high) {
+            (false, false) => (builder.ins().swiden_low(a), builder.ins().swiden_low(b)),
+            (false, true) => (builder.ins().swiden_high(a), builder.ins().swiden_high(b)),
+            (true, false) => (builder.ins().uwiden_low(a), builder.ins().uwiden_low(b)),
+            (true, true) => (builder.ins().uwiden_high(a), builder.ins().uwiden_high(b)),
+        };
+        builder.ins().imul(x, y)
+    };
+    let lo = wide(builder, false);
+    let hi = wide(builder, true);
+    if lane == Type::I32 {
+        return shuffle_lanes(builder, lo, hi, Type::I32, |j| 2 * j + 1);
+    }
+    let r = if unsigned {
+        let lo = builder.ins().ushr_imm_u(lo, 16);
+        let hi = builder.ins().ushr_imm_u(hi, 16);
+        builder.ins().unarrow(lo, hi)
+    } else {
+        let lo = builder.ins().sshr_imm_u(lo, 16);
+        let hi = builder.ins().sshr_imm_u(hi, 16);
+        builder.ins().snarrow(lo, hi)
+    };
+    to_part(builder, r)
 }
 
 /// Permutes the `lane` lanes of two 128-bit parts: lane `j` of the result is lane `pick(j)`
@@ -1086,6 +1176,14 @@ fn vbinary_part(
         // The validator only allows float lanes for vdiv.
         (VBinOp::Div, _) => builder.ins().fdiv(a, b),
         (VBinOp::Copysign, _) => copysign(builder, a, b),
+        // The validator only allows i8 and i16 lanes for the saturating ops.
+        (VBinOp::AddSat, _) => builder.ins().sadd_sat(a, b),
+        (VBinOp::SubSat, _) => builder.ins().ssub_sat(a, b),
+        (VBinOp::UAddSat, _) => builder.ins().uadd_sat(a, b),
+        (VBinOp::USubSat, _) => builder.ins().usub_sat(a, b),
+        (VBinOp::MulHi | VBinOp::UMulHi, _) => {
+            return vmulhi_part(builder, op == VBinOp::UMulHi, lane, a, b)
+        }
         (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
         // Takes the table from the first part (`vtbl_part`).
         (VBinOp::Tbl, _) => unreachable!(),

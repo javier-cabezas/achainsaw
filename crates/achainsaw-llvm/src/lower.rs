@@ -2911,10 +2911,57 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             // The validator only allows float lanes for vdiv.
             (VBinOp::Div, _) => vec2!(x, y, |a, c| b.build_float_div(a, c, "")?),
             (VBinOp::Copysign, _) => self.intr("llvm.copysign", &[t], &[x, y])?,
+            // The validator only allows i8 and i16 lanes for the saturating ops.
+            (VBinOp::AddSat, _) => self.intr("llvm.sadd.sat", &[t], &[x, y])?,
+            (VBinOp::SubSat, _) => self.intr("llvm.ssub.sat", &[t], &[x, y])?,
+            (VBinOp::UAddSat, _) => self.intr("llvm.uadd.sat", &[t], &[x, y])?,
+            (VBinOp::USubSat, _) => self.intr("llvm.usub.sat", &[t], &[x, y])?,
+            (VBinOp::MulHi | VBinOp::UMulHi, _) => {
+                self.vmulhi(op == VBinOp::UMulHi, lane, vty, x, y)?
+            }
             (VBinOp::And | VBinOp::Or | VBinOp::Xor, _) => unreachable!(),
             (VBinOp::Tbl, _) => return self.vtbl(vty, x, y),
         };
         self.to_canon(res, vty)
+    }
+
+    /// `vmulhi`/`vumulhi`: each lane's product in lanes twice as wide (sign- or zero-extended
+    /// operands), shifted down by the lane width. LLVM selects x86 `pmulhw`/`pmulhuw` and
+    /// `pmuldq`/`pmuludq` pairs, NEON `smull`/`umull` pairs and SVE `smulh`/`umulh` for it.
+    fn vmulhi(
+        &self,
+        unsigned: bool,
+        lane: Type,
+        vty: Type,
+        x: BasicValueEnum<'ctx>,
+        y: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let bits = lane_bits(lane);
+        let wide_int = if lane == Type::I16 {
+            self.i32()
+        } else {
+            self.ctx.i64_type()
+        };
+        let wide = self.vec_of(
+            wide_int.into(),
+            self.lanes_min(vty, lane),
+            self.scalable(vty),
+        );
+        let ext = if unsigned {
+            InstructionOpcode::ZExt
+        } else {
+            InstructionOpcode::SExt
+        };
+        let xw = b.build_cast(ext, x, wide, "")?;
+        let yw = b.build_cast(ext, y, wide, "")?;
+        let p = vec2!(xw, yw, |a, c| b.build_int_mul(a, c, "")?);
+        let k = self.splat_const(
+            wide_int.const_int(bits as u64, false).into(),
+            Self::shape_of(p),
+        )?;
+        let h = vec2!(p, k, |a, c| b.build_right_shift(a, c, false, "")?);
+        Ok(b.build_cast(InstructionOpcode::Trunc, h, x.get_type(), "")?)
     }
 
     /// `vtbl t, idx:i8`: byte i is byte `idx[i] & 15` of `t`'s first 16 bytes. SVE's `tbl`
@@ -3149,6 +3196,17 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 vec2!(one, root, |a, c| b.build_float_div(a, c, "")?)
             }
             VUnaryOp::Rev => self.intr("llvm.vector.reverse", &[x.get_type()], &[x])?,
+            VUnaryOp::Popcnt => self.intr("llvm.ctpop", &[x.get_type()], &[x])?,
+            // `false`: a zero lane gives the lane width rather than poison.
+            VUnaryOp::Clz | VUnaryOp::Ctz => self.intr(
+                if op == VUnaryOp::Clz {
+                    "llvm.ctlz"
+                } else {
+                    "llvm.cttz"
+                },
+                &[x.get_type()],
+                &[x, self.i1().const_zero().into()],
+            )?,
             VUnaryOp::Floor => self.intr("llvm.floor", &[x.get_type()], &[x])?,
             VUnaryOp::Ceil => self.intr("llvm.ceil", &[x.get_type()], &[x])?,
             VUnaryOp::Round => self.intr("llvm.round", &[x.get_type()], &[x])?,

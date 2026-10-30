@@ -449,6 +449,21 @@ fn int_bin(op: VBinOp, lane: Type, a: i64, b: i64) -> i64 {
         VBinOp::Umax => unsigned(lane, a).max(unsigned(lane, b)) as i64,
         VBinOp::Div | VBinOp::Copysign => unreachable!("float-only, rejected by the validator"),
         VBinOp::Tbl => unreachable!("not lane-wise; see `reference`"),
+        VBinOp::AddSat | VBinOp::SubSat => {
+            let bits = lane.bit_width().unwrap();
+            let r = if op == VBinOp::AddSat { a + b } else { a - b };
+            r.clamp(-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+        }
+        VBinOp::UAddSat | VBinOp::USubSat => {
+            let (x, y) = (unsigned(lane, a) as i64, unsigned(lane, b) as i64);
+            let r = if op == VBinOp::UAddSat { x + y } else { x - y };
+            r.clamp(0, (1i64 << lane.bit_width().unwrap()) - 1)
+        }
+        // i16 and i32 lanes: the full product fits an i64 (u64).
+        VBinOp::MulHi => (a * b) >> lane.bit_width().unwrap(),
+        VBinOp::UMulHi => {
+            ((unsigned(lane, a) * unsigned(lane, b)) >> lane.bit_width().unwrap()) as i64
+        }
     };
     lane.wrap_int(r)
 }
@@ -607,6 +622,19 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
             }
         }
         Kernel::Unary(op, l, _) => match op {
+            VUnaryOp::Popcnt | VUnaryOp::Clz | VUnaryOp::Ctz => {
+                let bits = l.bit_width().unwrap();
+                for i in 0..n {
+                    let x = unsigned(l, get_int(a, l, i));
+                    let r = match op {
+                        VUnaryOp::Popcnt => x.count_ones(),
+                        // Zero has as many leading and trailing zeros as the lane has bits.
+                        VUnaryOp::Clz => x.leading_zeros() - (64 - bits),
+                        _ => x.trailing_zeros().min(bits),
+                    };
+                    put_int(&mut out, l, i, r as i64);
+                }
+            }
             // Correctly rounded, as Rust's `as`.
             VUnaryOp::Itof | VUnaryOp::Uitof => {
                 let src = op.source_lane(l);

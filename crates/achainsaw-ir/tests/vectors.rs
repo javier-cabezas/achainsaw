@@ -95,6 +95,16 @@ fn k(pa:ptr, po:ptr)->f64
     il = inslane a, s8, 31:i8
     fl = inslane il, 2.5:f64, 3:f64
     st po, fl
+    sa = vaddsat a, b:i8
+    sb = vsubsat sa, b:i16
+    sc = vuaddsat sb, b:i8
+    sd = vusubsat sc, b:i16
+    mh = vmulhi sd, b:i16
+    mu = vumulhi mh, b:i32
+    pc = vpopcnt mu:i8
+    lz = vclz pc:i32
+    tz = vctz lz:i64
+    st po, tz
     ret t
 "#;
 
@@ -308,6 +318,47 @@ fn permutation_and_unary_rules() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn integer_bit_count_saturating_and_mulhi_rules() {
+    let one = |body: &str| {
+        format!("fn k(p:ptr)\n  b0:\n    a = ld p:v256\n    b = ld p:v256\n{body}    st p, r\n    ret\n")
+    };
+    for good in [
+        "r = vpopcnt a:i8",
+        "r = vclz a:i64",
+        "r = vctz a:i16",
+        "r = vaddsat a, b:i8",
+        "r = vusubsat a, b:i16",
+        "r = vmulhi a, b:i16",
+        "r = vumulhi a, b:i32",
+    ] {
+        assert!(
+            parse_and_validate(&one(&format!("    {good}\n"))).is_ok(),
+            "{good}"
+        );
+    }
+    // Bit counts take integer lanes, saturation i8/i16, the high products i16/i32.
+    for bad in [
+        "r = vpopcnt a:f32",
+        "r = vclz a:f64",
+        "r = vctz a:bf16",
+        "r = vaddsat a, b:i32",
+        "r = vsubsat a, b:f32",
+        "r = vuaddsat a, b:i64",
+        "r = vmulhi a, b:i8",
+        "r = vumulhi a, b:i64",
+    ] {
+        assert_eq!(
+            err_code(&one(&format!("    {bad}\n"))),
+            "ERR_INVALID_LANE_TYPE",
+            "{bad}"
+        );
+    }
+    // The mnemonics are still ordinary register names.
+    let src = "fn k(vpopcnt:i32, vmulhi:i32)->i32\n  b0:\n    vclz = add vpopcnt, vmulhi\n    vaddsat = mul vclz, vpopcnt\n    vumulhi = sub vaddsat, vclz\n    ret vumulhi\n";
+    assert!(parse_and_validate(src).is_ok());
 }
 
 #[test]
