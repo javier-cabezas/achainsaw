@@ -1624,3 +1624,66 @@ fn vdot_with_a_broadcast_operand_compiles() {
         }
     }
 }
+
+/// Integer lane types, for `vadd` chains across lane sizes.
+const INT_LANE_TYPES: [Type; 4] = [Type::I8, Type::I16, Type::I32, Type::I64];
+
+/// `x = vadd a, b:l1` then `r = vadd x, b:l2`: `b` is loaded once and read at two lane sizes.
+fn lane_chain_source() -> String {
+    let mut src = String::new();
+    for l1 in INT_LANE_TYPES {
+        for l2 in INT_LANE_TYPES {
+            src += &format!(
+                "fn chain_{l1}_{l2}(pa:ptr, pb:ptr, po:ptr)\n  b0:\n    a = ld pa:vx\n    b = ld pb:vx\n    x = vadd a, b:{l1}\n    r = vadd x, b:{l2}\n    st po, r\n    ret\n\n"
+            );
+        }
+    }
+    src
+}
+
+/// A vector loaded once and used at two lane sizes compiles for every target and computes
+/// the reference on the backend under test. LLVM 22's VectorCombine aborted on SVE when a
+/// scalable load's only users were bitcasts (`Cannot implicitly convert a scalable size`),
+/// which is what a load read at two lane types other than i32 left after InstCombine.
+#[test]
+fn loads_read_at_two_lane_sizes() {
+    let module = parse_and_validate(&lane_chain_source()).expect("valid");
+    #[cfg(feature = "llvm")]
+    for (triple, cpu, features) in LLVM_TARGETS {
+        use achainsaw_codegen::{compile_object, Backend};
+        let target = AotTarget {
+            triple: Some((*triple).into()),
+            cpu: Some((*cpu).into()),
+            features: (!features.is_empty()).then(|| (*features).into()),
+        };
+        compile_object(&module, &target, Backend::Llvm, &Default::default())
+            .unwrap_or_else(|e| panic!("{triple} {cpu} {features}: {e}"));
+    }
+    let mut rng = Rng(0x5eed_1a7e);
+    let a: Vec<u8> = (0..BUF).map(|_| rng.next() as u8).collect();
+    let b: Vec<u8> = (0..BUF).map(|_| rng.next() as u8).collect();
+    for (level, features) in host_levels() {
+        let mut engine = JitEngine::with_features(&features).unwrap();
+        engine.compile_module(&module).unwrap();
+        let n = engine.vx_bits() as usize / 8;
+        for l1 in INT_LANE_TYPES {
+            for l2 in INT_LANE_TYPES {
+                let f: extern "C" fn(*const u8, *const u8, *mut u8) = unsafe {
+                    std::mem::transmute(engine.get_fn_ptr(&format!("chain_{l1}_{l2}")).unwrap())
+                };
+                let mut out = vec![0u8; BUF];
+                f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+                let add = |x: &[u8], l: Type| {
+                    let mut r = vec![0u8; BUF];
+                    for i in 0..n / l.byte_size() {
+                        let s = int_bin(VBinOp::Add, l, get_int(x, l, i), get_int(&b, l, i));
+                        put_int(&mut r, l, i, s);
+                    }
+                    r
+                };
+                let want = add(&add(&a, l1), l2);
+                assert_eq!(out[..n], want[..n], "{l1} then {l2} at {level}");
+            }
+        }
+    }
+}
