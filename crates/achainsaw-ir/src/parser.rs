@@ -1351,7 +1351,8 @@ impl<'a> Parser<'a> {
                 "ERR_MISSING_DESTINATION",
                 format!(
                     "'{dst}' needs a destination register: write 'r = {dst} ...' (only st, \
-                     atomic st, stm, mm, free, call, call_indirect and par stand alone)"
+                     atomic st, stm, vscatter, mm, free, call, call_indirect and par stand \
+                     alone)"
                 ),
                 dst_span,
             )
