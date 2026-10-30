@@ -1628,13 +1628,34 @@ fn vdot_with_a_broadcast_operand_compiles() {
 /// Integer lane types, for `vadd` chains across lane sizes.
 const INT_LANE_TYPES: [Type; 4] = [Type::I8, Type::I16, Type::I32, Type::I64];
 
-/// `x = vadd a, b:l1` then `r = vadd x, b:l2`: `b` is loaded once and read at two lane sizes.
+/// `x = vadd a, b:l1` then `r = vadd x, b:l2`: `b` is loaded once and read at two lane
+/// sizes, directly (`chain`), with a dead i32 use (`dead`), through an op LLVM folds to `b`
+/// (`fold`), and in a helper LLVM can inline (`call`). Each computes the same.
+const CHAIN_FORMS: [&str; 4] = ["chain", "dead", "fold", "call"];
+
 fn lane_chain_source() -> String {
     let mut src = String::new();
     for l1 in INT_LANE_TYPES {
         for l2 in INT_LANE_TYPES {
+            let head = |form: &str| {
+                format!("fn {form}_{l1}_{l2}(pa:ptr, pb:ptr, po:ptr)\n  b0:\n    a = ld pa:vx\n    b = ld pb:vx\n")
+            };
+            let tail = "    st po, r\n    ret\n\n";
             src += &format!(
-                "fn chain_{l1}_{l2}(pa:ptr, pb:ptr, po:ptr)\n  b0:\n    a = ld pa:vx\n    b = ld pb:vx\n    x = vadd a, b:{l1}\n    r = vadd x, b:{l2}\n    st po, r\n    ret\n\n"
+                "{}    x = vadd a, b:{l1}\n    r = vadd x, b:{l2}\n{tail}",
+                head("chain")
+            );
+            src += &format!(
+                "{}    d = vadd b, b:i32\n    x = vadd a, b:{l1}\n    r = vadd x, b:{l2}\n{tail}",
+                head("dead")
+            );
+            src += &format!(
+                "{}    o = vor b, b:i32\n    x = vadd a, o:{l1}\n    r = vadd x, b:{l2}\n{tail}",
+                head("fold")
+            );
+            src += &format!(
+                "fn h_{l1}_{l2}(v:vx, w:vx)->vx\n  b0:\n    x = vadd w, v:{l1}\n    r = vadd x, v:{l2}\n    ret r\n\n{}    r = call h_{l1}_{l2}(b, a)\n{tail}",
+                head("call")
             );
         }
     }
@@ -1644,7 +1665,8 @@ fn lane_chain_source() -> String {
 /// A vector loaded once and used at two lane sizes compiles for every target and computes
 /// the reference on the backend under test. LLVM 22's VectorCombine aborted on SVE when a
 /// scalable load's only users were bitcasts (`Cannot implicitly convert a scalable size`),
-/// which is what a load read at two lane types other than i32 left after InstCombine.
+/// which every form left once InstCombine, DCE or inlining had run, until each scalable
+/// load was frozen.
 #[test]
 fn loads_read_at_two_lane_sizes() {
     let module = parse_and_validate(&lane_chain_source()).expect("valid");
@@ -1666,23 +1688,27 @@ fn loads_read_at_two_lane_sizes() {
         let mut engine = JitEngine::with_features(&features).unwrap();
         engine.compile_module(&module).unwrap();
         let n = engine.vx_bits() as usize / 8;
-        for l1 in INT_LANE_TYPES {
-            for l2 in INT_LANE_TYPES {
-                let f: extern "C" fn(*const u8, *const u8, *mut u8) = unsafe {
-                    std::mem::transmute(engine.get_fn_ptr(&format!("chain_{l1}_{l2}")).unwrap())
-                };
-                let mut out = vec![0u8; BUF];
-                f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
-                let add = |x: &[u8], l: Type| {
-                    let mut r = vec![0u8; BUF];
-                    for i in 0..n / l.byte_size() {
-                        let s = int_bin(VBinOp::Add, l, get_int(x, l, i), get_int(&b, l, i));
-                        put_int(&mut r, l, i, s);
-                    }
-                    r
-                };
-                let want = add(&add(&a, l1), l2);
-                assert_eq!(out[..n], want[..n], "{l1} then {l2} at {level}");
+        let add = |x: &[u8], l: Type| {
+            let mut r = vec![0u8; BUF];
+            for i in 0..n / l.byte_size() {
+                let s = int_bin(VBinOp::Add, l, get_int(x, l, i), get_int(&b, l, i));
+                put_int(&mut r, l, i, s);
+            }
+            r
+        };
+        for form in CHAIN_FORMS {
+            for l1 in INT_LANE_TYPES {
+                for l2 in INT_LANE_TYPES {
+                    let f: extern "C" fn(*const u8, *const u8, *mut u8) = unsafe {
+                        std::mem::transmute(
+                            engine.get_fn_ptr(&format!("{form}_{l1}_{l2}")).unwrap(),
+                        )
+                    };
+                    let mut out = vec![0u8; BUF];
+                    f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+                    let want = add(&add(&a, l1), l2);
+                    assert_eq!(out[..n], want[..n], "{form}: {l1} then {l2} at {level}");
+                }
             }
         }
     }

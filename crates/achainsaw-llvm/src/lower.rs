@@ -1860,7 +1860,16 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let (addr, p) = self.mem_ptr(st, ptr, index.as_ref(), *ty)?;
                 let bytes = self.access_bytes(*ty)?;
                 self.bounds_check(st, addr, bytes, false)?;
-                let v = self.load_ptr(self.air_type(*ty), p)?;
+                let mut v = self.load_ptr(self.air_type(*ty), p)?;
+                // LLVM 22's VectorCombine (`scalarizeLoadBitcast`) aborts on a scalable load
+                // whose users are all bitcasts, sizing it as a fixed-width vector (`Cannot
+                // implicitly convert a scalable size`). Vectors load as i32 lanes and are
+                // bitcast to each op's lane type, so a `vx` read at two other lane types got
+                // there, also once dead or folded users or LLVM's inlining left only the
+                // bitcasts. With a freeze (no code), the load's one user is never a bitcast.
+                if matches!(v, BasicValueEnum::ScalableVectorValue(_)) {
+                    v = self.freeze(v);
+                }
                 st.values.insert(dst.clone(), (v, *ty));
             }
             Instruction::Store {
