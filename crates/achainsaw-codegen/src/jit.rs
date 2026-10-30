@@ -86,6 +86,11 @@ pub enum ExecutionStatus {
     },
     /// Sandboxed code exceeded `SANDBOX_STACK_BYTES` of call stack.
     StackOverflow,
+    /// `call_indirect` through `handle`, which names no function of the module or one of
+    /// another signature.
+    BadIndirectCall {
+        handle: i64,
+    },
 }
 
 /// Call stack sandboxed code may use before it halts with `ERR_STACK_OVERFLOW`.
@@ -336,7 +341,15 @@ pub fn check_execution_status() -> Result<()> {
         ExecutionStatus::StackOverflow => Err(anyhow!(
             "[ERR_STACK_OVERFLOW] Execution halted: call stack exceeded {SANDBOX_STACK_BYTES} bytes (unbounded recursion?)"
         )),
+        ExecutionStatus::BadIndirectCall { handle } => Err(anyhow!(
+            "[ERR_BAD_INDIRECT_CALL] call_indirect through handle {handle}, which is not a function of the module with the call's signature (handles come from fnref)"
+        )),
     }
+}
+
+/// A `call_indirect` whose handle failed its checks: records it; the call gives zeros.
+extern "C" fn rt_bad_indirect_call(handle: i64) {
+    raise(ExecutionStatus::BadIndirectCall { handle });
 }
 
 /// Sandbox check failure: records the violation; the caller then unwinds.
@@ -1574,6 +1587,7 @@ struct CraneliftJit {
     rt_sandbox_check_mm_id: FuncId,
     rt_par_for_id: FuncId,
     rt_fuel_counter_id: FuncId,
+    rt_bad_indirect_call_id: FuncId,
 }
 
 impl CraneliftJit {
@@ -1617,6 +1631,7 @@ impl CraneliftJit {
         jit_builder.symbol("rt_sandbox_check_mm", rt_sandbox_check_mm as *const u8);
         jit_builder.symbol("rt_par_for", rt_par_for as *const u8);
         jit_builder.symbol("rt_fuel_counter", rt_fuel_counter as *const u8);
+        jit_builder.symbol("rt_bad_indirect_call", rt_bad_indirect_call as *const u8);
         jit_builder.symbol_lookup_fn(Box::new(move |name: &str| {
             reg_lookup.read().unwrap().lookup(name)
         }));
@@ -1680,6 +1695,11 @@ impl CraneliftJit {
         let rt_fuel_counter_id =
             module.declare_function("rt_fuel_counter", Linkage::Import, &counter_sig)?;
 
+        let mut bad_call_sig = module.make_signature();
+        bad_call_sig.params.push(AbiParam::new(types::I64));
+        let rt_bad_indirect_call_id =
+            module.declare_function("rt_bad_indirect_call", Linkage::Import, &bad_call_sig)?;
+
         let ctx = module.make_context();
 
         Ok(Self {
@@ -1696,6 +1716,7 @@ impl CraneliftJit {
             rt_sandbox_check_mm_id,
             rt_par_for_id,
             rt_fuel_counter_id,
+            rt_bad_indirect_call_id,
         })
     }
 
@@ -1793,6 +1814,13 @@ impl CraneliftJit {
             }),
             fast_math,
             data,
+            handles: crate::lower::define_handle_table(&mut self.module, ir_mod, &func_ids)?.map(
+                |(table, entries)| crate::lower::HandleConfig {
+                    table,
+                    entries,
+                    bad_call_id: Some(self.rt_bad_indirect_call_id),
+                },
+            ),
         };
 
         for func in &ir_mod.functions {
@@ -2182,6 +2210,7 @@ impl JitEngine {
                     sandbox_check_mm: rt_sandbox_check_mm as *const () as usize,
                     par_for: rt_par_for as *const () as usize,
                     fuel_counter: rt_fuel_counter as *const () as usize,
+                    bad_indirect_call: rt_bad_indirect_call as *const () as usize,
                 };
                 let opts = achainsaw_llvm::LowerOptions {
                     fuel: self.fuel_enabled,

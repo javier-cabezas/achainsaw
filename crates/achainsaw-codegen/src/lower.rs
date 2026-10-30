@@ -508,6 +508,52 @@ pub fn define_data<M: ClifModule>(
     Ok(places)
 }
 
+/// Defines `ir_mod`'s function handle table, when it uses handles: 16 bytes per function in
+/// handle order, its address then its signature id (`achainsaw_ir::indirect`). The table is
+/// the runtime's, not the program's: sandboxed code reaches it only through
+/// `call_indirect`'s checked loads.
+pub fn define_handle_table<M: ClifModule>(
+    module: &mut M,
+    ir_mod: &achainsaw_ir::ast::Module,
+    func_ids: &HashMap<String, FuncId>,
+) -> Result<Option<(DataId, achainsaw_ir::indirect::HandleTable)>> {
+    if !achainsaw_ir::indirect::uses_handles(ir_mod) {
+        return Ok(None);
+    }
+    let entries = achainsaw_ir::indirect::HandleTable::new(ir_mod);
+    let mut bytes = vec![0u8; 16 * entries.entries.len().max(1)];
+    for (i, (_, sig)) in entries.entries.iter().enumerate() {
+        bytes[16 * i + 8..16 * i + 16].copy_from_slice(&(*sig as u64).to_le_bytes());
+    }
+    let id = module.declare_anonymous_data(false, false)?;
+    let mut desc = DataDescription::new();
+    desc.define(bytes.into_boxed_slice());
+    desc.set_align(16);
+    for (i, (name, _)) in entries.entries.iter().enumerate() {
+        let f = module.declare_func_in_data(func_ids[name], &mut desc);
+        desc.write_function_addr(16 * i as u32, f);
+    }
+    module.define_data(id, &desc)?;
+    Ok(Some((id, entries)))
+}
+
+/// Zero of each part of a value of type `ty`.
+fn zero_parts(builder: &mut FunctionBuilder, ty: Type) -> Vec<ClifValue> {
+    let v = match ty {
+        Type::F32 => builder.ins().f32const(0.0),
+        Type::F64 => builder.ins().f64const(0.0),
+        Type::I64 | Type::Ptr => builder.ins().iconst(types::I64, 0),
+        Type::I32 => builder.ins().iconst(types::I32, 0),
+        Type::I16 | Type::F16 | Type::BF16 => builder.ins().iconst(types::I16, 0),
+        Type::I8 => builder.ins().iconst(types::I8, 0),
+        Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
+            let zero_f = builder.ins().f32const(0.0);
+            builder.ins().splat(VEC_PART, zero_f)
+        }
+    };
+    vec![v; part_count(ty)]
+}
+
 /// Branches to the fault block unless `[ptr, ptr + size)` lies inside the arena or
 /// `size` is 0, leaving the builder in the passing block. `size` must not exceed
 /// `MIN_SANDBOX_ARENA_BYTES`.
@@ -1930,6 +1976,18 @@ pub struct LowerConfig {
     pub fast_math: bool,
     /// Where each `data` of the module lives (`define_data`, or the sandbox's arena).
     pub data: HashMap<String, DataPlace>,
+    /// The module's function handle table, when it uses `fnref` or `call_indirect`.
+    pub handles: Option<HandleConfig>,
+}
+
+/// A module's handle table (`define_handle_table`) as the lowering uses it.
+#[derive(Debug, Clone)]
+pub struct HandleConfig {
+    pub table: DataId,
+    pub entries: achainsaw_ir::indirect::HandleTable,
+    /// `rt_bad_indirect_call(handle)`, which records the failure (JIT); without it a bad
+    /// call traps (AOT objects).
+    pub bad_call_id: Option<FuncId>,
 }
 
 #[derive(Debug, Clone)]
@@ -2139,6 +2197,7 @@ pub fn lower_function<M: ClifModule>(
             let calls_out = matches!(
                 inst,
                 Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
                     | Instruction::Alloc { .. }
                     | Instruction::Free { .. }
                     | Instruction::MatMul { .. }
@@ -2675,6 +2734,105 @@ pub fn lower_function<M: ClifModule>(
                         (None, None) => unreachable!("a function with stack has its buffers"),
                     };
                     values.insert(dst.clone(), (vec![p], Type::Ptr));
+                }
+                Instruction::FnRef {
+                    dst, func: target, ..
+                } => {
+                    let h = config
+                        .handles
+                        .as_ref()
+                        .and_then(|t| t.entries.handle(target))
+                        .ok_or_else(|| anyhow!("fnref of '{target}' without its handle"))?;
+                    let v = builder.ins().iconst(types::I64, h);
+                    values.insert(dst.clone(), (vec![v], Type::I64));
+                }
+                Instruction::CallIndirect {
+                    dsts,
+                    handle,
+                    args,
+                    rets,
+                    ..
+                } => {
+                    let hc = config
+                        .handles
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("call_indirect without a handle table"))?;
+                    let (h, _) = scalar(&values, handle);
+                    let arg_types: Vec<Type> = args.iter().map(|a| values[a].1).collect();
+                    let want = hc.entries.signature_id(&arg_types, rets);
+                    let n = hc.entries.entries.len() as i64;
+                    // Entry h - 1, if in range, with the call's signature id: its function.
+                    let check = builder.create_block();
+                    let call = builder.create_block();
+                    let bad = builder.create_block();
+                    let merge = builder.create_block();
+                    let mut ret_parts = Vec::new();
+                    for &t in rets.iter() {
+                        let clif = if t.is_vector() {
+                            VEC_PART
+                        } else {
+                            to_clif_type(t)
+                        };
+                        for _ in 0..part_count(t) {
+                            ret_parts.push(builder.append_block_param(merge, clif));
+                        }
+                    }
+                    let idx = builder.ins().iadd_imm_s(h, -1);
+                    let in_range = builder.ins().icmp_imm_u(IntCC::UnsignedLessThan, idx, n);
+                    builder.ins().brif(in_range, check, &[], bad, &[]);
+                    builder.switch_to_block(check);
+                    let gv = module.declare_data_in_func(hc.table, builder.func);
+                    let base = builder.ins().symbol_value(types::I64, gv);
+                    let off = builder.ins().imul_imm_s(idx, 16);
+                    let entry = builder.ins().iadd(base, off);
+                    let flags = MemFlagsData::trusted().with_readonly();
+                    let sig = builder.ins().load(types::I64, flags, entry, 8);
+                    let ok = builder.ins().icmp_imm_u(IntCC::Equal, sig, want as i64);
+                    builder.ins().brif(ok, call, &[], bad, &[]);
+                    builder.switch_to_block(call);
+                    let fp = builder.ins().load(types::I64, flags, entry, 0);
+                    let mut csig = module.make_signature();
+                    for &t in &arg_types {
+                        push_abi_params(&mut csig.params, t);
+                    }
+                    for &t in rets.iter() {
+                        push_abi_params(&mut csig.returns, t);
+                    }
+                    let sigref = builder.import_signature(csig);
+                    let arg_vals = flat_args(&values, args);
+                    let inst = builder.ins().call_indirect(sigref, fp, &arg_vals);
+                    let results: Vec<BlockArg> = builder
+                        .inst_results(inst)
+                        .iter()
+                        .map(|&v| BlockArg::Value(v))
+                        .collect();
+                    builder.ins().jump(merge, &results);
+                    builder.switch_to_block(bad);
+                    match hc.bad_call_id {
+                        Some(id) => {
+                            let hook = module.declare_func_in_func(id, builder.func);
+                            builder.ins().call(hook, &[h]);
+                            let mut zeros = Vec::new();
+                            for &t in rets.iter() {
+                                zeros.extend(zero_parts(&mut builder, t));
+                            }
+                            let zeros: Vec<BlockArg> =
+                                zeros.into_iter().map(BlockArg::Value).collect();
+                            builder.ins().jump(merge, &zeros);
+                        }
+                        None => {
+                            builder
+                                .ins()
+                                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                        }
+                    }
+                    builder.switch_to_block(merge);
+                    let mut at = 0;
+                    for (d, &t) in dsts.iter().zip(rets.iter()) {
+                        let k = part_count(t);
+                        values.insert(d.clone(), (ret_parts[at..at + k].to_vec(), t));
+                        at += k;
+                    }
                 }
                 Instruction::Addr { dst, name, .. } => {
                     let p = match config.data.get(name) {
@@ -3254,20 +3412,7 @@ pub fn lower_function<M: ClifModule>(
         builder.switch_to_block(trap_block);
         let mut zeros = Vec::new();
         for &r_ty in &func.rets {
-            let zero_val = match r_ty {
-                Type::F32 => builder.ins().f32const(0.0),
-                Type::F64 => builder.ins().f64const(0.0),
-                Type::I64 | Type::Ptr => builder.ins().iconst(types::I64, 0),
-                Type::I32 => builder.ins().iconst(types::I32, 0),
-                Type::I16 => builder.ins().iconst(types::I16, 0),
-                Type::I8 => builder.ins().iconst(types::I8, 0),
-                Type::F16 | Type::BF16 => builder.ins().iconst(types::I16, 0),
-                Type::V128 | Type::V256 | Type::V512 | Type::Vx => {
-                    let zero_f = builder.ins().f32const(0.0);
-                    builder.ins().splat(VEC_PART, zero_f)
-                }
-            };
-            zeros.extend(vec![zero_val; part_count(r_ty)]);
+            zeros.extend(zero_parts(&mut builder, r_ty));
         }
         builder.ins().return_(&zeros);
     }

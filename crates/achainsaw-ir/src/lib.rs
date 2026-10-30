@@ -3,6 +3,7 @@ pub mod binary;
 pub mod cfg;
 pub mod checks;
 pub mod diag;
+pub mod indirect;
 pub mod inline;
 pub mod lexer;
 pub mod loops;
@@ -29,6 +30,11 @@ pub use validator::Validator;
 /// full-vector copy and the original (`loops`). Borrowed when nothing changes.
 pub fn prepare_for_codegen(module: &Module) -> std::borrow::Cow<'_, Module> {
     let mut prepared = inline::inline_module(module);
+    // A call through a handle known in the same function becomes a direct call, which can
+    // then be inlined.
+    if indirect::uses_handles(&prepared) && indirect::devirtualize(prepared.to_mut()) > 0 {
+        prepared = std::borrow::Cow::Owned(inline::inline_module(&prepared).into_owned());
+    }
     if math::has_math(&prepared) {
         math::expand_module(prepared.to_mut());
     }

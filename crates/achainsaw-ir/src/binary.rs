@@ -268,6 +268,30 @@ pub fn to_air_text(module: &Module) -> String {
                     Instruction::Addr { dst, name, .. } => {
                         out.push_str(&format!("{dst} = addr {name}"));
                     }
+                    Instruction::FnRef { dst, func, .. } => {
+                        out.push_str(&format!("{dst} = fnref {func}"));
+                    }
+                    Instruction::CallIndirect {
+                        dsts,
+                        handle,
+                        args,
+                        rets,
+                        ..
+                    } => {
+                        if !dsts.is_empty() {
+                            out.push_str(&dsts.join(", "));
+                            out.push_str(" = ");
+                        }
+                        out.push_str(&format!("call_indirect {handle}({})", args.join(", ")));
+                        match rets.as_slice() {
+                            [] => {}
+                            [t] => out.push_str(&format!("->{t}")),
+                            many => {
+                                let ts: Vec<&str> = many.iter().map(|t| t.as_str()).collect();
+                                out.push_str(&format!("->({})", ts.join(", ")));
+                            }
+                        }
+                    }
                     Instruction::Select {
                         dst,
                         cond,
@@ -689,7 +713,8 @@ impl BinaryEncoder {
                     }
                     if let Instruction::Call { func, .. }
                     | Instruction::Par { func, .. }
-                    | Instruction::Addr { name: func, .. } = inst
+                    | Instruction::Addr { name: func, .. }
+                    | Instruction::FnRef { func, .. } = inst
                     {
                         self.intern(func);
                     }
@@ -1187,6 +1212,37 @@ impl BinaryEncoder {
             Instruction::Addr { dst, name, .. } => {
                 self.buf.push(0x38);
                 self.push_regs(&[dst, name]);
+            }
+            Instruction::FnRef { dst, func, .. } => {
+                self.buf.push(0x3B);
+                self.push_regs(&[dst, func]);
+            }
+            Instruction::CallIndirect {
+                dsts,
+                handle,
+                args,
+                rets,
+                ..
+            } => {
+                // The destinations, the handle, the arguments, then the result types.
+                self.buf.push(0x3C);
+                self.buf.push(dsts.len() as u8);
+                for d in dsts {
+                    self.buf
+                        .extend_from_slice(&self.string_map[d].to_le_bytes());
+                }
+                self.buf
+                    .extend_from_slice(&self.string_map[handle].to_le_bytes());
+                self.buf
+                    .extend_from_slice(&(args.len() as u32).to_le_bytes());
+                for a in args {
+                    self.buf
+                        .extend_from_slice(&self.string_map[a].to_le_bytes());
+                }
+                self.buf.push(rets.len() as u8);
+                for t in rets {
+                    self.buf.push(encode_type(*t));
+                }
             }
             Instruction::InsertLane {
                 dst,
@@ -1963,6 +2019,38 @@ impl<'a> BinaryDecoder<'a> {
                 name: self.read_string()?,
                 span,
             }),
+            0x3B => Ok(Instruction::FnRef {
+                dst: self.read_string()?,
+                func: self.read_string()?,
+                span,
+            }),
+            0x3C => {
+                let dst_count = self.read_u8()?;
+                let mut dsts = Vec::with_capacity(dst_count as usize);
+                for _ in 0..dst_count {
+                    dsts.push(self.read_string()?);
+                }
+                let handle = self.read_string()?;
+                let arg_count = self.read_u32()?;
+                let mut args = Vec::with_capacity(self.safe_capacity(arg_count));
+                for _ in 0..arg_count {
+                    args.push(self.read_string()?);
+                }
+                let ret_count = self.read_u8()?;
+                let mut rets = Vec::with_capacity(ret_count as usize);
+                for _ in 0..ret_count {
+                    let t = decode_type(self.read_u8()?)
+                        .ok_or_else(|| self.err("Invalid call_indirect result type in AIRB"))?;
+                    rets.push(t);
+                }
+                Ok(Instruction::CallIndirect {
+                    dsts,
+                    handle,
+                    args,
+                    rets,
+                    span,
+                })
+            }
             0x32 => {
                 let dst = self.read_string()?;
                 let vec = self.read_string()?;

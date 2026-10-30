@@ -31,7 +31,7 @@ fn sum(x:ptr, n:i64)->f32
 - **Math functions:** `y = exp x`, `log`, `tanh`, `sin`, `cos` on f32, and the same on vector lanes (`r = vsin v:f32`): see [Math functions](#math-functions).
 - **Memory:** `v = ld p:f32`, `st p, v`, `p = alloc n` (bytes), `free p`, pointer arithmetic with `add p, off`. Indexed operands scale by the element size: `ld x[i]:f32` reads `x + 4i`. Read-only tables are `data` declarations (`p = addr name`), and fixed-size scratch buffers live in the function's frame (`p = stack 256`): see [Constant data and stack buffers](#constant-data-and-stack-buffers). Memory that `par` calls share takes [atomic accesses](#atomics).
 - **Casts:** `itof ftoi uitof ftoui sext zext trunc fext ftrunc bitcast`, written `dst = op src:type`.
-- **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
+- **Calls:** `r = call f(a, b)`, `q, m = call divmod(a, b)`; through a function handle, `h = fnref f` then `r = call_indirect h(a, b)->i64` ([Function handles](#function-handles)); `extfn` declares C functions ([Calling C](ffi.md)); `par n, f(a, b)` runs `f(i, a, b)` for every `i < n` on all cores ([Parallel loops](parallel.md)).
 - **Comments** start with `#`.
 
 Every function is checked before it compiles: types, SSA (each use dominated by its definition, and reached by no other), block arguments, terminators. A failure is a JSON diagnostic with an `ERR_*` code, the source span and the context to fix it, such as the registers in scope ([Diagnostics](cli.md#diagnostics)).
@@ -159,6 +159,21 @@ The errors are the measured worst cases over every f32 input, against f64; `crat
 **Inline functions.** `inline fn` marks a helper whose calls are replaced by its body before compiling, on both backends, JIT and AOT (`achainsaw opt` shows the expansion). A straight-line helper merges into the caller's block, so it adds no branches and no fuel checks; inline functions cannot be recursive (`ERR_RECURSIVE_INLINE`). The standard library's quantized matrix kernels are built this way: `qmat_chunk` (1 token), `qmat_chunk4` (4 tokens) and `qmat_chunk8` (8) call the same inline steps (`qmat_w8`/`qmat_w4`/`qmat_w5`/`qmat_w6` unpack two weight vectors, `qmat_dot` and `qmat_dot1` run `vdotu`s, `qmat_accr`/`qmat_accmr` scale and accumulate), so every token's arithmetic is identical by construction, and `llama_decode.air` reads its tables with `load_cfg`, `model_globals` and `layer_weights`. Together with indexed operands, this cut the standard library from 712 to 447 lines of code (`qmat_chunk` 185 to 80, `qmat_chunk4` 335 to 114) and `llama_decode.air` from 718 to 637, without slowing anything down: in the base-vs-head benchmark comparison every kernel is within noise, and Cranelift's quantized GEMVs and prefill got 6–7% faster (its index shifts fold into x86 addressing modes).
 
 **Scalar math.** Rounding to an integral value, `floor`, `ceil`, `round` (halfway away from zero), `roundeven` and `roundz` (toward zero); bit counts `popcnt`, `clz` and `ctz` (the bit width for 0); `copysign a, b` for floats, `rotl`/`rotr` for integers (amount modulo the width); `r = fma a, b, c` with one rounding; `uitof`/`ftoui` unsigned conversions (`ftoui` saturates, negative values and NaN to 0). All are single instructions or exact sequences, bit-identical on both backends and checked against Rust's own operations (`tests/scalar_math.rs`). `quantize_q8` rounds with `vround`, so it now matches llama.cpp's `roundf` exactly at halfway cases. These mnemonics are recognized only right after `=`, so programs that use them as register names still parse.
+
+## Function handles
+
+`h = fnref f` gives the handle of the module's function `f`: an `i64` that can be stored in memory, passed, returned and compared, like a function pointer that never exposes a code address. `call_indirect` calls the function whose handle it is given, with the result types it declares:
+
+```air
+# A dispatch table filled at run time, then a call through entry k.
+fn apply(t:ptr, k:i64, x:i64)->i64
+  b0:
+    h = ld t[k]:i64
+    r = call_indirect h(x)->i64
+    ret r
+```
+
+`q, m = call_indirect h(a, b)->(i64, i64)` takes several results, and `call_indirect h(p, x)` none. Handles are 1 plus the function's index in the module (so 0 is never one), valid in the module that takes them. Every call checks its handle: it must name a function of the module whose parameter types are the arguments' and whose results are the declared ones. Otherwise nothing is called, the results are zero, and the run reports `ERR_BAD_INDIRECT_CALL` with the handle (in the sandbox and out of it; AOT objects, which have no runtime, trap). Each backend keeps the module's functions in a table of address and signature id, and a call loads both after the range check, so a forged handle can never jump to anything but a function of the module with the right types. A `call_indirect` whose handle comes from a `fnref` in the same function becomes a direct `call` before code generation (and in `achainsaw opt`), so it can be inlined. Calls through handles cost what calls cost: no fuel themselves, and the callee's checks in the sandbox (stack depth, so recursion through handles stops at the same limit). `fnref` names AIR functions only, not `extfn`s. `fnref` and `call_indirect` are keywords only where an instruction is expected, so they remain valid register names.
 
 ## Constant data and stack buffers
 

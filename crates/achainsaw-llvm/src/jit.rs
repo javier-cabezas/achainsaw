@@ -22,6 +22,7 @@ pub struct RuntimeHooks {
     pub sandbox_check_mm: usize,
     pub par_for: usize,
     pub fuel_counter: usize,
+    pub bad_indirect_call: usize,
 }
 
 /// One AIR module JIT compiled with ORC LLJIT. Code stays valid until this is dropped.
@@ -107,6 +108,7 @@ impl LlvmJit {
                 (lower::RT_SANDBOX_CHECK_MM.into(), hooks.sandbox_check_mm),
                 (lower::RT_PAR_FOR.into(), hooks.par_for),
                 (lower::RT_FUEL_COUNTER.into(), hooks.fuel_counter),
+                (lower::RT_BAD_INDIRECT_CALL.into(), hooks.bad_indirect_call),
             ];
             for ext in &air.extern_functions {
                 if let Some(addr) = resolve(&ext.name) {

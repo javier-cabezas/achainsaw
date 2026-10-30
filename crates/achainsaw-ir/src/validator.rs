@@ -485,7 +485,8 @@ impl Validator {
                 def_blocks.entry(name.as_str()).or_insert(&block.label);
             }
             for inst in &block.instructions {
-                if let Some(dst) = inst.dst() {
+                // Every destination, those of a call with several results too.
+                for dst in inst.dsts() {
                     def_blocks.entry(dst).or_insert(&block.label);
                 }
             }
@@ -945,6 +946,65 @@ impl Validator {
                     ));
                 }
                 Self::define(scope, dst, Type::Ptr);
+            }
+            Instruction::FnRef { dst, func, span } => {
+                if !self.functions.contains_key(func) || self.externs.contains(func) {
+                    let mut names: Vec<&String> = self
+                        .functions
+                        .keys()
+                        .filter(|f| !self.externs.contains(*f))
+                        .collect();
+                    names.sort();
+                    let what = if self.externs.contains(func) {
+                        format!("fnref names '{func}', an extfn; only AIR functions have handles")
+                    } else {
+                        format!("fnref names '{func}', which is not a function of the module")
+                    };
+                    return Err(Diagnostic::error("ERR_UNDEFINED_FUNCTION", what, *span)
+                        .with_context(
+                            serde_json::json!({ "target": func, "available_functions": names }),
+                        ));
+                }
+                Self::define(scope, dst, Type::I64);
+            }
+            Instruction::CallIndirect {
+                dsts,
+                handle,
+                args,
+                rets,
+                span,
+            } => {
+                let hty = self.check_reg(ctx, handle, scope, *span)?;
+                if hty != Type::I64 {
+                    return Err(Diagnostic::error(
+                        "ERR_TYPE_MISMATCH",
+                        format!("call_indirect handle '{handle}' must be an i64 (from fnref), found '{hty}'"),
+                        *span,
+                    ));
+                }
+                for arg in args {
+                    let ty = self.check_reg(ctx, arg, scope, *span)?;
+                    check_signature_type(ty, "call_indirect", false, *span)?;
+                }
+                for &ty in rets {
+                    check_signature_type(ty, "call_indirect", false, *span)?;
+                }
+                if !dsts.is_empty() && dsts.len() != rets.len() {
+                    return Err(Diagnostic::error(
+                        "ERR_RESULT_COUNT",
+                        format!(
+                            "call_indirect declares {} results, but assigns {} ({})",
+                            rets.len(),
+                            dsts.len(),
+                            dsts.join(", ")
+                        ),
+                        *span,
+                    )
+                    .with_context(serde_json::json!({ "returns": rets.iter().map(|t| t.as_str()).collect::<Vec<_>>() })));
+                }
+                for (d, &rty) in dsts.iter().zip(rets) {
+                    Self::define(scope, d, rty);
+                }
             }
             Instruction::Addr { dst, name, span } => {
                 if !self.data.contains(name) {
