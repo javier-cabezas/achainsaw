@@ -123,6 +123,9 @@ pub fn vbin_lane_types(op: VBinOp) -> &'static [Type] {
         VBinOp::Umin | VBinOp::Umax => &[I8, I16, I32],
         VBinOp::Copysign => &[F32, F64],
         VBinOp::Tbl => &[I8],
+        // The widths every target saturates in one instruction (x86 has no wider ones).
+        VBinOp::AddSat | VBinOp::SubSat | VBinOp::UAddSat | VBinOp::USubSat => &[I8, I16],
+        VBinOp::MulHi | VBinOp::UMulHi => &[I16, I32],
     }
 }
 
@@ -192,6 +195,7 @@ pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
         | VUnaryOp::Round
         | VUnaryOp::RoundEven
         | VUnaryOp::RoundZ => &[Type::F32, Type::F64],
+        VUnaryOp::Popcnt | VUnaryOp::Clz | VUnaryOp::Ctz => INT_LANES,
     }
 }
 

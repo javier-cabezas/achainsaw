@@ -140,11 +140,17 @@ pub enum VBinOp {
     Umin,
     Umax,
     Tbl,
+    AddSat,
+    SubSat,
+    UAddSat,
+    USubSat,
+    MulHi,
+    UMulHi,
 }
 
 impl VBinOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VBinOp; 13] = [
+    pub const ALL: [VBinOp; 19] = [
         VBinOp::Add,
         VBinOp::Sub,
         VBinOp::Mul,
@@ -158,6 +164,12 @@ impl VBinOp {
         VBinOp::Umin,
         VBinOp::Umax,
         VBinOp::Tbl,
+        VBinOp::AddSat,
+        VBinOp::SubSat,
+        VBinOp::UAddSat,
+        VBinOp::USubSat,
+        VBinOp::MulHi,
+        VBinOp::UMulHi,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -179,6 +191,12 @@ impl VBinOp {
             VBinOp::Umin => "vumin",
             VBinOp::Umax => "vumax",
             VBinOp::Tbl => "vtbl",
+            VBinOp::AddSat => "vaddsat",
+            VBinOp::SubSat => "vsubsat",
+            VBinOp::UAddSat => "vuaddsat",
+            VBinOp::USubSat => "vusubsat",
+            VBinOp::MulHi => "vmulhi",
+            VBinOp::UMulHi => "vumulhi",
         }
     }
 
@@ -478,11 +496,14 @@ pub enum VUnaryOp {
     Tanh,
     Sin,
     Cos,
+    Popcnt,
+    Clz,
+    Ctz,
 }
 
 impl VUnaryOp {
     /// Every op, in AIRB encoding order (append new ops at the end).
-    pub const ALL: [VUnaryOp; 25] = [
+    pub const ALL: [VUnaryOp; 28] = [
         VUnaryOp::Itof,
         VUnaryOp::Ftoi,
         VUnaryOp::WidenLo,
@@ -508,6 +529,9 @@ impl VUnaryOp {
         VUnaryOp::Tanh,
         VUnaryOp::Sin,
         VUnaryOp::Cos,
+        VUnaryOp::Popcnt,
+        VUnaryOp::Clz,
+        VUnaryOp::Ctz,
     ];
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -541,6 +565,9 @@ impl VUnaryOp {
             VUnaryOp::Tanh => "vtanh",
             VUnaryOp::Sin => "vsin",
             VUnaryOp::Cos => "vcos",
+            VUnaryOp::Popcnt => "vpopcnt",
+            VUnaryOp::Clz => "vclz",
+            VUnaryOp::Ctz => "vctz",
         }
     }
 
@@ -609,7 +636,10 @@ impl VUnaryOp {
                 | VUnaryOp::Ceil
                 | VUnaryOp::Round
                 | VUnaryOp::RoundEven
-                | VUnaryOp::RoundZ,
+                | VUnaryOp::RoundZ
+                | VUnaryOp::Popcnt
+                | VUnaryOp::Clz
+                | VUnaryOp::Ctz,
                 _,
             ) => lane,
         }
