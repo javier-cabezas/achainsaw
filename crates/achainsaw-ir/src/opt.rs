@@ -1157,6 +1157,7 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::Free { .. }
                 | Instruction::MaskedLoad { .. }
                 | Instruction::VGather { .. }
+                | Instruction::VScatter { .. }
                 | Instruction::MaskedStore { .. }
                 | Instruction::MatMul { .. }
                 | Instruction::Par { .. }

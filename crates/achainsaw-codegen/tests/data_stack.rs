@@ -123,6 +123,15 @@ fn stm_data()->i32
     stm p, v, 2:f32
     ret 0:i32
 
+fn scatter_data()->i32
+  b0:
+    p = addr floats
+    one = cst 1.0:f32
+    v = splat one:v128
+    ix = splat 1:i32:v128
+    vscatter p, ix, v, 2:f32
+    ret 0:i32
+
 fn mm_data()->i32
   b0:
     c = addr floats
@@ -317,12 +326,13 @@ fn data_and_stack_buffers_run_under_a_fuel_budget() {
 fn sandboxed_data_is_read_only_and_stack_buffers_come_from_the_arena() {
     let e = engine(true);
     check_programs(&e);
-    // Every way of writing: plain, atomic, masked, `mm`'s result, and stores in a loop
+    // Every way of writing: plain, atomic, masked, scattered, `mm`'s result, and stores in a loop
     // whose accesses the loop's dispatch checks at once.
     for (name, args) in [
         ("st_data", vec![]),
         ("atomic_data", vec![]),
         ("stm_data", vec![]),
+        ("scatter_data", vec![]),
         ("mm_data", vec![]),
         ("loop_write", vec![4]),
     ] {
