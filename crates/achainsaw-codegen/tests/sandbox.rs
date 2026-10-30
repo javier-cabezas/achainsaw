@@ -584,3 +584,102 @@ fn gathers_are_checked_lane_by_lane() {
     violation_at(r, -20, "every lane of an uncounted gather");
     assert!(call(&e, "gather_all", &[RtValue::I32(3)]).is_ok());
 }
+
+/// `vscatter` into a 2 KB table at the start of the arena, of 1.0 in every lane, indices 0
+/// except lanes 3 and 9; `sum` reads the table back.
+const SCATTER: &str = r#"
+fn base()->ptr
+  b0:
+    t = alloc 2048:i64
+    ret t
+
+fn clear(t:ptr)
+  b0:
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, 512:i64
+    br more, body, done
+  body:
+    st t[i], 0.0:f32
+    i2 = add i, 1:i64
+    jmp loop(i2)
+  done:
+    ret
+
+fn sum(t:ptr)->f32
+  b0:
+    jmp loop(0:i64, 0.0:f32)
+  loop(i:i64, s:f32):
+    more = lt i, 512:i64
+    br more, body, done(s)
+  body:
+    x = ld t[i]:f32
+    s2 = add s, x
+    i2 = add i, 1:i64
+    jmp loop(i2, s2)
+  done(r:f32):
+    ret r
+
+fn scatter2(t:ptr, a:i32, b:i32, n:i64)
+  b0:
+    v0 = splat 0:i32:v512
+    v1 = inslane v0, a, 3:i32
+    v2 = inslane v1, b, 9:i32
+    one = splat 1.0:f32:v512
+    vscatter t, v2, one, n:f32
+    ret
+"#;
+
+#[test]
+fn scatters_check_every_lane_before_writing() {
+    let e = sandboxed(SCATTER);
+    let base = match call(&e, "base", &[]).unwrap() {
+        Some(RtValue::Ptr(p)) => p,
+        other => panic!("{other:?}"),
+    };
+    let t = RtValue::Ptr(base);
+    let sum = || match call(&e, "sum", std::slice::from_ref(&t)).unwrap() {
+        Some(RtValue::F32(s)) => s,
+        other => panic!("{other:?}"),
+    };
+    let run = |a: i32, b: i32, n: i64| {
+        call(&e, "clear", std::slice::from_ref(&t)).unwrap();
+        call(
+            &e,
+            "scatter2",
+            &[t, RtValue::I32(a), RtValue::I32(b), RtValue::I64(n)],
+        )
+    };
+    let violation_at = |r: Result<Option<RtValue>, String>, offset: i64, what: &str| {
+        let err = r.expect_err(what);
+        assert!(err.contains("ERR_MEMORY_VIOLATION"), "{what}: {err}");
+        assert_eq!(
+            get_execution_status(),
+            ExecutionStatus::MemoryViolation {
+                addr: (base as i64 + offset) as usize,
+                size: 4
+            },
+            "{what}"
+        );
+    };
+    // Lanes 0..16 store to t[0] except lanes 3 and 9, so the table holds 1.0 at t[0] and at
+    // each of their indices.
+    assert!(run(1, 2, 16).is_ok());
+    assert_eq!(sum(), 3.0);
+    assert!(run(5, 5, 16).is_ok());
+    assert_eq!(sum(), 2.0);
+    // A lane out of bounds stops the scatter before any lane is written, lanes before it
+    // included, and the first such lane is reported.
+    violation_at(run(1, 1024, 16), 4096, "one element past the arena");
+    assert_eq!(sum(), 0.0, "a failed scatter wrote");
+    violation_at(run(-1, 7, 16), -4, "one element before it");
+    violation_at(run(2000, 1500, 16), 8000, "two lanes out");
+    assert_eq!(sum(), 0.0, "a failed scatter wrote");
+    // Lanes past the count are not stored, so not checked.
+    assert!(run(1, 5000, 9).is_ok());
+    assert_eq!(sum(), 2.0);
+    assert!(run(5000, 5000, 3).is_ok());
+    assert_eq!(sum(), 1.0);
+    violation_at(run(1, 5000, 10), 20000, "the count's last lane");
+    assert_eq!(sum(), 0.0, "a failed scatter wrote");
+}

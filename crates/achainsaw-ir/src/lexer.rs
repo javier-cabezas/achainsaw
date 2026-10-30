@@ -337,7 +337,7 @@ impl<'a> Lexer<'a> {
                 | "vcopysign" | "vumin" | "vumax" | "vult" | "vugt" | "vule" | "vuge"
                 | "vuwidenlo" | "vuwidenhi" | "vuitof" | "vftoui" | "inslane" | "vlog"
                 | "vtanh" | "vsin" | "vcos" | "vtbl" | "vaddsat" | "vsubsat" | "vuaddsat"
-                | "vusubsat" | "vmulhi" | "vumulhi" | "vpopcnt" | "vclz" | "vctz" => {
+                | "vusubsat" | "vmulhi" | "vumulhi" | "vpopcnt" | "vclz" | "vctz" | "vscatter" => {
                     TokenKind::VOp(ident)
                 }
                 "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"

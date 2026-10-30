@@ -423,6 +423,73 @@ fn emit_gather(
     out
 }
 
+/// `vscatter p, idx, v[, n]:lane`: stores lane `i` of `v` to `p[idx[i]]`, in lane order (the
+/// highest of several lanes with one index stays), only the first `n` lanes with a count.
+/// Every stored lane is checked before any is written, so a failed check leaves memory as it
+/// was, as on LLVM, which checks the lanes at once.
+fn emit_scatter(
+    builder: &mut FunctionBuilder,
+    guard: Option<Guard>,
+    ptr: ClifValue,
+    idx_parts: &[ClifValue],
+    val_parts: &[ClifValue],
+    count: Option<ClifValue>,
+    lane: Type,
+) {
+    let size = lane.byte_size();
+    let per_part = 16 / size;
+    let idx_lane = if size == 4 { Type::I32 } else { Type::I64 };
+    let n = count.map(|c| clamp_count(builder, c, (per_part * idx_parts.len()) as i64));
+    let mut addrs = Vec::with_capacity(per_part * idx_parts.len());
+    for &part in idx_parts {
+        let iv = as_lanes(builder, part, idx_lane);
+        for i in 0..per_part {
+            let x = builder.ins().extractlane(iv, i as u8);
+            let x = if idx_lane == Type::I32 {
+                builder.ins().sextend(types::I64, x)
+            } else {
+                x
+            };
+            let off = builder.ins().ishl_imm_u(x, size.trailing_zeros() as i64);
+            addrs.push(builder.ins().iadd(ptr, off));
+        }
+    }
+    // Runs `f` for lane `j`, only when `j < n` with a count.
+    let for_lane = |builder: &mut FunctionBuilder, j: usize, f: &dyn Fn(&mut FunctionBuilder)| {
+        let Some(n) = n else {
+            return f(builder);
+        };
+        let live = builder.create_block();
+        let next = builder.create_block();
+        let stored = builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThan, n, j as i64);
+        builder.ins().brif(stored, live, &[], next, &[]);
+        builder.switch_to_block(live);
+        f(builder);
+        builder.ins().jump(next, &[]);
+        builder.switch_to_block(next);
+    };
+    if guard.is_some() {
+        for (j, &addr) in addrs.iter().enumerate() {
+            for_lane(builder, j, &|b| {
+                emit_bounds_check_const(b, guard, addr, size)
+            });
+        }
+    }
+    let vals: Vec<ClifValue> = val_parts
+        .iter()
+        .map(|&p| as_lanes(builder, p, lane))
+        .collect();
+    for (j, &addr) in addrs.iter().enumerate() {
+        let v = vals[j / per_part];
+        for_lane(builder, j, &|b| {
+            let x = b.ins().extractlane(v, (j % per_part) as u8);
+            b.ins().store(MemFlagsData::trusted(), x, addr, 0);
+        });
+    }
+}
+
 /// `stm p, v, n:lane`: writes only the first `n` lanes.
 fn emit_masked_store(
     builder: &mut FunctionBuilder,
@@ -3329,6 +3396,21 @@ pub fn lower_function<M: ClifModule>(
                     let n = count.as_ref().map(|c| scalar(&values, c).0);
                     let out = emit_gather(&mut builder, guard, p, &idx_parts, n, *lane);
                     values.insert(dst.clone(), (out, vec_ty));
+                }
+                Instruction::VScatter {
+                    ptr,
+                    idx,
+                    val,
+                    count,
+                    lane,
+                    ..
+                } => {
+                    let (p, _) = scalar(&values, ptr);
+                    let (idx_parts, _) = parts(&values, idx);
+                    let (val_parts, _) = parts(&values, val);
+                    let n = count.as_ref().map(|c| scalar(&values, c).0);
+                    let guard = writes(guard);
+                    emit_scatter(&mut builder, guard, p, &idx_parts, &val_parts, n, *lane);
                 }
                 Instruction::MaskedStore {
                     ptr,

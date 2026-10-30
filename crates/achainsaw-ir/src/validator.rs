@@ -1425,6 +1425,22 @@ impl Validator {
                 let vec_ty = self.check_vector(ctx, idx, scope, *span)?;
                 Self::define(scope, dst, vec_ty);
             }
+            Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vscatter", *lane, VGATHER_LANE_TYPES, *span)?;
+                self.check_typed(ctx, ptr, Type::Ptr, "vscatter pointer", scope, *span)?;
+                if let Some(count) = count {
+                    self.check_typed(ctx, count, Type::I64, "vscatter lane count", scope, *span)?;
+                }
+                let vec_ty = self.check_vector(ctx, idx, scope, *span)?;
+                self.check_typed(ctx, val, vec_ty, "vscatter value", scope, *span)?;
+            }
             Instruction::MaskedStore {
                 ptr,
                 index,

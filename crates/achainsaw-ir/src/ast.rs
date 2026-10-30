@@ -1108,6 +1108,19 @@ pub enum Instruction {
         lane: Type,
         span: Span,
     },
+    /// `vscatter p, idx, v:f32`: stores lane `i` of `v` to the element `p[idx[i]]` of type
+    /// `lane`, the indices as for `vgather` (`idx` and `v` have the same vector type), in lane
+    /// order, so the highest of several lanes with one index is the one that stays. With a
+    /// count, `vscatter p, idx, v, n:f32` stores only the first `min(max(n, 0), lanes)`
+    /// lanes. In the sandbox every stored lane is checked before any is written.
+    VScatter {
+        ptr: String,
+        idx: String,
+        val: String,
+        count: Option<String>,
+        lane: Type,
+        span: Span,
+    },
     /// Tail-masked store: `stm p, v, n:f32` writes only the first `min(max(n, 0), lanes)` lanes.
     MaskedStore {
         ptr: String,
@@ -1174,6 +1187,7 @@ impl Instruction {
             | Instruction::VLen { span, .. }
             | Instruction::MaskedLoad { span, .. }
             | Instruction::VGather { span, .. }
+            | Instruction::VScatter { span, .. }
             | Instruction::MaskedStore { span, .. }
             | Instruction::MatMul { span, .. } => *span,
         }
@@ -1231,6 +1245,7 @@ impl Instruction {
             Instruction::Store { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
+            | Instruction::VScatter { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
             | Instruction::Par { .. }
@@ -1278,6 +1293,7 @@ impl Instruction {
             Instruction::Store { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::Free { .. }
+            | Instruction::VScatter { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
             | Instruction::Par { .. }
@@ -1370,6 +1386,13 @@ impl Instruction {
             Instruction::VGather {
                 ptr, idx, count, ..
             } => [ptr, idx].into_iter().chain(count.as_ref()).collect(),
+            Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                ..
+            } => [ptr, idx, val].into_iter().chain(count.as_ref()).collect(),
             Instruction::MaskedStore {
                 ptr, val, count, ..
             } => vec![ptr, val, count],
@@ -1469,6 +1492,13 @@ impl Instruction {
             Instruction::VGather {
                 ptr, idx, count, ..
             } => [ptr, idx].into_iter().chain(count.as_mut()).collect(),
+            Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                ..
+            } => [ptr, idx, val].into_iter().chain(count.as_mut()).collect(),
             Instruction::MaskedLoad {
                 ptr, count, index, ..
             } => [ptr, count]

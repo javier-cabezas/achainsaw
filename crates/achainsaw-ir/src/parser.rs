@@ -702,13 +702,37 @@ impl<'a> Parser<'a> {
         Ok(imm_reg)
     }
 
-    /// `stm p, v, n:f32` and `mm pc, pa, pb, m, n, k:bf16` (statements without a result).
+    /// `stm p, v, n:f32`, `vscatter p, idx, v[, n]:f32` and `mm pc, pa, pb, m, n, k:bf16`
+    /// (statements without a result).
     fn parse_vector_statement(
         &mut self,
         name: &str,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Instruction, Diagnostic> {
         let span = self.advance().span;
+        if name == "vscatter" {
+            let ptr = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let idx = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let val = self.parse_operand(instructions, None)?;
+            let count = if self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+                Some(self.parse_count_operand(instructions)?)
+            } else {
+                None
+            };
+            let lane = self.parse_lane_suffix("vscatter p, idx, v, n:f32")?;
+            self.expect_eol()?;
+            return Ok(Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                lane,
+                span,
+            });
+        }
         if name == "stm" {
             let (ptr, index) = self.parse_mem_ref(instructions)?;
             self.expect(TokenKind::Comma)?;
@@ -1209,9 +1233,11 @@ impl<'a> Parser<'a> {
     ) -> Result<Instruction, Diagnostic> {
         let first_tok = self.peek().clone();
 
-        // `stm`/`mm` statements; followed by `=` they are ordinary register names.
+        // `stm`/`vscatter`/`mm` statements; followed by `=` they are ordinary register names.
         if let TokenKind::VOp(name) = &first_tok.kind {
-            if (name == "stm" || name == "mm") && self.peek_at(1) != Some(&TokenKind::Equal) {
+            if matches!(name.as_str(), "stm" | "vscatter" | "mm")
+                && self.peek_at(1) != Some(&TokenKind::Equal)
+            {
                 let name = name.clone();
                 return self.parse_vector_statement(&name, instructions);
             }

@@ -2362,6 +2362,19 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let v = self.gather(st, self.int(st, ptr), iv, vty, n, *lane)?;
                 st.values.insert(dst.clone(), (v, vty));
             }
+            Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                lane,
+                ..
+            } => {
+                let (iv, vty) = self.val(st, idx);
+                let v = self.val(st, val).0;
+                let n = count.as_ref().map(|c| self.int(st, c));
+                self.scatter(st, self.int(st, ptr), iv, v, vty, n, *lane)?;
+            }
             Instruction::MaskedStore {
                 ptr,
                 index,
@@ -3633,10 +3646,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         })
     }
 
-    /// `vgather p, idx[, n]:lane` as `llvm.masked.gather` (AVX2/AVX-512 `vgather*`, SVE
-    /// `ld1w`/`ld1d` with vector offsets). In the sandbox every read lane is checked, and
-    /// the fault reports the first lane out of bounds, as Cranelift's lane-by-lane checks do.
-    fn gather(
+    /// The lane pointers `p + idx[i] * size` of `vgather`/`vscatter`, their vector type and
+    /// the mask of the first `n` lanes (all of them without a count). In the sandbox every
+    /// masked-in lane is checked (`writes`: past the arena's read-only `data`), and the fault
+    /// reports the first lane out of bounds, as Cranelift's lane-by-lane checks do.
+    #[allow(clippy::too_many_arguments)]
+    fn lane_ptrs(
         &self,
         st: &FnState<'ctx>,
         base: IntValue<'ctx>,
@@ -3644,7 +3659,12 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         vty: Type,
         count: Option<IntValue<'ctx>>,
         lane: Type,
-    ) -> Result<BasicValueEnum<'ctx>> {
+        writes: bool,
+    ) -> Result<(
+        BasicValueEnum<'ctx>,
+        BasicTypeEnum<'ctx>,
+        BasicValueEnum<'ctx>,
+    )> {
         let b = &self.builder;
         let size = lane.byte_size() as i64;
         let idx_lane = if size == 4 { Type::I32 } else { Type::I64 };
@@ -3682,7 +3702,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         if let (Some(sb), Some((fault, addr_phi, size_phi)), false) =
             (self.opts.sandbox, st.fault, st.covered)
         {
-            let (lo, len) = Self::arena(sb, false);
+            let (lo, len) = Self::arena(sb, writes);
             let addrs = b.build_cast(InstructionOpcode::PtrToInt, ptrs, wide_t, "")?;
             let los = self.splat_into(self.c64(lo).into(), wide_t)?;
             let rooms = self.splat_into(self.c64(len - size).into(), wide_t)?;
@@ -3697,8 +3717,8 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             let any = self
                 .intr("llvm.vector.reduce.or", &[bad.get_type()], &[bad])?
                 .into_int_value();
-            let report = self.ctx.append_basic_block(st.func, "gather.fault");
-            let pass = self.ctx.append_basic_block(st.func, "gather.inbounds");
+            let report = self.ctx.append_basic_block(st.func, "lanes.fault");
+            let pass = self.ctx.append_basic_block(st.func, "lanes.inbounds");
             b.build_conditional_branch(any, report, pass)?;
             b.position_at_end(report);
             let first = self
@@ -3715,7 +3735,21 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
             size_phi.add_incoming(&[(&size_v, report)]);
             b.position_at_end(pass);
         }
+        Ok((ptrs, ptrs_t, mask))
+    }
 
+    /// `vgather p, idx[, n]:lane` as `llvm.masked.gather` (AVX2/AVX-512 `vgather*`, SVE
+    /// `ld1w`/`ld1d` with vector offsets), after the lanes' checks (`lane_ptrs`).
+    fn gather(
+        &self,
+        st: &FnState<'ctx>,
+        base: IntValue<'ctx>,
+        iv: BasicValueEnum<'ctx>,
+        vty: Type,
+        count: Option<IntValue<'ctx>>,
+        lane: Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let (ptrs, ptrs_t, mask) = self.lane_ptrs(st, base, iv, vty, count, lane, false)?;
         let vt = self.lane_vec(vty, lane);
         let f = self.intrinsic("llvm.masked.gather", &[vt, ptrs_t]);
         let mut args: Vec<BasicValueEnum> = vec![ptrs];
@@ -3726,6 +3760,33 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         args.push(vt.const_zero());
         let v = self.call1(f, &args)?;
         self.to_canon(v, vty)
+    }
+
+    /// `vscatter p, idx, v[, n]:lane` as `llvm.masked.scatter` (AVX-512 `vscatter*`, SVE
+    /// `st1w`/`st1d` with vector offsets), which stores overlapping lanes in lane order, after
+    /// every stored lane's check (`lane_ptrs`), so a failed check writes nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter(
+        &self,
+        st: &FnState<'ctx>,
+        base: IntValue<'ctx>,
+        iv: BasicValueEnum<'ctx>,
+        v: BasicValueEnum<'ctx>,
+        vty: Type,
+        count: Option<IntValue<'ctx>>,
+        lane: Type,
+    ) -> Result<()> {
+        let (ptrs, ptrs_t, mask) = self.lane_ptrs(st, base, iv, vty, count, lane, true)?;
+        let x = self.as_lanes(v, vty, lane)?;
+        let f = self.intrinsic("llvm.masked.scatter", &[x.get_type(), ptrs_t]);
+        let mut args: Vec<BasicValueEnum> = vec![x, ptrs];
+        if f.count_params() == 4 {
+            args.push(self.c32(1).into());
+        }
+        args.push(mask);
+        let args: Vec<BasicMetadataValueEnum> = args.into_iter().map(Into::into).collect();
+        self.builder.build_call(f, &args, "")?;
+        Ok(())
     }
 
     /// Mask with the first `n` lanes of `ty` set (`llvm.get.active.lane.mask`, which

@@ -403,6 +403,19 @@ pub fn to_air_text(module: &Module) -> String {
                         }
                         None => out.push_str(&format!("{dst} = vgather {ptr}, {idx}:{lane}")),
                     },
+                    Instruction::VScatter {
+                        ptr,
+                        idx,
+                        val,
+                        count,
+                        lane,
+                        ..
+                    } => match count {
+                        Some(n) => {
+                            out.push_str(&format!("vscatter {ptr}, {idx}, {val}, {n}:{lane}"))
+                        }
+                        None => out.push_str(&format!("vscatter {ptr}, {idx}, {val}:{lane}")),
+                    },
                     Instruction::MaskedStore {
                         ptr,
                         index,
@@ -1107,6 +1120,22 @@ impl BinaryEncoder {
                 self.buf.push(if count.is_some() { 0x39 } else { 0x3A });
                 self.buf.push(encode_type(*lane));
                 self.push_regs(&[dst, ptr, idx]);
+                if let Some(n) = count {
+                    self.push_regs(&[n]);
+                }
+            }
+            Instruction::VScatter {
+                ptr,
+                idx,
+                val,
+                count,
+                lane,
+                ..
+            } => {
+                // 0x3E with a count, 0x3F without.
+                self.buf.push(if count.is_some() { 0x3E } else { 0x3F });
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[ptr, idx, val]);
                 if let Some(n) = count {
                     self.push_regs(&[n]);
                 }
@@ -2030,6 +2059,25 @@ impl<'a> BinaryDecoder<'a> {
                     dst,
                     ptr,
                     idx,
+                    count,
+                    lane,
+                    span,
+                })
+            }
+            0x3E | 0x3F => {
+                let lane = self.read_lane_type()?;
+                let ptr = self.read_string()?;
+                let idx = self.read_string()?;
+                let val = self.read_string()?;
+                let count = if tag == 0x3E {
+                    Some(self.read_string()?)
+                } else {
+                    None
+                };
+                Ok(Instruction::VScatter {
+                    ptr,
+                    idx,
+                    val,
                     count,
                     lane,
                     span,

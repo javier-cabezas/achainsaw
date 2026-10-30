@@ -553,3 +553,49 @@ fn k(t:ptr, ip:ptr, n:i64)->f32
         assert_eq!(err_code(&one(bad)), code, "{bad}");
     }
 }
+
+#[test]
+fn scatter_round_trips_and_rules() {
+    let src = r#"
+fn k(t:ptr, ip:ptr, n:i64)
+  b0:
+    idx = ld ip:vx
+    vscatter t, idx, idx:i32
+    vscatter t, idx, idx, n:f32
+    vscatter t, idx, idx, 3:i32
+    wide = ld ip:v256
+    vscatter t, wide, wide:f64
+    vscatter t, wide, wide, n:i64
+    vscatter = vadd idx, idx:i32
+    st ip, vscatter
+    ret
+"#;
+    let text = round_trips(src);
+    for line in [
+        "vscatter t, idx, idx:i32",
+        "vscatter t, idx, idx, n:f32",
+        "vscatter t, wide, wide:f64",
+        "vscatter t, wide, wide, n:i64",
+        "vscatter = vadd idx, idx:i32",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let one = |body: &str| {
+        format!(
+            "fn k(t:ptr, ip:ptr, n:i64, x:f32, m:i32)\n  b0:\n    v = ld ip:v128\n    w = ld ip:v256\n{body}    ret\n"
+        )
+    };
+    for (bad, code) in [
+        ("    vscatter t, v, v:i16\n", "ERR_INVALID_LANE_TYPE"),
+        ("    vscatter t, v, v:i8\n", "ERR_INVALID_LANE_TYPE"),
+        ("    vscatter t, x, v:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    vscatter x, v, v:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    vscatter t, v, v, m:f32\n", "ERR_TYPE_MISMATCH"),
+        // The values have the indices' vector type.
+        ("    vscatter t, v, w:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    vscatter t, v, x:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    vscatter t, v, v\n", "ERR_EXPECTED_LANE_TYPE"),
+    ] {
+        assert_eq!(err_code(&one(bad)), code, "{bad}");
+    }
+}
