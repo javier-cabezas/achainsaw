@@ -910,6 +910,15 @@ pub enum Instruction {
         rets: Vec<Type>,
         span: Span,
     },
+    /// `par n, call_indirect h(a, b)`: `par` over the function whose handle is `h`, which
+    /// must take `(i64, a's type, b's type)` and return nothing; otherwise no call runs and
+    /// the run reports `ERR_BAD_INDIRECT_CALL`.
+    ParIndirect {
+        count: String,
+        handle: String,
+        args: Vec<String>,
+        span: Span,
+    },
     // Phase 4 Extensions
     Unary {
         op: UnaryOp,
@@ -1116,6 +1125,7 @@ impl Instruction {
             | Instruction::Addr { span, .. }
             | Instruction::FnRef { span, .. }
             | Instruction::CallIndirect { span, .. }
+            | Instruction::ParIndirect { span, .. }
             | Instruction::Unary { span, .. }
             | Instruction::Cast { span, .. }
             | Instruction::Fma { span, .. }
@@ -1193,7 +1203,8 @@ impl Instruction {
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
-            | Instruction::Par { .. } => None,
+            | Instruction::Par { .. }
+            | Instruction::ParIndirect { .. } => None,
         }
     }
 
@@ -1239,7 +1250,8 @@ impl Instruction {
             | Instruction::Free { .. }
             | Instruction::MaskedStore { .. }
             | Instruction::MatMul { .. }
-            | Instruction::Par { .. } => vec![],
+            | Instruction::Par { .. }
+            | Instruction::ParIndirect { .. } => vec![],
         }
     }
 
@@ -1276,6 +1288,12 @@ impl Instruction {
             Instruction::CallIndirect { handle, args, .. } => {
                 std::iter::once(handle).chain(args).collect()
             }
+            Instruction::ParIndirect {
+                count,
+                handle,
+                args,
+                ..
+            } => [count, handle].into_iter().chain(args).collect(),
             Instruction::Binary { lhs, rhs, .. }
             | Instruction::VBinary { lhs, rhs, .. }
             | Instruction::VCmp { lhs, rhs, .. }
@@ -1382,6 +1400,12 @@ impl Instruction {
             Instruction::CallIndirect { handle, args, .. } => {
                 std::iter::once(handle).chain(args.iter_mut()).collect()
             }
+            Instruction::ParIndirect {
+                count,
+                handle,
+                args,
+                ..
+            } => [count, handle].into_iter().chain(args.iter_mut()).collect(),
             Instruction::Par { count, args, .. } => {
                 std::iter::once(count).chain(args.iter_mut()).collect()
             }
@@ -1689,6 +1713,6 @@ impl Module {
             .iter()
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.instructions)
-            .any(|i| matches!(i, Instruction::Par { .. }))
+            .any(|i| matches!(i, Instruction::Par { .. } | Instruction::ParIndirect { .. }))
     }
 }

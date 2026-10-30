@@ -1814,13 +1814,17 @@ impl CraneliftJit {
             }),
             fast_math,
             data,
-            handles: crate::lower::define_handle_table(&mut self.module, ir_mod, &func_ids)?.map(
-                |(table, entries)| crate::lower::HandleConfig {
-                    table,
-                    entries,
-                    bad_call_id: Some(self.rt_bad_indirect_call_id),
-                },
-            ),
+            handles: crate::lower::define_handle_table(
+                &mut self.module,
+                ir_mod,
+                &func_ids,
+                Some(&tramp_ids),
+            )?
+            .map(|(table, entries)| crate::lower::HandleConfig {
+                table,
+                entries,
+                bad_call_id: Some(self.rt_bad_indirect_call_id),
+            }),
         };
 
         for func in &ir_mod.functions {

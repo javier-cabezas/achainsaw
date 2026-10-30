@@ -1224,6 +1224,22 @@ impl<'a> Parser<'a> {
             let span = self.advance().span;
             let count = self.parse_operand(instructions, Some(Type::I64))?;
             self.expect(TokenKind::Comma)?;
+            // `par n, call_indirect h(args)` runs the function a handle names (any register
+            // name, mnemonics too); `par n, call_indirect(args)` runs a function so named.
+            if matches!(self.peek_kind(), TokenKind::Ident(w) if w == "call_indirect")
+                && self.peek_at(1).and_then(name_of).is_some()
+            {
+                self.advance();
+                let (handle, _) = self.expect_ident()?;
+                let args = self.parse_paren_operands(instructions)?;
+                self.expect_eol()?;
+                return Ok(Instruction::ParIndirect {
+                    count,
+                    handle,
+                    args,
+                    span,
+                });
+            }
             let (func, _) = self.expect_ident()?;
             let args = self.parse_paren_operands(instructions)?;
             self.expect_eol()?;

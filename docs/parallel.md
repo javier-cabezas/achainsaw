@@ -1,6 +1,6 @@
 # Parallel loops (`par`)
 
-`par n, f(a, b)` calls `f(i, a, b)` for every `i` in `0..n` across all cores and returns when every call has finished. It is the only parallel construct: no threads, futures, locks or closures. `f` is an ordinary AIR function whose first parameter is the `i64` index, followed by scalar or `ptr` parameters, and that returns nothing. Values the body needs are passed as arguments, exactly like `call`. From [`examples/kernels/gemv_par.air`](../examples/kernels/gemv_par.air):
+`par n, f(a, b)` calls `f(i, a, b)` for every `i` in `0..n` across all cores and returns when every call has finished. It is the only parallel construct: no threads, futures, locks or closures. `f` is an ordinary AIR function whose first parameter is the `i64` index, followed by scalar or `ptr` parameters, and that returns nothing. Values the body needs are passed as arguments, exactly like `call`. `par n, call_indirect h(a, b)` runs the function whose handle `h` is ([Function handles](language.md#function-handles)), so a helper can take its body as an argument: the handle must name a function taking `(i64, a's type, b's type)` and returning nothing, or no index runs and the run reports `ERR_BAD_INDIRECT_CALL`. From [`examples/kernels/gemv_par.air`](../examples/kernels/gemv_par.air):
 
 ```air
 fn gemv_par(a:ptr, x:ptr, y:ptr, m:i64, k:i64)

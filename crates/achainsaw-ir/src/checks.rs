@@ -526,6 +526,7 @@ fn hoist_loop(
                     | Instruction::Free { .. }
                     | Instruction::MatMul { .. }
                     | Instruction::Par { .. }
+                    | Instruction::ParIndirect { .. }
             )
         });
     if size > MAX_LOOP_INSTRUCTIONS || calls_out {

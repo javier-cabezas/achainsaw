@@ -849,6 +849,35 @@ impl Validator {
                     }
                 }
             }
+            Instruction::ParIndirect {
+                count,
+                handle,
+                args,
+                span,
+            } => {
+                for (what, reg) in [("par count", count), ("par handle", handle)] {
+                    let ty = self.check_reg(ctx, reg, scope, *span)?;
+                    if ty != Type::I64 {
+                        return Err(Diagnostic::error(
+                            "ERR_TYPE_MISMATCH",
+                            format!("{what} '{reg}' must be of type 'i64', found '{ty}'"),
+                            *span,
+                        ));
+                    }
+                }
+                for arg in args {
+                    let ty = self.check_reg(ctx, arg, scope, *span)?;
+                    if ty.is_vector() || ty.is_half() {
+                        return Err(Diagnostic::error(
+                            "ERR_PAR_SIGNATURE",
+                            format!(
+                                "par cannot pass '{arg}' ({ty}); pass vectors through memory (ptr)"
+                            ),
+                            *span,
+                        ));
+                    }
+                }
+            }
             Instruction::Splat { dst, src, ty, span } => {
                 let src_ty = self.check_reg(ctx, src, scope, *span)?;
                 if !src_ty.is_lane() {

@@ -266,20 +266,26 @@ fn par_uses_the_pool() {
     let src = r#"
 extfn worker_id()->i64
 
+# Spins on a recurrence LLVM cannot fold into a closed form, whose result is stored (an
+# empty loop would be deleted, and the caller could then run every index alone).
 fn spin(i:i64, p:ptr)
   b0:
-    jmp loop(0:i64)
-  loop(j:i64):
+    jmp loop(0:i64, i)
+  loop(j:i64, x:i64):
     more = lt j, 200000:i64
     br more, body, done
   body:
+    x1 = mul x, 6364136223846793005:i64
+    x2 = add x1, 1442695040888963407:i64
     j2 = add j, 1:i64
-    jmp loop(j2)
+    jmp loop(j2, x2)
   done:
     id = call worker_id()
     off = mul i, 8:i64
     q = add p, off
     st q, id
+    q2 = add q, 512:i64
+    st q2, x
     ret
 
 fn run(p:ptr, n:i64)
@@ -295,13 +301,14 @@ fn run(p:ptr, n:i64)
         e.set_threads(threads);
         e.compile_module(&module).unwrap();
         let n = 64;
-        let mut ids = vec![0i64; n];
+        // ids, then each index's spin result (512 bytes on).
+        let mut ids = vec![0i64; 2 * n];
         let args = [
             RtValue::Ptr(ids.as_mut_ptr() as usize),
             RtValue::I64(n as i64),
         ];
         call(&e, "run", &args).unwrap();
-        let distinct: HashSet<i64> = ids.iter().copied().collect();
+        let distinct: HashSet<i64> = ids[..n].iter().copied().collect();
         assert!(!distinct.contains(&0));
         distinct
     };
