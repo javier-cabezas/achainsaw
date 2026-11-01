@@ -1199,6 +1199,22 @@ fn vector_ops_match_reference_at_every_isa_level() {
     check_against_reference(&all_kernels(), levels);
 }
 
+/// `vcompress`/`vcount` on x86 without SSSE3's `pshufb` (plain SSE2): Cranelift's lane stores
+/// through the stack instead of its table of byte shuffles, LLVM's expansion.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn compress_without_byte_shuffles() {
+    use achainsaw_codegen::cpu::Arch;
+    let kernels: Vec<Kernel> = all_kernels()
+        .into_iter()
+        .filter(|k| matches!(k, Kernel::Compress(..) | Kernel::Count(..)))
+        .collect();
+    check_against_reference(
+        &kernels,
+        vec![(IsaLevel::Sse, CpuFeatures::empty(Arch::X86_64))],
+    );
+}
+
 /// Only the `vx` kernels, at the host's full ISA: what changes with the vector length, and
 /// small enough to run under emulation (CI reruns it under QEMU at several SVE lengths).
 #[test]

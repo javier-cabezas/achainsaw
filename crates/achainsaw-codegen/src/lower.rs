@@ -587,8 +587,9 @@ fn emit_compress(
         let buf = buffer(builder, 0);
         let mut off = c64(builder, 0);
         for (part, n) in out.iter().zip(counts) {
+            // At the running count, so aligned only to the lane size.
             let addr = builder.ins().iadd(buf, off);
-            builder.ins().store(MemFlagsData::trusted(), *part, addr, 0);
+            builder.ins().store(user_mem_flags(), *part, addr, 0);
             let bytes = builder.ins().ishl_imm_u(n, size.trailing_zeros() as i64);
             off = builder.ins().iadd(off, bytes);
         }
