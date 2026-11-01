@@ -479,6 +479,20 @@ pub fn to_air_text(module: &Module) -> String {
                     } => {
                         out.push_str(&format!("{dst} = vdup {vec}, {lane}:{ty}"));
                     }
+                    Instruction::VCompress {
+                        dst,
+                        src,
+                        mask,
+                        lane,
+                        ..
+                    } => {
+                        out.push_str(&format!("{dst} = vcompress {src}, {mask}:{lane}"));
+                    }
+                    Instruction::VCount {
+                        dst, mask, lane, ..
+                    } => {
+                        out.push_str(&format!("{dst} = vcount {mask}:{lane}"));
+                    }
                     Instruction::VDot {
                         dst,
                         acc,
@@ -1216,6 +1230,24 @@ impl BinaryEncoder {
                 self.push_regs(&[dst, vec]);
                 self.buf.extend_from_slice(&lane.to_le_bytes());
                 self.buf.push(encode_type(*ty));
+            }
+            Instruction::VCompress {
+                dst,
+                src,
+                mask,
+                lane,
+                ..
+            } => {
+                self.buf.push(0x40);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, src, mask]);
+            }
+            Instruction::VCount {
+                dst, mask, lane, ..
+            } => {
+                self.buf.push(0x41);
+                self.buf.push(encode_type(*lane));
+                self.push_regs(&[dst, mask]);
             }
             Instruction::AtomicRmw {
                 op, dst, ptr, val, ..
@@ -1989,6 +2021,25 @@ impl<'a> BinaryDecoder<'a> {
                     dst: self.read_string()?,
                     lhs: self.read_string()?,
                     rhs: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x40 => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VCompress {
+                    dst: self.read_string()?,
+                    src: self.read_string()?,
+                    mask: self.read_string()?,
+                    lane,
+                    span,
+                })
+            }
+            0x41 => {
+                let lane = self.read_lane_type()?;
+                Ok(Instruction::VCount {
+                    dst: self.read_string()?,
+                    mask: self.read_string()?,
                     lane,
                     span,
                 })

@@ -173,10 +173,12 @@ pub(crate) fn infer_reg_types(func: &Function, sigs: &Signatures) -> HashMap<Str
                     } => (dst, types.get(val).copied()),
                     Instruction::ExtractLane { dst, ty, .. } => (dst, Some(*ty)),
                     Instruction::Splat { dst, ty, .. } => (dst, Some(*ty)),
+                    Instruction::VCount { dst, .. } => (dst, Some(Type::I64)),
                     Instruction::VBinary { dst, lhs, .. }
                     | Instruction::VCmp { dst, lhs, .. }
                     | Instruction::VZip { dst, lhs, .. }
                     | Instruction::VDup { dst, vec: lhs, .. }
+                    | Instruction::VCompress { dst, src: lhs, .. }
                     | Instruction::InsertLane { dst, vec: lhs, .. }
                     | Instruction::VDot { dst, acc: lhs, .. }
                     | Instruction::Fma { dst, a: lhs, .. }
@@ -1140,6 +1142,8 @@ fn run_dead_code_elimination(func: &mut Function, sigs: &Signatures) -> usize {
                 | Instruction::VShift { dst, .. }
                 | Instruction::VZip { dst, .. }
                 | Instruction::VDup { dst, .. }
+                | Instruction::VCompress { dst, .. }
+                | Instruction::VCount { dst, .. }
                 | Instruction::InsertLane { dst, .. }
                 | Instruction::VDot { dst, .. }
                 | Instruction::Fma { dst, .. } => used.contains(dst),

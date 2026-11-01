@@ -1064,6 +1064,24 @@ pub enum Instruction {
         ty: Type,
         span: Span,
     },
+    /// `r = vcompress v, m:f32`: the lanes of `v` (of type `lane`) whose lane of the mask `m`
+    /// is set (not all zero bits; `vcmp` gives all-ones lanes), in order, in the low lanes of
+    /// a vector of `v`'s type, the rest zero.
+    VCompress {
+        dst: String,
+        src: String,
+        mask: String,
+        lane: Type,
+        span: Span,
+    },
+    /// `n = vcount m:f32`: the number of set lanes of the mask `m` (lanes of type `lane`), an
+    /// i64.
+    VCount {
+        dst: String,
+        mask: String,
+        lane: Type,
+        span: Span,
+    },
     /// `r = vdot acc, a, b:i8`: `acc` has i32 lanes and `a`, `b` lanes of type `lane` (i8),
     /// four per i32 lane; lane `i` of the result is `acc[i] + a[4i]*b[4i] + ... +
     /// a[4i+3]*b[4i+3]`, signed products summed exactly and added with i32 wrapping.
@@ -1183,6 +1201,8 @@ impl Instruction {
             | Instruction::VShift { span, .. }
             | Instruction::VZip { span, .. }
             | Instruction::VDup { span, .. }
+            | Instruction::VCompress { span, .. }
+            | Instruction::VCount { span, .. }
             | Instruction::VDot { span, .. }
             | Instruction::VLen { span, .. }
             | Instruction::MaskedLoad { span, .. }
@@ -1229,6 +1249,8 @@ impl Instruction {
             | Instruction::VShift { dst, .. }
             | Instruction::VZip { dst, .. }
             | Instruction::VDup { dst, .. }
+            | Instruction::VCompress { dst, .. }
+            | Instruction::VCount { dst, .. }
             | Instruction::VDot { dst, .. }
             | Instruction::Fma { dst, .. }
             | Instruction::AtomicRmw { dst, .. }
@@ -1280,6 +1302,8 @@ impl Instruction {
             | Instruction::VShift { dst, .. }
             | Instruction::VZip { dst, .. }
             | Instruction::VDup { dst, .. }
+            | Instruction::VCompress { dst, .. }
+            | Instruction::VCount { dst, .. }
             | Instruction::VDot { dst, .. }
             | Instruction::Fma { dst, .. }
             | Instruction::AtomicRmw { dst, .. }
@@ -1363,6 +1387,8 @@ impl Instruction {
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
+            Instruction::VCompress { src, mask, .. } => vec![src, mask],
+            Instruction::VCount { mask, .. } => vec![mask],
             Instruction::InsertLane { vec, val, .. } => vec![vec, val],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
@@ -1470,6 +1496,8 @@ impl Instruction {
             Instruction::VNarrow { lo, hi, .. } => vec![lo, hi],
             Instruction::VShift { src, amount, .. } => vec![src, amount],
             Instruction::ExtractLane { vec, .. } | Instruction::VDup { vec, .. } => vec![vec],
+            Instruction::VCompress { src, mask, .. } => vec![src, mask],
+            Instruction::VCount { mask, .. } => vec![mask],
             Instruction::InsertLane { vec, val, .. } => vec![vec, val],
             Instruction::Alloc { size, .. } => vec![size],
             Instruction::Select {
