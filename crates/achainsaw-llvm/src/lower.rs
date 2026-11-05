@@ -471,6 +471,132 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
         )
     }
 
+    /// `llvm.experimental.vector.compress` of `x` (integer `lane`s) by the `i1`s `bits`, zero
+    /// past the set lanes. LLVM 22 miscompiles fixed vectors wider than 128 bits when SVE is
+    /// on (a mask with only lane 1 set left lane 0 empty), so on SVE targets those compress
+    /// in 128-bit pieces, each stored where the previous pieces' set lanes end in a zeroed
+    /// buffer (its zero tail overwritten by the next piece), which is then read back.
+    fn compress(
+        &self,
+        st: &FnState<'ctx>,
+        x: BasicValueEnum<'ctx>,
+        bits: BasicValueEnum<'ctx>,
+        vty: Type,
+        lane: Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let b = &self.builder;
+        let whole = |x: BasicValueEnum<'ctx>, bits: BasicValueEnum<'ctx>| {
+            let zero = match x.get_type() {
+                BasicTypeEnum::VectorType(t) => t.const_zero().into(),
+                BasicTypeEnum::ScalableVectorType(t) => t.const_zero().into(),
+                other => unreachable!("vector expected, found {other:?}"),
+            };
+            self.intr(
+                "llvm.experimental.vector.compress",
+                &[x.get_type()],
+                &[x, bits, zero],
+            )
+        };
+        let sve = matches!(self.opts.vx, VxShape::Scalable { .. });
+        let (BasicValueEnum::VectorValue(xv), BasicValueEnum::VectorValue(mv), true) =
+            (x, bits, sve && self.vec_bits(vty) > 128)
+        else {
+            return whole(x, bits);
+        };
+        let elem = self.scalar_type(lane);
+        let per = 128 / lane_bits(lane);
+        let entry_b = self.ctx.create_builder();
+        match st.entry.get_terminator() {
+            Some(t) => entry_b.position_before(&t),
+            None => entry_b.position_at_end(st.entry),
+        }
+        let buf = entry_b.build_alloca(xv.get_type(), "compress.buf")?;
+        b.build_store(buf, xv.get_type().const_zero())?;
+        let mut off = self.c64(0);
+        for p in 0..xv.get_type().get_size() / per {
+            let picks: Vec<_> = (p * per..(p + 1) * per).map(|i| self.c32(i)).collect();
+            let picks = VectorType::const_vector(&picks);
+            let xp = b.build_shuffle_vector(xv, xv.get_type().get_poison(), picks, "")?;
+            let mp = b.build_shuffle_vector(mv, mv.get_type().get_poison(), picks, "")?;
+            let cp = whole(xp.into(), mp.into())?;
+            // SAFETY: `off` counts set lanes before this piece, so the piece ends in `buf`.
+            let at = unsafe { b.build_gep(elem, buf, &[off], "")? };
+            b.build_store(at, cp)?
+                .set_alignment(1)
+                .map_err(|e| anyhow!("{e}"))?;
+            off = b.build_int_add(off, self.count_lanes(mp.into())?, "")?;
+        }
+        Ok(b.build_load(xv.get_type(), buf, "")?)
+    }
+
+    /// The lanes of the mask register `mask` (as `lane`-sized lanes) that are set, not all
+    /// zero bits, as `i1`s: a `vcmp`'s own `i1`s when the mask is one with lanes this size.
+    fn set_lanes(
+        &self,
+        st: &FnState<'ctx>,
+        mask: &str,
+        lane: Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if let Some(&(bits, cmp_lane)) = st.masks.get(mask) {
+            if cmp_lane.byte_size() == lane.byte_size() {
+                return Ok(bits);
+            }
+        }
+        let (m, vty) = self.val(st, mask);
+        let int = match lane.byte_size() {
+            1 => Type::I8,
+            2 => Type::I16,
+            4 => Type::I32,
+            _ => Type::I64,
+        };
+        let m = self.as_lanes(m, vty, int)?;
+        let zero = self.lane_vec(vty, int).const_zero();
+        let b = &self.builder;
+        Ok(vec2!(m, zero, |x, y| b.build_int_compare(
+            IntPredicate::NE,
+            x,
+            y,
+            ""
+        )?))
+    }
+
+    /// The number of set `i1`s in `bits`, as an i64: a fixed mask's bits as an integer
+    /// counted with `ctpop` (x86 `kmov`/`movmsk` + `popcnt`), a scalable one with SVE `cntp`.
+    fn count_lanes(&self, bits: BasicValueEnum<'ctx>) -> Result<IntValue<'ctx>> {
+        let b = &self.builder;
+        match bits {
+            BasicValueEnum::VectorValue(v) => {
+                let n = v.get_type().get_size();
+                let word = self
+                    .ctx
+                    .custom_width_int_type(
+                        std::num::NonZeroU32::new(n).expect("a vector has lanes"),
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                let w = b.build_bit_cast(v, word, "")?;
+                let c = self
+                    .intr("llvm.ctpop", &[word.into()], &[w])?
+                    .into_int_value();
+                Ok(b.build_int_z_extend_or_bit_cast(c, self.i64(), "")?)
+            }
+            // Scalable vectors are SVE's: one `cntp` under an all-true predicate.
+            BasicValueEnum::ScalableVectorValue(v) => {
+                let all = self.splat_const(
+                    self.i1().const_int(1, false).into(),
+                    Self::shape_of(v.into()),
+                )?;
+                Ok(self
+                    .intr(
+                        "llvm.aarch64.sve.cntp",
+                        &[v.get_type().into()],
+                        &[all, v.into()],
+                    )?
+                    .into_int_value())
+            }
+            other => unreachable!("vector mask expected, found {other:?}"),
+        }
+    }
+
     /// `i1` mask with one bit per `lane` of `ty`.
     fn mask_vec(&self, ty: Type, lane: Type) -> BasicTypeEnum<'ctx> {
         self.vec_of(
@@ -2361,6 +2487,33 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
                 let n = count.as_ref().map(|c| self.int(st, c));
                 let v = self.gather(st, self.int(st, ptr), iv, vty, n, *lane)?;
                 st.values.insert(dst.clone(), (v, vty));
+            }
+            Instruction::VCompress {
+                dst,
+                src,
+                mask,
+                lane,
+                ..
+            } => {
+                let (v, vty) = self.val(st, src);
+                let bits = self.set_lanes(st, mask, *lane)?;
+                // Integer lanes of the same width: compressing moves bits, and LLVM 22's
+                // expansion without a compress instruction cannot select float zeros.
+                let int = if lane.byte_size() == 4 {
+                    Type::I32
+                } else {
+                    Type::I64
+                };
+                let x = self.as_lanes(v, vty, int)?;
+                let r = self.compress(st, x, bits, vty, int)?;
+                st.values.insert(dst.clone(), (self.to_canon(r, vty)?, vty));
+            }
+            Instruction::VCount {
+                dst, mask, lane, ..
+            } => {
+                let bits = self.set_lanes(st, mask, *lane)?;
+                let n = self.count_lanes(bits)?;
+                st.values.insert(dst.clone(), (n.into(), Type::I64));
             }
             Instruction::VScatter {
                 ptr,

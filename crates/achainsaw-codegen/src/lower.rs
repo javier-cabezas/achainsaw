@@ -105,6 +105,16 @@ fn c64(builder: &mut FunctionBuilder, v: i64) -> ClifValue {
     builder.ins().iconst(types::I64, v)
 }
 
+/// The integer lane type as wide as `lane` (for reading lanes as bits).
+fn int_lane(lane: Type) -> Type {
+    match lane.byte_size() {
+        1 => Type::I8,
+        2 => Type::I16,
+        4 => Type::I32,
+        _ => Type::I64,
+    }
+}
+
 /// Integer type with the same width as `lane` (for copying lanes as raw bits).
 fn lane_int_type(lane: Type) -> types::Type {
     match lane.byte_size() {
@@ -488,6 +498,141 @@ fn emit_scatter(
             b.ins().store(MemFlagsData::trusted(), x, addr, 0);
         });
     }
+}
+
+/// The `swizzle` controls of `vcompress` on a 128-bit part of `size`-byte lanes, one 16-byte
+/// row per mask (bit `i` set for lane `i`): the bytes of the set lanes in order, then 0x80,
+/// which `swizzle` (`pshufb`, `tbl`) reads as zero.
+fn compress_controls(size: usize) -> Vec<u8> {
+    let lanes = 16 / size;
+    let mut rows = Vec::with_capacity(16 << lanes);
+    for bits in 0..1usize << lanes {
+        let mut row = [0x80u8; 16];
+        let set = (0..lanes).filter(|i| bits >> i & 1 == 1);
+        for (q, i) in set.enumerate() {
+            for b in 0..size {
+                row[q * size + b] = (i * size + b) as u8;
+            }
+        }
+        rows.extend_from_slice(&row);
+    }
+    rows
+}
+
+/// `vcompress v, m:lane`. Cranelift has no compress instruction. With `swizzle` (AArch64 `tbl`,
+/// x86 SSSE3 `pshufb`) each 128-bit part takes its control from `table`
+/// (`compress_controls`), indexed by the part's mask bits (`vhigh_bits`). Otherwise each lane
+/// is stored to a zeroed frame buffer at the count of set lanes before it, unconditionally:
+/// a lane whose mask lane is clear is overwritten by the next set one, and the last such
+/// store, at the final count, is cleared again. Parts after the first go through a buffer
+/// too, each stored where the previous ones' set lanes end (its zero tail overwritten by the
+/// next).
+fn emit_compress(
+    builder: &mut FunctionBuilder,
+    table: Option<ClifValue>,
+    src: &[ClifValue],
+    mask: &[ClifValue],
+    lane: Type,
+) -> Parts {
+    let size = lane.byte_size();
+    let per_part = 16 / size;
+    let int = int_lane(lane);
+    let buffer = |builder: &mut FunctionBuilder, extra: usize| {
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (src.len() * 16 + extra) as u32,
+            4, // 16-byte alignment
+        ));
+        let buf = builder.ins().stack_addr(types::I64, slot, 0);
+        let zero_f = builder.ins().f32const(0.0);
+        let zero = builder.ins().splat(VEC_PART, zero_f);
+        for k in 0..src.len() {
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), zero, buf, (k * 16) as i32);
+        }
+        buf
+    };
+    let load_all = |builder: &mut FunctionBuilder, buf: ClifValue| -> Parts {
+        (0..src.len())
+            .map(|k| {
+                builder
+                    .ins()
+                    .load(VEC_PART, MemFlagsData::trusted(), buf, (k * 16) as i32)
+            })
+            .collect()
+    };
+    if let Some(table) = table {
+        let mut out = Vec::with_capacity(src.len());
+        let mut counts = Vec::with_capacity(src.len());
+        for (&v, &m) in src.iter().zip(mask) {
+            let m = as_lanes(builder, m, int);
+            let zero = builder.ins().iconst(lane_int_type(lane), 0);
+            let zero = builder.ins().splat(lane_vec_type(int), zero);
+            let set = builder.ins().icmp(IntCC::NotEqual, m, zero);
+            let bits = builder.ins().vhigh_bits(types::I64, set);
+            let row = builder.ins().ishl_imm_u(bits, 4);
+            let at = builder.ins().iadd(table, row);
+            let control = builder
+                .ins()
+                .load(types::I8X16, MemFlagsData::trusted(), at, 0);
+            let bytes = as_lanes(builder, v, Type::I8);
+            let packed = builder.ins().swizzle(bytes, control);
+            out.push(to_part(builder, packed));
+            counts.push(builder.ins().popcnt(bits));
+        }
+        if out.len() == 1 {
+            return out;
+        }
+        let buf = buffer(builder, 0);
+        let mut off = c64(builder, 0);
+        for (part, n) in out.iter().zip(counts) {
+            // At the running count, so aligned only to the lane size.
+            let addr = builder.ins().iadd(buf, off);
+            builder.ins().store(user_mem_flags(), *part, addr, 0);
+            let bytes = builder.ins().ishl_imm_u(n, size.trailing_zeros() as i64);
+            off = builder.ins().iadd(off, bytes);
+        }
+        return load_all(builder, buf);
+    }
+    let buf = buffer(builder, size);
+    let mut at = c64(builder, 0);
+    for (&v, &m) in src.iter().zip(mask) {
+        let v = as_lanes(builder, v, lane);
+        let m = as_lanes(builder, m, int);
+        for i in 0..per_part {
+            let x = builder.ins().extractlane(v, i as u8);
+            let off = builder.ins().ishl_imm_u(at, size.trailing_zeros() as i64);
+            let addr = builder.ins().iadd(buf, off);
+            builder.ins().store(MemFlagsData::trusted(), x, addr, 0);
+            let bit = builder.ins().extractlane(m, i as u8);
+            let set = builder.ins().icmp_imm_u(IntCC::NotEqual, bit, 0);
+            let set = builder.ins().uextend(types::I64, set);
+            at = builder.ins().iadd(at, set);
+        }
+    }
+    let off = builder.ins().ishl_imm_u(at, size.trailing_zeros() as i64);
+    let addr = builder.ins().iadd(buf, off);
+    let none = builder.ins().iconst(lane_int_type(lane), 0);
+    builder.ins().store(MemFlagsData::trusted(), none, addr, 0);
+    load_all(builder, buf)
+}
+
+/// `vcount m:lane`: the set (non-zero) lanes of each 128-bit part as a bit mask
+/// (`vhigh_bits` of a compare: `movmskps`, AArch64's narrowing sequence), counted.
+fn emit_count(builder: &mut FunctionBuilder, mask: &[ClifValue], lane: Type) -> ClifValue {
+    let int = int_lane(lane);
+    let mut n = c64(builder, 0);
+    for &m in mask {
+        let m = as_lanes(builder, m, int);
+        let zero = builder.ins().iconst(lane_int_type(lane), 0);
+        let zero = builder.ins().splat(lane_vec_type(int), zero);
+        let set = builder.ins().icmp(IntCC::NotEqual, m, zero);
+        let bits = builder.ins().vhigh_bits(types::I64, set);
+        let c = builder.ins().popcnt(bits);
+        n = builder.ins().iadd(n, c);
+    }
+    n
 }
 
 /// `stm p, v, n:lane`: writes only the first `n` lanes.
@@ -2312,6 +2457,8 @@ pub fn lower_function<M: ClifModule>(
 
     // Values map: SSA register name -> (Cranelift parts, Type)
     let mut values: Values = HashMap::new();
+    // The `vcompress` control tables this function defined, by lane size.
+    let mut compress_tables: HashMap<usize, DataId> = HashMap::new();
 
     // Loops that pay for their checks on entry.
     let loop_checks = config.loop_checks.function(&func.name);
@@ -3396,6 +3543,44 @@ pub fn lower_function<M: ClifModule>(
                     let n = count.as_ref().map(|c| scalar(&values, c).0);
                     let out = emit_gather(&mut builder, guard, p, &idx_parts, n, *lane);
                     values.insert(dst.clone(), (out, vec_ty));
+                }
+                Instruction::VCompress {
+                    dst,
+                    src,
+                    mask,
+                    lane,
+                    ..
+                } => {
+                    let (src_parts, vec_ty) = parts(&values, src);
+                    let (mask_parts, _) = parts(&values, mask);
+                    let table = if native_swizzle(module.isa()) {
+                        let size = lane.byte_size();
+                        let id = match compress_tables.get(&size) {
+                            Some(&id) => id,
+                            None => {
+                                let id = module.declare_anonymous_data(false, false)?;
+                                let mut desc = DataDescription::new();
+                                desc.define(compress_controls(size).into_boxed_slice());
+                                desc.set_align(16);
+                                module.define_data(id, &desc)?;
+                                compress_tables.insert(size, id);
+                                id
+                            }
+                        };
+                        let gv = module.declare_data_in_func(id, builder.func);
+                        Some(builder.ins().symbol_value(types::I64, gv))
+                    } else {
+                        None
+                    };
+                    let out = emit_compress(&mut builder, table, &src_parts, &mask_parts, *lane);
+                    values.insert(dst.clone(), (out, vec_ty));
+                }
+                Instruction::VCount {
+                    dst, mask, lane, ..
+                } => {
+                    let (mask_parts, _) = parts(&values, mask);
+                    let n = emit_count(&mut builder, &mask_parts, *lane);
+                    values.insert(dst.clone(), (vec![n], Type::I64));
                 }
                 Instruction::VScatter {
                     ptr,

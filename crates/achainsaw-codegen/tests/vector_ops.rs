@@ -15,8 +15,8 @@ use achainsaw_ir::ast::{vexp, VBinOp, VCmpOp, VShiftOp, VUnaryOp, VZipOp, Vector
 use achainsaw_ir::parse_and_validate;
 use achainsaw_ir::types::Type;
 use achainsaw_ir::validator::{
-    vbin_lane_types, vcmp_lane_types, vnarrow_source_lane, vunary_lane_types, VFMA_LANE_TYPES,
-    VNARROW_LANE_TYPES, VPERM_LANE_TYPES, VSHIFT_LANE_TYPES,
+    vbin_lane_types, vcmp_lane_types, vnarrow_source_lane, vunary_lane_types, VCOMPRESS_LANE_TYPES,
+    VFMA_LANE_TYPES, VNARROW_LANE_TYPES, VPERM_LANE_TYPES, VSHIFT_LANE_TYPES,
 };
 
 const WIDTHS: [Type; 4] = [Type::V128, Type::V256, Type::V512, Type::Vx];
@@ -70,6 +70,11 @@ enum Kernel {
     Dot(Type),
     /// `vdotu c, a, b:i8` (a unsigned).
     Dotu(Type),
+    /// `vcompress c, m:lane` with `m = vlt a, b` (`raw`: `m` and `c`'s bits instead, so set
+    /// lanes are any non-zero bits): lane type, width, raw.
+    Compress(Type, Type, bool),
+    /// `vcount m:lane`, `m` as for `Compress`; stores the i64 count.
+    Count(Type, Type, bool),
 }
 
 impl Kernel {
@@ -92,6 +97,10 @@ impl Kernel {
             Kernel::Dup(l, w, i) => format!("k_vdup{i}_{l}_{w}"),
             Kernel::Dot(w) => format!("k_vdot_{w}"),
             Kernel::Dotu(w) => format!("k_vdotu_{w}"),
+            Kernel::Compress(l, w, raw) => {
+                format!("k_vcompress{}_{l}_{w}", if *raw { "r" } else { "" })
+            }
+            Kernel::Count(l, w, raw) => format!("k_vcount{}_{l}_{w}", if *raw { "r" } else { "" }),
         }
     }
 
@@ -121,6 +130,18 @@ impl Kernel {
             Kernel::Dup(l, w, i) => format!("{}    r = vdup a, {i}:{l}\n", loads(*w)),
             Kernel::Dot(w) => format!("{}    r = vdot c, a, b:i8\n", loads(*w)),
             Kernel::Dotu(w) => format!("{}    r = vdotu c, a, b:i8\n", loads(*w)),
+            Kernel::Compress(l, w, raw) | Kernel::Count(l, w, raw) => {
+                let mask = if *raw {
+                    format!("    lt = vlt a, b:{l}\n    m = vand lt, c:{l}\n")
+                } else {
+                    format!("    m = vlt a, b:{l}\n")
+                };
+                let op = match self {
+                    Kernel::Compress(..) => format!("    r = vcompress c, m:{l}\n"),
+                    _ => format!("    r = vcount m:{l}\n"),
+                };
+                format!("{}{mask}{op}", loads(*w))
+            }
         };
         format!(
             "fn {}(pa:ptr, pb:ptr, pc:ptr, po:ptr)\n  b0:\n{body}    st po, r\n    ret\n",
@@ -150,6 +171,7 @@ impl Kernel {
             | Kernel::Zip(_, l, _)
             | Kernel::Dup(l, _, _) => *l,
             Kernel::Sel(_) | Kernel::Dot(_) | Kernel::Dotu(_) => Type::I8,
+            Kernel::Compress(l, ..) | Kernel::Count(l, ..) => *l,
         }
     }
 
@@ -188,7 +210,9 @@ impl Kernel {
             | Kernel::Zip(_, _, w)
             | Kernel::Dup(_, w, _)
             | Kernel::Dot(w)
-            | Kernel::Dotu(w) => *w,
+            | Kernel::Dotu(w)
+            | Kernel::Compress(_, w, _)
+            | Kernel::Count(_, w, _) => *w,
         }
     }
 
@@ -196,6 +220,7 @@ impl Kernel {
     fn out_bytes(&self, vx_bytes: usize) -> usize {
         match self {
             Kernel::Reduce(_, l, _) | Kernel::FastReduce(_, l, _) => l.byte_size(),
+            Kernel::Count(..) => 8,
             _ => width_bytes(self.width(), vx_bytes),
         }
     }
@@ -221,7 +246,9 @@ impl Kernel {
             | Kernel::Zip(..)
             | Kernel::Dup(..)
             | Kernel::Dot(..)
-            | Kernel::Dotu(..) => false,
+            | Kernel::Dotu(..)
+            | Kernel::Compress(..)
+            | Kernel::Count(..) => false,
         }
     }
 }
@@ -282,6 +309,14 @@ fn all_kernels() -> Vec<Kernel> {
         }
         ks.push(Kernel::Dot(w));
         ks.push(Kernel::Dotu(w));
+        for raw in [false, true] {
+            for &l in VCOMPRESS_LANE_TYPES {
+                ks.push(Kernel::Compress(l, w, raw));
+            }
+            for l in LANES {
+                ks.push(Kernel::Count(l, w, raw));
+            }
+        }
         for l in [Type::F32, Type::F64] {
             for op in [VBinOp::Min, VBinOp::Max] {
                 ks.push(Kernel::FastBin(op, l, w));
@@ -825,6 +860,29 @@ fn reference(k: Kernel, a: &[u8], b: &[u8], c: &[u8], vx_bytes: usize) -> Vec<u8
                 put_int(&mut out, Type::I32, i, r as i64);
             }
         }
+        // Set mask lanes: a < b (NaN compares false), and with `raw` also c's bits not all zero.
+        Kernel::Compress(l, _, raw) | Kernel::Count(l, _, raw) => {
+            let s = l.byte_size();
+            let set: Vec<bool> = (0..n)
+                .map(|i| {
+                    let lt = match l {
+                        Type::F32 => get_f32(a, i) < get_f32(b, i),
+                        Type::F64 => get_f64(a, i) < get_f64(b, i),
+                        _ => get_int(a, l, i) < get_int(b, l, i),
+                    };
+                    lt && (!raw || c[i * s..i * s + s].iter().any(|&x| x != 0))
+                })
+                .collect();
+            if matches!(k, Kernel::Count(..)) {
+                let count = set.iter().filter(|&&x| x).count() as i64;
+                out[..8].copy_from_slice(&count.to_le_bytes());
+            } else {
+                // c's lanes where set, in order, then zeros.
+                for (at, i) in (0..n).filter(|&i| set[i]).enumerate() {
+                    out[at * s..at * s + s].copy_from_slice(&c[i * s..i * s + s]);
+                }
+            }
+        }
         Kernel::Dup(l, _, k) => {
             let (s, k) = (l.byte_size(), k as usize);
             for i in 0..n {
@@ -1139,6 +1197,22 @@ fn vector_ops_match_reference_at_every_isa_level() {
     let levels = host_levels();
     assert!(!levels.is_empty());
     check_against_reference(&all_kernels(), levels);
+}
+
+/// `vcompress`/`vcount` on x86 without SSSE3's `pshufb` (plain SSE2): Cranelift's lane stores
+/// through the stack instead of its table of byte shuffles, LLVM's expansion.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn compress_without_byte_shuffles() {
+    use achainsaw_codegen::cpu::Arch;
+    let kernels: Vec<Kernel> = all_kernels()
+        .into_iter()
+        .filter(|k| matches!(k, Kernel::Compress(..) | Kernel::Count(..)))
+        .collect();
+    check_against_reference(
+        &kernels,
+        vec![(IsaLevel::Sse, CpuFeatures::empty(Arch::X86_64))],
+    );
 }
 
 /// Only the `vx` kernels, at the host's full ISA: what changes with the vector length, and

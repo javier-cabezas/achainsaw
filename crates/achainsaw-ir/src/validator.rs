@@ -174,6 +174,10 @@ pub const VFMA_LANE_TYPES: &[Type] = &[Type::F32, Type::F64];
 /// elements, i64 for 64-bit ones).
 pub const VGATHER_LANE_TYPES: &[Type] = &[Type::I32, Type::I64, Type::F32, Type::F64];
 
+/// Lane types of `vcompress`: 32- and 64-bit lanes, which SVE's `compact` and every other
+/// target compress (LLVM has no scalable expansion for narrower ones).
+pub const VCOMPRESS_LANE_TYPES: &[Type] = &[Type::I32, Type::I64, Type::F32, Type::F64];
+
 pub fn vunary_lane_types(op: VUnaryOp) -> &'static [Type] {
     match op {
         VUnaryOp::Itof | VUnaryOp::Uitof => &[Type::F32, Type::F64],
@@ -943,6 +947,28 @@ impl Validator {
                 let vec_ty = self.check_vector(ctx, vec, scope, *span)?;
                 Self::check_lane_index("vdup", vec_ty, *lane, *ty, *span)?;
                 Self::define(scope, dst, vec_ty);
+            }
+            Instruction::VCompress {
+                dst,
+                src,
+                mask,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vcompress", *lane, VCOMPRESS_LANE_TYPES, *span)?;
+                let vec_ty =
+                    self.check_same_vectors(ctx, "vcompress", &[src, mask], scope, *span)?;
+                Self::define(scope, dst, vec_ty);
+            }
+            Instruction::VCount {
+                dst,
+                mask,
+                lane,
+                span,
+            } => {
+                Self::check_lane("vcount", *lane, ALL_LANES, *span)?;
+                self.check_vector(ctx, mask, scope, *span)?;
+                Self::define(scope, dst, Type::I64);
             }
             Instruction::VZip {
                 op,

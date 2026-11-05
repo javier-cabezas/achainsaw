@@ -1049,6 +1049,29 @@ impl<'a> Parser<'a> {
                 span,
             });
         }
+        if name == "vcompress" {
+            let src = self.parse_operand(instructions, None)?;
+            self.expect(TokenKind::Comma)?;
+            let mask = self.parse_operand(instructions, None)?;
+            let lane = self.parse_lane_suffix("vcompress v, m:f32")?;
+            return Ok(Instruction::VCompress {
+                dst,
+                src,
+                mask,
+                lane,
+                span,
+            });
+        }
+        if name == "vcount" {
+            let mask = self.parse_operand(instructions, None)?;
+            let lane = self.parse_lane_suffix("vcount m:f32")?;
+            return Ok(Instruction::VCount {
+                dst,
+                mask,
+                lane,
+                span,
+            });
+        }
         if name == "vdup" {
             let (vec, lane, ty) = self.parse_lane_ref()?;
             return Ok(Instruction::VDup {

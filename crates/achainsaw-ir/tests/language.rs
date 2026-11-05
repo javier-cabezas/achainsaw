@@ -599,3 +599,57 @@ fn k(t:ptr, ip:ptr, n:i64)
         assert_eq!(err_code(&one(bad)), code, "{bad}");
     }
 }
+
+#[test]
+fn compress_and_count_round_trip_and_rules() {
+    let src = r#"
+fn k(p:ptr, q:ptr)->i64
+  b0:
+    v = ld p:vx
+    m = vlt v, v:f32
+    c = vcompress v, m:f32
+    st q, c
+    w = ld p:v512
+    d = vcompress w, w:i64
+    st q, d
+    n = vcount m:f32
+    b = vcount w:i8
+    vcount = add n, b
+    vcompress = add vcount, 1:i64
+    ret vcompress
+"#;
+    let text = round_trips(src);
+    for line in [
+        "c = vcompress v, m:f32",
+        "d = vcompress w, w:i64",
+        "n = vcount m:f32",
+        "b = vcount w:i8",
+        "vcount = add n, b",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    let one = |body: &str| {
+        format!("fn k(p:ptr, x:f32)\n  b0:\n    v = ld p:v128\n    w = ld p:v256\n{body}    ret\n")
+    };
+    // vcount takes any lane; vcompress 32- and 64-bit ones.
+    for good in [
+        "    n = vcount v:i16\n",
+        "    n = vcount v:f64\n",
+        "    r = vcompress v, v:i32\n",
+    ] {
+        assert!(parse_and_validate(&one(good)).is_ok(), "{good}");
+    }
+    for (bad, code) in [
+        ("    r = vcompress v, v:i8\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vcompress v, v:i16\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vcompress v, v:bf16\n", "ERR_INVALID_LANE_TYPE"),
+        ("    n = vcount v:f16\n", "ERR_INVALID_LANE_TYPE"),
+        ("    r = vcompress v, w:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vcompress x, v:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    n = vcount x:f32\n", "ERR_TYPE_MISMATCH"),
+        ("    r = vcompress v, v\n", "ERR_EXPECTED_LANE_TYPE"),
+        ("    vcompress v, v:f32\n", "ERR_MISSING_DESTINATION"),
+    ] {
+        assert_eq!(err_code(&one(bad)), code, "{bad}");
+    }
+}
