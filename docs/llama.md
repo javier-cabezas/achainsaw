@@ -110,16 +110,20 @@ python benchmarks/benchmark_decode.py --gguf Qwen3-1.7B-Q8_0.gguf --chat \
 # The capital of France is Paris.
 ```
 
-Its tokens match the NumPy implementation on both backends, for Qwen3-1.7B in Q8_0 and Qwen3-4B in Q4_K_M (Qwen's files; the 4B one has Q4_K matrices, V and the down projection in Q6_K in half the layers, a Q6_K embedding shared with the LM head). A prompt of 512 tokens then 64 generated, 8 threads:
+Its tokens match the NumPy implementation on both backends for the chat prompts above, for Qwen3-1.7B in Q8_0 and Qwen3-4B in Q4_K_M (Qwen's files; the 4B one has Q4_K matrices, V and the down projection in Q6_K in half the layers, a Q6_K embedding shared with the LM head). A prompt of 512 tokens then 64 generated, 8 threads, against llama.cpp build 6868a52 (`llama-bench -t 8 -p 512` for the prefill, `-n 64 -d 512` for the decode; the AIR rows run separately, the same day):
 
 | | Prefill | Decode | weights read per token |
 |---|---|---|---|
 | Qwen3-1.7B Q8_0, AIR on LLVM | 588 tokens/s (1.70 ms/token) | 26.4 tokens/s (37.8 ms/token) | 1.83 GB at 48 GB/s |
 | Qwen3-1.7B Q8_0, AIR on Cranelift | 121 tokens/s (8.29 ms/token) | 22.0 tokens/s (45.4 ms/token) | 1.83 GB at 40 GB/s |
+| Qwen3-1.7B Q8_0, llama.cpp | 171 tokens/s (5.84 ms/token) | 24.8 tokens/s (40.3 ms/token) | |
 | Qwen3-4B Q4_K_M, AIR on LLVM | 204 tokens/s (4.90 ms/token) | 19.4 tokens/s (51.7 ms/token) | 2.59 GB at 50 GB/s |
 | Qwen3-4B Q4_K_M, AIR on Cranelift | 23.7 tokens/s (42.3 ms/token) | 14.2 tokens/s (70.4 ms/token) | 2.59 GB at 37 GB/s |
+| Qwen3-4B Q4_K_M, llama.cpp | 126 tokens/s (7.94 ms/token) | 17.2 tokens/s (58.0 ms/token) | |
 
-Decode runs at the memory's bandwidth on LLVM, as for Llama. llama.cpp has not been measured on these files yet.
+On LLVM the kernel prefills 3.4x (1.7B, Q8_0) and 1.6x (4B, Q4_K_M) faster than llama.cpp, and decodes 6% and 13% faster; decode runs at the memory's bandwidth, as for Llama.
+
+Greedy text can part from llama.cpp's where two tokens come within a few hundredths of a logit. Continuing "The capital of France is", Qwen3-1.7B's NumPy implementation and llama.cpp both write " Paris. The capital of the United States", but " the" leads " Italy" there by 0.08 logits (of about 21), and later " States" leads " Kingdom" by 0.02: the kernel's hidden state, 0.2 to 0.4% of its scale from NumPy's (an int8 rounding of an activation landing one step apart, as the tests allow), takes " Italy" on LLVM and " Kingdom" on Cranelift.
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
