@@ -41,8 +41,7 @@ PyTorch runs the same model eagerly on its weight-only quantized kernels (`bench
 **Against llama.cpp, by context length.** llama.cpp is a git submodule pinned to the build these comparisons use (`third_party/llama.cpp`, build 6868a52); `tools/llama_cpp.sh` builds its `llama-bench` and `llama-simple` into `target/llama.cpp/bin` (CPU only, tuned for the machine). `benchmark_decode.py --llama-bench` then runs `llama-bench` on the same file, thread count, prompt length and number of generated tokens, and prints it as one more row (`--prompt-tokens N` makes the prompt N random tokens, as llama-bench's are; `--llama-bench PATH` takes another build):
 
 ```bash
-git submodule update --init third_party/llama.cpp   # tools/llama_cpp.sh does it too
-tools/llama_cpp.sh
+tools/llama_cpp.sh   # checks out the pinned submodule and builds it
 python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 \
     --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench
 ```

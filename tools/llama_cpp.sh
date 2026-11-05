@@ -9,11 +9,11 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 src="$root/third_party/llama.cpp"
 out="$root/target/llama.cpp"
-if [ ! -f "$src/CMakeLists.txt" ]; then
-  git -C "$root" submodule update --init third_party/llama.cpp
-fi
+# Checks out the pinned commit, also over a checkout of another one.
+git -C "$root" submodule update --init third_party/llama.cpp
 jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-cmake -S "$src" -B "$out" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
+# Metal is on by default on macOS, and llama-bench would offload every layer to the GPU.
+cmake -S "$src" -B "$out" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_METAL=OFF \
   -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF >/dev/null
 cmake --build "$out" -j "$jobs" --target llama-bench llama-simple
 echo "built $(git -C "$src" rev-parse --short HEAD): $out/bin/llama-bench, $out/bin/llama-simple"
