@@ -413,17 +413,23 @@ class TestGGUFDecode(unittest.TestCase):
                 want: int = m.numpy_step(np_cache, token, pos)
                 # The KV cache holds bf16 (or int8) values; NumPy's f32 K and V can round
                 # to the neighboring value where they sit at a rounding boundary: one bf16
-                # step, or one step of the position's int8 scale.
+                # step, or one step of the position's int8 scale. After the first layer, an
+                # int8 quantization of an earlier activation that flipped (see below) moves a
+                # head's K and V by up to about 1% of their scale too.
                 planes: tuple[F32, F32] = m.cache_kv(cache)
                 for l, (kc, vc) in enumerate(np_cache):
                     for kv, ref in enumerate((kc[pos], vc[pos])):
                         got_kv: F32 = planes[kv][l, :, pos, :]
                         msg: str = f"{be} cache l={l} pos {pos} kv_q8={kv_q8}"
+                        scale_kv: Floats = np.abs(ref).max(axis=1, keepdims=True)
+                        flip: Floats = 1e-2 * scale_kv if l > 0 else 0 * scale_kv
                         if kv_q8:
-                            step: Floats = np.abs(ref).max(axis=1, keepdims=True) / 127
-                            self.assertTrue(np.all(np.abs(got_kv - ref) <= 1.01 * step), msg)
+                            step: Floats = scale_kv / 127
+                            self.assertTrue(
+                                np.all(np.abs(got_kv - ref) <= 1.01 * step + flip), msg)
                         else:
-                            np.testing.assert_allclose(got_kv, ref, rtol=2.0 ** -7, err_msg=msg)
+                            self.assertTrue(np.all(
+                                np.abs(got_kv - ref) <= 2.0 ** -7 * np.abs(ref) + flip), msg)
                 # Such a step can flip an int8 quantization of a later attention output,
                 # which moves the hidden state by up to about 0.5% of its scale.
                 scale: float = float(np.abs(m.last_h).max())
