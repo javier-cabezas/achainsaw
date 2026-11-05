@@ -430,6 +430,12 @@ class TestGGUFDecode(unittest.TestCase):
                         else:
                             self.assertTrue(np.all(
                                 np.abs(got_kv - ref) <= 2.0 ** -7 * np.abs(ref) + flip), msg)
+                # The next step starts from the kernel's cache, so such a step stays in the
+                # position it came from instead of growing through every later one's
+                # attention.
+                for l, (kc, vc) in enumerate(np_cache):
+                    kc[pos] = planes[0][l, :, pos, :]
+                    vc[pos] = planes[1][l, :, pos, :]
                 # Such a step can flip an int8 quantization of a later attention output,
                 # which moves the hidden state by up to about 0.5% of its scale.
                 scale: float = float(np.abs(m.last_h).max())
@@ -519,8 +525,11 @@ class TestQwen3GGUF(TestGGUFDecode):
         for i, types_ in enumerate([{n: 8 for n in SHAPES}, LAYER_TYPES[2]]):
             add(f"blk.{i}.attn_norm.weight", 0, 1, D)
             add(f"blk.{i}.ffn_norm.weight", 0, 1, D)
-            add(f"blk.{i}.attn_q_norm.weight", 0, 1, HEAD_DIM)
-            add(f"blk.{i}.attn_k_norm.weight", 0, 1, HEAD_DIM)
+            # Head norms scale q and k to unit RMS: weights below 1 keep the scores (and so
+            # the softmax's sensitivity to an int8 step of the kernel's queries) moderate.
+            for n in ("q", "k"):
+                add(f"blk.{i}.attn_{n}_norm.weight", 0, 1, HEAD_DIM,
+                    values=rng.uniform(0.25, 0.5, (1, HEAD_DIM)))
             for name, t in types_.items():
                 rows, k = SHAPES[name]
                 add(f"blk.{i}.{name}.weight", t, rows, k)
