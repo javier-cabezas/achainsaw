@@ -66,6 +66,12 @@ python benchmarks/benchmark_decode.py --gguf FILE --threads 8 --prompt-tokens 51
 python benchmarks/perf_compare.py BASE_DIR HEAD_DIR
 ```
 
+Comparisons with llama.cpp use the pinned submodule in `third_party/llama.cpp`
+(build 6868a52, the one in docs/llama.md): `tools/llama_cpp.sh` initializes
+and builds it (`llama-bench`, `llama-simple`) into `target/llama.cpp/bin`, and
+`benchmark_decode.py --gguf FILE --llama-bench` runs it. Nothing else needs
+it, so a plain clone without submodules builds and tests as before.
+
 CI runs `perf_compare.py` on every pull request: it builds the base and the
 head, runs both alternately, and fails if a kernel gets more than 25% slower
 on either backend. An intended slowdown needs the `perf-regression-ok`

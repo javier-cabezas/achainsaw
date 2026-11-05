@@ -38,9 +38,10 @@ kernel's.
     python benchmarks/benchmark_decode.py --weights q8 --layers 4 --tokens 16 --no-numpy
     python benchmarks/benchmark_decode.py --prompt-tokens 512 --tokens 1 --no-numpy  # prefill
 
-    # Against llama.cpp on the same file (build llama-bench from github.com/ggml-org/llama.cpp):
+    # Against llama.cpp on the same file (tools/llama_cpp.sh builds the pinned submodule's
+    # llama-bench; --llama-bench PATH takes another build):
     python benchmarks/benchmark_decode.py --gguf model.gguf --threads 8 --prompt-tokens 512 \\
-        --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
+        --tokens 64 --no-numpy --llama-bench
 
 llama.cpp runs its own `llama-bench` (3 repetitions) with the same thread count: prefill of a
 prompt of the same length, then the same number of generated tokens after a context of that
@@ -75,6 +76,9 @@ from gguf import F32  # noqa: E402
 # averages 3 repetitions too).
 PREFILL_REPS: int = 3
 
+# llama-bench as tools/llama_cpp.sh builds it from the third_party/llama.cpp submodule.
+LLAMA_BENCH: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target",
+                                                "llama.cpp", "bin", "llama-bench"))
 KERNEL: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "kernels",
                                       "llama_decode.air"))
 
@@ -157,15 +161,18 @@ def main() -> None:
     parser.add_argument("--no-numpy", action="store_true", help="skip the NumPy baseline")
     parser.add_argument("--no-torch", action="store_true",
                         help="skip the PyTorch baseline (skipped anyway without PyTorch)")
-    parser.add_argument("--llama-bench", metavar="PATH",
+    parser.add_argument("--llama-bench", metavar="PATH", nargs="?", const=LLAMA_BENCH,
                         help="with --gguf: also run llama.cpp's llama-bench on the same file, "
-                             "threads, prompt length and token count")
+                             "threads, prompt length and token count (default PATH: the "
+                             "submodule's build by tools/llama_cpp.sh)")
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args: argparse.Namespace = parser.parse_args()
     use_torch: bool = torch is not None and not args.no_torch
     kv_q8: bool = args.kv_cache == "int8"
     if args.llama_bench and not args.gguf:
         parser.error("--llama-bench needs --gguf")
+    if args.llama_bench and not os.path.exists(args.llama_bench):
+        parser.error(f"no llama-bench at {args.llama_bench} (build it with tools/llama_cpp.sh)")
 
     t0: float = time.perf_counter()
     tok: Tokenizer | None = None
