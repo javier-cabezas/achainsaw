@@ -8,7 +8,9 @@ benchmarks/gguf.py and benchmarks/llama_model.py, and checks
     order; fused matrices, including a QKV matrix whose parts keep different formats),
   - the BPE tokenizer on a small vocabulary,
   - examples/kernels/llama_decode.air against the NumPy forward pass of the loaded model, on
-    every available backend.
+    every available backend;
+and the same for a tiny Qwen3 GGUF (q and k head norms, Q and K rows in GGUF order already,
+Qwen's pre-tokenizer and no BOS token).
 Needs numpy and the achainsaw extension (no download).
 """
 
@@ -29,7 +31,7 @@ sys.path.insert(0, ROOT)
 import achainsaw  # noqa: E402
 from gguf import (F32, GGUF, IQ4_NL_VALUES, U8, Floats, Ints, Tokenizer,  # noqa: E402
                   _bytes_to_unicode)
-from llama_model import MATS, Mat, Model, Parts  # noqa: E402
+from llama_model import MATS, Layer, Mat, Model, Parts  # noqa: E402
 
 D: int = 256
 LAYERS: int = 3
@@ -207,7 +209,7 @@ def write_gguf(path: str, meta: dict[str, tuple[int, Any]],
         if t == 9:
             et, items = v
             return struct.pack("<IQ", et, len(items)) + b"".join(value(et, i) for i in items)
-        return struct.pack({4: "<I", 5: "<i", 6: "<f"}[t], v)
+        return struct.pack({4: "<I", 5: "<i", 6: "<f", 7: "<?"}[t], v)
 
     out: bytearray = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(meta)))
     for k, (t, v) in meta.items():
@@ -464,6 +466,91 @@ class TestGGUFDecode(unittest.TestCase):
             self.assertEqual(got, want, be)
             np.testing.assert_array_equal(p_h, h, err_msg=be)
             np.testing.assert_array_equal(p_cache, cache, err_msg=be)
+
+
+class TestQwen3GGUF(TestGGUFDecode):
+    """The Llama checks on a tiny qwen3 GGUF; the kernel and prefill tests are inherited."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rng: np.random.Generator = np.random.default_rng(8)
+        tokens, types, merges = tiny_vocab()
+        # Merges Qwen's pre-tokenizer never reaches, since it splits digits one by one.
+        tokens[-2:] = ["12", "123"]
+        types[-2:] = [1, 1]
+        merges += ["1 2", "12 3"]
+        meta: dict[str, tuple[int, Any]] = {
+            "general.architecture": (8, "qwen3"),
+            "general.name": (8, "tiny qwen3"),
+            "qwen3.block_count": (4, 2),
+            "qwen3.embedding_length": (4, D),
+            "qwen3.feed_forward_length": (4, FFN),
+            "qwen3.attention.head_count": (4, HEADS),
+            "qwen3.attention.head_count_kv": (4, KV_HEADS),
+            "qwen3.attention.key_length": (4, HEAD_DIM),
+            "qwen3.rope.freq_base": (6, 1000000.0),
+            "qwen3.attention.layer_norm_rms_epsilon": (6, 1e-6),
+            "tokenizer.ggml.model": (8, "gpt2"),
+            "tokenizer.ggml.pre": (8, "qwen2"),
+            "tokenizer.ggml.tokens": (9, (8, tokens)),
+            "tokenizer.ggml.token_type": (9, (5, types)),
+            "tokenizer.ggml.merges": (9, (8, merges)),
+            "tokenizer.ggml.bos_token_id": (4, tokens.index("<|end_of_text|>")),
+            "tokenizer.ggml.add_bos_token": (7, False),
+        }
+        cls.expected = {}
+        cls.k_codes = {}
+        tensors: list[tuple[str, list[int], int, U8]] = []
+
+        def add(name: str, t: int, rows: int, k: int, **kw: Any) -> None:
+            raw, vals, *_ = ENCODERS[t](rng, rows, k, **kw)
+            cls.expected[name] = vals.reshape(rows, k)
+            dims: list[int] = [k] if rows == 1 else [k, rows]
+            tensors.append((name, dims, t, raw))
+
+        add("token_embd.weight", 8, VOCAB, D)                  # tied: also the LM head
+        add("output_norm.weight", 0, 1, D)
+        for i, types_ in enumerate([{n: 8 for n in SHAPES}, LAYER_TYPES[2]]):
+            add(f"blk.{i}.attn_norm.weight", 0, 1, D)
+            add(f"blk.{i}.ffn_norm.weight", 0, 1, D)
+            add(f"blk.{i}.attn_q_norm.weight", 0, 1, HEAD_DIM)
+            add(f"blk.{i}.attn_k_norm.weight", 0, 1, HEAD_DIM)
+            for name, t in types_.items():
+                rows, k = SHAPES[name]
+                add(f"blk.{i}.{name}.weight", t, rows, k)
+        cls.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.path = os.path.join(cls.tmp.name, "qwen3.gguf")
+        write_gguf(cls.path, meta, tensors)
+        cls.gguf = GGUF(cls.path)
+
+    def test_loader_conversions(self) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
+        e: dict[str, Floats] = self.expected
+        l0: Layer = m.layers[0]
+        # Q and K rows as the file has them (Qwen3's NeoX RoPE already uses the kernel's
+        # half-split order); Q8_0 loads exactly.
+        qkv: Mat | Parts = l0["qkv"]
+        got: Floats = np.concatenate([
+            (p.q_blocks * p.s_blocks[:, :, None]).transpose(1, 0, 2).reshape(p.rows, -1)
+            for p in qkv.parts()])
+        np.testing.assert_array_equal(got, np.concatenate(
+            [e["blk.0.attn_q.weight"], e["blk.0.attn_k.weight"], e["blk.0.attn_v.weight"]]))
+        for i, layer in enumerate(m.layers):
+            for n in ("q_norm", "k_norm"):
+                w: F32 | None = layer["q_norm"] if n == "q_norm" else layer["k_norm"]
+                assert w is not None
+                np.testing.assert_array_equal(w, e[f"blk.{i}.attn_{n}.weight"][0], err_msg=n)
+        np.testing.assert_array_equal(m.embd, e["token_embd.weight"])
+        self.assertEqual(m.lm.fmt, "q8")
+        self.assertEqual(float(m.eps), float(np.float32(1e-6)))
+
+    def test_tokenizer(self) -> None:
+        tok: Tokenizer = Tokenizer(self.gguf)
+        ids: dict[str, int] = {t: i for i, t in enumerate(tok.tokens)}
+        # No BOS (add_bos_token false), and digits one at a time: "123" never merges.
+        self.assertEqual(tok.encode("the 123"),
+                         [ord("t"), ids["he"], ids["Ġ"], ord("1"), ord("2"), ord("3")])
+        self.assertEqual(tok.decode(tok.encode("the cat 42!")), "the cat 42!")
 
 
 if __name__ == "__main__":

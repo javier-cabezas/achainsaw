@@ -195,7 +195,8 @@ It prints the same text as llama.cpp, a prefill leaves exactly the state that
 decoding the prompt token by token would, and its decode reads weights at
 about the memory's bandwidth. [docs/llama.md](docs/llama.md) explains how,
 with the numbers for K-quant files, an int8 KV cache (14% faster decode at
-8192 tokens) and against PyTorch.
+8192 tokens) and against PyTorch. The same kernel runs Qwen3's dense models
+(their q and k head norms included), from Qwen's own GGUF files.
 
 **Kernels against NumPy and PyTorch.** [`examples/kernels/`](examples/kernels)
 holds 22 kernels for LLM inference, vector search and more: quantized GEMV
