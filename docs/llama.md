@@ -130,6 +130,16 @@ Greedy text can part from llama.cpp's where two tokens come within a few hundred
 
 The kernel matches an f64 reference with mixed expert formats at every ISA level on both backends (`qwen3_moe_matches_reference`), and the NumPy implementation of a `qwen3moe` GGUF. It also matches llama.cpp: on a synthetic `qwen3moe` file (2 layers, 64 experts of which 4 are used, random weights; Qwen3-30B-A3B itself is 18 GB in Q4_K_M, more than this machine's memory), `llama-simple` and the kernel on both backends generate the same 16 tokens greedily, including the two steps where the top two logits are 0.01 and 0.04 apart.
 
+Speed at Qwen3-30B-A3B's layer shapes (d 2048, 32 query heads over 4 KV heads of 128, 128 experts of 768 of which 8 are used, a 151936-token vocabulary), on a random Q4_0 file of 8 such layers (3 GB; the model's 48 do not fit this machine), a prompt of 512 tokens then 64 generated, 8 threads, measured one after the other:
+
+| | Prefill | Decode (after the prompt) | weights read per token |
+|---|---|---|---|
+| AIR on LLVM | 421 tokens/s (2.37 ms/token) | 113 tokens/s (8.84 ms/token) | 0.43 GB at 49 GB/s |
+| AIR on Cranelift | 198 tokens/s (5.06 ms/token) | 84.8 tokens/s (11.8 ms/token) | 0.43 GB at 37 GB/s |
+| llama.cpp (build 6868a52, `llama-bench -t 8 -p 512`, `-n 64 -d 512`) | 439 tokens/s (500 on an empty cache) | 86.1 tokens/s (105 on an empty cache) | |
+
+Decode reads the used experts' weights at the memory's bandwidth on LLVM, 1.31x llama.cpp's rate after 512 tokens. Prefill is 0.96x llama.cpp's after the same context (0.84x from an empty one) because each token runs its own experts, while llama.cpp groups the prompt's tokens by expert.
+
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
 | Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |
