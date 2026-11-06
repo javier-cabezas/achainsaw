@@ -38,11 +38,12 @@ The kernel prints the same text as llama.cpp (`llama-simple`, greedy), and its t
 
 PyTorch runs the same model eagerly on its weight-only quantized kernels (`benchmark_decode.py` uses them when PyTorch is installed; `--no-torch` skips it). Q4_0 and Q4_1 matrices become int4 with the same 32-blocks; the Q6_K LM head becomes int8 with one scale per row. Its tokens match too. Its int4 kernel streams weights at about half the rate of LLVM's `vdotu` loop, and it reads the int8 LM head instead of 6.5-bit Q6_K.
 
-**Against llama.cpp, by context length.** `benchmark_decode.py --llama-bench PATH` runs llama.cpp's own `llama-bench` on the same file, thread count, prompt length and number of generated tokens, and prints it as one more row (`--prompt-tokens N` makes the prompt N random tokens, as llama-bench's are):
+**Against llama.cpp, by context length.** llama.cpp is a git submodule pinned to the build these comparisons use (`third_party/llama.cpp`, build 6868a52); `tools/llama_cpp.sh` builds its `llama-bench` and `llama-simple` into `target/llama.cpp/bin` (CPU only, tuned for the machine). `benchmark_decode.py --llama-bench` then runs `llama-bench` on the same file, thread count, prompt length and number of generated tokens, and prints it as one more row (`--prompt-tokens N` makes the prompt N random tokens, as llama-bench's are; `--llama-bench PATH` takes another build):
 
 ```bash
+tools/llama_cpp.sh   # checks out the pinned submodule and builds it
 python benchmarks/benchmark_decode.py --gguf Llama-3.2-1B-Instruct-Q4_0.gguf --threads 8 \
-    --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench ~/llama.cpp/build/bin/llama-bench
+    --prompt-tokens 512 --tokens 64 --no-numpy --llama-bench
 ```
 
 Prefill of the prompt (one `llama_prefill` call, the mean of 3 after a first one, as llama-bench's `-p` averages 3), then 64 tokens generated after it (`llama_decode`; llama-bench's `-n 64 -d <prompt>`), 8 threads, llama.cpp build 6868a52 with its default f16 KV cache:
