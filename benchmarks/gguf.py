@@ -290,10 +290,23 @@ _LLAMA3_SPLIT: re.Pattern[str] = re.compile(
     r"|\s+(?!\S)"
     r"|\s+")
 
+# Qwen2's and Qwen3's (llama.cpp's "qwen2"): Llama 3's, but digits one at a time.
+_QWEN2_SPLIT: re.Pattern[str] = re.compile(
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|(?:[^\r\n\w]|_)?[^\W\d_]+"
+    r"|\d"
+    r"| ?(?:[^\s\w]|_)+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+")
+
 
 class Tokenizer:
-    """The byte-level BPE tokenizer of a GGUF file whose tokenizer.ggml.model is gpt2 (Llama 3).
-    Control tokens (`<|eot_id|>` and the like) in the text are encoded as themselves."""
+    """The byte-level BPE tokenizer of a GGUF file whose tokenizer.ggml.model is gpt2, with
+    Llama 3's pre-tokenizer (tokenizer.ggml.pre "llama-bpe", the default) or Qwen's
+    ("qwen2"). Control tokens (`<|eot_id|>` and the like) in the text are encoded as
+    themselves. A BOS token is added only when the file says so
+    (tokenizer.ggml.add_bos_token, true when absent)."""
 
     def __init__(self, gguf: GGUF) -> None:
         meta: dict[str, Any] = gguf.meta
@@ -304,7 +317,14 @@ class Tokenizer:
         self.ids: dict[str, int] = {t: i for i, t in enumerate(self.tokens)}
         self.ranks: dict[tuple[str, ...], int] = {
             tuple(m.split(" ", 1)): r for r, m in enumerate(meta["tokenizer.ggml.merges"])}
-        self.bos: int | None = meta.get("tokenizer.ggml.bos_token_id")
+        pre: str = meta.get("tokenizer.ggml.pre", "llama-bpe")
+        if pre not in ("llama-bpe", "qwen2"):
+            raise ValueError(f"unsupported pre-tokenizer {pre!r} (llama-bpe and qwen2 only)")
+        self.split: re.Pattern[str] = _QWEN2_SPLIT if pre == "qwen2" else _LLAMA3_SPLIT
+        # llama.cpp skips the merges of words already in the vocabulary for Llama 3 only.
+        self.ignore_merges: bool = pre == "llama-bpe"
+        self.bos: int | None = meta.get("tokenizer.ggml.bos_token_id") \
+            if meta.get("tokenizer.ggml.add_bos_token", True) else None
         self.eos: int | None = meta.get("tokenizer.ggml.eos_token_id")
         self.special: dict[str, int] = {
             self.tokens[i]: i for i, t in enumerate(types) if t in (3, 4)}
@@ -315,7 +335,7 @@ class Tokenizer:
         self._dec: dict[str, int] = {c: b for b, c in self._enc.items()}
 
     def _bpe(self, word: str) -> list[int]:
-        if word in self.ids:  # llama-bpe skips merges for whole-vocabulary words
+        if self.ignore_merges and word in self.ids:
             return [self.ids[word]]
         parts: list[str] = list(word)
         while len(parts) > 1:
@@ -335,7 +355,7 @@ class Tokenizer:
             if chunk in self.special:
                 out.append(self.special[chunk])
                 continue
-            for piece in _LLAMA3_SPLIT.findall(chunk):
+            for piece in self.split.findall(chunk):
                 out += self._bpe("".join(self._enc[b] for b in piece.encode("utf-8")))
         return out
 

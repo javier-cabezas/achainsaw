@@ -354,6 +354,9 @@ struct Layer {
     ffn_norm: Vec<f32>,
     gate_up: Matrix,
     down: Matrix,
+    /// Qwen3's RMSNorm weights of each q and k head, applied before RoPE.
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
 }
 
 struct Model {
@@ -429,6 +432,8 @@ impl Model {
                     ffn_norm,
                     gate_up: Matrix::random(&mut rng, &[2 * f], d, &[fmt(4)]),
                     down: Matrix::random(&mut rng, &[d], f, &[fmt(5)]),
+                    q_norm: None,
+                    k_norm: None,
                 }
             })
             .collect();
@@ -453,6 +458,33 @@ impl Model {
             cos,
             sin,
             layers,
+        }
+    }
+
+    /// The model with Qwen3's q and k head norms in every layer.
+    fn with_qk_norm(mut self) -> Self {
+        let mut rng = Rng(31);
+        let hd = self.hd;
+        let mut norm = || {
+            Some(
+                (0..hd)
+                    .map(|_| 1.0 + 0.2 * rng.next())
+                    .collect::<Vec<f32>>(),
+            )
+        };
+        for l in &mut self.layers {
+            l.q_norm = norm();
+            l.k_norm = norm();
+        }
+        self
+    }
+
+    /// RMSNorm of one head in place with the weights `w`.
+    fn head_norm(&self, x: &mut [f64], w: &[f32]) {
+        let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+        let inv = 1.0 / (ms + self.eps as f64).sqrt();
+        for (v, w) in x.iter_mut().zip(w) {
+            *v *= inv * *w as f64;
         }
     }
 
@@ -541,6 +573,9 @@ impl Model {
             let qkv = layer.qkv.matvec(&self.norm_quant(&h, &layer.attn_norm));
             let mut q = qkv[..nh * hd].to_vec();
             for head in q.chunks_mut(hd) {
+                if let Some(w) = &layer.q_norm {
+                    self.head_norm(head, w);
+                }
                 self.rope(head, pos);
                 if self.kv_q8 {
                     head.copy_from_slice(&q8_round(head));
@@ -548,6 +583,9 @@ impl Model {
             }
             for g in 0..nkv {
                 let mut k = qkv[(nh + g) * hd..(nh + g + 1) * hd].to_vec();
+                if let Some(w) = &layer.k_norm {
+                    self.head_norm(&mut k, w);
+                }
                 self.rope(&mut k, pos);
                 let v = &qkv[(nh + nkv + g) * hd..(nh + nkv + g + 1) * hd];
                 let at = (pos * nkv + g) * hd;
@@ -619,6 +657,8 @@ impl Model {
             let m = 1 + 4 * i;
             t.extend([p(&l.attn_norm), mp(m), mp(m + 1)]);
             t.extend([p(&l.ffn_norm), mp(m + 2), mp(m + 3)]);
+            let opt = |w: &Option<Vec<f32>>| w.as_deref().map_or(0, p);
+            t.extend([opt(&l.q_norm), opt(&l.k_norm)]);
         }
         let cfg = [
             self.d,
@@ -654,25 +694,32 @@ fn host_levels() -> Vec<(IsaLevel, CpuFeatures)> {
 
 #[test]
 fn llama_decode_matches_reference() {
-    check_decode(false, false);
+    check_decode(false, false, false);
+}
+
+/// Qwen3's RMSNorm of each q and k head before RoPE, with either cache format.
+#[test]
+fn qwen3_head_norms_match_reference() {
+    check_decode(true, false, true);
+    check_decode(false, true, true);
 }
 
 /// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 and IQ4_NL matrices mixed within and across layers (Q, K and V
 /// in different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {
-    check_decode(true, false);
+    check_decode(true, false, false);
 }
 
 /// The int8 KV cache (cfg's format 1), against the reference rounding K, V and the attention
 /// queries to int8 per row.
 #[test]
 fn llama_decode_int8_cache_matches_reference() {
-    check_decode(false, true);
-    check_decode(true, true);
+    check_decode(false, true, false);
+    check_decode(true, true, false);
 }
 
-fn check_decode(mixed: bool, kv_q8: bool) {
+fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -681,6 +728,9 @@ fn check_decode(mixed: bool, kv_q8: bool) {
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     // d=128, 2 layers, 4 q heads over 2 KV heads of 64, MLP 256, vocab 512, context 8.
     let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
+    if qk_norm {
+        model = model.with_qk_norm();
+    }
     model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;
@@ -695,8 +745,9 @@ fn check_decode(mixed: bool, kv_q8: bool) {
             "{level}{}{}{}",
             if fast { " fast_math" } else { "" },
             if mixed { " mixed formats" } else { "" },
-            if kv_q8 { " int8 cache" } else { "" }
+            if kv_q8 { " int8 cache" } else { "" },
         );
+        let level = if qk_norm { level + " qk norm" } else { level };
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         // As `Model::cache_value` reads it.
@@ -787,19 +838,24 @@ fn llama_prefill_matches_decode_exactly() {
         .map(|_| (rng.next().abs() * 511.0) as i64)
         .collect();
     let short = vec![7, 300, 42, 511, 0, 99];
-    // (mixed formats, int8 cache, prompt, context length, ways to split the prompt into
-    // prefill calls)
-    type Case<'a> = (bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 6] = [
-        (false, false, &short, 8, &[&[6], &[1, 5]]),
-        (true, false, &short, 8, &[&[6], &[1, 5]]),
-        (false, false, &long, 530, &[&[530], &[255, 2, 273]]),
-        (true, false, &long, 530, &[&[300, 230]]),
-        (true, true, &short, 8, &[&[6], &[1, 5]]),
-        (false, true, &long, 530, &[&[530], &[255, 2, 273]]),
+    // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
+    // the prompt into prefill calls)
+    type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
+    let cases: [Case; 8] = [
+        (false, false, false, &short, 8, &[&[6], &[1, 5]]),
+        (true, false, false, &short, 8, &[&[6], &[1, 5]]),
+        (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
+        (true, false, false, &long, 530, &[&[300, 230]]),
+        (true, true, false, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, false, &long, 530, &[&[530], &[255, 2, 273]]),
+        (true, false, true, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, true, &long, 530, &[&[300, 230]]),
     ];
-    for &(mixed, kv_q8, prompt, max_ctx, all_pieces) in &cases {
+    for &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces) in &cases {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
+        if qk_norm {
+            model = model.with_qk_norm();
+        }
         model.kv_q8 = kv_q8;
         let (table, cfg, _parts) = model.tables();
         let cache_len = model.cache_len();

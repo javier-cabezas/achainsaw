@@ -79,8 +79,12 @@ KERNEL: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "exa
                                       "llama_decode.air"))
 
 
-def chat_prompt(text: str) -> str:
-    """Llama 3's chat format for one user turn, without a system message."""
+def chat_prompt(text: str, arch: str = "llama") -> str:
+    """The chat format of `arch` for one user turn, without a system message: Llama 3's, or
+    Qwen3's in its non-thinking mode (an empty think block, as its template writes it)."""
+    if arch == "qwen3":
+        return (f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+                "<think>\n\n</think>\n\n")
     return (f"<|start_header_id|>user<|end_header_id|>\n\n{text}<|eot_id|>"
             "<|start_header_id|>assistant<|end_header_id|>\n\n")
 
@@ -179,10 +183,11 @@ def main() -> None:
             prompt_ids: list[int] = [int(t) for t in np.random.default_rng(1).integers(
                 0, 128000, args.prompt_tokens)]
         else:
-            prompt: str = chat_prompt(args.prompt) if args.chat else args.prompt
+            arch: str = g.meta.get("general.architecture", "llama")
+            prompt: str = chat_prompt(args.prompt, arch) if args.chat else args.prompt
             prompt_ids = tok.encode(prompt)
-            stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>")
-                    if t in tok.ids}
+            stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>",
+                                         "<|im_end|>", "<|endoftext|>") if t in tok.ids}
         model: Model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
                                        numpy=not args.no_numpy, use_torch=use_torch,
                                        kv_q8=kv_q8)

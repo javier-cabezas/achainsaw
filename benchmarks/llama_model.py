@@ -451,6 +451,9 @@ class Layer(TypedDict):
     ffn_norm: F32
     gate_up: Mat
     down: Mat
+    # Qwen3's RMSNorm weights of each q and k head [head_dim], applied before RoPE.
+    q_norm: F32 | None
+    k_norm: F32 | None
 
 
 # A layer's matrices.
@@ -559,8 +562,11 @@ class Model:
         words: list[int] = [embd.ctypes.data, norm_out.ctypes.data, mat(lm), cos.ctypes.data,
                  sin.ctypes.data]
         for l in layers:
+            qn: F32 | None = l["q_norm"]
+            kn: F32 | None = l["k_norm"]
             words += [l["attn_norm"].ctypes.data, mat(l["qkv"]), mat(l["o"]),
-                      l["ffn_norm"].ctypes.data, mat(l["gate_up"]), mat(l["down"])]
+                      l["ffn_norm"].ctypes.data, mat(l["gate_up"]), mat(l["down"]),
+                      0 if qn is None else qn.ctypes.data, 0 if kn is None else kn.ctypes.data]
         self.table: npt.NDArray[np.uint64] = np.array(words, dtype=np.uint64)
 
     def matrices(self) -> list[Mat | Parts]:
@@ -570,9 +576,13 @@ class Model:
     @classmethod
     def random(cls, d: int, layers: int, heads: int, kv_heads: int, head_dim: int, ffn: int,
                vocab: int, max_ctx: int, fmt: str = "q8", numpy: bool = False,
-               use_torch: bool = False, kv_q8: bool = False) -> Model:
+               use_torch: bool = False, kv_q8: bool = False, qk_norm: bool = False) -> Model:
         rng: np.random.Generator = np.random.default_rng(0)
         ls: list[Layer] = []
+
+        def head_norm() -> F32 | None:
+            return rng.uniform(0.8, 1.2, head_dim).astype(np.float32) if qk_norm else None
+
         for _ in range(layers):
             ls.append(Layer(
                 attn_norm=rng.uniform(0.8, 1.2, d).astype(np.float32),
@@ -581,6 +591,8 @@ class Model:
                 ffn_norm=rng.uniform(0.8, 1.2, d).astype(np.float32),
                 gate_up=Mat.random(rng, 2 * ffn, d, fmt),
                 down=Mat.random(rng, d, ffn, fmt),
+                q_norm=head_norm(),
+                k_norm=head_norm(),
             ))
         cos, sin = rope_tables(max_ctx, head_dim, 500000.0)
         return cls((d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx),
@@ -595,21 +607,22 @@ class Model:
         m: dict[str, Any] = g.meta
         t: dict[str, Tensor] = g.tensors
         arch: str | None = m.get("general.architecture")
-        if arch != "llama":
-            raise ValueError(f"unsupported architecture {arch!r} (llama only)")
-        d: int = m["llama.embedding_length"]
-        nl: int = m["llama.block_count"]
-        nh: int = m["llama.attention.head_count"]
-        nkv: int = m.get("llama.attention.head_count_kv", nh)
-        hd: int = m.get("llama.attention.key_length", d // nh)
-        f: int = m["llama.feed_forward_length"]
+        if arch not in ("llama", "qwen3"):
+            raise ValueError(f"unsupported architecture {arch!r} (llama and qwen3 only)")
+        a: str = f"{arch}."
+        d: int = m[a + "embedding_length"]
+        nl: int = m[a + "block_count"]
+        nh: int = m[a + "attention.head_count"]
+        nkv: int = m.get(a + "attention.head_count_kv", nh)
+        hd: int = m.get(a + "attention.key_length", d // nh)
+        f: int = m[a + "feed_forward_length"]
         vocab: int = t["token_embd.weight"].rows
-        rope_dims: int = m.get("llama.rope.dimension_count", hd)
-        if rope_dims != hd or m.get("llama.attention.value_length", hd) != hd:
+        rope_dims: int = m.get(a + "rope.dimension_count", hd)
+        if rope_dims != hd or m.get(a + "attention.value_length", hd) != hd:
             raise ValueError("partial RoPE and differing K/V head sizes are not supported")
         ff: F32 | None = t["rope_freqs.weight"].dequantize()[0] \
             if "rope_freqs.weight" in t else None
-        cos, sin = rope_tables(max_ctx, hd, m.get("llama.rope.freq_base", 10000.0), ff)
+        cos, sin = rope_tables(max_ctx, hd, m.get(a + "rope.freq_base", 10000.0), ff)
 
         embd: F32 = np.empty((vocab, d), dtype=np.float32)
         for r in range(0, vocab, 8192):
@@ -617,10 +630,13 @@ class Model:
         lm: Mat = Mat.from_tensor(t.get("output.weight", t["token_embd.weight"]))
 
         def hf_rows(n_heads: int) -> npt.NDArray[np.intp]:
-            # llama.cpp stores each head's rows as (i, half) pairs interleaved; Hugging Face
-            # (and the kernel's RoPE) puts the first halves first.
-            return np.arange(n_heads * hd).reshape(n_heads, hd // 2, 2).transpose(
-                0, 2, 1).reshape(-1)
+            # llama.cpp stores each Llama head's rows as (i, half) pairs interleaved; Hugging
+            # Face (and the kernel's RoPE) puts the first halves first. Qwen3 uses that order
+            # in GGUF files too (NeoX RoPE).
+            rows: npt.NDArray[np.intp] = np.arange(n_heads * hd)
+            if arch != "llama":
+                return rows
+            return rows.reshape(n_heads, hd // 2, 2).transpose(0, 2, 1).reshape(-1)
 
         def norm(name: str) -> F32:
             return np.ascontiguousarray(t[name].dequantize()[0])
@@ -643,8 +659,10 @@ class Model:
                 ffn_norm=norm(p + "ffn_norm.weight"),
                 gate_up=Mat.concat([gate, up]).take(gu_rows),
                 down=Mat.from_tensor(t[p + "ffn_down.weight"]),
+                q_norm=norm(p + "attn_q_norm.weight") if p + "attn_q_norm.weight" in t else None,
+                k_norm=norm(p + "attn_k_norm.weight") if p + "attn_k_norm.weight" in t else None,
             ))
-        eps: float = m.get("llama.attention.layer_norm_rms_epsilon", 1e-5)
+        eps: float = m.get(a + "attention.layer_norm_rms_epsilon", 1e-5)
         model: Model = cls((d, nl, nh, nkv, hd, f, vocab, max_ctx), embd, norm(
             "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch, kv_q8)
         model.formats = {n: sorted({l[n].fmt for l in layers}) for n in MATS}
@@ -706,6 +724,14 @@ class Model:
         y: Floats = h / np.sqrt(np.mean(h * h) + self.eps) * w
         return y
 
+    def head_norm(self, x: F32, w: F32 | None) -> F32:
+        """RMSNorm of each head (row) of x with the weights w, or x itself without them."""
+        if w is None:
+            return x
+        y: F32 = (x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + self.eps) * w).astype(
+            np.float32)
+        return y
+
     def rope(self, x: F32, pos: int) -> F32:
         half: int = self.hd // 2
         a: F32 = x[..., :half]
@@ -727,8 +753,9 @@ class Model:
         for l, layer in enumerate(self.layers):
             kc, vc = cache[l]
             qkv: F32 = layer["qkv"].matvec(self.norm(h, layer["attn_norm"]))
-            q: F32 = self.rope(qkv[:nh * hd].reshape(nh, hd), pos)
-            k: F32 = self.rope(qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), pos)
+            q: F32 = self.rope(self.head_norm(qkv[:nh * hd].reshape(nh, hd), layer["q_norm"]), pos)
+            k: F32 = self.rope(self.head_norm(
+                qkv[nh * hd:(nh + nkv) * hd].reshape(nkv, hd), layer["k_norm"]), pos)
             v: F32 = qkv[(nh + nkv) * hd:].reshape(nkv, hd)
             if self.kv_q8:
                 # int8 K and V per position, and queries per head (attn_split_q8).
@@ -784,12 +811,17 @@ class Model:
         def norm(h: torch.Tensor, w: F32) -> torch.Tensor:
             return F.rms_norm(h, (d,), torch.from_numpy(w), eps=eps)
 
+        def head_norm(x: torch.Tensor, w: F32 | None) -> torch.Tensor:
+            return x if w is None else F.rms_norm(x, (hd,), torch.from_numpy(w), eps=eps)
+
         h: torch.Tensor = torch.from_numpy(self.embd[token].copy())
         for l, layer in enumerate(self.layers):
             kc, vc = cache[l]
             qkv: torch.Tensor = layer["qkv"].torch_matvec(norm(h, layer["attn_norm"]))
-            q: torch.Tensor = self.torch_rope(qkv[:nh * hd].view(nh, hd), pos)
-            kc[:, pos] = self.torch_rope(qkv[nh * hd:(nh + nkv) * hd].view(nkv, hd), pos)
+            q: torch.Tensor = self.torch_rope(
+                head_norm(qkv[:nh * hd].view(nh, hd), layer["q_norm"]), pos)
+            kc[:, pos] = self.torch_rope(head_norm(
+                qkv[nh * hd:(nh + nkv) * hd].view(nkv, hd), layer["k_norm"]), pos)
             vc[:, pos] = qkv[(nh + nkv) * hd:].view(nkv, hd)
             keys: torch.Tensor = kc[None, :, :pos + 1]  # [1, nkv, t, hd]
             vals: torch.Tensor = vc[None, :, :pos + 1]

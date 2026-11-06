@@ -1,4 +1,5 @@
-# One Llama-style decode step in a single call: token in, next token (greedy) out.
+# One decode step of a Llama-style model (Llama, Qwen3) in a single call: token in, next
+# token (greedy) out.
 #
 # Megakernel-style fusion for CPUs: every elementwise op runs inside the pass that produces
 # or consumes its data, so a layer is 2 serial norms and 5 `par` regions:
@@ -39,10 +40,12 @@
 # and number of 64-row chunks (see qmat_chunk in the standard library).
 #   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]   [2] LM head
 #   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape)
-#   then 6 per layer, at 5 + 6 * l:
+#   then 8 per layer, at 5 + 8 * l:
 #   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
 #   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
-#   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn]
+#   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn];
+#   Q and K norm weights f32 [head_dim] (Qwen3's RMSNorm of each q and k head before RoPE),
+#   or 0 for none
 # cache: per layer, K then V, each kv_heads x ctx x head_dim bf16 values, ctx = max_ctx
 # rounded up to a multiple of 32 (head-major, so a KV head's positions are contiguous): V is
 # [kv_heads x ctx x head_dim]; K is in tiles of 32 positions, [kv_heads x ctx / 32 x
@@ -123,12 +126,12 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
     call norm_quant(h, attn_norm, xn, xq, dx, d, eps)
-    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_r, sin_r)
+    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_r, sin_r, q_norm, k_norm, eps)
     par a_tasks, attn_task(qbuf, kc, vc, part, nh, nkv, hd, npos, max_ctx, kvf, splits, scale)
     par nh, attn_out(part, xq, dx, hd, splits)
     par dchunks, proj_add(m_o, xq, dx, h, qd)
@@ -220,10 +223,10 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
     call quantize_q8(xn, xq, dx, d)
     ret
 
-# Q, K or V head t: 64-row chunks of the QKV projection, then RoPE for q and k. A q head
-# lands in the q buffer; a K or V head in a staging row, rounded to bf16 into this position's
-# slot of its KV-cache row after RoPE.
-fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_r:ptr, sin_r:ptr)
+# Q, K or V head t: 64-row chunks of the QKV projection, then for q and k the head's RMSNorm
+# when the layer has one (qk_norm) and RoPE. A q head lands in the q buffer; a K or V head in
+# a staging row, rounded to bf16 into this position's slot of its KV-cache row after RoPE.
+fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32)
   b0:
     hd4 = mul hd, 4:i64
     is_q = lt t, nh
@@ -250,6 +253,7 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
   epilogue:
     br is_k, rotate, store
   rotate:
+    call qk_norm(dst, is_q, q_norm, k_norm, hd, eps)
     call rope_half(dst, hd, cos_r, sin_r)
     jmp store
   store:
@@ -259,6 +263,50 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
     jmp done
   done:
     free stage
+    ret
+
+# Qwen3's RMSNorm of one q (is_q) or k head of hd values in place, x * w / rms(x) with the
+# layer's q_norm or k_norm weights; nothing when the layer has none (a zero pointer). The
+# sum of squares runs as norm_quant's does.
+fn qk_norm(x:ptr, is_q:i32, q_norm:ptr, k_norm:ptr, hd:i64, eps:f32)
+  b0:
+    wt = select is_q, q_norm, k_norm
+    none = eq wt, 0:ptr
+    z = cst 0.0:f32
+    zero = splat z:vx
+    w = vl f32
+    br none, done, sum(0:i64, zero)
+  sum(i:i64, acc:vx):
+    more = lt i, hd
+    br more, sum_body, scale
+  sum_body:
+    rest = sub hd, i
+    xv = ldm x[i]:vx, rest:f32
+    acc2 = vfma xv, xv, acc:f32
+    i2 = add i, w
+    jmp sum(i2, acc2)
+  scale:
+    ss = vsum acc:f32
+    nf = itof hd:f32
+    mean = div ss, nf
+    mean_eps = add mean, eps
+    rms = sqrt mean_eps
+    inv = div 1.0:f32, rms
+    vinv = splat inv:vx
+    jmp norm(0:i64)
+  norm(j:i64):
+    more_j = lt j, hd
+    br more_j, norm_body, done
+  norm_body:
+    rest_j = sub hd, j
+    xv_j = ldm x[j]:vx, rest_j:f32
+    wv = ldm wt[j]:vx, rest_j:f32
+    xs = vmul xv_j, vinv:f32
+    y = vmul xs, wv:f32
+    stm x[j], y, rest_j:f32
+    j2 = add j, w
+    jmp norm(j2)
+  done:
     ret
 
 # Where K or V head t (t >= nh; a q head gets an unused address) stores position p: the
@@ -646,12 +694,12 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
     par n, norm_tok(hs, attn_norm, xn, xq, dx, d, eps, xs)
-    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_t, sin_t, n, xs)
+    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps)
     par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, max_ctx, kvf, scale, xs, n)
     par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
@@ -703,9 +751,9 @@ fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i6
     ret
 
 # qkv_head for n tokens: head t's 64-row chunks for every token (qmat_batch), each token's
-# rows written to its q row or a staging row, then RoPE at its position and, for K and V,
-# bf16 into its position's KV-cache slot.
-fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64)
+# rows written to its q row or a staging row, then the head's norm (qk_norm) and RoPE at its
+# position and, for K and V, bf16 into its position's KV-cache slot.
+fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32)
   b0:
     w = vl f32
     hd4 = mul hd, 4:i64
@@ -776,6 +824,7 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     rr = mul rp, rope_row
     cos_r = add cos_t, rr
     sin_r = add sin_t, rr
+    call qk_norm(x, is_q, q_norm, k_norm, hd, eps)
     call rope_half(x, hd, cos_r, sin_r)
     jmp store
   store:
@@ -1033,11 +1082,11 @@ inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
     sin_t = ld model[4]:ptr
     ret embd, norm_out, lm, cos_t, sin_t
 
-# Layer l's entries (6 words at 5 + 6 l): its two norm weights and its QKV, O, gate/up and
-# down matrices.
-inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr)
+# Layer l's entries (8 words at 5 + 8 l): its two norm weights, its QKV, O, gate/up and down
+# matrices, and its q and k head norm weights (0 for none).
+inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)
   b0:
-    slot0 = mul l, 6:i64
+    slot0 = mul l, 8:i64
     slot = add slot0, 5:i64
     lp_off = shl slot, 3:i64
     lp = add model, lp_off
@@ -1047,4 +1096,6 @@ inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr)
     ffn_norm = ld lp[3]:ptr
     m_gu = ld lp[4]:ptr
     m_dn = ld lp[5]:ptr
-    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn
+    q_norm = ld lp[6]:ptr
+    k_norm = ld lp[7]:ptr
+    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm

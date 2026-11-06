@@ -16,7 +16,7 @@ That is 2 serial norms and 6 `par` regions per layer. The KV cache is bf16 and h
 
 **Prefill.** `llama_prefill` runs a whole prompt of n tokens through the same passes in one call. Every projection task applies its rows to 8 tokens per weight load (`qmat_batch`, which runs the standard library's `qmat_chunk8` on tiles of 8 tokens, `qmat_chunk4` on a tile of 4 and `qmat_chunk` on the rest; with 128-bit vectors, as on Cranelift, tiles of 4), so the weights are read once per 8 tokens instead of once per token, and the work turns from memory-bound into compute-bound. Norms, RoPE and epilogues run per token, and attention runs one task per tile of 8 tokens and KV head, each token over the cache up to its own position with `llama_decode`'s splits and merges; the splits that all 8 tokens see whole run once for the tile's query heads, so each K and V vector is read once per tile. Each token's operations are exactly those of `llama_decode`, so a prefill leaves the same KV cache, hidden state and next token bit for bit as decoding the prompt token by token (`llama_prefill_matches_decode_exactly`, in one call or in pieces).
 
-**A real model.** [`benchmarks/gguf.py`](../benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, IQ4_NL, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32, and the Llama 3 BPE tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](../benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, Q4_K and Q5_K bit for bit (values, 6-bit scales and mins, and f16 super-block factors), Q4_1 bit for bit (values and f16 scales and mins), IQ4_NL bit for bit (codes and f16 scales), anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
+**A real model.** [`benchmarks/gguf.py`](../benchmarks/gguf.py) reads llama.cpp's GGUF files with NumPy alone (metadata, tensors, dequantization of Q4_0, Q4_1, IQ4_NL, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32, and the byte-level BPE tokenizer with Llama 3's or Qwen's pre-tokenizer, which gives the same ids as `llama-tokenize`), and [`benchmarks/llama_model.py`](../benchmarks/llama_model.py) converts a Llama checkpoint for the kernel: Q4_0 and Q8_0 matrices bit for bit, Q6_K values bit for bit with each 16-value scale (super-block scale times sub-block scale) rounded to f16, Q4_K and Q5_K bit for bit (values, 6-bit scales and mins, and f16 super-block factors), Q4_1 bit for bit (values and f16 scales and mins), IQ4_NL bit for bit (codes and f16 scales), anything else to Q8_0; Q and K rows back from llama.cpp's interleaved RoPE order; RoPE tables with Llama 3's frequency factors. The prompt goes through `llama_prefill`, then each new token through `llama_decode`.
 
 ```bash
 curl -LO https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -100,6 +100,30 @@ Prefill of the prompt (one `llama_prefill` call, the mean of 3 after a first one
 - **Against llama.cpp:** 2.1x the prefill and 13% faster decode.
 - Cranelift prefills 155 tokens/s (Q4_0: 165) and decodes 55.9 tokens/s (57.5).
 - The kernel's tokens match NumPy's (24 of 24 on the default prompt, both backends).
+
+**Qwen3.** Qwen3's dense models are Llama's architecture with one addition: an RMSNorm of every query and key head (over its `head_dim` values, with learned weights) before RoPE. Each layer's entry in the model table holds two more words for those weights (0 for none, as in Llama), and `qkv_head` applies them in the QKV pass (`qk_norm`), as `llama_prefill` does for each token, so a prefill still equals decoding bit for bit. The loader reads `qwen3` GGUF files: their Q and K rows are already in the half-split order the kernel's RoPE uses (NeoX RoPE, so no un-permuting), the embedding doubles as the LM head (tied), RoPE's base is 10^6, and the tokenizer takes Qwen's pre-tokenizer (digits one at a time) and adds no BOS token. `benchmark_decode.py --chat` writes Qwen3's chat format in its non-thinking mode (an empty `<think>` block). The attention width may differ from the model's: Qwen3-4B has 32 query heads of 128 (4096) over d = 2560.
+
+```bash
+curl -LO https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf
+python benchmarks/benchmark_decode.py --gguf Qwen3-1.7B-Q8_0.gguf --chat \
+    --prompt "What is the capital of France? Answer in one sentence." --threads 8 --tokens 24
+# The capital of France is Paris.
+```
+
+Its tokens match the NumPy implementation on both backends for the chat prompts above, for Qwen3-1.7B in Q8_0 and Qwen3-4B in Q4_K_M (Qwen's files; the 4B one has Q4_K matrices, V and the down projection in Q6_K in half the layers, a Q6_K embedding shared with the LM head). A prompt of 512 tokens then 64 generated, 8 threads, against llama.cpp build 6868a52 (`llama-bench -t 8 -p 512` for the prefill, `-n 64 -d 512` for the decode; the AIR rows run separately, the same day):
+
+| | Prefill | Decode | weights read per token |
+|---|---|---|---|
+| Qwen3-1.7B Q8_0, AIR on LLVM | 588 tokens/s (1.70 ms/token) | 26.4 tokens/s (37.8 ms/token) | 1.83 GB at 48 GB/s |
+| Qwen3-1.7B Q8_0, AIR on Cranelift | 121 tokens/s (8.29 ms/token) | 22.0 tokens/s (45.4 ms/token) | 1.83 GB at 40 GB/s |
+| Qwen3-1.7B Q8_0, llama.cpp | 171 tokens/s (5.84 ms/token) | 24.8 tokens/s (40.3 ms/token) | |
+| Qwen3-4B Q4_K_M, AIR on LLVM | 204 tokens/s (4.90 ms/token) | 19.4 tokens/s (51.7 ms/token) | 2.59 GB at 50 GB/s |
+| Qwen3-4B Q4_K_M, AIR on Cranelift | 23.7 tokens/s (42.3 ms/token) | 14.2 tokens/s (70.4 ms/token) | 2.59 GB at 37 GB/s |
+| Qwen3-4B Q4_K_M, llama.cpp | 126 tokens/s (7.94 ms/token) | 17.2 tokens/s (58.0 ms/token) | |
+
+On LLVM the kernel prefills 3.4x (1.7B, Q8_0) and 1.6x (4B, Q4_K_M) faster than llama.cpp, and decodes 6% and 13% faster; decode runs at the memory's bandwidth, as for Llama.
+
+Greedy text can part from llama.cpp's where two tokens come within a few hundredths of a logit. Continuing "The capital of France is", Qwen3-1.7B's NumPy implementation and llama.cpp both write " Paris. The capital of the United States", but " the" leads " Italy" there by 0.08 logits (of about 21), and later " States" leads " Kingdom" by 0.02: the kernel's hidden state, 0.2 to 0.4% of its scale from NumPy's (an int8 rounding of an activation landing one step apart, as the tests allow), takes " Italy" on LLVM and " Kingdom" on Cranelift.
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
