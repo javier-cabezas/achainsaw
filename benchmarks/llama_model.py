@@ -397,6 +397,19 @@ class Mat:
         return y.sum(axis=0)
 
 
+def pad_rows(m: Mat, multiple: int = 64) -> Mat:
+    """m in Q8_0 with zero rows after its own up to a multiple of `multiple` rows (a router
+    whose experts are not a multiple of 64: the kernel computes logits 64 rows at a time and
+    reads only the experts' own)."""
+    q8: Mat = m if m.fmt == "q8" else m.to_q8()
+    pad: int = -q8.rows % multiple
+    if not pad:
+        return q8
+    nb: int = q8.q.shape[1]
+    zero: Mat = Mat("q8", np.zeros((pad, nb, 32), np.int8), np.zeros((pad, nb), np.float32))
+    return Mat.concat([q8, zero])
+
+
 class Parts:
     """A matrix stacked by rows from parts of whole 64-row chunks in their own formats (a
     fused QKV matrix whose Q, K and V differ): qmat_chunk walks its parts' words."""
@@ -630,7 +643,7 @@ class Model:
                 down=None if moe else Mat.random(rng, d, ffn, fmt),
                 q_norm=head_norm(),
                 k_norm=head_norm(),
-                router=Mat.random(rng, moe[0], d, "q8") if moe else None,
+                router=pad_rows(Mat.random(rng, moe[0], d, "q8")) if moe else None,
                 experts=[(Mat.random(rng, 2 * ffn, d, fmt), Mat.random(rng, d, ffn, fmt))
                          for _ in range(moe[0])] if moe else None,
             ))
@@ -717,7 +730,7 @@ class Model:
                     ed: npt.NDArray[np.intp] = np.arange(e * d, (e + 1) * d)
                     experts.append((Mat.concat([gates.take(er), ups.take(er)]).take(gu_rows),
                                     downs.take(ed)))
-                router = Mat.from_tensor(t[p + "ffn_gate_inp.weight"])
+                router = pad_rows(Mat.from_tensor(t[p + "ffn_gate_inp.weight"]))
             layers.append(Layer(
                 attn_norm=norm(p + "attn_norm.weight"),
                 qkv=Parts.of([q, k, v]),
@@ -885,8 +898,8 @@ class Model:
         (the first on ties), weighted by them (renormalized to sum to 1 if the model says so),
         their outputs added in that order."""
         assert self.moe is not None
-        _, n_used, renorm = self.moe
-        logits: F32 = router.matvec(xn)
+        n_exp, n_used, renorm = self.moe
+        logits: F32 = router.matvec(xn)[:n_exp]
         e: Floats = np.exp(logits - np.max(logits))
         p: Floats = e / e.sum()
         picked: list[int] = [int(i) for i in np.argsort(-p, kind="stable")[:n_used]]

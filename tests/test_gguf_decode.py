@@ -685,6 +685,36 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
                                                err_msg=f"{p} expert {x} {got_m.fmt}")
         self.assertEqual(m.formats["experts"], ["q4k", "q6", "q8"])
 
+    def test_experts_not_a_multiple_of_64(self) -> None:
+        # 32 experts (gpt-oss has 32, Mixtral 8): the router is padded to 64 zero rows, whose
+        # logits the kernel computes but never picks.
+        m: Model = Model.random(d=128, layers=2, heads=4, kv_heads=2, head_dim=64, ffn=128,
+                                vocab=256, max_ctx=8, numpy=True, qk_norm=True,
+                                moe=(32, 4, True))
+        router: Mat | None = m.layers[0]["router"]
+        assert router is not None
+        self.assertEqual(router.rows, 64)
+        with open(os.path.join(ROOT, "examples", "kernels", "llama_decode.air"),
+                  encoding="utf-8") as f:
+            src: str = f.read()
+        for be in achainsaw.available_backends():
+            k: achainsaw.Kernel = achainsaw.compile(src, backend=be, fast_math=True)
+            cache: npt.NDArray[np.uint16] = m.new_cache()
+            h: F32 = np.zeros(m.d, dtype=np.float32)
+            np_cache: list[tuple[F32, F32]] = m.numpy_cache()
+            token: int = 3
+            for pos in range(6):
+                got: int = k.run("llama_decode", m.table, m.cfg, cache, token, pos, h,
+                                 float(m.eps))
+                m.numpy_step(np_cache, token, pos)
+                np.testing.assert_allclose(h, m.last_h, atol=1e-2 * np.abs(m.last_h).max(),
+                                           err_msg=f"{be} pos {pos}")
+                planes: tuple[F32, F32] = m.cache_kv(cache)
+                for l, (kc, vc) in enumerate(np_cache):
+                    kc[pos] = planes[0][l, :, pos, :]
+                    vc[pos] = planes[1][l, :, pos, :]
+                token = got
+
 
 if __name__ == "__main__":
     unittest.main()
