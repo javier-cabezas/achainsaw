@@ -357,6 +357,14 @@ struct Layer {
     /// Qwen3's RMSNorm weights of each q and k head, applied before RoPE.
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
+    /// A mixture-of-experts MLP in place of gate_up and down.
+    moe: Option<Moe>,
+}
+
+/// A mixture-of-experts MLP: the router [experts x d] and each expert's gate/up and down.
+struct Moe {
+    router: Matrix,
+    experts: Vec<(Matrix, Matrix)>,
 }
 
 struct Model {
@@ -369,6 +377,9 @@ struct Model {
     max_ctx: usize,
     /// An int8 KV cache (cfg's format 1) instead of bf16.
     kv_q8: bool,
+    /// A mixture-of-experts model's experts used per token and whether their weights are
+    /// renormalized (f is then an expert's MLP width).
+    moe: Option<(usize, bool)>,
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
@@ -434,6 +445,7 @@ impl Model {
                     down: Matrix::random(&mut rng, &[d], f, &[fmt(5)]),
                     q_norm: None,
                     k_norm: None,
+                    moe: None,
                 }
             })
             .collect();
@@ -446,6 +458,7 @@ impl Model {
             vocab,
             max_ctx,
             kv_q8: false,
+            moe: None,
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
@@ -459,6 +472,74 @@ impl Model {
             sin,
             layers,
         }
+    }
+
+    /// The model with a mixture of `n_exp` experts (each `f` wide, `n_used` used per token)
+    /// in every layer's MLP; `mixed` rotates the experts' formats.
+    fn with_moe(mut self, n_exp: usize, n_used: usize, renorm: bool, mixed: bool) -> Self {
+        let mut rng = Rng(53);
+        let (d, f) = (self.d, self.f);
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let fmt = |i: usize| {
+                if mixed {
+                    Fmt::ALL[(i + l) % Fmt::ALL.len()]
+                } else {
+                    Fmt::Q8
+                }
+            };
+            layer.moe = Some(Moe {
+                router: Matrix::random(&mut rng, &[n_exp], d, &[Fmt::Q8]),
+                experts: (0..n_exp)
+                    .map(|e| {
+                        (
+                            Matrix::random(&mut rng, &[2 * f], d, &[fmt(2 * e)]),
+                            Matrix::random(&mut rng, &[d], f, &[fmt(2 * e + 1)]),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        self.moe = Some((n_used, renorm));
+        self
+    }
+
+    /// SwiGLU MLP of quantized input xn: gate/up rows (chunks of 64 interleaved), then down.
+    fn mlp(&self, gate_up: &Matrix, down: &Matrix, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
+        let gu = gate_up.matvec(xn);
+        let mut act = vec![0f32; self.f];
+        for c in 0..self.f / 64 {
+            for j in 0..64 {
+                let (g, u) = (gu[128 * c + j], gu[128 * c + 64 + j]);
+                act[64 * c + j] = (g / (1.0 + (-g).exp()) * u) as f32;
+            }
+        }
+        down.matvec(&quantize(&act))
+    }
+
+    /// The experts with the largest softmax probabilities of the router's logits (the first
+    /// on ties), weighted by them (renormalized if the model says so), added in that order.
+    fn moe_mlp(&self, moe: &Moe, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
+        let (n_used, renorm) = self.moe.unwrap();
+        let logits = moe.router.matvec(xn);
+        let m = logits.iter().cloned().fold(f64::MIN, f64::max);
+        let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+        let total: f64 = e.iter().sum();
+        let mut order: Vec<usize> = (0..e.len()).collect();
+        order.sort_by(|&a, &b| e[b].partial_cmp(&e[a]).unwrap());
+        let picked = &order[..n_used];
+        let mut w: Vec<f64> = picked.iter().map(|&i| e[i] / total).collect();
+        if renorm {
+            let sum = w.iter().sum::<f64>().max(2f64.powi(-14));
+            w.iter_mut().for_each(|x| *x /= sum);
+        }
+        let mut out = vec![0f64; self.d];
+        for (&i, wi) in picked.iter().zip(w) {
+            let (gu, dn) = &moe.experts[i];
+            for (o, v) in out.iter_mut().zip(self.mlp(gu, dn, xn)) {
+                *o += wi * v;
+            }
+        }
+        out
     }
 
     /// The model with Qwen3's q and k head norms in every layer.
@@ -621,16 +702,13 @@ impl Model {
             for (hv, ov) in h.iter_mut().zip(layer.o.matvec(&quantize(&attn))) {
                 *hv += ov;
             }
-            let gu = layer.gate_up.matvec(&self.norm_quant(&h, &layer.ffn_norm));
-            let mut act = vec![0f32; self.f];
-            for c in 0..self.f / 64 {
-                for j in 0..64 {
-                    let (g, u) = (gu[128 * c + j], gu[128 * c + 64 + j]);
-                    act[64 * c + j] = (g / (1.0 + (-g).exp()) * u) as f32;
-                }
-            }
-            for (hv, dv) in h.iter_mut().zip(layer.down.matvec(&quantize(&act))) {
-                *hv += dv;
+            let xn = self.norm_quant(&h, &layer.ffn_norm);
+            let out = match &layer.moe {
+                None => self.mlp(&layer.gate_up, &layer.down, &xn),
+                Some(moe) => self.moe_mlp(moe, &xn),
+            };
+            for (hv, ov) in h.iter_mut().zip(out) {
+                *hv += ov;
             }
         }
         let logits = self.lm.matvec(&self.norm_quant(&h, &self.norm_out));
@@ -641,25 +719,43 @@ impl Model {
     /// points to (to keep alive while it is used).
     fn tables(&self) -> (Vec<usize>, Vec<i64>, Vec<Vec<usize>>) {
         let p = |v: &[f32]| v.as_ptr() as usize;
-        let mut parts = vec![self.lm.words()];
-        for l in &self.layers {
-            parts.extend([&l.qkv, &l.o, &l.gate_up, &l.down].map(Matrix::words));
-        }
-        let mp = |i: usize| parts[i].as_ptr() as usize;
+        // Part lists and expert tables, kept alive with the table (an inner Vec's buffer
+        // stays put as this one grows).
+        let mut keep: Vec<Vec<usize>> = Vec::new();
+        let mp = |m: &Matrix, keep: &mut Vec<Vec<usize>>| {
+            keep.push(m.words());
+            keep.last().unwrap().as_ptr() as usize
+        };
+        let lm = mp(&self.lm, &mut keep);
         let mut t = vec![
             p(&self.embd),
             p(&self.norm_out),
-            mp(0),
+            lm,
             p(&self.cos),
             p(&self.sin),
         ];
-        for (i, l) in self.layers.iter().enumerate() {
-            let m = 1 + 4 * i;
-            t.extend([p(&l.attn_norm), mp(m), mp(m + 1)]);
-            t.extend([p(&l.ffn_norm), mp(m + 2), mp(m + 3)]);
+        for l in &self.layers {
             let opt = |w: &Option<Vec<f32>>| w.as_deref().map_or(0, p);
-            t.extend([opt(&l.q_norm), opt(&l.k_norm)]);
+            let (qkv, o) = (mp(&l.qkv, &mut keep), mp(&l.o, &mut keep));
+            let (gu, dn, router, experts) = match &l.moe {
+                None => (mp(&l.gate_up, &mut keep), mp(&l.down, &mut keep), 0, 0),
+                Some(moe) => {
+                    let router = mp(&moe.router, &mut keep);
+                    let table: Vec<usize> = moe
+                        .experts
+                        .iter()
+                        .flat_map(|(g, d)| [mp(g, &mut keep), mp(d, &mut keep)])
+                        .collect();
+                    keep.push(table);
+                    (0, 0, router, keep.last().unwrap().as_ptr() as usize)
+                }
+            };
+            t.extend([p(&l.attn_norm), qkv, o, p(&l.ffn_norm), gu, dn]);
+            t.extend([opt(&l.q_norm), opt(&l.k_norm), router, experts]);
         }
+        let parts = keep;
+        let n_exp = self.layers[0].moe.as_ref().map_or(0, |m| m.experts.len());
+        let (n_used, renorm) = self.moe.unwrap_or((0, false));
         let cfg = [
             self.d,
             self.layers.len(),
@@ -670,6 +766,10 @@ impl Model {
             self.vocab,
             self.max_ctx,
             self.kv_q8 as usize,
+            n_exp,
+            n_used,
+            if self.moe.is_some() { self.f } else { 0 },
+            renorm as usize,
         ]
         .map(|v| v as i64)
         .to_vec();
@@ -697,6 +797,14 @@ fn llama_decode_matches_reference() {
     check_decode(false, false, false);
 }
 
+/// Qwen3-MoE: each MLP a mixture of 64 experts, 4 used per token, renormalized (Qwen3's) or
+/// not, with mixed expert formats and either cache format.
+#[test]
+fn qwen3_moe_matches_reference() {
+    check_decode_moe(true, false, true, Some((64, 4, true)));
+    check_decode_moe(false, true, true, Some((64, 8, false)));
+}
+
 /// Qwen3's RMSNorm of each q and k head before RoPE, with either cache format.
 #[test]
 fn qwen3_head_norms_match_reference() {
@@ -720,6 +828,11 @@ fn llama_decode_int8_cache_matches_reference() {
 }
 
 fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
+    check_decode_moe(mixed, kv_q8, qk_norm, None);
+}
+
+/// check_decode on a model whose MLPs are mixtures of `(experts, used, renormalized)`.
+fn check_decode_moe(mixed: bool, kv_q8: bool, qk_norm: bool, moe: Option<(usize, usize, bool)>) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -730,6 +843,9 @@ fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
     let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 8, mixed);
     if qk_norm {
         model = model.with_qk_norm();
+    }
+    if let Some((n_exp, n_used, renorm)) = moe {
+        model = model.with_moe(n_exp, n_used, renorm, mixed);
     }
     model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
@@ -748,6 +864,7 @@ fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
             if kv_q8 { " int8 cache" } else { "" },
         );
         let level = if qk_norm { level + " qk norm" } else { level };
+        let level = if moe.is_some() { level + " moe" } else { level };
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         // As `Model::cache_value` reads it.
@@ -768,19 +885,25 @@ fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
             );
             let (ref_h, logits) = model.step(&mut ref_cache, token, pos);
             let scale = ref_h.iter().fold(0f64, |a, v| a.max(v.abs()));
+            // An int8 rounding step landing apart moves h by up to a few 1e-3 of its scale;
+            // each used expert rounds its own SwiGLU output, so a mixture has more of them.
+            let tol = if moe.is_some() { 1e-2 } else { 2e-3 };
             for (i, (&got, &want)) in h.iter().zip(&ref_h).enumerate() {
                 assert!(
-                    (got as f64 - want).abs() <= 2e-3 * scale,
+                    (got as f64 - want).abs() <= tol * scale,
                     "h[{i}] at pos {pos}, {level}: got {got}, want {want} (scale {scale})"
                 );
             }
             for (l, (kr, vr)) in ref_cache.iter().enumerate() {
                 let row = pos * model.nkv * model.hd;
-                // A bf16 step, or for int8 one step of the row's scale.
+                // A bf16 step, or for int8 one step of the row's scale; after the first layer,
+                // also the hidden state's own rounding step (1e-2 of the row's scale).
                 let tol = |r: &[f64], g: usize, w: f64| {
                     let r = &r[row + g * model.hd..row + (g + 1) * model.hd];
-                    if kv_q8 {
-                        1.01 * r.iter().fold(0f64, |a, v| a.max(v.abs())) / 127.0
+                    let rs = r.iter().fold(0f64, |a, v| a.max(v.abs()));
+                    let flip = if l > 0 { 1e-2 * rs } else { 0.0 };
+                    flip + if kv_q8 {
+                        1.01 * rs / 127.0
                     } else {
                         1e-2 * (1.0 + w.abs())
                     }
@@ -797,6 +920,17 @@ fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
                         (v - vw).abs() <= tol(vr, g, vw),
                         "V l={l} pos {pos} [{j}] {level}: {v} vs {vw}"
                     );
+                }
+            }
+            // The next step starts from the kernel's cache, so an int8 rounding step landing
+            // apart at one position stays there instead of growing through every later
+            // position's attention.
+            for (l, (kr, vr)) in ref_cache.iter_mut().enumerate() {
+                let row = pos * model.nkv * model.hd;
+                for j in 0..model.nkv * model.hd {
+                    let (k, v) = model.cache_value(&cache, l, j / model.hd, pos, j % model.hd);
+                    kr[row + j] = k;
+                    vr[row + j] = v;
                 }
             }
             let mut order: Vec<usize> = (0..model.vocab).collect();
@@ -841,7 +975,7 @@ fn llama_prefill_matches_decode_exactly() {
     // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
     // the prompt into prefill calls)
     type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 8] = [
+    let cases: [Case; 10] = [
         (false, false, false, &short, 8, &[&[6], &[1, 5]]),
         (true, false, false, &short, 8, &[&[6], &[1, 5]]),
         (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
@@ -850,11 +984,17 @@ fn llama_prefill_matches_decode_exactly() {
         (false, true, false, &long, 530, &[&[530], &[255, 2, 273]]),
         (true, false, true, &short, 8, &[&[6], &[1, 5]]),
         (false, true, true, &long, 530, &[&[300, 230]]),
+        // With mixtures of experts (the last two cases).
+        (true, false, true, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, true, &short, 8, &[&[6], &[2, 4]]),
     ];
-    for &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces) in &cases {
+    for (case, &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces)) in cases.iter().enumerate() {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         if qk_norm {
             model = model.with_qk_norm();
+        }
+        if case >= 8 {
+            model = model.with_moe(64, 4, case == 8, mixed);
         }
         model.kv_q8 = kv_q8;
         let (table, cfg, _parts) = model.tables();
