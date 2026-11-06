@@ -136,9 +136,9 @@ Speed at Qwen3-30B-A3B's layer shapes (d 2048, 32 query heads over 4 KV heads of
 |---|---|---|---|
 | AIR on LLVM | 421 tokens/s (2.37 ms/token) | 113 tokens/s (8.84 ms/token) | 0.43 GB at 49 GB/s |
 | AIR on Cranelift | 198 tokens/s (5.06 ms/token) | 84.8 tokens/s (11.8 ms/token) | 0.43 GB at 37 GB/s |
-| llama.cpp (build 6868a52, `llama-bench -t 8 -p 512`, `-n 64 -d 512`) | 439 tokens/s (500 on an empty cache) | 86.1 tokens/s (105 on an empty cache) | |
+| llama.cpp (build 6868a52, `llama-bench -t 8 -p 512`, `-n 64 -d 512`) | 500 tokens/s (2.00 ms/token) | 86.1 tokens/s (11.6 ms/token) | |
 
-Decode reads the used experts' weights at the memory's bandwidth on LLVM, 1.31x llama.cpp's rate after 512 tokens. Prefill is 0.96x llama.cpp's after the same context (0.84x from an empty one) because each token runs its own experts, while llama.cpp groups the prompt's tokens by expert.
+Decode reads the used experts' weights at the memory's bandwidth on LLVM, 1.31x llama.cpp's rate after 512 tokens. Prefill (both from an empty cache) is 0.84x llama.cpp's, because each token runs its own experts while llama.cpp groups the prompt's tokens by expert, reading each expert's weights once for all the tokens that picked it.
 
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
