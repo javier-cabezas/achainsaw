@@ -157,6 +157,12 @@ def enc_f32(rng: np.random.Generator, rows: int, k: int,
     return v.view(np.uint8).reshape(rows, -1), v
 
 
+def need(x: Mat | None) -> Mat:
+    """A dense layer's MLP matrix, which it always has."""
+    assert x is not None
+    return x
+
+
 ENCODERS: dict[int, Encoder] = {2: enc_q4_0, 8: enc_q8_0, 3: enc_q4_1, 20: enc_iq4_nl,
                                 14: enc_q6_k, 12: enc_k(4), 13: enc_k(5), 1: enc_f16,
                                 0: enc_f32}
@@ -313,16 +319,16 @@ class TestGGUFDecode(unittest.TestCase):
 
         e: dict[str, Floats] = self.expected
         l0, l1, l2 = m.layers
-        self.assertEqual((l0["qkv"].fmt, l0["o"].fmt, l0["gate_up"].fmt, l0["down"].fmt),
+        self.assertEqual((l0["qkv"].fmt, l0["o"].fmt, need(l0["gate_up"]).fmt, need(l0["down"]).fmt),
                          ("q4", "q4", "q4", "q41"))
-        self.assertEqual((l1["qkv"].fmt, l1["o"].fmt, l1["gate_up"].fmt, l1["down"].fmt),
+        self.assertEqual((l1["qkv"].fmt, l1["o"].fmt, need(l1["gate_up"]).fmt, need(l1["down"]).fmt),
                          ("q8+q4+iq4", "q6", "q8", "q4"))
-        self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, l2["gate_up"].fmt, l2["down"].fmt),
+        self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, need(l2["gate_up"]).fmt, need(l2["down"]).fmt),
                          ("q4k+q4k+q6", "q5k", "q4k", "q5k"))
         self.assertEqual(m.lm.fmt, "q6")
         # Q4_K and Q5_K: values exact, and scales and mins too (6-bit codes times f16 factors).
         for name in ("attn_output", "ffn_down"):
-            mat: Mat = l2["o"] if name == "attn_output" else l2["down"]
+            mat: Mat = l2["o"] if name == "attn_output" else need(l2["down"])
             codes: Ints = mat.q_blocks.transpose(1, 0, 2).reshape(mat.rows, -1)
             np.testing.assert_array_equal(codes, self.k_codes[f"blk.2.{name}.weight"])
         for i, layer in enumerate(m.layers):
@@ -344,10 +350,12 @@ class TestGGUFDecode(unittest.TestCase):
                                            1).reshape(-1, D)
                 for n in MATS:
                     w: Floats = want[n]
-                    if layer[n].fmt in ("q4k", "q5k"):
-                        np.testing.assert_array_equal(weights(layer[n]), w, err_msg=f"{p}{n}")
+                    ln: object = layer[n]
+                    assert isinstance(ln, (Mat, Parts))
+                    if ln.fmt in ("q4k", "q5k"):
+                        np.testing.assert_array_equal(weights(ln), w, err_msg=f"{p}{n}")
                     else:
-                        np.testing.assert_allclose(weights(layer[n]), w,
+                        np.testing.assert_allclose(weights(ln), w,
                                                    atol=2 ** -11 * np.abs(w).max(),
                                                    err_msg=f"{p}{n}")
                 continue
@@ -364,14 +372,14 @@ class TestGGUFDecode(unittest.TestCase):
             up = e[p + "ffn_up.weight"]
             want_gu: Floats = np.stack([gate.reshape(-1, 64, D), up.reshape(-1, 64, D)],
                                        1).reshape(-1, D)
-            got_gu: Floats = weights(layer["gate_up"])
+            got_gu: Floats = weights(need(layer["gate_up"]))
             if LAYER_TYPES[i]["ffn_gate"] == 2:
                 np.testing.assert_array_equal(got_gu, want_gu, err_msg=f"{p}gate_up")
             else:  # F16 gate re-quantized to Q8_0
                 np.testing.assert_allclose(got_gu, want_gu, atol=np.abs(gate).max() / 100)
             down: Floats = e[p + "ffn_down.weight"]
             # Q4_0 and Q4_1 (layer 0): values, scales and mins exact.
-            np.testing.assert_array_equal(weights(layer["down"]), down, err_msg=f"{p}down")
+            np.testing.assert_array_equal(weights(need(layer["down"])), down, err_msg=f"{p}down")
         # Q6_K: values exact, scales d * sc rounded to f16.
         got: Floats = weights(m.lm)
         want_lm: Floats = e["token_embd.weight"]
@@ -566,6 +574,116 @@ class TestQwen3GGUF(TestGGUFDecode):
         self.assertEqual(tok.encode("the 123"),
                          [ord("t"), ids["he"], ids["Ġ"], ord("1"), ord("2"), ord("3")])
         self.assertEqual(tok.decode(tok.encode("the cat 42!")), "the cat 42!")
+
+
+# The tiny Qwen3-MoE: experts per layer, experts used per token, an expert's MLP width.
+EXPERTS: int = 64
+EXPERTS_USED: int = 4
+EXPERT_FFN: int = 256
+
+
+class TestQwen3MoeGGUF(TestQwen3GGUF):
+    """A tiny qwen3moe GGUF: Qwen3's attention, each MLP a mixture of experts stored as 3-D
+    tensors (Q8_0 in layer 0; Q4_K gate/up and Q6_K down in layer 1) under an F32 router.
+    The kernel, prefill and tokenizer tests are inherited."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rng: np.random.Generator = np.random.default_rng(13)
+        tokens, types, merges = tiny_vocab()
+        tokens[-2:] = ["12", "123"]
+        types[-2:] = [1, 1]
+        merges += ["1 2", "12 3"]
+        meta: dict[str, tuple[int, Any]] = {
+            "general.architecture": (8, "qwen3moe"),
+            "general.name": (8, "tiny qwen3moe"),
+            "qwen3moe.block_count": (4, 2),
+            "qwen3moe.embedding_length": (4, D),
+            "qwen3moe.feed_forward_length": (4, EXPERT_FFN * EXPERTS_USED),
+            "qwen3moe.expert_feed_forward_length": (4, EXPERT_FFN),
+            "qwen3moe.expert_count": (4, EXPERTS),
+            "qwen3moe.expert_used_count": (4, EXPERTS_USED),
+            "qwen3moe.attention.head_count": (4, HEADS),
+            "qwen3moe.attention.head_count_kv": (4, KV_HEADS),
+            "qwen3moe.attention.key_length": (4, HEAD_DIM),
+            "qwen3moe.rope.freq_base": (6, 1000000.0),
+            "qwen3moe.attention.layer_norm_rms_epsilon": (6, 1e-6),
+            "tokenizer.ggml.model": (8, "gpt2"),
+            "tokenizer.ggml.pre": (8, "qwen2"),
+            "tokenizer.ggml.tokens": (9, (8, tokens)),
+            "tokenizer.ggml.token_type": (9, (5, types)),
+            "tokenizer.ggml.merges": (9, (8, merges)),
+            "tokenizer.ggml.bos_token_id": (4, tokens.index("<|end_of_text|>")),
+            "tokenizer.ggml.add_bos_token": (7, False),
+        }
+        cls.expected = {}
+        cls.k_codes = {}
+        tensors: list[tuple[str, list[int], int, U8]] = []
+
+        def add(name: str, t: int, rows: int, k: int, dims: list[int] | None = None,
+                **kw: Any) -> None:
+            raw, vals, *_ = ENCODERS[t](rng, rows, k, **kw)
+            cls.expected[name] = vals.reshape(rows, k)
+            tensors.append((name, dims or ([k] if rows == 1 else [k, rows]), t, raw))
+
+        add("token_embd.weight", 8, VOCAB, D)
+        add("output_norm.weight", 0, 1, D)
+        for i, (gu_t, dn_t) in enumerate([(8, 8), (12, 14)]):
+            p: str = f"blk.{i}."
+            add(p + "attn_norm.weight", 0, 1, D)
+            add(p + "ffn_norm.weight", 0, 1, D)
+            for n in ("q", "k"):
+                add(p + f"attn_{n}_norm.weight", 0, 1, HEAD_DIM,
+                    values=rng.uniform(0.25, 0.5, (1, HEAD_DIM)))
+            for name in ("attn_q", "attn_k", "attn_v", "attn_output"):
+                rows, k = SHAPES[name]
+                add(f"{p}{name}.weight", 8, rows, k)
+            # The router's logits a few units apart, as a trained model's are.
+            add(p + "ffn_gate_inp.weight", 0, EXPERTS, D,
+                values=rng.standard_normal((EXPERTS, D)) * 4 / np.sqrt(D))
+            for name, t in (("gate", gu_t), ("up", gu_t)):
+                add(f"{p}ffn_{name}_exps.weight", t, EXPERTS * EXPERT_FFN, D,
+                    dims=[D, EXPERT_FFN, EXPERTS])
+            add(p + "ffn_down_exps.weight", dn_t, EXPERTS * D, EXPERT_FFN,
+                dims=[EXPERT_FFN, D, EXPERTS])
+        cls.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.path = os.path.join(cls.tmp.name, "qwen3moe.gguf")
+        write_gguf(cls.path, meta, tensors)
+        cls.gguf = GGUF(cls.path)
+
+    def test_loader_conversions(self) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
+        e: dict[str, Floats] = self.expected
+        self.assertEqual(m.moe, (EXPERTS, EXPERTS_USED, True))
+        self.assertEqual(list(m.cfg[9:]), [EXPERTS, EXPERTS_USED, EXPERT_FFN, 1])
+        for i, layer in enumerate(m.layers):
+            p: str = f"blk.{i}."
+            self.assertIsNone(layer["gate_up"])
+            router: Mat | None = layer["router"]
+            experts: list[tuple[Mat, Mat]] | None = layer["experts"]
+            assert router is not None and experts is not None
+            self.assertEqual((router.fmt, router.rows), ("q8", EXPERTS))
+            self.assertEqual(len(experts), EXPERTS)
+            gates: Floats = e[p + "ffn_gate_exps.weight"]
+            ups: Floats = e[p + "ffn_up_exps.weight"]
+            downs: Floats = e[p + "ffn_down_exps.weight"]
+            for x in (0, 17, EXPERTS - 1):
+                gu, dn = experts[x]
+                rows: slice = slice(x * EXPERT_FFN, (x + 1) * EXPERT_FFN)
+                # Expert x's rows of the 3-D tensors, gate/up chunks interleaved as the dense
+                # MLP's; exact in each format (Q6_K values, its scales to f16).
+                want_gu: Floats = np.stack([gates[rows].reshape(-1, 64, D),
+                                            ups[rows].reshape(-1, 64, D)], 1).reshape(-1, D)
+                want_dn: Floats = downs[x * D:(x + 1) * D]
+                for got_m, want in ((gu, want_gu), (dn, want_dn)):
+                    v: Floats = got_m.q_blocks * got_m.s_blocks[:, :, None]
+                    if got_m.m_blocks is not None:
+                        v = v - got_m.m_blocks[:, :, None]
+                    got: Floats = v.transpose(1, 0, 2).reshape(got_m.rows, -1)
+                    np.testing.assert_allclose(got, want, rtol=2 ** -11,
+                                               atol=2 ** -11 * np.abs(want).max(),
+                                               err_msg=f"{p} expert {x} {got_m.fmt}")
+        self.assertEqual(m.formats["experts"], ["q4k", "q6", "q8"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-# One decode step of a Llama-style model (Llama, Qwen3) in a single call: token in, next
-# token (greedy) out.
+# One decode step of a Llama-style model (Llama, Qwen3, Qwen3-MoE) in a single call: token
+# in, next token (greedy) out.
 #
 # Megakernel-style fusion for CPUs: every elementwise op runs inside the pass that produces
 # or consumes its data, so a layer is 2 serial norms and 5 `par` regions:
@@ -33,19 +33,23 @@
 # Shapes: d, ffn and vocab multiples of 64; head_dim a multiple of 64; heads a multiple of
 # kv_heads (grouped-query attention); pos < max_ctx.
 #
-# cfg (i64[9]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, KV cache format
-# (0 bf16, 1 int8)
+# cfg (i64[13]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, KV cache format
+# (0 bf16, 1 int8), then for a mixture-of-experts model the experts, the experts each token
+# uses, an expert's MLP width (ffn's place for its layers) and whether the used experts'
+# weights are renormalized to sum to 1 (0s for a dense model)
 # model (table of 8-byte words): a matrix is a pointer to its parts, 4 words each: packed
 # weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K, 5: Q4_1, 6: IQ4_NL)
 # and number of 64-row chunks (see qmat_chunk in the standard library).
 #   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]   [2] LM head
 #   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape)
-#   then 8 per layer, at 5 + 8 * l:
+#   then 10 per layer, at 5 + 10 * l:
 #   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
 #   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
 #   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn];
 #   Q and K norm weights f32 [head_dim] (Qwen3's RMSNorm of each q and k head before RoPE),
-#   or 0 for none
+#   or 0 for none; then for a mixture-of-experts layer (gate/up and down 0) its router
+#   [experts x d] and a table of 2 words per expert, its gate/up [2 expert_ffn x d] and down
+#   [d x expert_ffn] matrices (0 and 0 for a dense layer)
 # cache: per layer, K then V, each kv_heads x ctx x head_dim bf16 values, ctx = max_ctx
 # rounded up to a multiple of 32 (head-major, so a KV head's positions are contiguous): V is
 # [kv_heads x ctx x head_dim]; K is in tiles of 32 positions, [kv_heads x ctx / 32 x
@@ -64,6 +68,7 @@ use qmat_chunk, qmat_batch, quantize_q8, rope_half, silu_mul, attn_split, attn_s
 fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
+    n_exp, n_used, exp_norm = call load_moe(cfg)
     embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
@@ -126,7 +131,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
@@ -136,8 +141,16 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     par nh, attn_out(part, xq, dx, hd, splits)
     par dchunks, proj_add(m_o, xq, dx, h, qd)
     call norm_quant(h, ffn_norm, xn, xq, dx, d, eps)
+    is_moe = ne router, 0:ptr
+    br is_moe, moe_mlp, dense_mlp
+  moe_mlp:
+    call moe_ffn(h, xq, dx, router, experts, d, n_exp, n_used, f, exp_norm)
+    jmp layer_next
+  dense_mlp:
     par fchunks, gate_up(m_gu, xq, dx, aq, adx, d)
     par dchunks, proj_add(m_dn, aq, adx, h, f)
+    jmp layer_next
+  layer_next:
     l2 = add l, 1:i64
     jmp layers(l2)
 
@@ -306,6 +319,184 @@ fn qk_norm(x:ptr, is_q:i32, q_norm:ptr, k_norm:ptr, hd:i64, eps:f32)
     stm x[j], y, rest_j:f32
     j2 = add j, w
     jmp norm(j2)
+  done:
+    ret
+
+# A mixture-of-experts MLP for one token (Qwen3-MoE's), from its quantized normed input xq/dx
+# into its residual stream h: the router picks the n_used experts with the largest softmax
+# probabilities (moe_route), each expert's gate/up rows and SwiGLU run in one `par` (64 rows
+# of one expert per task, gate_up), and the down projections in another (moe_down), which
+# adds the experts' outputs, each times its weight, in the order they were picked.
+fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, exp_norm:i64)
+  b0:
+    ne4 = mul n_exp, 4:i64
+    logits = alloc ne4
+    sel_sz = mul n_used, 8:i64
+    sel = alloc sel_sz
+    w_sz = mul n_used, 4:i64
+    wts = alloc w_sz
+    call moe_route(router, xq, dx, logits, sel, wts, d, n_exp, n_used, exp_norm)
+    a_sz = mul n_used, fe
+    aq = alloc a_sz
+    ad_sz = udiv a_sz, 2:i64
+    adx = alloc ad_sz
+    fchunks = udiv fe, 64:i64
+    tasks = mul n_used, fchunks
+    par tasks, moe_gate_up(experts, sel, xq, dx, aq, adx, d, fe)
+    dchunks = udiv d, 64:i64
+    par dchunks, moe_down(experts, sel, wts, aq, adx, h, fe, n_used)
+    free adx
+    free aq
+    free wts
+    free sel
+    free logits
+    ret
+
+# The router: logits = router x (n_exp a multiple of 64), softmax numerators e_i = exp(logit_i
+# - max), then the n_used largest (the first on ties), each one's weight e_i / sum(e) into
+# wts and its index into sel, in that order; with exp_norm the weights are then divided by
+# their sum (at least 2^-14, as llama.cpp clamps it).
+fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, exp_norm:i64)
+  b0:
+    chunks = udiv n_exp, 64:i64
+    jmp rows(0:i64)
+  rows(c:i64):
+    c_more = lt c, chunks
+    br c_more, rows_body, max_loop(0:i64, -3.4e38:f32)
+  rows_body:
+    o = mul c, 256:i64
+    out = add logits, o
+    call qmat_chunk(c, router, xq, dx, out, d)
+    c2 = add c, 1:i64
+    jmp rows(c2)
+  max_loop(i:i64, m:f32):
+    i_more = lt i, n_exp
+    br i_more, max_body, softmax
+  max_body:
+    li = ld logits[i]:f32
+    m2 = max m, li
+    i2 = add i, 1:i64
+    jmp max_loop(i2, m2)
+  softmax:
+    total = call exp_shift(logits, n_exp, m)
+    jmp pick(0:i64, 0.0:f32)
+  pick(s:i64, wsum:f32):
+    s_more = lt s, n_used
+    br s_more, scan(0:i64, 0:i64, -1.0:f32), renorm
+  scan(j:i64, best:i64, bv:f32):
+    j_more = lt j, n_exp
+    br j_more, scan_body, picked
+  scan_body:
+    v = ld logits[j]:f32
+    better = gt v, bv
+    best2 = select better, j, best
+    bv2 = select better, v, bv
+    j2 = add j, 1:i64
+    jmp scan(j2, best2, bv2)
+  picked:
+    st sel[s], best
+    wt = div bv, total
+    st wts[s], wt
+    # Taken: below every numerator (they are at least 0).
+    st logits[best], -1.0:f32
+    wsum2 = add wsum, wt
+    s2 = add s, 1:i64
+    jmp pick(s2, wsum2)
+  renorm:
+    no_norm = eq exp_norm, 0:i64
+    br no_norm, done, norm_start
+  norm_start:
+    clamped = max wsum, 0.00006103515625:f32
+    jmp norm_loop(0:i64)
+  norm_loop(r:i64):
+    r_more = lt r, n_used
+    br r_more, norm_body, done
+  norm_body:
+    wr = ld wts[r]:f32
+    wn = div wr, clamped
+    st wts[r], wn
+    r2 = add r, 1:i64
+    jmp norm_loop(r2)
+  done:
+    ret
+
+# Task t of an expert MLP: rows 64c..64c+63 of picked expert s (t = s * fe/64 + c), into
+# that expert's slot of the down projections' int8 input (fe values per slot).
+fn moe_gate_up(t:i64, experts:ptr, sel:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, d:i64, fe:i64)
+  b0:
+    fchunks = udiv fe, 64:i64
+    s = udiv t, fchunks
+    c = urem t, fchunks
+    e = ld sel[s]:i64
+    e2 = mul e, 2:i64
+    mat = ld experts[e2]:ptr
+    q_off = mul s, fe
+    aq_s = add aq, q_off
+    d_off = udiv q_off, 2:i64
+    adx_s = add adx, d_off
+    call gate_up(c, mat, xq, dx, aq_s, adx_s, d)
+    ret
+
+# Rows 64c..64c+63 of the residual stream += the sum over the picked experts, in the order
+# they were picked, of each one's weight times its down projection.
+fn moe_down(c:i64, experts:ptr, sel:ptr, wts:ptr, aq:ptr, adx:ptr, h:ptr, fe:i64, n_used:i64)
+  b0:
+    w = vl f32
+    tmp = stack 256
+    acc = stack 256
+    zero = splat 0.0:f32:vx
+    jmp clear(0:i64)
+  clear(j:i64):
+    j_more = lt j, 64:i64
+    br j_more, clear_body, slots(0:i64)
+  clear_body:
+    j_rest = sub 64:i64, j
+    stm acc[j], zero, j_rest:f32
+    j2 = add j, w
+    jmp clear(j2)
+  slots(s:i64):
+    s_more = lt s, n_used
+    br s_more, slot_body, add_h(0:i64)
+  slot_body:
+    e = ld sel[s]:i64
+    e2 = mul e, 2:i64
+    e21 = add e2, 1:i64
+    mat = ld experts[e21]:ptr
+    q_off = mul s, fe
+    aq_s = add aq, q_off
+    d_off = udiv q_off, 2:i64
+    adx_s = add adx, d_off
+    call qmat_chunk(c, mat, aq_s, adx_s, tmp, fe)
+    ws = ld wts[s]:f32
+    vw = splat ws:vx
+    jmp mix(0:i64)
+  mix(k:i64):
+    k_more = lt k, 64:i64
+    br k_more, mix_body, slot_next
+  mix_body:
+    k_rest = sub 64:i64, k
+    tv = ldm tmp[k]:vx, k_rest:f32
+    av = ldm acc[k]:vx, k_rest:f32
+    nv = vfma tv, vw, av:f32
+    stm acc[k], nv, k_rest:f32
+    k2 = add k, w
+    jmp mix(k2)
+  slot_next:
+    s2 = add s, 1:i64
+    jmp slots(s2)
+  add_h(a:i64):
+    a_more = lt a, 64:i64
+    br a_more, add_body, done
+  add_body:
+    a_rest = sub 64:i64, a
+    h_off = mul c, 256:i64
+    hc = add h, h_off
+    acv = ldm acc[a]:vx, a_rest:f32
+    hv = ldm hc[a]:vx, a_rest:f32
+    sum = vadd hv, acv:f32
+    stm hc[a], sum, a_rest:f32
+    a2 = add a, w
+    jmp add_h(a2)
   done:
     ret
 
@@ -630,6 +821,7 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
+    n_exp, n_used, exp_norm = call load_moe(cfg)
     embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
@@ -694,7 +886,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
@@ -703,8 +895,28 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, max_ctx, kvf, scale, xs, n)
     par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
+    is_moe = ne router, 0:ptr
+    br is_moe, moe_tok(0:i64), dense_mlp
+  # Each token's experts on their own, as llama_decode runs them.
+  moe_tok(s:i64):
+    s_more = lt s, n
+    br s_more, moe_body, layer_next
+  moe_body:
+    h_off = mul s, d4
+    h_s = add hs, h_off
+    x_off = mul s, xs
+    xq_s = add xq, x_off
+    ds = udiv xs, 2:i64
+    d_off = mul s, ds
+    dx_s = add dx, d_off
+    call moe_ffn(h_s, xq_s, dx_s, router, experts, d, n_exp, n_used, f, exp_norm)
+    s2 = add s, 1:i64
+    jmp moe_tok(s2)
+  dense_mlp:
     par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs)
     par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d)
+    jmp layer_next
+  layer_next:
     l2 = add l, 1:i64
     jmp layers(l2)
 
@@ -1082,11 +1294,12 @@ inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
     sin_t = ld model[4]:ptr
     ret embd, norm_out, lm, cos_t, sin_t
 
-# Layer l's entries (8 words at 5 + 8 l): its two norm weights, its QKV, O, gate/up and down
-# matrices, and its q and k head norm weights (0 for none).
-inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)
+# Layer l's entries (10 words at 5 + 10 l): its two norm weights, its QKV, O, gate/up and
+# down matrices, its q and k head norm weights (0 for none), and a mixture-of-experts layer's
+# router and expert table (0 for a dense layer).
+inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)
   b0:
-    slot0 = mul l, 8:i64
+    slot0 = mul l, 10:i64
     slot = add slot0, 5:i64
     lp_off = shl slot, 3:i64
     lp = add model, lp_off
@@ -1098,4 +1311,15 @@ inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, p
     m_dn = ld lp[5]:ptr
     q_norm = ld lp[6]:ptr
     k_norm = ld lp[7]:ptr
-    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm
+    router = ld lp[8]:ptr
+    experts = ld lp[9]:ptr
+    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts
+
+# cfg's mixture-of-experts words: the experts, the experts each token uses, and whether their
+# weights are renormalized (cfg[11], an expert's MLP width, is ffn's place in cfg[5]).
+inline fn load_moe(cfg:ptr)->(i64, i64, i64)
+  b0:
+    n_exp = ld cfg[9]:i64
+    n_used = ld cfg[10]:i64
+    exp_norm = ld cfg[12]:i64
+    ret n_exp, n_used, exp_norm
