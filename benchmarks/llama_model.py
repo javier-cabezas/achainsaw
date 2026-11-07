@@ -397,6 +397,19 @@ class Mat:
         return y.sum(axis=0)
 
 
+def pad_rows(m: Mat, multiple: int = 64) -> Mat:
+    """m in Q8_0 with zero rows after its own up to a multiple of `multiple` rows (a router
+    whose experts are not a multiple of 64: the kernel computes logits 64 rows at a time and
+    reads only the experts' own)."""
+    q8: Mat = m if m.fmt == "q8" else m.to_q8()
+    pad: int = -q8.rows % multiple
+    if not pad:
+        return q8
+    nb: int = q8.q.shape[1]
+    zero: Mat = Mat("q8", np.zeros((pad, nb, 32), np.int8), np.zeros((pad, nb), np.float32))
+    return Mat.concat([q8, zero])
+
+
 class Parts:
     """A matrix stacked by rows from parts of whole 64-row chunks in their own formats (a
     fused QKV matrix whose Q, K and V differ): qmat_chunk walks its parts' words."""
@@ -449,11 +462,16 @@ class Layer(TypedDict):
     qkv: Mat | Parts
     o: Mat
     ffn_norm: F32
-    gate_up: Mat
-    down: Mat
+    # The dense MLP, or None in a mixture-of-experts layer.
+    gate_up: Mat | None
+    down: Mat | None
     # Qwen3's RMSNorm weights of each q and k head [head_dim], applied before RoPE.
     q_norm: F32 | None
     k_norm: F32 | None
+    # A mixture-of-experts layer's router [experts x d] and each expert's gate/up
+    # [2 expert_ffn x d] (chunks interleaved as the dense gate/up's) and down [d x expert_ffn].
+    router: Mat | None
+    experts: list[tuple[Mat, Mat]] | None
 
 
 # A layer's matrices.
@@ -525,10 +543,19 @@ class Model:
 
     def __init__(self, cfg: tuple[int, int, int, int, int, int, int, int], embd: F32,
                  norm_out: F32, lm: Mat, cos: F32, sin: F32, layers: list[Layer], eps: float,
-                 numpy: bool = False, use_torch: bool = False, kv_q8: bool = False) -> None:
+                 numpy: bool = False, use_torch: bool = False, kv_q8: bool = False,
+                 moe: tuple[int, int, bool] | None = None) -> None:
         d, nl, nh, nkv, hd, f, vocab, max_ctx = cfg
-        # The kernel's cfg: the shapes, then the KV cache's format (0 bf16, 1 int8).
-        self.cfg: npt.NDArray[np.int64] = np.array(cfg + (int(kv_q8),), dtype=np.int64)
+        # A mixture-of-experts model's experts, experts used per token and whether their
+        # weights are renormalized; f is then an expert's MLP width.
+        self.moe: tuple[int, int, bool] | None = moe
+        n_exp, n_used, renorm = moe if moe is not None else (0, 0, False)
+        # The kernel's cfg: the shapes, the KV cache's format (0 bf16, 1 int8), then the
+        # experts, the experts used, an expert's MLP width and the renormalization (0s if
+        # dense).
+        self.cfg: npt.NDArray[np.int64] = np.array(
+            cfg + (int(kv_q8), n_exp, n_used, f if moe is not None else 0, int(renorm)),
+            dtype=np.int64)
         self.kv_q8: bool = kv_q8
         self.d: int = d
         self.nh: int = nh
@@ -561,22 +588,45 @@ class Model:
 
         words: list[int] = [embd.ctypes.data, norm_out.ctypes.data, mat(lm), cos.ctypes.data,
                  sin.ctypes.data]
+        # Each mixture-of-experts layer's expert table: 2 words per expert.
+        self.expert_tables: list[npt.NDArray[np.uint64]] = []
+
+        def opt_mat(m: Mat | None) -> int:
+            return 0 if m is None else mat(m)
+
+        def expert_table(es: list[tuple[Mat, Mat]] | None) -> int:
+            if es is None:
+                return 0
+            t: npt.NDArray[np.uint64] = np.array([mat(m) for pair in es for m in pair],
+                                                 dtype=np.uint64)
+            self.expert_tables.append(t)
+            return t.ctypes.data
+
         for l in layers:
             qn: F32 | None = l["q_norm"]
             kn: F32 | None = l["k_norm"]
             words += [l["attn_norm"].ctypes.data, mat(l["qkv"]), mat(l["o"]),
-                      l["ffn_norm"].ctypes.data, mat(l["gate_up"]), mat(l["down"]),
-                      0 if qn is None else qn.ctypes.data, 0 if kn is None else kn.ctypes.data]
+                      l["ffn_norm"].ctypes.data, opt_mat(l["gate_up"]), opt_mat(l["down"]),
+                      0 if qn is None else qn.ctypes.data, 0 if kn is None else kn.ctypes.data,
+                      opt_mat(l["router"]), expert_table(l["experts"])]
         self.table: npt.NDArray[np.uint64] = np.array(words, dtype=np.uint64)
 
     def matrices(self) -> list[Mat | Parts]:
-        """The LM head and every layer's matrices."""
-        return [self.lm] + [l[n] for l in self.layers for n in MATS]
+        """The LM head and every layer's matrices, experts included."""
+        out: list[Mat | Parts] = [self.lm]
+        for l in self.layers:
+            out += [m for m in (l["qkv"], l["o"], l["gate_up"], l["down"], l["router"])
+                    if m is not None]
+            out += [m for pair in l["experts"] or [] for m in pair]
+        return out
 
     @classmethod
     def random(cls, d: int, layers: int, heads: int, kv_heads: int, head_dim: int, ffn: int,
                vocab: int, max_ctx: int, fmt: str = "q8", numpy: bool = False,
-               use_torch: bool = False, kv_q8: bool = False, qk_norm: bool = False) -> Model:
+               use_torch: bool = False, kv_q8: bool = False, qk_norm: bool = False,
+               moe: tuple[int, int, bool] | None = None) -> Model:
+        """A random model; with `moe` (experts, experts used, renormalized), every layer's MLP
+        is a mixture of experts, each `ffn` wide."""
         rng: np.random.Generator = np.random.default_rng(0)
         ls: list[Layer] = []
 
@@ -589,16 +639,20 @@ class Model:
                 qkv=Mat.random(rng, (heads + 2 * kv_heads) * head_dim, d, fmt),
                 o=Mat.random(rng, d, heads * head_dim, fmt),
                 ffn_norm=rng.uniform(0.8, 1.2, d).astype(np.float32),
-                gate_up=Mat.random(rng, 2 * ffn, d, fmt),
-                down=Mat.random(rng, d, ffn, fmt),
+                gate_up=None if moe else Mat.random(rng, 2 * ffn, d, fmt),
+                down=None if moe else Mat.random(rng, d, ffn, fmt),
                 q_norm=head_norm(),
                 k_norm=head_norm(),
+                router=pad_rows(Mat.random(rng, moe[0], d, "q8")) if moe else None,
+                experts=[(Mat.random(rng, 2 * ffn, d, fmt), Mat.random(rng, d, ffn, fmt))
+                         for _ in range(moe[0])] if moe else None,
             ))
         cos, sin = rope_tables(max_ctx, head_dim, 500000.0)
         return cls((d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx),
                    rng.standard_normal((vocab, d), dtype=np.float32),
                    rng.uniform(0.8, 1.2, d).astype(np.float32),
-                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy, use_torch, kv_q8)
+                   Mat.random(rng, vocab, d, fmt), cos, sin, ls, 1e-5, numpy, use_torch, kv_q8,
+                   moe)
 
     @classmethod
     def from_gguf(cls, path: str | GGUF, max_ctx: int, numpy: bool = False,
@@ -607,15 +661,20 @@ class Model:
         m: dict[str, Any] = g.meta
         t: dict[str, Tensor] = g.tensors
         arch: str | None = m.get("general.architecture")
-        if arch not in ("llama", "qwen3"):
-            raise ValueError(f"unsupported architecture {arch!r} (llama and qwen3 only)")
+        if arch not in ("llama", "qwen3", "qwen3moe"):
+            raise ValueError(f"unsupported architecture {arch!r} (llama, qwen3 and qwen3moe "
+                             "only)")
         a: str = f"{arch}."
         d: int = m[a + "embedding_length"]
         nl: int = m[a + "block_count"]
         nh: int = m[a + "attention.head_count"]
         nkv: int = m.get(a + "attention.head_count_kv", nh)
         hd: int = m.get(a + "attention.key_length", d // nh)
-        f: int = m[a + "feed_forward_length"]
+        n_exp: int = m.get(a + "expert_count", 0)
+        # A mixture-of-experts model's experts each have an MLP of their own width.
+        f: int = m[a + "expert_feed_forward_length"] if n_exp else m[a + "feed_forward_length"]
+        moe: tuple[int, int, bool] | None = (n_exp, m[a + "expert_used_count"], True) \
+            if n_exp else None
         vocab: int = t["token_embd.weight"].rows
         rope_dims: int = m.get(a + "rope.dimension_count", hd)
         if rope_dims != hd or m.get(a + "attention.value_length", hd) != hd:
@@ -647,31 +706,71 @@ class Model:
             q: Mat = Mat.from_tensor(t[p + "attn_q.weight"]).take(hf_rows(nh))
             k: Mat = Mat.from_tensor(t[p + "attn_k.weight"]).take(hf_rows(nkv))
             v: Mat = Mat.from_tensor(t[p + "attn_v.weight"])
-            gate: Mat = Mat.from_tensor(t[p + "ffn_gate.weight"])
-            up: Mat = Mat.from_tensor(t[p + "ffn_up.weight"])
             # Gate/up chunks interleave: gate rows 64c.., then up rows 64c...
             gu_rows: npt.NDArray[np.intp] = np.arange(2 * f).reshape(2, f // 64, 64).transpose(
                 1, 0, 2).reshape(-1)
+            gate_up: Mat | None = None
+            down: Mat | None = None
+            router: Mat | None = None
+            experts: list[tuple[Mat, Mat]] | None = None
+            if moe is None:
+                gate: Mat = Mat.from_tensor(t[p + "ffn_gate.weight"])
+                up: Mat = Mat.from_tensor(t[p + "ffn_up.weight"])
+                gate_up = Mat.concat([gate, up]).take(gu_rows)
+                down = Mat.from_tensor(t[p + "ffn_down.weight"])
+            else:
+                # [experts x expert_ffn x d] tensors (dims innermost first), one expert's
+                # rows after another's.
+                gates: Mat = Mat.from_tensor(t[p + "ffn_gate_exps.weight"])
+                ups: Mat = Mat.from_tensor(t[p + "ffn_up_exps.weight"])
+                downs: Mat = Mat.from_tensor(t[p + "ffn_down_exps.weight"])
+                experts = []
+                for e in range(n_exp):
+                    er: npt.NDArray[np.intp] = np.arange(e * f, (e + 1) * f)
+                    ed: npt.NDArray[np.intp] = np.arange(e * d, (e + 1) * d)
+                    experts.append((Mat.concat([gates.take(er), ups.take(er)]).take(gu_rows),
+                                    downs.take(ed)))
+                router = pad_rows(Mat.from_tensor(t[p + "ffn_gate_inp.weight"]))
             layers.append(Layer(
                 attn_norm=norm(p + "attn_norm.weight"),
                 qkv=Parts.of([q, k, v]),
                 o=Mat.from_tensor(t[p + "attn_output.weight"]),
                 ffn_norm=norm(p + "ffn_norm.weight"),
-                gate_up=Mat.concat([gate, up]).take(gu_rows),
-                down=Mat.from_tensor(t[p + "ffn_down.weight"]),
+                gate_up=gate_up,
+                down=down,
+                router=router,
+                experts=experts,
                 q_norm=norm(p + "attn_q_norm.weight") if p + "attn_q_norm.weight" in t else None,
                 k_norm=norm(p + "attn_k_norm.weight") if p + "attn_k_norm.weight" in t else None,
             ))
         eps: float = m.get(a + "attention.layer_norm_rms_epsilon", 1e-5)
         model: Model = cls((d, nl, nh, nkv, hd, f, vocab, max_ctx), embd, norm(
-            "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch, kv_q8)
-        model.formats = {n: sorted({l[n].fmt for l in layers}) for n in MATS}
+            "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch, kv_q8, moe)
+        model.formats = {}
+        for n in MATS:
+            fmts: set[str] = {mt.fmt for l in layers if (mt := l[n]) is not None}
+            if fmts:
+                model.formats[n] = sorted(fmts)
+        if moe is not None:
+            model.formats["experts"] = sorted(
+                {mt.fmt for l in layers for pair in l["experts"] or [] for mt in pair})
+            model.formats["router"] = sorted(
+                {mt.fmt for l in layers if (mt := l["router"]) is not None})
         model.formats["lm"] = [lm.fmt]
         return model
 
     def weight_bytes(self) -> int:
-        """Bytes of packed matrices one token reads (embedding row and norms aside)."""
-        return sum(m.packed_nbytes() for m in self.matrices())
+        """Bytes of packed matrices one token reads (embedding row and norms aside): of a
+        mixture of experts, the experts it uses (their mean size times their number)."""
+        total: int = 0
+        for m in self.matrices():
+            total += m.packed_nbytes()
+        for l in self.layers:
+            es: list[tuple[Mat, Mat]] | None = l["experts"]
+            if es and self.moe is not None:
+                all_e: int = sum(g.packed_nbytes() + d.packed_nbytes() for g, d in es)
+                total -= all_e - all_e * self.moe[1] // len(es)
+        return total
 
     def torch_weight_bytes(self) -> int:
         """Bytes of PyTorch's matrices one token reads (see Mat.prepare_torch)."""
@@ -771,16 +870,46 @@ class Model:
             p: F32 = np.exp(scores - scores.max(axis=1, keepdims=True))
             attn: F32 = np.einsum("ht,thd->hd", p, vals) / p.sum(axis=1, keepdims=True)
             h = h + layer["o"].matvec(attn.reshape(-1))
-            gu: F32 = layer["gate_up"].matvec(self.norm(h, layer["ffn_norm"])).reshape(-1, 2, 64)
-            g: F32 = gu[:, 0].reshape(-1)
-            u: F32 = gu[:, 1].reshape(-1)
-            silu: Floats = g / (1.0 + np.exp(-g))
-            h = h + layer["down"].matvec(silu * u)
+            xn: Floats = self.norm(h, layer["ffn_norm"])
+            router: Mat | None = layer["router"]
+            if router is None:
+                gate_up: Mat | None = layer["gate_up"]
+                down: Mat | None = layer["down"]
+                assert gate_up is not None and down is not None
+                h = h + self.mlp(gate_up, down, xn)
+            else:
+                h = h + self.moe_mlp(router, layer["experts"] or [], xn)
         logits: F32 = self.lm.matvec(self.norm(h, self.norm_out))
         # What the kernel leaves in `h`, for tests.
         self.last_h = h
         self.last_logits = logits
         return int(np.argmax(logits))
+
+    def mlp(self, gate_up: Mat, down: Mat, xn: Floats) -> F32:
+        gu: F32 = gate_up.matvec(xn).reshape(-1, 2, 64)
+        g: F32 = gu[:, 0].reshape(-1)
+        u: F32 = gu[:, 1].reshape(-1)
+        silu: Floats = g / (1.0 + np.exp(-g))
+        out: F32 = down.matvec(silu * u)
+        return out
+
+    def moe_mlp(self, router: Mat, experts: list[tuple[Mat, Mat]], xn: Floats) -> F32:
+        """The kernel's mixture of experts: the experts with the largest softmax probabilities
+        (the first on ties), weighted by them (renormalized to sum to 1 if the model says so),
+        their outputs added in that order."""
+        assert self.moe is not None
+        n_exp, n_used, renorm = self.moe
+        logits: F32 = router.matvec(xn)[:n_exp]
+        e: Floats = np.exp(logits - np.max(logits))
+        p: Floats = e / e.sum()
+        picked: list[int] = [int(i) for i in np.argsort(-p, kind="stable")[:n_used]]
+        w: Floats = p[picked]
+        if renorm:
+            w = w / max(float(w.sum()), 2.0 ** -14)
+        out: F32 = np.zeros(self.d, np.float32)
+        for wi, i in zip(w, picked):
+            out = out + np.float32(wi) * self.mlp(experts[i][0], experts[i][1], xn)
+        return out
 
     # PyTorch forward pass of the same model (needs use_torch=True at construction): the
     # matrices on PyTorch's weight-only kernels (Mat.torch_matvec), everything else in f32.
@@ -830,10 +959,14 @@ class Model:
             qg: torch.Tensor = q.view(1, nkv, nh // nkv, hd).bfloat16()
             attn: torch.Tensor = F.scaled_dot_product_attention(qg, keys, vals).float()
             h = h + layer["o"].torch_matvec(attn.reshape(-1))
-            gu: torch.Tensor = layer["gate_up"].torch_matvec(
+            gate_up: Mat | None = layer["gate_up"]
+            down: Mat | None = layer["down"]
+            if gate_up is None or down is None:
+                raise NotImplementedError("PyTorch runs dense MLPs only")
+            gu: torch.Tensor = gate_up.torch_matvec(
                 norm(h, layer["ffn_norm"])).view(-1, 2, 64)
             g: torch.Tensor = gu[:, 0].reshape(-1)
             u: torch.Tensor = gu[:, 1].reshape(-1)
-            h = h + layer["down"].torch_matvec(F.silu(g) * u)
+            h = h + down.torch_matvec(F.silu(g) * u)
         logits: torch.Tensor = self.lm.torch_matvec(norm(h, self.norm_out))
         return int(torch.max(logits, 0).indices)
