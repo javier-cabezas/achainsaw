@@ -43,6 +43,7 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
     14: ("Q6_K", 256, 210),
     20: ("IQ4_NL", 32, 18),
     30: ("BF16", 1, 2),
+    39: ("MXFP4", 32, 17),
 }
 
 _SCALARS: dict[int, str] = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f",
@@ -127,6 +128,26 @@ def _deq_iq4_nl(b: U8) -> F32:
     return IQ4_NL_VALUES[codes].astype(np.float32) * d
 
 
+# MXFP4's codebook (llama.cpp's kvalues_mxfp4): twice each 4-bit code's E2M1 value.
+MXFP4_VALUES: npt.NDArray[np.int8] = np.array(
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.int8)
+
+
+def mxfp4_scale(e: U8) -> F32:
+    """The scale of an MXFP4 block's E8M0 byte, halved as llama.cpp's
+    ggml_e8m0_to_fp32_half (the codebook holds twice the E2M1 values): 2^(e - 128)."""
+    s: F32 = np.ldexp(np.float32(1.0), e.astype(np.int32) - 128).astype(np.float32)
+    return s
+
+
+def _deq_mxfp4(b: U8) -> F32:
+    # Per block: the E8M0 scale byte, then 16 bytes of codes: byte t holds values t (low
+    # nibble) and t + 16 (high), as Q4_0's.
+    d: F32 = mxfp4_scale(b[:, 0])[:, None]
+    codes: U8 = np.concatenate([b[:, 1:17] & 15, b[:, 1:17] >> 4], axis=1)
+    return MXFP4_VALUES[codes].astype(np.float32) * d
+
+
 def _deq_q8_0(b: U8) -> F32:
     return np.ascontiguousarray(b[:, 2:34]).view(np.int8).astype(np.float32) * _f16(b[:, 0:2])
 
@@ -201,6 +222,7 @@ def _deq_k(bits: int) -> Callable[[U8], F32]:
 
 _DEQUANT: dict[str, Callable[[U8], F32]] = {
     "Q4_0": _deq_q4_0, "Q4_1": _deq_q4_1, "Q8_0": _deq_q8_0, "IQ4_NL": _deq_iq4_nl,
+    "MXFP4": _deq_mxfp4,
     "Q4_K": _deq_k(4), "Q5_K": _deq_k(5), "Q6_K": _deq_q6_k}
 
 

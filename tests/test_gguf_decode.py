@@ -29,8 +29,8 @@ ROOT: str = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "benchmarks"))
 sys.path.insert(0, ROOT)
 import achainsaw  # noqa: E402
-from gguf import (F32, GGUF, IQ4_NL_VALUES, U8, Floats, Ints, Tokenizer,  # noqa: E402
-                  _bytes_to_unicode)
+from gguf import (F32, GGUF, IQ4_NL_VALUES, MXFP4_VALUES, U8, Floats, Ints,  # noqa: E402
+                  Tensor, Tokenizer, _bytes_to_unicode, mxfp4_scale)
 from llama_model import MATS, Layer, Mat, Model, Parts  # noqa: E402
 
 D: int = 256
@@ -67,6 +67,17 @@ def enc_iq4_nl(rng: np.random.Generator, rows: int, k: int) -> Encoded:
     qs: Ints = codes[:, :, :16] | (codes[:, :, 16:] << 4)
     raw: U8 = np.concatenate([d[:, :, None].view(np.uint8), qs], axis=2)
     vals: F32 = IQ4_NL_VALUES[codes].astype(np.float32) * d[:, :, None].astype(np.float32)
+    return raw.reshape(rows, -1), vals
+
+
+def enc_mxfp4(rng: np.random.Generator, rows: int, k: int) -> Encoded:
+    codes: U8 = rng.integers(0, 16, size=(rows, k // 32, 32), dtype=np.uint8)
+    # E8M0 scale bytes, 2^(e - 128) of roughly 1 / (5.9 sqrt(k)) (the codebook's rms is 5.9).
+    e: U8 = np.round(128 + np.log2(rng.uniform(0.5, 1.0, size=(rows, k // 32))
+                                    / (5.9 * np.sqrt(k)))).astype(np.uint8)
+    qs: Ints = codes[:, :, :16] | (codes[:, :, 16:] << 4)
+    raw: U8 = np.concatenate([e[:, :, None], qs], axis=2).astype(np.uint8)
+    vals: F32 = MXFP4_VALUES[codes].astype(np.float32) * mxfp4_scale(e)[:, :, None]
     return raw.reshape(rows, -1), vals
 
 
@@ -164,14 +175,16 @@ def need(x: Mat | None) -> Mat:
 
 
 ENCODERS: dict[int, Encoder] = {2: enc_q4_0, 8: enc_q8_0, 3: enc_q4_1, 20: enc_iq4_nl,
+                                39: enc_mxfp4,
                                 14: enc_q6_k, 12: enc_k(4), 13: enc_k(5), 1: enc_f16,
                                 0: enc_f32}
 
-# Per layer, the type of each weight: layer 0 is all Q4_0 but a Q4_1 down projection;
+# Per layer, the type of each weight: layer 0 is all Q4_0 but an MXFP4 K and a Q4_1 down
+# projection;
 # layer 1 mixes formats inside the fused QKV (Q8_0, Q4_0, IQ4_NL) and gate/up matrices; layer 2 is laid out like
 # a Q4_K_M file's (Q and K Q4_K, V Q6_K), with Q5_K O and down projections.
 LAYER_TYPES: list[dict[str, int]] = [
-    dict(attn_q=2, attn_k=2, attn_v=2, attn_output=2, ffn_gate=2, ffn_up=2, ffn_down=3),
+    dict(attn_q=2, attn_k=39, attn_v=2, attn_output=2, ffn_gate=2, ffn_up=2, ffn_down=3),
     dict(attn_q=8, attn_k=2, attn_v=20, attn_output=14, ffn_gate=1, ffn_up=2, ffn_down=2),
     dict(attn_q=12, attn_k=12, attn_v=14, attn_output=13, ffn_gate=12, ffn_up=12, ffn_down=13),
 ]
@@ -320,7 +333,7 @@ class TestGGUFDecode(unittest.TestCase):
         e: dict[str, Floats] = self.expected
         l0, l1, l2 = m.layers
         self.assertEqual((l0["qkv"].fmt, l0["o"].fmt, need(l0["gate_up"]).fmt, need(l0["down"]).fmt),
-                         ("q4", "q4", "q4", "q41"))
+                         ("q4+mx4+q4", "q4", "q4", "q41"))
         self.assertEqual((l1["qkv"].fmt, l1["o"].fmt, need(l1["gate_up"]).fmt, need(l1["down"]).fmt),
                          ("q8+q4+iq4", "q6", "q8", "q4"))
         self.assertEqual((l2["qkv"].fmt, l2["o"].fmt, need(l2["gate_up"]).fmt, need(l2["down"]).fmt),
@@ -360,7 +373,7 @@ class TestGGUFDecode(unittest.TestCase):
                                                    err_msg=f"{p}{n}")
                 continue
             p = f"blk.{i}."
-            # Q and K rows back in Hugging Face order; exact for Q4_0, Q8_0 and IQ4_NL (layer 1's
+            # Q and K rows back in Hugging Face order; exact for Q4_0, Q8_0, MXFP4 and IQ4_NL (layer 1's
             # QKV in parts of each format; its gate/up re-quantized to Q8_0, see below).
             hf_q = np.empty_like(e[p + "attn_q.weight"])
             hf_q[gguf_order(HEADS)] = e[p + "attn_q.weight"]
@@ -714,6 +727,29 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
                     kc[pos] = planes[0][l, :, pos, :]
                     vc[pos] = planes[1][l, :, pos, :]
                 token = got
+
+
+
+class TestMxfp4(unittest.TestCase):
+    def test_scales_outside_f16_become_q8(self) -> None:
+        # Power-of-two scales from 2^-24 to 2^15 are exact f16s, so MXFP4 stays MXFP4; a
+        # matrix with any other scale (none in gpt-oss) is dequantized and quantized to Q8_0.
+        rng: np.random.Generator = np.random.default_rng(5)
+        enc: Encoded = enc_mxfp4(rng, 64, 128)
+        raw: U8 = enc[0]
+        vals: Floats = enc[1]
+        mat: Mat = Mat.from_tensor(Tensor("w", [128, 64], 39, raw))
+        self.assertEqual(mat.fmt, "mx4")
+        np.testing.assert_array_equal(mat.dequantize(), vals.reshape(64, 128))
+        for e in (103, 144):
+            out: U8 = raw.copy()
+            out[5, 17] = e  # row 5's second block
+            want: F32 = Tensor("w", [128, 64], 39, out).dequantize()
+            mat = Mat.from_tensor(Tensor("w", [128, 64], 39, out))
+            self.assertEqual(mat.fmt, "q8")
+            # Q8_0's rounding: at most half a step of its block's scale, max / 127.
+            err: Floats = np.abs(mat.dequantize() - want)
+            self.assertTrue(np.all(err <= np.abs(want).max(axis=1, keepdims=True) / 200), e)
 
 
 if __name__ == "__main__":
