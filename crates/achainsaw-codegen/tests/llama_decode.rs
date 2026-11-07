@@ -37,6 +37,7 @@ enum Fmt {
     Q5K = 4,
     Q41 = 5,
     Iq4 = 6,
+    Mx4 = 7,
 }
 
 /// IQ4_NL's codebook (llama.cpp's kvalues_iq4nl): the value of each 4-bit code.
@@ -44,8 +45,11 @@ const IQ4_NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
+/// MXFP4's codebook (llama.cpp's kvalues_mxfp4): twice each 4-bit code's E2M1 value.
+const MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 impl Fmt {
-    const ALL: [Fmt; 7] = [
+    const ALL: [Fmt; 8] = [
         Fmt::Q4,
         Fmt::Q8,
         Fmt::Q6,
@@ -53,7 +57,17 @@ impl Fmt {
         Fmt::Q5K,
         Fmt::Q41,
         Fmt::Iq4,
+        Fmt::Mx4,
     ];
+
+    /// The 4-bit codes' values of a codebook format.
+    fn codebook(self) -> Option<&'static [i8; 16]> {
+        match self {
+            Fmt::Iq4 => Some(&IQ4_NL),
+            Fmt::Mx4 => Some(&MXFP4),
+            _ => None,
+        }
+    }
 
     /// Values per scale.
     fn group(self) -> usize {
@@ -114,12 +128,13 @@ impl Mat {
             Fmt::Q4K | Fmt::Q41 => (8.0, 4.6),
             Fmt::Q5K => (16.0, 9.2),
             Fmt::Iq4 => (8.0, 60.0),
+            Fmt::Mx4 => (8.0, 5.9),
         };
         let q: Vec<i8> = (0..rows * k)
             .map(|_| {
-                if fmt == Fmt::Iq4 {
+                if let Some(book) = fmt.codebook() {
                     // A random code's codebook value.
-                    return IQ4_NL[((rng.next() + 1.0) * 8.0).clamp(0.0, 15.0) as usize];
+                    return book[((rng.next() + 1.0) * 8.0).clamp(0.0, 15.0) as usize];
                 }
                 let v = ((rng.next() * qmax).floor() as i32).clamp(-qmax as i32, qmax as i32 - 1);
                 // Q4_K and Q5_K values are unsigned: 0 .. 2 qmax.
@@ -128,7 +143,7 @@ impl Mat {
             .collect();
         let f16 = |v: f32| half::f16::from_f32(v).to_f32();
         // Entries of roughly unit variance times 1/sqrt(k), as in a trained layer; f16 scales
-        // (Q4_0's are often negative).
+        // (Q4_0's are often negative; MXFP4's are powers of two).
         let mut s: Vec<f32> = (0..k / g * rows)
             .map(|_| {
                 let v = (0.75 + 0.25 * rng.next()) / (smax * (k as f32).sqrt());
@@ -137,7 +152,11 @@ impl Mat {
                 } else {
                     v
                 };
-                f16(v)
+                if fmt == Fmt::Mx4 {
+                    v.log2().round().exp2()
+                } else {
+                    f16(v)
+                }
             })
             .collect();
         // Q4_K and Q5_K: codes near the top of their 6 bits times an f16 factor per 256
@@ -175,7 +194,7 @@ impl Mat {
         }
         let block_bytes = match fmt {
             Fmt::Q8 => 2048,
-            Fmt::Q4 | Fmt::Q4K | Fmt::Q41 | Fmt::Iq4 => 1024,
+            Fmt::Q4 | Fmt::Q4K | Fmt::Q41 | Fmt::Iq4 | Fmt::Mx4 => 1024,
             Fmt::Q6 => 1536,
             Fmt::Q5K => 1280,
         };
@@ -193,8 +212,9 @@ impl Mat {
                     match fmt {
                         Fmt::Q8 => packed_q[at(t / 4, t % 4)] = v as u8 ^ 0x80,
                         Fmt::Q4 => packed_q[at(n / 4, n % 4)] |= ((v + 8) as u8) << (4 * (t / 16)),
-                        Fmt::Iq4 => {
-                            let code = IQ4_NL.iter().position(|&c| c == v).unwrap() as u8;
+                        Fmt::Iq4 | Fmt::Mx4 => {
+                            let book = fmt.codebook().unwrap();
+                            let code = book.iter().position(|&c| c == v).unwrap() as u8;
                             packed_q[at(n / 4, n % 4)] |= code << (4 * (t / 16))
                         }
                         Fmt::Q4K | Fmt::Q41 => {
@@ -417,7 +437,7 @@ impl Model {
                 sin.push(a.sin() as f32);
             }
         }
-        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 and IQ4_NL rotate across the matrices of a layer
+        // `mixed`: Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1, IQ4_NL and MXFP4 rotate across the matrices of a layer
         // (Q, K and V each in its own) and across layers, and the LM head is Q6_K.
         let layers = attn_norms
             .into_iter()
@@ -812,7 +832,7 @@ fn qwen3_head_norms_match_reference() {
     check_decode(false, true, true);
 }
 
-/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1 and IQ4_NL matrices mixed within and across layers (Q, K and V
+/// Q4_0, Q8_0, Q6_K, Q4_K, Q5_K, Q4_1, IQ4_NL and MXFP4 matrices mixed within and across layers (Q, K and V
 /// in different formats), and a Q6_K LM head.
 #[test]
 fn llama_decode_mixed_formats_match_reference() {
