@@ -323,10 +323,28 @@ _QWEN2_SPLIT: re.Pattern[str] = re.compile(
     r"|\s+")
 
 
+# GPT-4o's (llama.cpp's "gpt-4o", gpt-oss's o200k), as llama.cpp writes it with lookaheads: a
+# word is optional upper-case letters then lower-case ones, or upper-case ones then optional
+# lower-case ones (\p{L} not a-z counts as upper, not A-Z as lower), with an optional
+# contraction; digits in threes; punctuation keeps a trailing newline or slash.
+_CONTRACTION: str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+_GPT4O_SPLIT: re.Pattern[str] = re.compile(
+    r"(?:[^\r\n\w]|_)?(?:(?=[^\W\d_])[^a-z])*(?:(?=[^\W\d_])[^A-Z])+" + _CONTRACTION +
+    r"|(?:[^\r\n\w]|_)?(?:(?=[^\W\d_])[^a-z])+(?:(?=[^\W\d_])[^A-Z])*" + _CONTRACTION +
+    r"|\d{1,3}"
+    r"| ?(?:[^\s\w]|_)+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+")
+
+_SPLITS: dict[str, re.Pattern[str]] = {
+    "llama-bpe": _LLAMA3_SPLIT, "qwen2": _QWEN2_SPLIT, "gpt-4o": _GPT4O_SPLIT}
+
+
 class Tokenizer:
     """The byte-level BPE tokenizer of a GGUF file whose tokenizer.ggml.model is gpt2, with
-    Llama 3's pre-tokenizer (tokenizer.ggml.pre "llama-bpe", the default) or Qwen's
-    ("qwen2"). Control tokens (`<|eot_id|>` and the like) in the text are encoded as
+    Llama 3's pre-tokenizer (tokenizer.ggml.pre "llama-bpe", the default), Qwen's ("qwen2")
+    or GPT-4o's ("gpt-4o", gpt-oss's). Control tokens (`<|eot_id|>` and the like) in the text are encoded as
     themselves. A BOS token is added only when the file says so
     (tokenizer.ggml.add_bos_token, true when absent)."""
 
@@ -340,9 +358,10 @@ class Tokenizer:
         self.ranks: dict[tuple[str, ...], int] = {
             tuple(m.split(" ", 1)): r for r, m in enumerate(meta["tokenizer.ggml.merges"])}
         pre: str = meta.get("tokenizer.ggml.pre", "llama-bpe")
-        if pre not in ("llama-bpe", "qwen2"):
-            raise ValueError(f"unsupported pre-tokenizer {pre!r} (llama-bpe and qwen2 only)")
-        self.split: re.Pattern[str] = _QWEN2_SPLIT if pre == "qwen2" else _LLAMA3_SPLIT
+        if pre not in _SPLITS:
+            raise ValueError(f"unsupported pre-tokenizer {pre!r} (llama-bpe, qwen2 and gpt-4o "
+                             "only)")
+        self.split: re.Pattern[str] = _SPLITS[pre]
         # llama.cpp skips the merges of words already in the vocabulary for Llama 3 only.
         self.ignore_merges: bool = pre == "llama-bpe"
         self.bos: int | None = meta.get("tokenizer.ggml.bos_token_id") \

@@ -67,7 +67,7 @@ fn attend_split(task:i64, q:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i
     s_part = mul s, prow_b
     g_part1 = add g_part0, s_part
     pg = add part, g_part1
-    call attn_split(qg, kb, vb, pg, group, hd, nt, scale, head_b)
+    call attn_split(qg, kb, vb, pg, group, hd, nt, 0:i64, scale, head_b)
     ret
 
 # Query head h: merges its splits' partial results into out[h].

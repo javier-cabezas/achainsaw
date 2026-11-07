@@ -1,5 +1,5 @@
-# One decode step of a Llama-style model (Llama, Qwen3, Qwen3-MoE) in a single call: token
-# in, next token (greedy) out.
+# One decode step of a Llama-style model (Llama, Qwen3, Qwen3-MoE, gpt-oss) in a single
+# call: token in, next token (greedy) out.
 #
 # Megakernel-style fusion for CPUs: every elementwise op runs inside the pass that produces
 # or consumes its data, so a layer is 2 serial norms and 5 `par` regions:
@@ -20,10 +20,10 @@
 # token in tiles of 8, the splits all 8 see whole once for the tile's query heads; norms and
 # epilogues run per token. Its results are exactly those of n llama_decode calls.
 #
-# Each weight matrix is Q8_0, Q4_0, Q6_K, Q4_K, Q5_K, Q4_1 or IQ4_NL, chosen per matrix (and
-# per part of a fused matrix: Q, K and V may differ): 8-, 4-, 6- or 5-bit weights with f16
-# scales per 32 (Q6_K: 16) values of a row (Q4_1 an f16 min too; IQ4_NL's 4-bit codes index
-# a codebook), or for Q4_K and Q5_K a 6-bit scale
+# Each weight matrix is Q8_0, Q4_0, Q6_K, Q4_K, Q5_K, Q4_1, IQ4_NL or MXFP4, chosen per
+# matrix (and per part of a fused matrix: Q, K and V may differ): 8-, 4-, 6- or 5-bit
+# weights with f16 scales per 32 (Q6_K: 16) values of a row (Q4_1 an f16 min too; IQ4_NL's
+# and MXFP4's 4-bit codes index a codebook), or for Q4_K and Q5_K a 6-bit scale
 # and min per 32 under f16 factors per 256, packed in chunks of 64 output rows; activations are quantized to int8 per 32-block on the fly and the int8 dots
 # run on `vdotu` (weights stored unsigned; the activation sums of quantize_q8 remove their
 # offset or apply the mins).
@@ -33,23 +33,31 @@
 # Shapes: d, ffn and vocab multiples of 64; head_dim a multiple of 64; heads a multiple of
 # kv_heads (grouped-query attention); pos < max_ctx.
 #
-# cfg (i64[13]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, KV cache format
+# cfg (i64[14]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, KV cache format
 # (0 bf16, 1 int8), then for a mixture-of-experts model the experts, the experts each token
-# uses, an expert's MLP width (ffn's place for its layers) and whether the used experts'
-# weights are renormalized to sum to 1 (0s for a dense model)
+# uses, an expert's MLP width (ffn's place for its layers) and how the used experts' weights
+# are made (0 softmax probabilities, 1 those renormalized to sum to 1 (Qwen3-MoE), 2 a
+# softmax of the picked logits (gpt-oss); 0s for a dense model), then the MLP's activation
+# (0 SwiGLU, 1 gpt-oss's clamped SwiGLU)
 # model (table of 8-byte words): a matrix is a pointer to its parts, 4 words each: packed
-# weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K, 5: Q4_1, 6: IQ4_NL)
-# and number of 64-row chunks (see qmat_chunk in the standard library).
+# weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K, 5: Q4_1, 6: IQ4_NL,
+# 7: MXFP4) and number of 64-row chunks (see qmat_chunk in the standard library). A vector
+# (norm weights, biases) is a pointer to f32s, 0 where the model has none.
 #   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]   [2] LM head
-#   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape)
-#   then 10 per layer, at 5 + 10 * l:
+#   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape; RoPE
+#   scaling such as YaRN is in the tables)
+#   then 15 per layer, at 5 + 15 * l:
 #   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
 #   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
 #   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn];
-#   Q and K norm weights f32 [head_dim] (Qwen3's RMSNorm of each q and k head before RoPE),
-#   or 0 for none; then for a mixture-of-experts layer (gate/up and down 0) its router
-#   [experts x d] and a table of 2 words per expert, its gate/up [2 expert_ffn x d] and down
-#   [d x expert_ffn] matrices (0 and 0 for a dense layer)
+#   Q and K norm weights f32 [head_dim] (Qwen3's RMSNorm of each q and k head before RoPE);
+#   then for a mixture-of-experts layer (gate/up and down 0) its router [experts x d] and a
+#   table of 4 words per expert: its gate/up [2 expert_ffn x d] and down [d x expert_ffn]
+#   matrices and their biases (f32, gate/up's laid out as its rows) (0 and 0 for a dense
+#   layer); then gpt-oss's biases of QKV [(heads + 2 kv_heads) * head_dim], O [d] and the
+#   router [experts], its attention sinks f32 [heads] (a logit per query head that takes
+#   part in the softmax with no value), and the layer's attention window in positions (a
+#   query sees the last that many, itself included; 0 for all of them)
 # cache: per layer, K then V, each kv_heads x ctx x head_dim bf16 values, ctx = max_ctx
 # rounded up to a multiple of 32 (head-major, so a KV head's positions are contiguous): V is
 # [kv_heads x ctx x head_dim]; K is in tiles of 32 positions, [kv_heads x ctx / 32 x
@@ -62,13 +70,14 @@
 # groups of 4 per position, [head_dim / 4 x 32 x 4]; V [32 x head_dim]) then an f32 scale per
 # position (to_q8_kv); attn_split_q8 scores it with int8 dots (`vdotu`) on queries rounded
 # to int8.
+# The cache holds every position in every layer, windowed or not.
 # h: f32 [d], the residual stream; holds the final hidden state on return.
-use qmat_chunk, qmat_batch, quantize_q8, rope_half, silu_mul, attn_split, attn_split_q8, attn_merge
+use qmat_chunk, qmat_batch, quantize_q8, rope_half, silu_mul, swiglu_oai, attn_split, attn_split_q8, attn_merge
 
 fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
-    n_exp, n_used, exp_norm = call load_moe(cfg)
+    n_exp, n_used, gating, act = call load_moe(cfg)
     embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
@@ -116,14 +125,15 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     heads_all = add nh, heads_all0
     dchunks = udiv d, 64:i64
     fchunks = udiv f, 64:i64
-    # attention: splits of 256 positions, a record per query head and split (attn_split)
+    # attention: splits of 256 positions, a record per query head and split (attn_split),
+    # and one for its sink
     npos = add pos, 1:i64
     npos255 = add npos, 255:i64
     splits = udiv npos255, 256:i64
-    a_tasks = mul nkv, splits
+    splits1 = add splits, 1:i64
     hd2 = add hd, 2:i64
     rec = mul hd2, 4:i64
-    part0 = mul nh, splits
+    part0 = mul nh, splits1
     part_sz = mul part0, rec
     part = alloc part_sz
     scale = call attn_scale(hd)
@@ -133,24 +143,27 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
     call norm_quant(h, attn_norm, xn, xq, dx, d, eps)
-    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_r, sin_r, q_norm, k_norm, eps)
-    par a_tasks, attn_task(qbuf, kc, vc, part, nh, nkv, hd, npos, max_ctx, kvf, splits, scale)
-    par nh, attn_out(part, xq, dx, hd, splits)
-    par dchunks, proj_add(m_o, xq, dx, h, qd)
+    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_r, sin_r, q_norm, k_norm, eps, qkv_b)
+    # the splits of the layer's window (all positions without one)
+    lo, s_lo, nsp = call attn_window(npos, win)
+    a_tasks = mul nkv, nsp
+    par a_tasks, attn_task(qbuf, kc, vc, part, nh, nkv, hd, npos, max_ctx, kvf, nsp, scale, lo, s_lo)
+    par nh, attn_out(part, xq, dx, hd, nsp, sinks)
+    par dchunks, proj_add(m_o, xq, dx, h, qd, o_b)
     call norm_quant(h, ffn_norm, xn, xq, dx, d, eps)
     is_moe = ne router, 0:ptr
     br is_moe, moe_mlp, dense_mlp
   moe_mlp:
-    call moe_ffn(h, xq, dx, router, experts, d, n_exp, n_used, f, exp_norm, moe_buf)
+    call moe_ffn(h, xq, dx, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act)
     jmp layer_next
   dense_mlp:
-    par fchunks, gate_up(m_gu, xq, dx, aq, adx, d)
-    par dchunks, proj_add(m_dn, aq, adx, h, f)
+    par fchunks, gate_up(m_gu, xq, dx, aq, adx, d, 0:ptr, act)
+    par dchunks, proj_add(m_dn, aq, adx, h, f, 0:ptr)
     jmp layer_next
   layer_next:
     l2 = add l, 1:i64
@@ -239,10 +252,11 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
     call quantize_q8(xn, xq, dx, d)
     ret
 
-# Q, K or V head t: 64-row chunks of the QKV projection, then for q and k the head's RMSNorm
-# when the layer has one (qk_norm) and RoPE. A q head lands in the q buffer; a K or V head in
+# Q, K or V head t: 64-row chunks of the QKV projection plus the head's rows of the bias when
+# the layer has one, then for q and k the head's RMSNorm when the layer has one (qk_norm) and
+# RoPE. A q head lands in the q buffer; a K or V head in
 # a staging row, rounded to bf16 into this position's slot of its KV-cache row after RoPE.
-fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32)
+fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr)
   b0:
     hd4 = mul hd, 4:i64
     is_q = lt t, nh
@@ -267,6 +281,8 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
     i2 = add i, 1:i64
     jmp chunks(i2)
   epilogue:
+    b_off = mul t, hd
+    call add_rows(dst, bias, b_off, hd)
     br is_k, rotate, store
   rotate:
     call qk_norm(dst, is_q, q_norm, k_norm, hd, eps)
@@ -325,19 +341,20 @@ fn qk_norm(x:ptr, is_q:i32, q_norm:ptr, k_norm:ptr, hd:i64, eps:f32)
   done:
     ret
 
-# A mixture-of-experts MLP for one token (Qwen3-MoE's), from its quantized normed input xq/dx
-# into its residual stream h: the router picks the n_used experts with the largest softmax
-# probabilities (moe_route), each expert's gate/up rows and SwiGLU run in one `par` (64 rows
-# of one expert per task, gate_up), and the down projections in another (moe_down), which
-# adds the experts' outputs, each times its weight, in the order they were picked. scratch
-# holds moe_scratch's bytes (allocated once per call of llama_decode or llama_prefill).
-fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, exp_norm:i64, scratch:ptr)
+# A mixture-of-experts MLP for one token (Qwen3-MoE's, gpt-oss's), from its quantized normed
+# input xq/dx into its residual stream h: the router picks the n_used experts with the
+# largest softmax probabilities (moe_route), each expert's gate/up rows, their bias and the
+# activation run in one `par` (64 rows of one expert per task, gate_up), and the down
+# projections and their bias in another (moe_down), which adds the experts' outputs, each
+# times its weight, in the order they were picked. scratch holds moe_scratch's bytes
+# (allocated once per call of llama_decode or llama_prefill).
+fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64)
   b0:
     logits, sel, wts, aq, adx = call moe_buffers(scratch, n_exp, n_used, fe)
-    call moe_route(router, xq, dx, logits, sel, wts, d, n_exp, n_used, exp_norm)
+    call moe_route(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b)
     fchunks = udiv fe, 64:i64
     tasks = mul n_used, fchunks
-    par tasks, moe_gate_up(experts, sel, xq, dx, aq, adx, d, fe)
+    par tasks, moe_gate_up(experts, sel, xq, dx, aq, adx, d, fe, act)
     dchunks = udiv d, 64:i64
     par dchunks, moe_down(experts, sel, wts, aq, adx, h, fe, n_used)
     ret
@@ -375,11 +392,13 @@ inline fn moe_buffers(scratch:ptr, n_exp:i64, n_used:i64, fe:i64)->(ptr, ptr, pt
     adx = add aq, a
     ret scratch, sel, wts, aq, adx
 
-# The router: logits = router x, softmax numerators e_i = exp(logit_i
-# - max), then the n_used largest (the first on ties), each one's weight e_i / sum(e) into
-# wts and its index into sel, in that order; with exp_norm the weights are then divided by
-# their sum (at least 2^-14, as llama.cpp clamps it).
-fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, exp_norm:i64)
+# The router: logits = router x (plus its bias, when the layer has one), softmax numerators
+# e_i = exp(logit_i - max), then the n_used largest (the first on ties), each one's weight
+# into wts and its index into sel, in that order. The weight, by `gating`: 0 the softmax
+# probability e_i / sum(e); 1 that, then divided by the picked ones' sum (at least 2^-14, as
+# llama.cpp clamps it; Qwen3-MoE); 2 the softmax of the picked logits, e_i over the picked
+# numerators' sum (gpt-oss).
+fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr)
   b0:
     # The router has n_exp rows rounded up to 64 (zero rows past n_exp), whose logits only
     # fill the buffer: the softmax and the choice read the first n_exp.
@@ -388,13 +407,16 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     jmp rows(0:i64)
   rows(c:i64):
     c_more = lt c, chunks
-    br c_more, rows_body, max_loop(0:i64, -3.4e38:f32)
+    br c_more, rows_body, biased
   rows_body:
     o = mul c, 256:i64
     out = add logits, o
     call qmat_chunk(c, router, xq, dx, out, d)
     c2 = add c, 1:i64
     jmp rows(c2)
+  biased:
+    call add_rows(logits, router_b, 0:i64, n_exp)
+    jmp max_loop(0:i64, -3.4e38:f32)
   max_loop(i:i64, m:f32):
     i_more = lt i, n_exp
     br i_more, max_body, softmax
@@ -405,6 +427,8 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     jmp max_loop(i2, m2)
   softmax:
     total = call exp_shift(logits, n_exp, m)
+    over_picked = eq gating, 2:i64
+    denom = select over_picked, 1.0:f32, total
     jmp pick(0:i64, 0.0:f32)
   pick(s:i64, wsum:f32):
     s_more = lt s, n_used
@@ -421,7 +445,7 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     jmp scan(j2, best2, bv2)
   picked:
     st sel[s], best
-    wt = div bv, total
+    wt = div bv, denom
     st wts[s], wt
     # Taken: below every numerator (they are at least 0).
     st logits[best], -1.0:f32
@@ -429,7 +453,7 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     s2 = add s, 1:i64
     jmp pick(s2, wsum2)
   renorm:
-    no_norm = eq exp_norm, 0:i64
+    no_norm = eq gating, 0:i64
     br no_norm, done, norm_start
   norm_start:
     clamped = max wsum, 0.00006103515625:f32
@@ -448,23 +472,25 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
 
 # Task t of an expert MLP: rows 64c..64c+63 of picked expert s (t = s * fe/64 + c), into
 # that expert's slot of the down projections' int8 input (fe values per slot).
-fn moe_gate_up(t:i64, experts:ptr, sel:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, d:i64, fe:i64)
+fn moe_gate_up(t:i64, experts:ptr, sel:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, d:i64, fe:i64, act:i64)
   b0:
     fchunks = udiv fe, 64:i64
     s = udiv t, fchunks
     c = urem t, fchunks
     e = ld sel[s]:i64
-    e2 = mul e, 2:i64
-    mat = ld experts[e2]:ptr
+    e4 = mul e, 4:i64
+    mat = ld experts[e4]:ptr
+    e42 = add e4, 2:i64
+    bias = ld experts[e42]:ptr
     q_off = mul s, fe
     aq_s = add aq, q_off
     d_off = udiv q_off, 2:i64
     adx_s = add adx, d_off
-    call gate_up(c, mat, xq, dx, aq_s, adx_s, d)
+    call gate_up(c, mat, xq, dx, aq_s, adx_s, d, bias, act)
     ret
 
 # Rows 64c..64c+63 of the residual stream += the sum over the picked experts, in the order
-# they were picked, of each one's weight times its down projection.
+# they were picked, of each one's weight times its down projection (plus its bias).
 fn moe_down(c:i64, experts:ptr, sel:ptr, wts:ptr, aq:ptr, adx:ptr, h:ptr, fe:i64, n_used:i64)
   b0:
     w = vl f32
@@ -485,14 +511,18 @@ fn moe_down(c:i64, experts:ptr, sel:ptr, wts:ptr, aq:ptr, adx:ptr, h:ptr, fe:i64
     br s_more, slot_body, add_h(0:i64)
   slot_body:
     e = ld sel[s]:i64
-    e2 = mul e, 2:i64
-    e21 = add e2, 1:i64
-    mat = ld experts[e21]:ptr
+    e4 = mul e, 4:i64
+    e41 = add e4, 1:i64
+    mat = ld experts[e41]:ptr
+    e43 = add e4, 3:i64
+    bias = ld experts[e43]:ptr
     q_off = mul s, fe
     aq_s = add aq, q_off
     d_off = udiv q_off, 2:i64
     adx_s = add adx, d_off
     call qmat_chunk(c, mat, aq_s, adx_s, tmp, fe)
+    b_off = mul c, 64:i64
+    call add_rows(tmp, bias, b_off, 64:i64)
     ws = ld wts[s]:f32
     vw = splat ws:vx
     jmp mix(0:i64)
@@ -696,12 +726,29 @@ fn attn_scale(hd:i64)->f32
     scale = div 1.0:f32, sq
     ret scale
 
-# Split s of KV head g (task = g * splits + s): positions 256 s .. of the first npos, for the
-# group's query heads; records in `part`, head h's split s at (h * splits + s) * (hd + 2) f32.
-fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, splits:i64, scale:f32)
+# The window of a layer whose queries see the last win positions (0: all of them) for a query
+# at npos - 1: its first position lo, its first split s_lo (of 256 positions) and its number
+# of splits.
+inline fn attn_window(npos:i64, win:i64)->(i64, i64, i64)
   b0:
-    g = udiv task, splits
-    s = urem task, splits
+    none = eq win, 0:i64
+    lo0 = sub npos, win
+    lo1 = max lo0, 0:i64
+    lo = select none, 0:i64, lo1
+    s_lo = udiv lo, 256:i64
+    n255 = add npos, 255:i64
+    splits = udiv n255, 256:i64
+    nsp = sub splits, s_lo
+    ret lo, s_lo, nsp
+
+# Split s_lo + i of KV head g (task = g * nsp + i): positions max(256 s, lo) .. of the first
+# npos, for the group's query heads; records in `part`, head h's i-th at (h * (nsp + 1) + i)
+# * (hd + 2) f32, the last of a head's nsp + 1 for its sink (attn_out).
+fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, nsp:i64, scale:f32, lo:i64, s_lo:i64)
+  b0:
+    g = udiv task, nsp
+    i = urem task, nsp
+    s = add s_lo, i
     group = udiv nh, nkv
     h0 = mul g, group
     hd4 = mul hd, 4:i64
@@ -709,25 +756,30 @@ fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i
     qg = add qbuf, q_off
     hd2 = add hd, 2:i64
     rec = mul hd2, 4:i64
-    head_b = mul splits, rec
+    nsp1 = add nsp, 1:i64
+    head_b = mul nsp1, rec
     p0 = mul h0, head_b
-    p1 = mul s, rec
+    p1 = mul i, rec
     p2 = add p0, p1
     pg = add part, p2
-    call attn_part(g, s, qg, kc, vc, pg, group, hd, npos, max_ctx, kvf, scale, head_b)
+    call attn_part(g, s, qg, kc, vc, pg, group, hd, npos, max_ctx, kvf, scale, head_b, lo)
     ret
 
 # One split of attention (attn_split, or attn_split_q8 for an int8 cache) for KV head g:
-# positions 256 s .. 256 s + 256 of the first npos, query heads at qg, records from pg
-# (head_b bytes per head).
-fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, scale:f32, head_b:i64)
+# positions max(256 s, lo) .. 256 s + 256 of the first npos (lo < npos), query heads at qg,
+# records from pg (head_b bytes per head). The cache is read from the tile of 32 positions
+# that holds the first one; attn_split leaves the positions before it out.
+fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, scale:f32, head_b:i64, lo:i64)
   b0:
     t0 = mul s, 256:i64
     t_end0 = add t0, 256:i64
     t1 = min t_end0, npos
-    nt = sub t1, t0
+    ta = max t0, lo
+    skip = and ta, 31:i64
+    tb = sub ta, skip
+    nt = sub t1, tb
     g_rows = mul g, max_ctx
-    first = add g_rows, t0
+    first = add g_rows, tb
     rb = call kv_rb(hd, kvf)
     kv_off = mul first, rb
     kb = add kc, kv_off
@@ -735,32 +787,60 @@ fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, np
     is_q8 = eq kvf, 1:i64
     br is_q8, q8, bf16
   bf16:
-    call attn_split(qg, kb, vb, pg, group, hd, nt, scale, head_b)
+    call attn_split(qg, kb, vb, pg, group, hd, nt, skip, scale, head_b)
     ret
   q8:
-    call attn_split_q8(qg, kb, vb, pg, group, hd, nt, scale, head_b)
+    call attn_split_q8(qg, kb, vb, pg, group, hd, nt, skip, scale, head_b)
     ret
 
-# Query head hq: merges its splits (attn_merge) and writes the result Q8-quantized into
-# xq/dx at the head's offset, the O projection's input.
-fn attn_out(hq:i64, part:ptr, xq:ptr, dx:ptr, hd:i64, splits:i64)
+# Query head hq: merges its nsp splits and its sink (merge_quant) and writes the result
+# Q8-quantized into xq/dx at the head's offset, the O projection's input.
+fn attn_out(hq:i64, part:ptr, xq:ptr, dx:ptr, hd:i64, nsp:i64, sinks:ptr)
   b0:
     hd2 = add hd, 2:i64
     rec = mul hd2, 4:i64
-    head_b = mul splits, rec
+    nsp1 = add nsp, 1:i64
+    head_b = mul nsp1, rec
     hp_off = mul hq, head_b
     hp = add part, hp_off
-    call merge_quant(hp, splits, hd, hq, xq, dx)
+    call merge_quant(hp, nsp, hd, hq, xq, dx, sinks)
     ret
 
 # attn_merge of a query head's splits (records from hp), quantized into xq/dx at head hq.
-fn merge_quant(hp:ptr, splits:i64, hd:i64, hq:i64, xq:ptr, dx:ptr)
+# With attention sinks (gpt-oss: a logit per query head that takes part in the softmax but
+# has no value), the head's sink is one more record after the splits, max sinks[hq], sum 1
+# and outputs 0, so the merge adds exp(sink - m) to the softmax's denominator alone.
+fn merge_quant(hp:ptr, splits:i64, hd:i64, hq:i64, xq:ptr, dx:ptr, sinks:ptr)
   b0:
     hd4 = mul hd, 4:i64
     out = alloc hd4
     hd2 = add hd, 2:i64
     rec = mul hd2, 4:i64
-    call attn_merge(hp, splits, rec, hd, out)
+    w = vl f32
+    zero = splat 0.0:f32:vx
+    has_sink = ne sinks, 0:ptr
+    br has_sink, sink, merge(splits)
+  sink:
+    sk_off = mul splits, rec
+    sk = add hp, sk_off
+    sv = ld sinks[hq]:f32
+    st sk, sv
+    st sk[1], 1.0:f32
+    sk_o = add sk, 8:i64
+    jmp sink_zero(0:i64)
+  sink_zero(z:i64):
+    z_more = lt z, hd
+    br z_more, sink_zero_body, sink_done
+  sink_zero_body:
+    z_rest = sub hd, z
+    stm sk_o[z], zero, z_rest:f32
+    z2 = add z, w
+    jmp sink_zero(z2)
+  sink_done:
+    with_sink = add splits, 1:i64
+    jmp merge(with_sink)
+  merge(count:i64):
+    call attn_merge(hp, count, rec, hd, out)
     xq_off = mul hq, hd
     xq_h = add xq, xq_off
     blocks = udiv hd, 32:i64
@@ -771,12 +851,15 @@ fn merge_quant(hp:ptr, splits:i64, hd:i64, hq:i64, xq:ptr, dx:ptr)
     free out
     ret
 
-# h[64c .. 64c + 64] += (W x)[64c .. 64c + 64]: a projection fused with the residual add.
-fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
+# h[64c .. 64c + 64] += (W x + b)[64c .. 64c + 64]: a projection fused with the residual add
+# (b the bias, when not 0).
+fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64, bias:ptr)
   b0:
     w = vl f32
     tmp = stack 256
     call qmat_chunk(c, mat, xq, dx, tmp, k)
+    b_off = mul c, 64:i64
+    call add_rows(tmp, bias, b_off, 64:i64)
     h_off = mul c, 256:i64
     hc = add h, h_off
     jmp add_loop(0:i64)
@@ -794,9 +877,10 @@ fn proj_add(c:i64, mat:ptr, xq:ptr, dx:ptr, h:ptr, k:i64)
   done:
     ret
 
-# MLP rows 64c..64c+63: gate and up chunks, SwiGLU, then Q8 quantization for the down
+# MLP rows 64c..64c+63: gate and up chunks plus their rows of the bias (laid out as the
+# matrix's rows, when not 0), the activation (glu), then Q8 quantization for the down
 # projection (two 32-blocks per task).
-fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
+fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, bias:ptr, act:i64)
   b0:
     g = stack 256
     u = stack 256
@@ -805,7 +889,11 @@ fn gate_up(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64)
     cu = add cg, 1:i64
     call qmat_chunk(cg, mat, xq, dx, g, k)
     call qmat_chunk(cu, mat, xq, dx, u, k)
-    call silu_mul(g, u, a, 64:i64)
+    gb = mul cg, 64:i64
+    call add_rows(g, bias, gb, 64:i64)
+    ub = mul cu, 64:i64
+    call add_rows(u, bias, ub, 64:i64)
+    call glu(g, u, a, 64:i64, act)
     q_off = mul c, 64:i64
     aq_c = add aq, q_off
     d_off = mul c, 32:i64
@@ -837,6 +925,41 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
     st best_idx[c], tok
     ret
 
+# x[0 .. n] += b[off .. off + n], when b is not 0 (a layer's bias).
+fn add_rows(x:ptr, b:ptr, off:i64, n:i64)
+  b0:
+    none = eq b, 0:ptr
+    w = vl f32
+    b_off = shl off, 2:i64
+    bo = add b, b_off
+    br none, done, loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    xv = ldm x[i]:vx, rest:f32
+    bv = ldm bo[i]:vx, rest:f32
+    y = vadd xv, bv:f32
+    stm x[i], y, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  done:
+    ret
+
+# The MLP's activation of n gate and up values into out, by act: 0 SwiGLU (silu_mul), 1
+# gpt-oss's clamped SwiGLU (swiglu_oai: alpha 1.702, limit 7).
+fn glu(g:ptr, u:ptr, out:ptr, n:i64, act:i64)
+  b0:
+    oai = eq act, 1:i64
+    br oai, clamped, silu
+  clamped:
+    call swiglu_oai(g, u, out, n, 1.702:f32, 7.0:f32)
+    ret
+  silu:
+    call silu_mul(g, u, out, n)
+    ret
+
 # Prefill: n prompt tokens (i64 [n] at `tokens`) at positions pos .. pos + n - 1, with the
 # model, cache and h of llama_decode (pos + n <= max_ctx). Returns the greedy token after
 # the last one; h holds the last token's final hidden state. Per layer: 2 norm passes over
@@ -847,7 +970,7 @@ fn lm_chunk(c:i64, mat:ptr, xq:ptr, dx:ptr, best:ptr, best_idx:ptr, k:i64)
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
-    n_exp, n_used, exp_norm = call load_moe(cfg)
+    n_exp, n_used, gating, act = call load_moe(cfg)
     embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
@@ -914,14 +1037,14 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
-    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts = call layer_weights(model, l)
+    attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
     kc_off = mul l, kv_layer
     kc = add cache, kc_off
     vc = add kc, kv_plane
     par n, norm_tok(hs, attn_norm, xn, xq, dx, d, eps, xs)
-    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps)
-    par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, max_ctx, kvf, scale, xs, n)
-    par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d)
+    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps, qkv_b)
+    par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, max_ctx, kvf, scale, xs, n, win, sinks)
+    par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d, o_b)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
     is_moe = ne router, 0:ptr
     br is_moe, moe_tok(0:i64), dense_mlp
@@ -937,12 +1060,12 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
-    call moe_ffn(h_s, xq_s, dx_s, router, experts, d, n_exp, n_used, f, exp_norm, moe_buf)
+    call moe_ffn(h_s, xq_s, dx_s, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act)
     s2 = add s, 1:i64
     jmp moe_tok(s2)
   dense_mlp:
-    par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs)
-    par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d)
+    par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs, 0:ptr, act)
+    par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d, 0:ptr)
     jmp layer_next
   layer_next:
     l2 = add l, 1:i64
@@ -992,9 +1115,9 @@ fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i6
     ret
 
 # qkv_head for n tokens: head t's 64-row chunks for every token (qmat_batch), each token's
-# rows written to its q row or a staging row, then the head's norm (qk_norm) and RoPE at its
-# position and, for K and V, bf16 into its position's KV-cache slot.
-fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32)
+# rows written to its q row or a staging row, then the head's bias, norm (qk_norm) and RoPE
+# at its position and, for K and V, bf16 into its position's KV-cache slot.
+fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr)
   b0:
     w = vl f32
     hd4 = mul hd, 4:i64
@@ -1060,6 +1183,8 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     rkv = add stage, rs
     x = select is_q, rq, rkv
     rp = add pos, r
+    b_off = mul t, hd
+    call add_rows(x, bias, b_off, hd)
     br is_k, rotate, store
   rotate:
     rr = mul rp, rope_row
@@ -1083,14 +1208,15 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     ret
 
 # Attention of a tile of up to 8 tokens s0 .. s0 + tn - 1 for KV head g (task = tile * nkv
-# + g), token s over positions 0 .. pos + s: the same splits (attn_part) and merges
-# (merge_quant) as llama_decode at that position, in a buffer of its own, so its results are
-# llama_decode's bit for bit. The splits that every token of the tile sees whole (all 256
-# positions) run once for all of the tile's query heads, so each K and V vector is read
-# from memory once for the tile; attn_split computes each head's row on its own, so a row's
-# results do not depend on the heads beside it. Each token's remaining splits run on their
-# own. Writes the group's Q8 outputs into each token's activations.
-fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, scale:f32, xs:i64, n:i64)
+# + g), token s over its window of positions up to pos + s (attn_window; all of them
+# without one): the same splits (attn_part) and merges with its sink (merge_quant) as
+# llama_decode at that position, in a buffer of its own, so its results are llama_decode's
+# bit for bit. The splits that every token of the tile sees whole (all 256 positions, inside
+# every token's window) run once for all of the tile's query heads, so each K and V vector
+# is read from memory once for the tile; attn_split computes each head's row on its own, so
+# a row's results do not depend on the heads beside it. Each token's remaining splits run on
+# their own. Writes the group's Q8 outputs into each token's activations.
+fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, scale:f32, xs:i64, n:i64, win:i64, sinks:ptr)
   b0:
     tile = udiv task, nkv
     g = urem task, nkv
@@ -1101,16 +1227,24 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     h0 = mul g, group
     hd4 = mul hd, 4:i64
     qd4 = mul nh, hd4
-    # splits every token sees whole, and the last token's split count
+    # The first token's first split (the tile's lowest), the last token's window, and the
+    # splits every token sees whole: from the last token's window start rounded up to a
+    # split, to the first token's last whole split.
     p0 = add pos, s0
     npos0 = add p0, 1:i64
-    shared = udiv npos0, 256:i64
+    lo0_, base, nsp0_ = call attn_window(npos0, win)
     npos_last = add p0, tn
-    last255 = add npos_last, 255:i64
-    smax = udiv last255, 256:i64
+    lo_last, slo_last, nsp_last = call attn_window(npos_last, win)
+    smax = add slo_last, nsp_last
+    lo255 = add lo_last, 255:i64
+    sh_lo = udiv lo255, 256:i64
+    sh_hi = udiv npos0, 256:i64
     hd2 = add hd, 2:i64
     rec = mul hd2, 4:i64
-    head_b = mul smax, rec
+    # a row's records: splits base .. smax - 1, then room for the last token's sink
+    span0 = sub smax, base
+    span = add span0, 1:i64
+    head_b = mul span, rec
     rows = mul tn, group
     part_sz = mul rows, head_b
     part = alloc part_sz
@@ -1122,7 +1256,7 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     jmp gather(0:i64)
   gather(gs:i64):
     gs_more = lt gs, tn
-    br gs_more, gather_start, shared_splits(0:i64)
+    br gs_more, gather_start, shared_splits(sh_lo)
   gather_start:
     gtok = add s0, gs
     gq0 = mul gtok, qd4
@@ -1134,12 +1268,13 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     gs2 = add gs, 1:i64
     jmp gather(gs2)
   shared_splits(sp:i64):
-    sp_more = lt sp, shared
+    sp_more = lt sp, sh_hi
     br sp_more, shared_body, tokens(0:i64)
   shared_body:
-    sp_off = mul sp, rec
+    sp_rel = sub sp, base
+    sp_off = mul sp_rel, rec
     pg = add part, sp_off
-    call attn_part(g, sp, qt, kc, vc, pg, rows, hd, npos0, max_ctx, kvf, scale, head_b)
+    call attn_part(g, sp, qt, kc, vc, pg, rows, hd, npos0, max_ctx, kvf, scale, head_b, lo_last)
     sp2 = add sp, 1:i64
     jmp shared_splits(sp2)
   # Token by token: its own splits, then the merge of each of its heads.
@@ -1150,8 +1285,8 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     s = add s0, ts
     p = add pos, s
     npos = add p, 1:i64
-    npos255 = add npos, 255:i64
-    splits = udiv npos255, 256:i64
+    lo, slo, nsp = call attn_window(npos, win)
+    splits = add slo, nsp
     t_rows = mul ts, group
     t_part0 = mul t_rows, head_b
     t_part = add part, t_part0
@@ -1162,14 +1297,22 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
-    jmp split(shared)
+    jmp split(slo)
   split(tsp:i64):
     tsp_more = lt tsp, splits
-    br tsp_more, split_body, merge(0:i64)
+    br tsp_more, split_check, merge(0:i64)
+  split_check:
+    at_lo = ge tsp, sh_lo
+    below_hi = lt tsp, sh_hi
+    shared = and at_lo, below_hi
+    br shared, split_next, split_body
   split_body:
-    tsp_off = mul tsp, rec
+    tsp_rel = sub tsp, base
+    tsp_off = mul tsp_rel, rec
     tpg = add t_part, tsp_off
-    call attn_part(g, tsp, t_q, kc, vc, tpg, group, hd, npos, max_ctx, kvf, scale, head_b)
+    call attn_part(g, tsp, t_q, kc, vc, tpg, group, hd, npos, max_ctx, kvf, scale, head_b, lo)
+    jmp split_next
+  split_next:
     tsp2 = add tsp, 1:i64
     jmp split(tsp2)
   merge(r:i64):
@@ -1177,9 +1320,12 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     br r_more, merge_body, token_next
   merge_body:
     hp_off = mul r, head_b
-    hp = add t_part, hp_off
+    hp0 = add t_part, hp_off
+    first_rel = sub slo, base
+    first_off = mul first_rel, rec
+    hp = add hp0, first_off
     hq = add h0, r
-    call merge_quant(hp, splits, hd, hq, xq_s, dx_s)
+    call merge_quant(hp, nsp, hd, hq, xq_s, dx_s, sinks)
     r2 = add r, 1:i64
     jmp merge(r2)
   token_next:
@@ -1208,8 +1354,8 @@ fn copy_f32(src:ptr, dst:ptr, bytes:i64)
   done:
     ret
 
-# proj_add for n tokens: rows 64c..64c+63 of every token's residual stream += (W x).
-fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i64)
+# proj_add for n tokens: rows 64c..64c+63 of every token's residual stream += (W x + b).
+fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i64, bias:ptr)
   b0:
     w = vl f32
     tmp_sz = mul n, 256:i64
@@ -1227,6 +1373,8 @@ fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i6
     hc = add row, c_off
     t_off = mul s, 256:i64
     ts = add tmp, t_off
+    b_off = mul c, 64:i64
+    call add_rows(ts, bias, b_off, 64:i64)
     jmp add_loop(0:i64)
   add_loop(j:i64):
     more = lt j, 64:i64
@@ -1246,9 +1394,9 @@ fn proj_add_n(c:i64, mat:ptr, xq:ptr, dx:ptr, hs:ptr, k:i64, n:i64, xs:i64, d:i6
     free tmp
     ret
 
-# gate_up for n tokens: MLP rows 64c..64c+63 of every token, SwiGLU, then Q8 quantization
-# into the token's down-projection input.
-fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i64)
+# gate_up for n tokens: MLP rows 64c..64c+63 of every token, their bias and the activation,
+# then Q8 quantization into the token's down-projection input.
+fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i64, bias:ptr, act:i64)
   b0:
     tmp_sz = mul n, 256:i64
     g = alloc tmp_sz
@@ -1269,7 +1417,11 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
     t_off = mul s, 256:i64
     gs = add g, t_off
     us = add u, t_off
-    call silu_mul(gs, us, a, 64:i64)
+    gb = mul cg, 64:i64
+    call add_rows(gs, bias, gb, 64:i64)
+    ub = mul cu, 64:i64
+    call add_rows(us, bias, ub, 64:i64)
+    call glu(gs, us, a, 64:i64, act)
     x_off = mul s, xs
     aq_s = add aq, x_off
     aq_c = add aq_s, q_off
@@ -1323,12 +1475,13 @@ inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
     sin_t = ld model[4]:ptr
     ret embd, norm_out, lm, cos_t, sin_t
 
-# Layer l's entries (10 words at 5 + 10 l): its two norm weights, its QKV, O, gate/up and
-# down matrices, its q and k head norm weights (0 for none), and a mixture-of-experts layer's
-# router and expert table (0 for a dense layer).
-inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)
+# Layer l's entries (15 words at 5 + 15 l): its two norm weights, its QKV, O, gate/up and
+# down matrices, its q and k head norm weights (0 for none), a mixture-of-experts layer's
+# router and expert table (0 for a dense layer), its QKV, O and router biases and attention
+# sinks (0 for none), and its attention window in positions (0 for all of them).
+inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)
   b0:
-    slot0 = mul l, 10:i64
+    slot0 = mul l, 15:i64
     slot = add slot0, 5:i64
     lp_off = shl slot, 3:i64
     lp = add model, lp_off
@@ -1342,13 +1495,21 @@ inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, p
     k_norm = ld lp[7]:ptr
     router = ld lp[8]:ptr
     experts = ld lp[9]:ptr
-    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts
+    qkv_b = ld lp[10]:ptr
+    o_b = ld lp[11]:ptr
+    router_b = ld lp[12]:ptr
+    sinks = ld lp[13]:ptr
+    win = ld lp[14]:i64
+    ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win
 
-# cfg's mixture-of-experts words: the experts, the experts each token uses, and whether their
-# weights are renormalized (cfg[11], an expert's MLP width, is ffn's place in cfg[5]).
-inline fn load_moe(cfg:ptr)->(i64, i64, i64)
+# cfg's mixture-of-experts and MLP words: the experts, the experts each token uses, how
+# their weights are made (moe_route's gating: 0 softmax probabilities, 1 renormalized, 2 a
+# softmax of the picked logits; cfg[11], an expert's MLP width, is ffn's place in cfg[5]),
+# and the MLP's activation (glu: 0 SwiGLU, 1 gpt-oss's clamped SwiGLU).
+inline fn load_moe(cfg:ptr)->(i64, i64, i64, i64)
   b0:
     n_exp = ld cfg[9]:i64
     n_used = ld cfg[10]:i64
-    exp_norm = ld cfg[12]:i64
-    ret n_exp, n_used, exp_norm
+    gating = ld cfg[12]:i64
+    act = ld cfg[13]:i64
+    ret n_exp, n_used, gating, act

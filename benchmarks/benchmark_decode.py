@@ -33,6 +33,9 @@ kernel's.
     python benchmarks/benchmark_decode.py --gguf model.gguf --chat --prompt "Explain SSA form"
     python benchmarks/benchmark_decode.py --gguf model.gguf --threads 8   # physical cores
 
+    # gpt-oss-20b (MXFP4 experts), in its harmony chat format with --chat:
+    python benchmarks/benchmark_decode.py --gguf gpt-oss-20b-mxfp4.gguf --chat --prompt "Hi"
+
     # Random weights (no download):
     python benchmarks/benchmark_decode.py                       # Q4_0, 16 layers, 32 tokens
     python benchmarks/benchmark_decode.py --weights q8 --layers 4 --tokens 16 --no-numpy
@@ -84,9 +87,16 @@ KERNEL: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "exa
 
 
 def chat_prompt(text: str, arch: str = "llama") -> str:
-    """The chat format of `arch` for one user turn, without a system message: Llama 3's, or
-    Qwen3's in its non-thinking mode (an empty think block, as its template writes it)."""
-    if arch == "qwen3":
+    """The chat format of `arch` for one user turn: Llama 3's or Qwen3's without a system
+    message (Qwen3 in its non-thinking mode, an empty think block, as its template writes
+    it), or gpt-oss's harmony format with its template's system message at low reasoning
+    effort (the model answers in an analysis channel, then the final one)."""
+    if arch == "gpt-oss":
+        return ("<|start|>system<|message|>You are ChatGPT, a large language model trained by "
+                "OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: low\n\n# Valid channels: "
+                "analysis, commentary, final. Channel must be included for every message."
+                f"<|end|><|start|>user<|message|>{text}<|end|><|start|>assistant")
+    if arch in ("qwen3", "qwen3moe"):
         return (f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
                 "<think>\n\n</think>\n\n")
     return (f"<|start_header_id|>user<|end_header_id|>\n\n{text}<|eot_id|>"
@@ -153,6 +163,11 @@ def main() -> None:
     parser.add_argument("--moe", action="store_true",
                         help="random model with Qwen3-30B-A3B's layer shapes (mixtures of 128 "
                              "experts, 8 used per token; use few --layers)")
+    parser.add_argument("--gpt-oss", action="store_true",
+                        help="random model with gpt-oss-20b's layer shapes and additions "
+                             "(mixtures of 32 experts, 4 used per token, biases, sinks, a "
+                             "128-position window in every other layer; use few --layers and "
+                             "--weights mx4)")
     parser.add_argument("--weights", choices=["q4", "q8", "q6", "q4k", "q5k", "q41", "iq4", "mx4"], default="q4",
                         help="random model weight format (default: q4)")
     parser.add_argument("--tokens", type=int, default=32, help="tokens to generate")
@@ -175,7 +190,8 @@ def main() -> None:
     parser.add_argument("--json", metavar="PATH", help="also write the timings as JSON")
     args: argparse.Namespace = parser.parse_args()
     # PyTorch's forward pass has dense MLPs only.
-    use_torch: bool = torch is not None and not args.no_torch and not args.moe
+    use_torch: bool = torch is not None and not args.no_torch and not args.moe and \
+        not args.gpt_oss
     kv_q8: bool = args.kv_cache == "int8"
     if args.llama_bench and not args.gguf:
         parser.error("--llama-bench needs --gguf")
@@ -189,7 +205,7 @@ def main() -> None:
         g: GGUF = GGUF(args.gguf)
         tok = Tokenizer(g)
         if g.meta.get(f"{g.meta.get('general.architecture')}.expert_count", 0):
-            use_torch = False
+            use_torch = False  # PyTorch runs dense MLPs only
         if args.prompt_tokens:
             # Random ordinary tokens (below the special ones), as llama-bench uses; no stop
             # tokens, so every run generates exactly --tokens.
@@ -200,7 +216,8 @@ def main() -> None:
             prompt: str = chat_prompt(args.prompt, arch) if args.chat else args.prompt
             prompt_ids = tok.encode(prompt)
             stop = {tok.ids[t] for t in ("<|eot_id|>", "<|end_of_text|>", "<|eom_id|>",
-                                         "<|im_end|>", "<|endoftext|>") if t in tok.ids}
+                                         "<|im_end|>", "<|endoftext|>", "<|return|>",
+                                         "<|call|>") if t in tok.ids}
         model: Model = Model.from_gguf(g, max_ctx=len(prompt_ids) + args.tokens + 1,
                                        numpy=not args.no_numpy, use_torch=use_torch,
                                        kv_q8=kv_q8)
@@ -215,8 +232,19 @@ def main() -> None:
         model = Model.random(d=2048, layers=args.layers, heads=32, kv_heads=4, head_dim=128,
                              ffn=768, vocab=151936, max_ctx=len(prompt_ids) + args.tokens + 1,
                              fmt=args.weights, numpy=not args.no_numpy, kv_q8=kv_q8,
-                             qk_norm=True, moe=(128, 8, True))
+                             qk_norm=True, moe=(128, 8, 1))
         print(f"Qwen3-30B-A3B layer shapes (128 experts, 8 used), random weights, "
+              f"{args.layers} layers, {args.weights.upper()} {model.weight_bytes() / 1e9:.2f} GB "
+              f"read per token (built in {time.perf_counter() - t0:.1f} s); prompt of "
+              f"{len(prompt_ids)} tokens, decoding {args.tokens}")
+    elif args.gpt_oss:
+        prompt_ids = [int(t) for t in np.random.default_rng(1).integers(
+            0, 199998, max(args.prompt_tokens or 16, 1))]
+        model = Model.random(d=2880, layers=args.layers, heads=64, kv_heads=8, head_dim=64,
+                             ffn=2880, vocab=201088, max_ctx=len(prompt_ids) + args.tokens + 1,
+                             fmt=args.weights, numpy=not args.no_numpy, kv_q8=kv_q8,
+                             moe=(32, 4, 2), gpt_oss=128)
+        print(f"gpt-oss-20b layer shapes (32 experts, 4 used), random weights, "
               f"{args.layers} layers, {args.weights.upper()} {model.weight_bytes() / 1e9:.2f} GB "
               f"read per token (built in {time.perf_counter() - t0:.1f} s); prompt of "
               f"{len(prompt_ids)} tokens, decoding {args.tokens}")

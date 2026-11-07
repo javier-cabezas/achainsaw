@@ -667,8 +667,8 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
     def test_loader_conversions(self) -> None:
         m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
         e: dict[str, Floats] = self.expected
-        self.assertEqual(m.moe, (EXPERTS, EXPERTS_USED, True))
-        self.assertEqual(list(m.cfg[9:]), [EXPERTS, EXPERTS_USED, EXPERT_FFN, 1])
+        self.assertEqual(m.moe, (EXPERTS, EXPERTS_USED, 1))
+        self.assertEqual(list(m.cfg[9:]), [EXPERTS, EXPERTS_USED, EXPERT_FFN, 1, 0])
         for i, layer in enumerate(m.layers):
             p: str = f"blk.{i}."
             self.assertIsNone(layer["gate_up"])
@@ -703,7 +703,7 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
         # logits the kernel computes but never picks.
         m: Model = Model.random(d=128, layers=2, heads=4, kv_heads=2, head_dim=64, ffn=128,
                                 vocab=256, max_ctx=8, numpy=True, qk_norm=True,
-                                moe=(32, 4, True))
+                                moe=(32, 4, 1))
         router: Mat | None = m.layers[0]["router"]
         assert router is not None
         self.assertEqual(router.rows, 64)
@@ -729,6 +729,173 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
                 token = got
 
 
+
+# The tiny gpt-oss: experts, experts used per token, an expert's MLP width, and the window of
+# the even layers.
+OSS_EXPERTS: int = 32
+OSS_USED: int = 4
+OSS_FFN: int = 128
+OSS_WINDOW: int = 4
+
+
+def gpt_oss_meta(tokens: list[str], types: list[int], merges: list[str]) -> dict[str, tuple[int, Any]]:
+    """A tiny gpt-oss GGUF's metadata: gpt-oss's attention (YaRN over 4096 positions, a window
+    in the even layers) and router, at the test's shapes, with the GPT-4o pre-tokenizer."""
+    return {
+        "general.architecture": (8, "gpt-oss"),
+        "general.name": (8, "tiny gpt-oss"),
+        "gpt-oss.block_count": (4, 2),
+        "gpt-oss.context_length": (4, 131072),
+        "gpt-oss.embedding_length": (4, D),
+        "gpt-oss.feed_forward_length": (4, OSS_FFN),
+        "gpt-oss.expert_feed_forward_length": (4, OSS_FFN),
+        "gpt-oss.expert_count": (4, OSS_EXPERTS),
+        "gpt-oss.expert_used_count": (4, OSS_USED),
+        "gpt-oss.attention.head_count": (4, HEADS),
+        "gpt-oss.attention.head_count_kv": (4, KV_HEADS),
+        "gpt-oss.attention.key_length": (4, HEAD_DIM),
+        "gpt-oss.attention.value_length": (4, HEAD_DIM),
+        "gpt-oss.attention.sliding_window": (4, OSS_WINDOW),
+        "gpt-oss.attention.layer_norm_rms_epsilon": (6, 1e-5),
+        "gpt-oss.rope.freq_base": (6, 150000.0),
+        "gpt-oss.rope.scaling.type": (8, "yarn"),
+        "gpt-oss.rope.scaling.factor": (6, 32.0),
+        "gpt-oss.rope.scaling.original_context_length": (4, 4096),
+        "tokenizer.ggml.model": (8, "gpt2"),
+        "tokenizer.ggml.pre": (8, "gpt-4o"),
+        "tokenizer.ggml.tokens": (9, (8, tokens)),
+        "tokenizer.ggml.token_type": (9, (5, types)),
+        "tokenizer.ggml.merges": (9, (8, merges)),
+        "tokenizer.ggml.bos_token_id": (4, tokens.index("<|begin_of_text|>")),
+        "tokenizer.ggml.eos_token_id": (4, tokens.index("<|end_of_text|>")),
+        "tokenizer.ggml.add_bos_token": (7, False),
+    }
+
+
+def gpt_oss_tensors(rng: np.random.Generator, expected: dict[str, Floats],
+                    expert_types: list[int]) -> list[tuple[str, list[int], int, U8]]:
+    """A tiny gpt-oss GGUF's tensors (their values into `expected`): Q8_0 attention with f32
+    biases and sinks, an f32 router and its bias, and per layer 3-D expert tensors of the
+    given type (MXFP4 in gpt-oss) with f32 biases, and an untied Q8_0 LM head."""
+    tensors: list[tuple[str, list[int], int, U8]] = []
+
+    def add(name: str, t: int, rows: int, k: int, dims: list[int] | None = None,
+            **kw: Any) -> None:
+        raw, vals, *_ = ENCODERS[t](rng, rows, k, **kw)
+        expected[name] = vals.reshape(rows, k)
+        tensors.append((name, dims or ([k] if rows == 1 else [k, rows]), t, raw))
+
+    def uniform(lo: float, hi: float, *shape: int) -> Floats:
+        v: Floats = rng.uniform(lo, hi, shape)
+        return v
+
+    add("token_embd.weight", 8, VOCAB, D)
+    add("output.weight", 8, VOCAB, D)
+    add("output_norm.weight", 0, 1, D)
+    for i, et in enumerate(expert_types):
+        p: str = f"blk.{i}."
+        add(p + "attn_norm.weight", 0, 1, D)
+        add(p + "post_attention_norm.weight", 0, 1, D)
+        for name in ("attn_q", "attn_k", "attn_v", "attn_output"):
+            rows, k = SHAPES[name]
+            add(f"{p}{name}.weight", 8, rows, k)
+            add(f"{p}{name}.bias", 0, 1, rows, values=uniform(-0.3, 0.3, 1, rows))
+        # Sinks around the scores' own range, so they take a share of every softmax.
+        add(p + "attn_sinks.weight", 0, 1, HEADS, values=uniform(-1.0, 2.0, 1, HEADS))
+        # The router's logits a few units apart, as a trained model's are.
+        add(p + "ffn_gate_inp.weight", 0, OSS_EXPERTS, D,
+            values=rng.standard_normal((OSS_EXPERTS, D)) * 4 / np.sqrt(D))
+        add(p + "ffn_gate_inp.bias", 0, 1, OSS_EXPERTS, values=uniform(-1.0, 1.0, 1, OSS_EXPERTS))
+        for name in ("gate", "up"):
+            add(f"{p}ffn_{name}_exps.weight", et, OSS_EXPERTS * OSS_FFN, D,
+                dims=[D, OSS_FFN, OSS_EXPERTS])
+            add(f"{p}ffn_{name}_exps.bias", 0, OSS_EXPERTS, OSS_FFN,
+                values=uniform(-0.5, 0.5, OSS_EXPERTS, OSS_FFN))
+        add(p + "ffn_down_exps.weight", et, OSS_EXPERTS * D, OSS_FFN,
+            dims=[OSS_FFN, D, OSS_EXPERTS])
+        add(p + "ffn_down_exps.bias", 0, OSS_EXPERTS, D,
+            values=uniform(-0.2, 0.2, OSS_EXPERTS, D))
+    return tensors
+
+
+class TestGptOssGGUF(TestGGUFDecode):
+    """A tiny gpt-oss GGUF: attention with QKV and O biases, sinks, YaRN and a window of
+    OSS_WINDOW positions in layer 0, then a mixture of 32 MXFP4 experts with biases under a
+    biased f32 router (a softmax of the picked logits) and the clamped SwiGLU. The kernel
+    (8 positions) and prefill (13 tokens) tests are inherited, so both run past the window."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rng: np.random.Generator = np.random.default_rng(21)
+        tokens, types, merges = tiny_vocab()
+        cls.expected = {}
+        cls.k_codes = {}
+        tensors: list[tuple[str, list[int], int, U8]] = gpt_oss_tensors(
+            rng, cls.expected, [39, 39])
+        cls.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.path = os.path.join(cls.tmp.name, "gpt-oss.gguf")
+        write_gguf(cls.path, gpt_oss_meta(tokens, types, merges), tensors)
+        cls.gguf = GGUF(cls.path)
+
+    def test_loader_conversions(self) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
+        e: dict[str, Floats] = self.expected
+        self.assertEqual(m.moe, (OSS_EXPERTS, OSS_USED, 2))
+        self.assertEqual(list(m.cfg[9:]), [OSS_EXPERTS, OSS_USED, OSS_FFN, 2, 1])
+        self.assertEqual([l["window"] for l in m.layers], [OSS_WINDOW, 0])
+        self.assertEqual(m.formats["experts"], ["mx4"])
+        self.assertEqual(m.lm.fmt, "q8")
+        gu_rows: npt.NDArray[np.intp] = np.arange(2 * OSS_FFN).reshape(
+            2, OSS_FFN // 64, 64).transpose(1, 0, 2).reshape(-1)
+        for i, layer in enumerate(m.layers):
+            p: str = f"blk.{i}."
+            # Biases and sinks as written: QKV's rows in the file's order (NeoX RoPE), each
+            # expert's gate/up bias chunk-interleaved as its rows.
+            qkv_b: F32 | None = layer["qkv_b"]
+            o_b: F32 | None = layer["o_b"]
+            sinks: F32 | None = layer["sinks"]
+            router_b: F32 | None = layer["router_b"]
+            expert_b: list[tuple[F32, F32]] | None = layer["expert_b"]
+            assert qkv_b is not None and o_b is not None and sinks is not None
+            assert router_b is not None and expert_b is not None
+            np.testing.assert_array_equal(qkv_b, np.concatenate(
+                [e[f"{p}attn_{n}.bias"][0] for n in ("q", "k", "v")]))
+            np.testing.assert_array_equal(o_b, e[p + "attn_output.bias"][0])
+            np.testing.assert_array_equal(sinks, e[p + "attn_sinks.weight"][0])
+            np.testing.assert_array_equal(router_b, e[p + "ffn_gate_inp.bias"][0])
+            np.testing.assert_array_equal(layer["ffn_norm"], e[p + "post_attention_norm.weight"][0])
+            for x in (0, OSS_EXPERTS - 1):
+                gub, dnb = expert_b[x]
+                np.testing.assert_array_equal(gub, np.concatenate(
+                    [e[p + "ffn_gate_exps.bias"][x], e[p + "ffn_up_exps.bias"][x]])[gu_rows])
+                np.testing.assert_array_equal(dnb, e[p + "ffn_down_exps.bias"][x])
+            experts: list[tuple[Mat, Mat]] | None = layer["experts"]
+            assert experts is not None
+            # MXFP4 bit for bit: values and power-of-two scales.
+            dn: Mat = experts[7][1]
+            got: Floats = (dn.q_blocks * dn.s_blocks[:, :, None]).transpose(1, 0, 2).reshape(
+                dn.rows, -1)
+            np.testing.assert_array_equal(got, e[p + "ffn_down_exps.weight"][7 * D:8 * D])
+        # YaRN: cos and sin scaled by 1 + 0.1 ln 32 (so cos at position 0), and the fastest
+        # dimension's angle unscaled (extrapolated), the slowest's divided by 32.
+        mscale: float = 1 + 0.1 * np.log(32.0)
+        np.testing.assert_allclose(m.cos[0], mscale, rtol=1e-6)
+        ang: F32 = np.arctan2(m.sin[3], m.cos[3])
+        self.assertAlmostEqual(float(ang[0]), 3.0, places=5)
+        theta_last: float = 3.0 * 150000.0 ** (-2.0 * (HEAD_DIM // 2 - 1) / HEAD_DIM)
+        self.assertAlmostEqual(float(ang[-1]), theta_last / 32, places=7)
+
+    def test_tokenizer(self) -> None:
+        tok: Tokenizer = Tokenizer(self.gguf)
+        # GPT-4o's pre-tokenizer: words split at a lower-to-upper case change and keep their
+        # contraction (or a punctuation mark before them), digits in threes, punctuation
+        # with a trailing slash or newline.
+        self.assertEqual(tok.split.findall("HelloWorld don't 12345 a/b x!!/\nCAPSlock"),
+                         ["Hello", "World", " don't", " ", "123", "45", " a", "/b", " x",
+                          "!!/\n", "CAPSlock"])
+        ids: dict[str, int] = {t: i for i, t in enumerate(tok.tokens)}
+        self.assertEqual(tok.encode("the cat"), [ord("t"), ids["he"], ids["Ġcat"]])
+        self.assertEqual(tok.decode(tok.encode("the cat 42!")), "the cat 42!")
 
 class TestMxfp4(unittest.TestCase):
     def test_scales_outside_f16_become_q8(self) -> None:

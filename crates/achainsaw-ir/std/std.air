@@ -1487,6 +1487,44 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
   done:
     ret
 
+# out = x / (1 + exp(-alpha x)) * (y + 1) for n f32 values, x = min(gate, limit) and y = up
+# clamped to [-limit, limit]: gpt-oss's SwiGLU (alpha 1.702, limit 7), as llama.cpp computes
+# it (ggml_swiglu_oai). The clamps compare and select, so a NaN gate or up passes through.
+fn swiglu_oai(gate:ptr, up:ptr, out:ptr, n:i64, alpha:f32, limit:f32)
+  b0:
+    w = vl f32
+    v_one = splat 1.0:f32:vx
+    v_lim = splat limit:vx
+    nlim = neg limit
+    v_nlim = splat nlim:vx
+    nalpha = neg alpha
+    v_na = splat nalpha:vx
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, done
+  body:
+    rest = sub n, i
+    g = ldm gate[i]:vx, rest:f32
+    u = ldm up[i]:vx, rest:f32
+    g_hi = vgt g, v_lim:f32
+    x = vsel g_hi, v_lim, g
+    u_hi = vgt u, v_lim:f32
+    u1 = vsel u_hi, v_lim, u
+    u_lo = vlt u1, v_nlim:f32
+    y = vsel u_lo, v_nlim, u1
+    ax = vmul x, v_na:f32
+    e = vexp ax:f32
+    den = vadd e, v_one:f32
+    glu = vdiv x, den:f32
+    y1 = vadd y, v_one:f32
+    o = vmul glu, y1:f32
+    stm out[i], o, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  done:
+    ret
+
 # Attention of `group` query heads (f32 rows of hd at qg) over nt >= 1 positions of one KV
 # head: one split of flash-decoding. K is stored in tiles of 32 positions, each [hd x 32]
 # bf16 (value j of position t at (t / 32 * 32 * hd + 32 j + t mod 32) * 2 bytes from kb),
@@ -1496,8 +1534,10 @@ fn silu_mul(gate:ptr, up:ptr, out:ptr, n:i64)
 # attn_merge combines splits. Scores take positions in lanes: each K vector, widened from
 # bf16 once, gets 4 heads' FMAs with their query values broadcast (then one head at a time
 # for the rest of the group), and no score needs a horizontal sum. Outputs take V's columns
-# in lanes, 4 heads' sums in registers over all positions of the split.
-fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f32, head_b:i64)
+# in lanes, 4 heads' sums in registers over all positions of the split. The positions before
+# t0 (t0 < nt; kb and vb start at a tile) take no part: their probabilities are 0, so a
+# sliding window can start inside a tile.
+fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, t0:i64, scale:f32, head_b:i64)
   b0:
     w16 = vl bf16
     w32 = vl f32
@@ -1627,6 +1667,7 @@ fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f
   sm_head:
     srow0 = mul h, ntb
     srow = add sc, srow0
+    call attn_front(srow, t0, low)
     jmp sm_vmax(0:i64, v_low)
   sm_vmax(um:i64, mv:vx):
     u_end = add um, w32
@@ -1648,7 +1689,11 @@ fn attn_split(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f
     uu2 = add uu, 1:i64
     jmp sm_smax(uu2, mx2)
   sm_exp:
-    total = call exp_shift(srow, nt, mx)
+    t0b = shl t0, 2:i64
+    srow_t0 = add srow, t0b
+    nt_w = sub nt, t0
+    total = call exp_shift(srow_t0, nt_w, mx)
+    call attn_front(srow, t0, 0.0:f32)
     pr_off = mul h, head_b
     prow = add pg, pr_off
     st prow, mx
@@ -1769,6 +1814,21 @@ inline fn score_store(sc:ptr, si:i64, w32:i64, lo:vx, hi:vx, v_scale:vx, n_lo:i6
     stm sc[si_hi], shi, n_hi:f32
     ret
 
+# Sets the first t0 scores of an attn_split row to v: the lowest f32 before the max (which it
+# leaves as it is), then 0 for the probabilities, the exponentials having run from t0.
+inline fn attn_front(row:ptr, t0:i64, v:f32)
+  b0:
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, t0
+    br more, body, done
+  body:
+    st row[i], v
+    i2 = add i, 1:i64
+    jmp loop(i2)
+  done:
+    ret
+
 # attn_split over an int8 cache. K and V of the KV head are in tiles of 32 positions, each
 # 32 * (hd + 4) bytes from kb (vb): the values, then 32 f32 scales, one per position (a value
 # is its scale times the int8). K's values are stored plus 128, [hd / 4 x 32 x 4] (byte q of
@@ -1777,8 +1837,8 @@ inline fn score_store(sc:ptr, si:i64, w32:i64, lo:vx, hi:vx, v_scale:vx, n_lo:i6
 # scale per row (attn_q8_rows), so a score is an exact int32 dot, less 128 times the query's
 # sum, times the K scale, the query scale and `scale`; positions are in lanes, as in
 # attn_split. Each probability takes its position's V scale before P V, which widens V's
-# int8 columns to f32. Records as attn_split's.
-fn attn_split_q8(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scale:f32, head_b:i64)
+# int8 columns to f32. Records as attn_split's, and positions before t0 left out as there.
+fn attn_split_q8(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, t0:i64, scale:f32, head_b:i64)
   b0:
     w16 = vl bf16
     w32 = vl f32
@@ -1924,6 +1984,7 @@ fn attn_split_q8(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scal
   sm_head:
     srow0 = mul h, ntb
     srow = add sc, srow0
+    call attn_front(srow, t0, low)
     jmp sm_vmax(0:i64, v_low)
   sm_vmax(um:i64, mv:vx):
     u_end = add um, w32
@@ -1945,7 +2006,11 @@ fn attn_split_q8(qg:ptr, kb:ptr, vb:ptr, pg:ptr, group:i64, hd:i64, nt:i64, scal
     uu2 = add uu, 1:i64
     jmp sm_smax(uu2, mx2)
   sm_exp:
-    total = call exp_shift(srow, nt, mx)
+    t0b = shl t0, 2:i64
+    srow_t0 = add srow, t0b
+    nt_w = sub nt, t0
+    total = call exp_shift(srow_t0, nt_w, mx)
+    call attn_front(srow, t0, 0.0:f32)
     pr_off = mul h, head_b
     prow = add pg, pr_off
     st prow, mx
