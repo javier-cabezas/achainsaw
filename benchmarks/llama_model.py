@@ -1,6 +1,6 @@
 """
-Llama-style models for examples/kernels/llama_decode.air: Q8_0, Q4_0, Q6_K, Q4_K, Q5_K, Q4_1 and
-IQ4_NL weight matrices in the kernel's packed layout, a random model or one loaded from a GGUF file (benchmarks/gguf.py),
+Llama-style models for examples/kernels/llama_decode.air: Q8_0, Q4_0, Q6_K, Q4_K, Q5_K, Q4_1,
+IQ4_NL and MXFP4 weight matrices in the kernel's packed layout, a random model or one loaded from a GGUF file (benchmarks/gguf.py),
 the kernel's model table, a NumPy forward pass with the kernel's data types, and a PyTorch
 forward pass on PyTorch's weight-only quantized kernels (see Mat.prepare_torch).
 
@@ -14,6 +14,9 @@ GGUF tensors are converted as follows:
   Q4_1             -> bit for bit: 4-bit values and an f16 scale and min per 32 values
   IQ4_NL           -> bit for bit: 4-bit codes into the int8 codebook and an f16 scale per
                       32 values
+  MXFP4            -> bit for bit: 4-bit E2M1 codes and their power-of-two scale per 32
+                      values as an f16 (exact for every scale of a trained model, 2^-24 to
+                      2^15, and 0 for a block of zeros; a matrix with others becomes Q8_0)
   anything else    -> dequantized to f32, then Q8_0 as llama.cpp quantizes it (e.g. F16,
                       BF16)
 A fused QKV matrix keeps each part's format (Parts: Q4_K_M files store V as Q6_K in some
@@ -37,7 +40,8 @@ try:
 except ImportError:
     torch = None
 
-from gguf import F32, GGUF, IQ4_NL_VALUES, U8, Floats, Ints, Tensor, k_quant_codes
+from gguf import (F32, GGUF, IQ4_NL_VALUES, MXFP4_VALUES, U8, Floats, Ints, Tensor, k_quant_codes,
+                  mxfp4_scale)
 
 I8: TypeAlias = npt.NDArray[np.int8]
 # Q4_K and Q5_K scales as GGUF stores them: 6-bit scale and min codes [rows x k/32] and the
@@ -93,10 +97,12 @@ class Mat:
       Q4_1: q uint8 [rows x k/32 x 32] in 0..15, sub = 32, and f16 mins `m` [rows x k/32]
             (GGUF's negated): weight d * q - m
       IQ4_NL: q uint8 [rows x k/32 x 16], GGUF's code bytes as Q4_0's (byte t: codes of
-            values t and t + 16), each value the codebook entry IQ4_NL_VALUES[code]; sub = 32"""
+            values t and t + 16), each value the codebook entry IQ4_NL_VALUES[code]; sub = 32
+      MXFP4: as IQ4_NL with the codebook MXFP4_VALUES (twice E2M1's values) and scales
+            that are powers of two (GGUF's E8M0 byte e, 2^(e - 128))"""
 
     FORMATS: dict[str, int] = {"q8": 0, "q4": 1, "q6": 2, "q4k": 3, "q5k": 4, "q41": 5,
-                               "iq4": 6}
+                               "iq4": 6, "mx4": 7}
 
     # The kernel's layout, from pack().
     packed_q: Ints
@@ -140,9 +146,9 @@ class Mat:
         nb: int = k // 32
         m: F32 | None = None
         top: int = 0
-        if fmt in ("q4", "iq4"):
+        if fmt in ("q4", "iq4", "mx4"):
             q: Ints = rng.integers(0, 256, size=(rows, nb, 16), dtype=np.uint8)
-            scale: float = 4.6 if fmt == "q4" else 60.0
+            scale: float = {"q4": 4.6, "iq4": 60.0, "mx4": 5.9}[fmt]
         elif fmt == "q6":
             q = rng.integers(-32, 32, size=(rows, nb, 32), dtype=np.int8)
             scale = 18.5
@@ -165,6 +171,9 @@ class Mat:
             return cls.k_quant(fmt, q, (sc, mn, ds, f16_round(ds * (top / 2))))
         n_scales: int = k // (16 if fmt == "q6" else 32)
         d: F32 = f16_round(rng.uniform(0.75, 1.0, size=(rows, n_scales)) / (scale * np.sqrt(k)))
+        if fmt == "mx4":
+            # Powers of two, as E8M0 scales are.
+            d = np.exp2(np.round(np.log2(d))).astype(np.float32)
         if fmt == "q41":
             # Mins near the middle of the values' range.
             m = f16_round(d * 8 * rng.uniform(0.9, 1.1, size=d.shape))
@@ -183,6 +192,15 @@ class Mat:
             dn: F32 = np.ascontiguousarray(b[:, :, 0:2]).view(np.float16)[:, :, 0].astype(
                 np.float32)
             return cls("iq4", np.ascontiguousarray(b[:, :, 2:18]), dn)
+        if t.type_name == "MXFP4":
+            b = t.blocks()
+            e: U8 = b[:, :, 0]
+            qs: U8 = np.ascontiguousarray(b[:, :, 1:17])
+            # A block of zeros (codes 0 and 8, which llama.cpp's quantizer writes with e = 0)
+            # takes any scale: 0.
+            zero: npt.NDArray[np.bool_] = np.all(((qs & 7) == 0) & ((qs >> 4 & 7) == 0), axis=2)
+            if np.all(zero | ((e >= 104) & (e <= 143))):
+                return cls("mx4", qs, np.where(zero, np.float32(0), mxfp4_scale(e)))
         if t.type_name == "Q4_1":
             b = t.blocks()
             f: F32 = np.ascontiguousarray(b[:, :, 0:4]).view(np.float16).astype(np.float32)
@@ -209,7 +227,7 @@ class Mat:
 
     def dequantize(self) -> F32:
         """f32 [rows x k]."""
-        if self.fmt in ("q4", "iq4"):
+        if self.fmt in ("q4", "iq4", "mx4"):
             return self.to_q8().dequantize()
         w: F32 = self.q.reshape(self.rows, -1, self.sub) * self.d[:, :, None]
         if self.m is not None:
@@ -222,10 +240,10 @@ class Mat:
         if self.fmt == "q4":
             q: I8 = np.concatenate([self.q & 15, self.q >> 4], axis=2).astype(np.int8) - np.int8(8)
             return Mat("q8", q, self.d)
-        if self.fmt == "iq4":
+        if self.fmt in ("iq4", "mx4"):
             # Exactly: the codebook values are int8, under the same scales.
-            return Mat("q8", IQ4_NL_VALUES[np.concatenate([self.q & 15, self.q >> 4], axis=2)],
-                       self.d)
+            book: npt.NDArray[np.int8] = IQ4_NL_VALUES if self.fmt == "iq4" else MXFP4_VALUES
+            return Mat("q8", book[np.concatenate([self.q & 15, self.q >> 4], axis=2)], self.d)
         return Mat("q8", *quantize_rows(self.dequantize()))
 
     def take(self, rows: Rows) -> Mat:
@@ -255,8 +273,8 @@ class Mat:
 
     def values(self) -> Ints:
         """int8 [rows x k/32 x 32]: the integer weights (q - 8 for Q4_0, the codebook values for
-        IQ4_NL; unsigned for Q4_K, Q5_K and Q4_1, whose mins matvec applies)."""
-        if self.fmt in ("q4", "iq4"):
+        IQ4_NL and MXFP4; unsigned for Q4_K, Q5_K and Q4_1, whose mins matvec applies)."""
+        if self.fmt in ("q4", "iq4", "mx4"):
             return self.to_q8().q
         return self.q
 
@@ -273,8 +291,8 @@ class Mat:
         """The kernel's layout (see qmat_chunk in the AIR standard library): 64-row chunks;
         per chunk and 32-block, groups of 4 consecutive bytes of a row form one 32-bit lane,
         byte (g * 64 + j) * 4 + q holding row j's byte 4g + q: its int8 values plus 128 for Q8_0, its
-        nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q), IQ4_NL (its code bytes, the
-        same way) and Q4_K (the same, from its values); for Q6_K the low 4 bits as Q4_0's nibbles, then a 512-byte plane whose byte
+        nibble bytes for Q4_0 (values 4g + q and 16 + 4g + q), IQ4_NL and MXFP4 (their code
+        bytes, the same way) and Q4_K (the same, from its values); for Q6_K the low 4 bits as Q4_0's nibbles, then a 512-byte plane whose byte
         (g * 64 + j) * 4 + q holds the high 2 bits of values 8p + 4g + q in bit pair p; for
         Q5_K the low 4 bits as nibbles, then a 256-byte plane whose byte j * 4 + q holds the
         top bits of values 4g + q (bit g) and 16 + 4g + q (bit 4 + g); Q4_1's values as Q4_K's.
@@ -288,8 +306,8 @@ class Mat:
             # [c, 64, nb, n] row bytes -> [c, nb, n/4 groups, 64 rows, 4]
             return v.reshape(c, 64, nb, n // 4, 4).transpose(0, 2, 3, 1, 4).reshape(c, nb, -1)
 
-        if self.fmt in ("q4", "iq4"):
-            # The code bytes; the kernel looks IQ4_NL's codes up in its codebook.
+        if self.fmt in ("q4", "iq4", "mx4"):
+            # The code bytes; the kernel looks IQ4_NL's and MXFP4's codes up in its codebook.
             q: Ints = lanes(self.q, 16)
         elif self.has_min:
             u: Ints = self.q.reshape(c, 64, nb, 32)
