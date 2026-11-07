@@ -747,9 +747,20 @@ class TestMxfp4(unittest.TestCase):
             want: F32 = Tensor("w", [128, 64], 39, out).dequantize()
             mat = Mat.from_tensor(Tensor("w", [128, 64], 39, out))
             self.assertEqual(mat.fmt, "q8")
-            # Q8_0's rounding: at most half a step of its block's scale, max / 127.
+            # Q8_0's rounding: at most half a step of its block's scale (the block's max / 127,
+            # at most the row's), or the whole value where that scale underflows f16 (the
+            # e = 103 block's values, below 2^-21).
             err: Floats = np.abs(mat.dequantize() - want)
             self.assertTrue(np.all(err <= np.abs(want).max(axis=1, keepdims=True) / 200), e)
+        # A block of zeros, which llama.cpp writes with e = 0 (any scale fits), stays MXFP4.
+        out = raw.copy()
+        out[5, 17:34] = 0
+        out[6, 17] = 0
+        out[6, 18:34] = 0x88  # code 8, -0
+        mat = Mat.from_tensor(Tensor("w", [128, 64], 39, out))
+        self.assertEqual(mat.fmt, "mx4")
+        np.testing.assert_array_equal(mat.dequantize(),
+                                      Tensor("w", [128, 64], 39, out).dequantize())
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ GGUF tensors are converted as follows:
                       32 values
   MXFP4            -> bit for bit: 4-bit E2M1 codes and their power-of-two scale per 32
                       values as an f16 (exact for every scale of a trained model, 2^-24 to
-                      2^15; a matrix with others becomes Q8_0)
+                      2^15, and 0 for a block of zeros; a matrix with others becomes Q8_0)
   anything else    -> dequantized to f32, then Q8_0 as llama.cpp quantizes it (e.g. F16,
                       BF16)
 A fused QKV matrix keeps each part's format (Parts: Q4_K_M files store V as Q6_K in some
@@ -195,8 +195,12 @@ class Mat:
         if t.type_name == "MXFP4":
             b = t.blocks()
             e: U8 = b[:, :, 0]
-            if np.all((e >= 104) & (e <= 143)):
-                return cls("mx4", np.ascontiguousarray(b[:, :, 1:17]), mxfp4_scale(e))
+            qs: U8 = np.ascontiguousarray(b[:, :, 1:17])
+            # A block of zeros (codes 0 and 8, which llama.cpp's quantizer writes with e = 0)
+            # takes any scale: 0.
+            zero: npt.NDArray[np.bool_] = np.all(((qs & 7) == 0) & ((qs >> 4 & 7) == 0), axis=2)
+            if np.all(zero | ((e >= 104) & (e <= 143))):
+                return cls("mx4", qs, np.where(zero, np.float32(0), mxfp4_scale(e)))
         if t.type_name == "Q4_1":
             b = t.blocks()
             f: F32 = np.ascontiguousarray(b[:, :, 0:4]).view(np.float16).astype(np.float32)
