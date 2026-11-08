@@ -42,7 +42,8 @@
 # bias and renormalized (GLM-4.5, dots.llm1), 4 the same not renormalized; 0s for a dense
 # model), then the MLP's activation (0 SwiGLU, 1 gpt-oss's clamped SwiGLU), the rotary
 # dimensions of a head (0 for all of head_dim; GLM-4.5 rotates half), the shared experts'
-# MLP width (0 for none) and the routed experts' weight scale (an f32 in the low 4 bytes)
+# MLP width (0 for none) and the routed experts' weight scale (an f32 in the low 4 bytes, 0
+# for 1)
 # model (table of 8-byte words): a matrix is a pointer to its parts, 4 words each: packed
 # weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K, 5: Q4_1, 6: IQ4_NL,
 # 7: MXFP4) and number of 64-row chunks (see qmat_chunk in the standard library). A vector
@@ -2070,7 +2071,7 @@ inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, p
 
 # cfg's words 11 and 14-16: an expert's MLP width, the rotary dimensions of a head (0 for
 # all hd; GLM-4.5 rotates half), the shared experts' MLP width (0 for none) and the routed
-# experts' weight scale (an f32 in the word's low 4 bytes).
+# experts' weight scale (an f32 in the word's low 4 bytes; 0 for 1).
 inline fn load_ext(cfg:ptr, hd:i64)->(i64, i64, i64, f32)
   b0:
     fe = ld cfg[11]:i64
@@ -2078,7 +2079,11 @@ inline fn load_ext(cfg:ptr, hd:i64)->(i64, i64, i64, f32)
     none = eq rd0, 0:i64
     rd = select none, hd, rd0
     fs = ld cfg[15]:i64
-    wscale = ld cfg[16:i64]:f32
+    # 0 for a scale of 1, as for the other words' defaults
+    ws_bits = ld cfg[16]:i64
+    ws_none = eq ws_bits, 0:i64
+    ws0 = ld cfg[16:i64]:f32
+    wscale = select ws_none, 1.0:f32, ws0
     ret fe, rd, fs, wscale
 
 # Layer l's DeepSeek-style entries (words 15-17 of its 18): its shared expert's gate/up and
