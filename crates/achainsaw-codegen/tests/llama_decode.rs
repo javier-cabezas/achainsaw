@@ -334,6 +334,15 @@ impl Matrix {
 }
 
 /// Rounds to bf16 (nearest even), as the kernel stores its KV cache.
+/// x += b, when there is a bias.
+fn add_bias(x: &mut [f64], b: &Option<Vec<f32>>) {
+    if let Some(b) = b {
+        for (v, b) in x.iter_mut().zip(b) {
+            *v += *b as f64;
+        }
+    }
+}
+
 fn bf16_round(v: f64) -> f64 {
     half::bf16::from_f32(v as f32).to_f64()
 }
@@ -379,12 +388,27 @@ struct Layer {
     k_norm: Option<Vec<f32>>,
     /// A mixture-of-experts MLP in place of gate_up and down.
     moe: Option<Moe>,
+    /// gpt-oss's biases of the QKV rows and the O projection, its attention sink logit per
+    /// query head, and the positions a query sees (0: all of them).
+    qkv_b: Option<Vec<f32>>,
+    o_b: Option<Vec<f32>>,
+    sinks: Option<Vec<f32>>,
+    window: usize,
 }
 
-/// A mixture-of-experts MLP: the router [experts x d] and each expert's gate/up and down.
+/// A mixture-of-experts MLP: the router [experts x d] and its bias, and the experts.
 struct Moe {
     router: Matrix,
-    experts: Vec<(Matrix, Matrix)>,
+    router_b: Option<Vec<f32>>,
+    experts: Vec<Expert>,
+}
+
+/// An expert's gate/up and down matrices and their biases (gate/up's laid out as its rows).
+struct Expert {
+    gate_up: Matrix,
+    down: Matrix,
+    gate_up_b: Option<Vec<f32>>,
+    down_b: Option<Vec<f32>>,
 }
 
 struct Model {
@@ -397,9 +421,12 @@ struct Model {
     max_ctx: usize,
     /// An int8 KV cache (cfg's format 1) instead of bf16.
     kv_q8: bool,
-    /// A mixture-of-experts model's experts used per token and whether their weights are
-    /// renormalized (f is then an expert's MLP width).
-    moe: Option<(usize, bool)>,
+    /// A mixture-of-experts model's experts used per token and how their weights are made
+    /// (moe_route's gating: 0 softmax probabilities, 1 renormalized, 2 a softmax of the picked
+    /// logits); f is then an expert's MLP width.
+    moe: Option<(usize, usize)>,
+    /// The MLP's activation: 0 SwiGLU, 1 gpt-oss's clamped SwiGLU.
+    act: usize,
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
@@ -466,6 +493,10 @@ impl Model {
                     q_norm: None,
                     k_norm: None,
                     moe: None,
+                    qkv_b: None,
+                    o_b: None,
+                    sinks: None,
+                    window: 0,
                 }
             })
             .collect();
@@ -479,6 +510,7 @@ impl Model {
             max_ctx,
             kv_q8: false,
             moe: None,
+            act: 0,
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
@@ -509,38 +541,85 @@ impl Model {
             };
             layer.moe = Some(Moe {
                 router: Matrix::random(&mut rng, &[n_exp], d, &[Fmt::Q8]),
+                router_b: None,
                 experts: (0..n_exp)
-                    .map(|e| {
-                        (
-                            Matrix::random(&mut rng, &[2 * f], d, &[fmt(2 * e)]),
-                            Matrix::random(&mut rng, &[d], f, &[fmt(2 * e + 1)]),
-                        )
+                    .map(|e| Expert {
+                        gate_up: Matrix::random(&mut rng, &[2 * f], d, &[fmt(2 * e)]),
+                        down: Matrix::random(&mut rng, &[d], f, &[fmt(2 * e + 1)]),
+                        gate_up_b: None,
+                        down_b: None,
                     })
                     .collect(),
             });
         }
-        self.moe = Some((n_used, renorm));
+        self.moe = Some((n_used, renorm as usize));
         self
     }
 
-    /// SwiGLU MLP of quantized input xn: gate/up rows (chunks of 64 interleaved), then down.
-    fn mlp(&self, gate_up: &Matrix, down: &Matrix, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
-        let gu = gate_up.matvec(xn);
+    /// The model with gpt-oss's additions: biases of QKV and O, an attention sink per query
+    /// head, a window of `window` positions in the even layers, the clamped SwiGLU, and in a
+    /// mixture of experts biases of the router and of each expert's matrices, and weights
+    /// from a softmax of the picked logits.
+    fn with_gpt_oss(mut self, window: usize) -> Self {
+        let mut rng = Rng(67);
+        let mut bias = |n: usize, scale: f32| Some((0..n).map(|_| scale * rng.next()).collect());
+        let (d, nh, nkv, hd, f) = (self.d, self.nh, self.nkv, self.hd, self.f);
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            layer.qkv_b = bias((nh + 2 * nkv) * hd, 0.5);
+            layer.o_b = bias(d, 0.2);
+            // Sinks around the scores' own range, so they take a share of every softmax.
+            layer.sinks = bias(nh, 1.5);
+            layer.window = if l % 2 == 0 { window } else { 0 };
+            if let Some(moe) = &mut layer.moe {
+                moe.router_b = bias(moe.experts.len(), 0.5);
+                for e in &mut moe.experts {
+                    e.gate_up_b = bias(2 * f, 0.5);
+                    e.down_b = bias(d, 0.2);
+                }
+            }
+        }
+        if let Some((n_used, _)) = self.moe {
+            self.moe = Some((n_used, 2));
+        }
+        self.act = 1;
+        self
+    }
+
+    /// The MLP of quantized input xn: gate/up rows (chunks of 64 interleaved) plus their
+    /// bias, the activation (SwiGLU, or gpt-oss's clamped one), then down plus its bias.
+    fn mlp(
+        &self,
+        gate_up: &Matrix,
+        down: &Matrix,
+        biases: (&Option<Vec<f32>>, &Option<Vec<f32>>),
+        xn: &(Vec<i8>, Vec<f32>),
+    ) -> Vec<f64> {
+        let mut gu = gate_up.matvec(xn);
+        add_bias(&mut gu, biases.0);
         let mut act = vec![0f32; self.f];
         for c in 0..self.f / 64 {
             for j in 0..64 {
                 let (g, u) = (gu[128 * c + j], gu[128 * c + 64 + j]);
-                act[64 * c + j] = (g / (1.0 + (-g).exp()) * u) as f32;
+                act[64 * c + j] = if self.act == 1 {
+                    let (x, y) = (g.min(7.0), u.clamp(-7.0, 7.0));
+                    x / (1.0 + (-1.702 * x).exp()) * (y + 1.0)
+                } else {
+                    g / (1.0 + (-g).exp()) * u
+                } as f32;
             }
         }
-        down.matvec(&quantize(&act))
+        let mut out = down.matvec(&quantize(&act));
+        add_bias(&mut out, biases.1);
+        out
     }
 
-    /// The experts with the largest softmax probabilities of the router's logits (the first
-    /// on ties), weighted by them (renormalized if the model says so), added in that order.
+    /// The experts with the largest softmax probabilities of the router's logits plus its
+    /// bias (the first on ties), weighted by them (renormalized, or a softmax of the picked
+    /// logits, if the model says so), added in that order.
     fn moe_mlp(&self, moe: &Moe, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
-        let (n_used, renorm) = self.moe.unwrap();
-        let logits = moe.router.matvec(xn);
+        let (n_used, gating) = self.moe.unwrap();
+        let mut logits = moe.router.matvec(xn);
+        add_bias(&mut logits, &moe.router_b);
         let m = logits.iter().cloned().fold(f64::MIN, f64::max);
         let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
         let total: f64 = e.iter().sum();
@@ -548,14 +627,16 @@ impl Model {
         order.sort_by(|&a, &b| e[b].partial_cmp(&e[a]).unwrap());
         let picked = &order[..n_used];
         let mut w: Vec<f64> = picked.iter().map(|&i| e[i] / total).collect();
-        if renorm {
+        if gating > 0 {
+            // Renormalized, or (gating 2) the softmax of the picked logits: the same in f64.
             let sum = w.iter().sum::<f64>().max(2f64.powi(-14));
             w.iter_mut().for_each(|x| *x /= sum);
         }
         let mut out = vec![0f64; self.d];
         for (&i, wi) in picked.iter().zip(w) {
-            let (gu, dn) = &moe.experts[i];
-            for (o, v) in out.iter_mut().zip(self.mlp(gu, dn, xn)) {
+            let ex = &moe.experts[i];
+            let v = self.mlp(&ex.gate_up, &ex.down, (&ex.gate_up_b, &ex.down_b), xn);
+            for (o, v) in out.iter_mut().zip(v) {
                 *o += wi * v;
             }
         }
@@ -671,7 +752,8 @@ impl Model {
             .map(|&v| v as f64)
             .collect();
         for (layer, (kc, vc)) in self.layers.iter().zip(cache.iter_mut()) {
-            let qkv = layer.qkv.matvec(&self.norm_quant(&h, &layer.attn_norm));
+            let mut qkv = layer.qkv.matvec(&self.norm_quant(&h, &layer.attn_norm));
+            add_bias(&mut qkv, &layer.qkv_b);
             let mut q = qkv[..nh * hd].to_vec();
             for head in q.chunks_mut(hd) {
                 if let Some(w) = &layer.q_norm {
@@ -702,29 +784,41 @@ impl Model {
                 vc[at..at + hd].copy_from_slice(&vr);
             }
             let mut attn = vec![0f32; nh * hd];
+            // The positions in the layer's window, and each head's sink: one more logit in
+            // the softmax, with no value.
+            let lo = if layer.window > 0 {
+                (pos + 1).saturating_sub(layer.window)
+            } else {
+                0
+            };
             for hq in 0..nh {
                 let g = hq / (nh / nkv);
                 let qh = &q[hq * hd..(hq + 1) * hd];
-                let scores: Vec<f64> = (0..=pos)
+                let scores: Vec<f64> = (lo..=pos)
                     .map(|t| {
                         let kt = &kc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                         qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f64>() / (hd as f64).sqrt()
                     })
                     .collect();
-                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let sink = layer.sinks.as_ref().map(|s| s[hq] as f64);
+                let m = scores.iter().cloned().chain(sink).fold(f64::MIN, f64::max);
                 let p: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-                let total: f64 = p.iter().sum();
+                let total: f64 = p.iter().sum::<f64>() + sink.map_or(0.0, |s| (s - m).exp());
                 for j in 0..hd {
-                    let o: f64 = (0..=pos).map(|t| p[t] * vc[(t * nkv + g) * hd + j]).sum();
+                    let o: f64 = (lo..=pos)
+                        .map(|t| p[t - lo] * vc[(t * nkv + g) * hd + j])
+                        .sum();
                     attn[hq * hd + j] = (o / total) as f32;
                 }
             }
-            for (hv, ov) in h.iter_mut().zip(layer.o.matvec(&quantize(&attn))) {
+            let mut o = layer.o.matvec(&quantize(&attn));
+            add_bias(&mut o, &layer.o_b);
+            for (hv, ov) in h.iter_mut().zip(o) {
                 *hv += ov;
             }
             let xn = self.norm_quant(&h, &layer.ffn_norm);
             let out = match &layer.moe {
-                None => self.mlp(&layer.gate_up, &layer.down, &xn),
+                None => self.mlp(&layer.gate_up, &layer.down, (&None, &None), &xn),
                 Some(moe) => self.moe_mlp(moe, &xn),
             };
             for (hv, ov) in h.iter_mut().zip(out) {
@@ -757,25 +851,40 @@ impl Model {
         for l in &self.layers {
             let opt = |w: &Option<Vec<f32>>| w.as_deref().map_or(0, p);
             let (qkv, o) = (mp(&l.qkv, &mut keep), mp(&l.o, &mut keep));
-            let (gu, dn, router, experts) = match &l.moe {
-                None => (mp(&l.gate_up, &mut keep), mp(&l.down, &mut keep), 0, 0),
+            let (gu, dn, router, router_b, experts) = match &l.moe {
+                None => (mp(&l.gate_up, &mut keep), mp(&l.down, &mut keep), 0, 0, 0),
                 Some(moe) => {
                     let router = mp(&moe.router, &mut keep);
                     let table: Vec<usize> = moe
                         .experts
                         .iter()
-                        .flat_map(|(g, d)| [mp(g, &mut keep), mp(d, &mut keep)])
+                        .flat_map(|e| {
+                            [
+                                mp(&e.gate_up, &mut keep),
+                                mp(&e.down, &mut keep),
+                                opt(&e.gate_up_b),
+                                opt(&e.down_b),
+                            ]
+                        })
                         .collect();
                     keep.push(table);
-                    (0, 0, router, keep.last().unwrap().as_ptr() as usize)
+                    let table = keep.last().unwrap().as_ptr() as usize;
+                    (0, 0, router, opt(&moe.router_b), table)
                 }
             };
             t.extend([p(&l.attn_norm), qkv, o, p(&l.ffn_norm), gu, dn]);
             t.extend([opt(&l.q_norm), opt(&l.k_norm), router, experts]);
+            t.extend([
+                opt(&l.qkv_b),
+                opt(&l.o_b),
+                router_b,
+                opt(&l.sinks),
+                l.window,
+            ]);
         }
         let parts = keep;
         let n_exp = self.layers[0].moe.as_ref().map_or(0, |m| m.experts.len());
-        let (n_used, renorm) = self.moe.unwrap_or((0, false));
+        let (n_used, gating) = self.moe.unwrap_or((0, 0));
         let cfg = [
             self.d,
             self.layers.len(),
@@ -789,7 +898,8 @@ impl Model {
             n_exp,
             n_used,
             if self.moe.is_some() { self.f } else { 0 },
-            renorm as usize,
+            gating,
+            self.act,
         ]
         .map(|v| v as i64)
         .to_vec();
@@ -821,8 +931,19 @@ fn llama_decode_matches_reference() {
 /// not, with mixed expert formats and either cache format.
 #[test]
 fn qwen3_moe_matches_reference() {
-    check_decode_moe(true, false, true, Some((64, 4, true)));
-    check_decode_moe(false, true, true, Some((64, 8, false)));
+    check_decode_moe(true, false, true, Some((64, 4, true)), None);
+    check_decode_moe(false, true, true, Some((64, 8, false)), None);
+}
+
+/// gpt-oss: QKV and O biases, attention sinks, a 3-position window in the even layers (the
+/// test runs 6 positions), and a mixture of 64 experts (the router's rows a multiple of 64,
+/// as `pad_rows` makes gpt-oss's 32), 4 used per token, with router and expert biases,
+/// weights from a softmax of the picked logits and the clamped SwiGLU; with mixed expert
+/// formats (MXFP4 among them) and either cache format.
+#[test]
+fn gpt_oss_matches_reference() {
+    check_decode_moe(true, false, false, Some((64, 4, false)), Some(3));
+    check_decode_moe(false, true, false, Some((64, 4, false)), Some(3));
 }
 
 /// Qwen3's RMSNorm of each q and k head before RoPE, with either cache format.
@@ -848,11 +969,18 @@ fn llama_decode_int8_cache_matches_reference() {
 }
 
 fn check_decode(mixed: bool, kv_q8: bool, qk_norm: bool) {
-    check_decode_moe(mixed, kv_q8, qk_norm, None);
+    check_decode_moe(mixed, kv_q8, qk_norm, None, None);
 }
 
-/// check_decode on a model whose MLPs are mixtures of `(experts, used, renormalized)`.
-fn check_decode_moe(mixed: bool, kv_q8: bool, qk_norm: bool, moe: Option<(usize, usize, bool)>) {
+/// check_decode on a model whose MLPs are mixtures of `(experts, used, renormalized)`, and
+/// with gpt-oss's additions and their window (`Model::with_gpt_oss`).
+fn check_decode_moe(
+    mixed: bool,
+    kv_q8: bool,
+    qk_norm: bool,
+    moe: Option<(usize, usize, bool)>,
+    gpt_oss: Option<usize>,
+) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -866,6 +994,9 @@ fn check_decode_moe(mixed: bool, kv_q8: bool, qk_norm: bool, moe: Option<(usize,
     }
     if let Some((n_exp, n_used, renorm)) = moe {
         model = model.with_moe(n_exp, n_used, renorm, mixed);
+    }
+    if let Some(window) = gpt_oss {
+        model = model.with_gpt_oss(window);
     }
     model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
@@ -885,6 +1016,11 @@ fn check_decode_moe(mixed: bool, kv_q8: bool, qk_norm: bool, moe: Option<(usize,
         );
         let level = if qk_norm { level + " qk norm" } else { level };
         let level = if moe.is_some() { level + " moe" } else { level };
+        let level = if gpt_oss.is_some() {
+            level + " gpt-oss"
+        } else {
+            level
+        };
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         // As `Model::cache_value` reads it.
@@ -995,7 +1131,7 @@ fn llama_prefill_matches_decode_exactly() {
     // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
     // the prompt into prefill calls)
     type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 10] = [
+    let cases: [Case; 14] = [
         (false, false, false, &short, 8, &[&[6], &[1, 5]]),
         (true, false, false, &short, 8, &[&[6], &[1, 5]]),
         (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
@@ -1004,17 +1140,30 @@ fn llama_prefill_matches_decode_exactly() {
         (false, true, false, &long, 530, &[&[530], &[255, 2, 273]]),
         (true, false, true, &short, 8, &[&[6], &[1, 5]]),
         (false, true, true, &long, 530, &[&[300, 230]]),
-        // With mixtures of experts (the last two cases).
+        // With mixtures of experts (the next two cases).
         (true, false, true, &short, 8, &[&[6], &[1, 5]]),
         (false, true, true, &short, 8, &[&[6], &[2, 4]]),
+        // gpt-oss (the last four): with a mixture of experts and a 3-position window; dense
+        // with a 200-position window (never a whole split, and starting inside tiles of 32)
+        // and a 300-position one (some splits whole for a tile of 8 tokens).
+        (true, false, false, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, false, &long, 530, &[&[530], &[255, 2, 273]]),
+        (true, false, false, &long, 530, &[&[300, 230]]),
+        (false, false, false, &long, 530, &[&[530], &[37, 493]]),
     ];
     for (case, &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces)) in cases.iter().enumerate() {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         if qk_norm {
             model = model.with_qk_norm();
         }
-        if case >= 8 {
+        if case == 8 || case == 9 || case == 10 {
             model = model.with_moe(64, 4, case == 8, mixed);
+        }
+        match case {
+            10 => model = model.with_gpt_oss(3),
+            11 | 12 => model = model.with_gpt_oss(200),
+            13 => model = model.with_gpt_oss(300),
+            _ => {}
         }
         model.kv_q8 = kv_q8;
         let (table, cfg, _parts) = model.tables();
@@ -1097,7 +1246,18 @@ fn llama_long_context_int8_cache_matches_reference() {
     check_long_context(true);
 }
 
+/// gpt-oss's attention over a long context: windows of 300 positions in the even layer, which
+/// start inside a tile of 32 and span two splits, and sinks, QKV and O biases in both.
+#[test]
+fn gpt_oss_long_context_matches_reference() {
+    check_long_context_with(false, Some(300));
+}
+
 fn check_long_context(kv_q8: bool) {
+    check_long_context_with(kv_q8, None);
+}
+
+fn check_long_context_with(kv_q8: bool, gpt_oss: Option<usize>) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -1105,6 +1265,9 @@ fn check_long_context(kv_q8: bool) {
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
     let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
+    if let Some(window) = gpt_oss {
+        model = model.with_gpt_oss(window);
+    }
     model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
     let plane = model.max_ctx * model.nkv * model.hd;

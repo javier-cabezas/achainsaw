@@ -142,6 +142,30 @@ Speed at Qwen3-30B-A3B's layer shapes (d 2048, 32 query heads over 4 KV heads of
 
 Decode reads the used experts' weights at the memory's bandwidth on LLVM, 1.31x llama.cpp's rate after 512 tokens. Prefill (both from an empty cache) is 0.84x llama.cpp's, because each token runs its own experts while llama.cpp groups the prompt's tokens by expert, reading each expert's weights once for all the tokens that picked it.
 
+**gpt-oss.** gpt-oss is a mixture of experts too, with these additions, which the kernel runs as llama.cpp does (`openai-moe.cpp`):
+
+- **Attention biases and sinks.** Q, K, V and the output projection have biases, added after each projection (QKV's before RoPE). Each query head has a sink, a learned logit that joins the softmax's denominator with no value: one more record after the head's flash-decoding splits, with the sink as its max, a sum of 1 and zero outputs, so `attn_merge` adds exp(sink − m) to the total alone.
+- **A sliding window.** The even layers' queries see the last 128 positions. Only the splits from the window's start run, and `attn_split` leaves out the positions of the first tile of 32 before it, with probabilities of exactly 0. The cache still holds every position.
+- **The router.** It has a bias. Its weights are a softmax of the picked experts' logits (cfg's gating 2), and the experts' gate/up and down projections have biases too.
+- **The activation.** The experts use a clamped SwiGLU: x / (1 + e^(−1.702x)) · (y + 1) with x = min(gate, 7) and y = up clamped to ±7 (the standard library's `swiglu_oai`).
+- **RoPE and the tokenizer.** RoPE is YaRN (factor 32 over 4096 positions), which only changes the cos and sin tables. The tokenizer uses GPT-4o's pre-tokenizer, and `benchmark_decode.py --chat` writes the harmony format.
+- **Weights.** The experts are in MXFP4 (see above). gpt-oss-20b's 32 experts are padded to a router of 64 rows.
+
+The kernel matches an f64 reference with all of these at every ISA level on both backends (`gpt_oss_matches_reference`, and `gpt_oss_long_context_matches_reference` for windows that start inside a tile and span splits). `llama_prefill` equals decoding bit for bit with windows of 3, 200 and 300 positions. The kernel also matches the NumPy implementation of a synthetic `gpt-oss` GGUF. gpt-oss-20b (over 12 GB) does not fit this machine, so the comparison with llama.cpp uses synthetic files:
+
+- **2 layers, 32 MXFP4 experts with 4 used per token, a window of 4.** On five random files, `llama-simple` and the kernel on both backends generate the same tokens greedily until a near-tie: all 16 and all 32 on two of them. On the third and fourth, the first difference is a token whose two best logits are 0.9% and 0.009% of the logits' scale apart, and llama.cpp takes the second. On the fifth, after 11 matching tokens, a router's 4th and 5th logits are 0.0004 apart, and llama.cpp picks the other expert. Its f16 KV cache and f32 router (bf16 and Q8_0 here) can tip such ties.
+- **gpt-oss-20b's layer shapes, 8 layers.** They generate the same first 6 tokens, then part where the two best logits are 0.007% of the scale apart.
+
+Speed at gpt-oss-20b's layer shapes (d 2880, 64 query heads over 8 KV heads of 64, 32 MXFP4 experts of 2880 of which 4 are used, a 201088-token vocabulary), on a random file of 8 such layers (4.9 GB: Q8_0 attention, embedding and LM head, f32 biases and router). The model's 24 layers do not fit this machine. Each run is a prompt of 512 tokens then 64 generated, 8 threads, measured one after the other (the mean of two runs; llama-bench's of three):
+
+| | Prefill | Decode (after the prompt) | weights read per token |
+|---|---|---|---|
+| AIR on LLVM | 121 tokens/s (8.29 ms/token) | 41.2 tokens/s (24.3 ms/token) | 1.29 GB at 53 GB/s |
+| AIR on Cranelift | 86.0 tokens/s (11.6 ms/token) | 35.5 tokens/s (28.2 ms/token) | 1.29 GB at 46 GB/s |
+| llama.cpp (build 6868a52, `llama-bench -t 8 -p 512`, `-n 64 -d 512`) | 176 tokens/s (5.69 ms/token) | 37.8 tokens/s (26.5 ms/token) | |
+
+Decode runs at the memory's bandwidth on LLVM, 1.09x llama.cpp's rate. The LM head is half of the 1.29 GB at these 8 layers; with these formats the full 24 layers would read 2.6 GB per token. Prefill is 0.69x llama.cpp's, for the reason given for Qwen3-MoE: each token reads its 4 experts' 0.42 GB on its own.
+
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
 | Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |
