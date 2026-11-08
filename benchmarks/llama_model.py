@@ -930,34 +930,58 @@ class Model:
         an f32 scale."""
         return self.hd + 4 if self.kv_q8 else 2 * self.hd
 
+    def kv_ring(self, l: int) -> tuple[int, int]:
+        """Layer l's slots per KV head in the kernel's cache and its ring (the kernel's
+        kv_ring): with a window, a ring of R = window + 31 + 256 slots rounded up to 32 held
+        twice (2 R slots; position p at slot p mod R and R slots on), when that is less than
+        cache_ctx; else cache_ctx and 0."""
+        win: int = self.layers[l]["window"]
+        ring: int = (win + 318) & ~31
+        if win and 2 * ring < self.cache_ctx:
+            return 2 * ring, ring
+        return self.cache_ctx, 0
+
+    def cache_words(self, l: int) -> int:
+        """u16 words of layer l in the kernel's cache: K then V, nkv x kv_ring slots each."""
+        return 2 * self.nkv * self.kv_ring(l)[0] * self.cache_rb // 2
+
     def new_cache(self) -> npt.NDArray[np.uint16]:
-        """The kernel's KV cache, as u16 words: per layer, K then V, each nkv x cache_ctx
-        positions of cache_rb bytes, in tiles of 32 positions. bf16: V is [nkv x cache_ctx x
-        hd], K [nkv x cache_ctx / 32 x hd x 32]. int8: each tile holds the values, K's plus
-        128 as [hd / 4 x 32 x 4] and V's as [32 x hd], then an f32 scale per position."""
-        return np.zeros(len(self.layers) * 2 * self.nkv * self.cache_ctx * self.cache_rb // 2,
+        """The kernel's KV cache, as u16 words: per layer, K then V, each nkv x ctx_l slots
+        (kv_ring) of cache_rb bytes, in tiles of 32 slots. bf16: V is [nkv x ctx_l x hd], K
+        [nkv x ctx_l / 32 x hd x 32]. int8: each tile holds the values, K's plus 128 as
+        [hd / 4 x 32 x 4] and V's as [32 x hd], then an f32 scale per slot."""
+        return np.zeros(sum(self.cache_words(l) for l in range(len(self.layers))),
                         dtype=np.uint16)
 
-    def cache_kv(self, cache: npt.NDArray[np.uint16]) -> tuple[F32, F32]:
-        """K and V of a kernel cache as f32 values, each [layers x nkv x cache_ctx x hd]."""
-        nl: int = len(self.layers)
+    def cache_at(self, cache: npt.NDArray[np.uint16], pos: int) -> tuple[F32, F32]:
+        """K and V of position pos in a kernel cache as f32 values, each [layers x nkv x hd]
+        (its slot in a ring: pos mod R)."""
         hd: int = self.hd
-        tiles: int = self.cache_ctx // 32
-        if not self.kv_q8:
-            bits: npt.NDArray[np.uint32] = cache.astype(np.uint32) << np.uint32(16)
-            planes: F32 = bits.view(np.float32).reshape(nl, 2, self.nkv, self.cache_ctx, hd)
-            k: F32 = planes[:, 0].reshape(nl, self.nkv, tiles, hd, 32).transpose(
-                0, 1, 2, 4, 3).reshape(nl, self.nkv, self.cache_ctx, hd)
-            return k, planes[:, 1]
-        t: U8 = cache.view(np.uint8).reshape(nl, 2, self.nkv, tiles, 32 * (hd + 4))
-        scales: F32 = np.ascontiguousarray(t[..., 32 * hd:]).view(np.float32)  # [.., 32]
-        kq: Ints = (t[:, 0, ..., :32 * hd] ^ np.uint8(0x80)).view(np.int8).reshape(
-            nl, self.nkv, tiles, hd // 4, 32, 4).transpose(0, 1, 2, 4, 3, 5).reshape(
-            nl, self.nkv, tiles, 32, hd)
-        vq: Ints = t[:, 1, ..., :32 * hd].view(np.int8).reshape(nl, self.nkv, tiles, 32, hd)
-        kv: list[F32] = [(q * scales[:, i, ..., None]).astype(np.float32).reshape(
-            nl, self.nkv, self.cache_ctx, hd) for i, q in enumerate((kq, vq))]
-        return kv[0], kv[1]
+        out: list[list[F32]] = [[], []]
+        at: int = 0
+        for l in range(len(self.layers)):
+            ctx, ring = self.kv_ring(l)
+            words: npt.NDArray[np.uint16] = cache[at:at + self.cache_words(l)]
+            at += self.cache_words(l)
+            slot: int = pos % ring if ring else pos
+            tile: int = slot // 32
+            col: int = slot % 32
+            if not self.kv_q8:
+                bits: npt.NDArray[np.uint32] = words.astype(np.uint32) << np.uint32(16)
+                planes: F32 = bits.view(np.float32).reshape(2, self.nkv, ctx // 32, 32 * hd)
+                out[0].append(planes[0, :, tile].reshape(self.nkv, hd, 32)[:, :, col])
+                out[1].append(planes[1, :, tile].reshape(self.nkv, 32, hd)[:, col])
+                continue
+            t: U8 = words.view(np.uint8).reshape(2, self.nkv, ctx // 32, 32 * (hd + 4))
+            scales: F32 = np.ascontiguousarray(t[:, :, tile, 32 * hd:]).view(np.float32)
+            kq: Ints = (t[0, :, tile, :32 * hd] ^ np.uint8(0x80)).view(np.int8).reshape(
+                self.nkv, hd // 4, 32, 4)[:, :, col].reshape(self.nkv, hd)
+            vq: Ints = t[1, :, tile, :32 * hd].view(np.int8).reshape(self.nkv, 32, hd)[:, col]
+            out[0].append((kq * scales[0, :, col, None]).astype(np.float32))
+            out[1].append((vq * scales[1, :, col, None]).astype(np.float32))
+        k: F32 = np.stack(out[0])
+        v: F32 = np.stack(out[1])
+        return k, v
 
     # NumPy forward pass of the same model (needs numpy=True at construction).
     def norm(self, h: Floats, w: F32) -> Floats:
