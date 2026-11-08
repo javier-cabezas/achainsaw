@@ -437,10 +437,10 @@ class TestGGUFDecode(unittest.TestCase):
                 # step, or one step of the position's int8 scale. After the first layer, an
                 # int8 quantization of an earlier activation that flipped (see below) moves a
                 # head's K and V by up to about 1% of their scale too.
-                planes: tuple[F32, F32] = m.cache_kv(cache)
+                planes: tuple[F32, F32] = m.cache_at(cache, pos)
                 for l, (kc, vc) in enumerate(np_cache):
                     for kv, ref in enumerate((kc[pos], vc[pos])):
-                        got_kv: F32 = planes[kv][l, :, pos, :]
+                        got_kv: F32 = planes[kv][l]
                         msg: str = f"{be} cache l={l} pos {pos} kv_q8={kv_q8}"
                         scale_kv: Floats = np.abs(ref).max(axis=1, keepdims=True)
                         flip: Floats = 1e-2 * scale_kv if l > 0 else 0 * scale_kv
@@ -455,8 +455,8 @@ class TestGGUFDecode(unittest.TestCase):
                 # position it came from instead of growing through every later one's
                 # attention.
                 for l, (kc, vc) in enumerate(np_cache):
-                    kc[pos] = planes[0][l, :, pos, :]
-                    vc[pos] = planes[1][l, :, pos, :]
+                    kc[pos] = planes[0][l]
+                    vc[pos] = planes[1][l]
                 # Such a step can flip an int8 quantization of a later attention output,
                 # which moves the hidden state by up to about 0.5% of its scale.
                 scale: float = float(np.abs(m.last_h).max())
@@ -722,10 +722,10 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
                 m.numpy_step(np_cache, token, pos)
                 np.testing.assert_allclose(h, m.last_h, atol=1e-2 * np.abs(m.last_h).max(),
                                            err_msg=f"{be} pos {pos}")
-                planes: tuple[F32, F32] = m.cache_kv(cache)
+                planes: tuple[F32, F32] = m.cache_at(cache, pos)
                 for l, (kc, vc) in enumerate(np_cache):
-                    kc[pos] = planes[0][l, :, pos, :]
-                    vc[pos] = planes[1][l, :, pos, :]
+                    kc[pos] = planes[0][l]
+                    vc[pos] = planes[1][l]
                 token = got
 
 
@@ -884,6 +884,44 @@ class TestGptOssGGUF(TestGGUFDecode):
         self.assertAlmostEqual(float(ang[0]), 3.0, places=5)
         theta_last: float = 3.0 * 150000.0 ** (-2.0 * (HEAD_DIM // 2 - 1) / HEAD_DIM)
         self.assertAlmostEqual(float(ang[-1]), theta_last / 32, places=7)
+
+    def test_ring_cache(self) -> None:
+        # A 1024-position context: layer 0's window of OSS_WINDOW positions keeps a ring of
+        # 320 slots held twice (640) instead of 1024, which 360 positions go around. The
+        # kernel matches NumPy at each position (reading each from its slot), and a prefill
+        # (in pieces of 256 tokens) leaves llama_decode's cache and hidden state exactly.
+        m: Model = Model.from_gguf(self.gguf, max_ctx=1024, numpy=True)
+        self.assertEqual(m.kv_ring(0), (640, 320))
+        self.assertEqual(m.kv_ring(1), (1024, 0))
+        self.assertEqual(len(m.new_cache()), m.cache_words(0) + m.cache_words(1))
+        with open(os.path.join(ROOT, "examples", "kernels", "llama_decode.air"),
+                  encoding="utf-8") as f:
+            src: str = f.read()
+        prompt: npt.NDArray[np.int64] = np.random.default_rng(3).integers(
+            0, 262, 360).astype(np.int64)
+        for be in achainsaw.available_backends():
+            k: achainsaw.Kernel = achainsaw.compile(src, backend=be, fast_math=True)
+            cache: npt.NDArray[np.uint16] = m.new_cache()
+            h: F32 = np.zeros(m.d, dtype=np.float32)
+            np_cache: list[tuple[F32, F32]] = m.numpy_cache()
+            want: int = 0
+            for pos, tok in enumerate(prompt):
+                want = k.run("llama_decode", m.table, m.cfg, cache, int(tok), pos, h,
+                             float(m.eps))
+                m.numpy_step(np_cache, int(tok), pos)
+                np.testing.assert_allclose(h, m.last_h, atol=1e-2 * np.abs(m.last_h).max(),
+                                           err_msg=f"{be} pos {pos}")
+                planes: tuple[F32, F32] = m.cache_at(cache, pos)
+                for l, (kc, vc) in enumerate(np_cache):
+                    kc[pos] = planes[0][l]
+                    vc[pos] = planes[1][l]
+            p_cache: npt.NDArray[np.uint16] = m.new_cache()
+            p_h: F32 = np.zeros(m.d, dtype=np.float32)
+            got: int = k.run("llama_prefill", m.table, m.cfg, p_cache, prompt, len(prompt), 0,
+                             p_h, float(m.eps))
+            self.assertEqual(got, want, be)
+            np.testing.assert_array_equal(p_h, h, err_msg=be)
+            np.testing.assert_array_equal(p_cache, cache, err_msg=be)
 
     def test_tokenizer(self) -> None:
         tok: Tokenizer = Tokenizer(self.gguf)

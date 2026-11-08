@@ -70,7 +70,10 @@
 # groups of 4 per position, [head_dim / 4 x 32 x 4]; V [32 x head_dim]) then an f32 scale per
 # position (to_q8_kv); attn_split_q8 scores it with int8 dots (`vdotu`) on queries rounded
 # to int8.
-# The cache holds every position in every layer, windowed or not.
+# A windowed layer whose window needs far fewer positions than the context keeps a ring
+# instead (kv_ring): R = window + 31 + 256 slots rounded up to 32, position p at slot p mod R
+# and again at p mod R + R, so its planes are 2 R slots per KV head rather than ctx; layers
+# follow one another in the cache, each its own size.
 # h: f32 [d], the residual stream; holds the final hidden state on return.
 use qmat_chunk, qmat_batch, quantize_q8, rope_half, silu_mul, swiglu_oai, attn_split, attn_split_q8, attn_merge
 
@@ -119,8 +122,6 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     sin_r = add sin_t, rope_off
     rb = call kv_rb(hd, kvf)
     kv_row = mul nkv, rb
-    kv_plane = mul max_ctx, kv_row
-    kv_layer = mul kv_plane, 2:i64
     heads_all0 = mul nkv, 2:i64
     heads_all = add nh, heads_all0
     dchunks = udiv d, 64:i64
@@ -137,22 +138,26 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     part_sz = mul part0, rec
     part = alloc part_sz
     scale = call attn_scale(hd)
-    jmp layers(0:i64)
+    jmp layers(0:i64, 0:i64)
 
-  layers(l:i64):
+  layers(l:i64, kc_off:i64):
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
     attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
-    kc_off = mul l, kv_layer
+    # the layer's K and V planes: ctx_l positions per KV head (a ring for a window, kv_ring)
+    ctx_l, ring = call kv_ring(win, max_ctx)
+    kv_plane0 = mul ctx_l, kv_row
     kc = add cache, kc_off
-    vc = add kc, kv_plane
+    vc = add kc, kv_plane0
+    kv_layer = mul kv_plane0, 2:i64
+    kc_next = add kc_off, kv_layer
     call norm_quant(h, attn_norm, xn, xq, dx, d, eps)
-    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_r, sin_r, q_norm, k_norm, eps, qkv_b)
+    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_r, sin_r, q_norm, k_norm, eps, qkv_b, ring)
     # the splits of the layer's window (all positions without one)
     lo, s_lo, nsp = call attn_window(npos, win)
     a_tasks = mul nkv, nsp
-    par a_tasks, attn_task(qbuf, kc, vc, part, nh, nkv, hd, npos, max_ctx, kvf, nsp, scale, lo, s_lo)
+    par a_tasks, attn_task(qbuf, kc, vc, part, nh, nkv, hd, npos, ctx_l, kvf, nsp, scale, lo, s_lo, ring)
     par nh, attn_out(part, xq, dx, hd, nsp, sinks)
     par dchunks, proj_add(m_o, xq, dx, h, qd, o_b)
     call norm_quant(h, ffn_norm, xn, xq, dx, d, eps)
@@ -167,7 +172,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     jmp layer_next
   layer_next:
     l2 = add l, 1:i64
-    jmp layers(l2)
+    jmp layers(l2, kc_next)
 
   final:
     call norm_quant(h, norm_out, xn, xq, dx, d, eps)
@@ -256,7 +261,7 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
 # the layer has one, then for q and k the head's RMSNorm when the layer has one (qk_norm) and
 # RoPE. A q head lands in the q buffer; a K or V head in
 # a staging row, rounded to bf16 into this position's slot of its KV-cache row after RoPE.
-fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr)
+fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64)
   b0:
     hd4 = mul hd, 4:i64
     is_q = lt t, nh
@@ -266,7 +271,6 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
     q_dst = add qbuf, q_off
     stage = alloc hd4
     dst = select is_q, q_dst, stage
-    ctile, ccol = call kv_slot(t, kc, vc, nh, nkv, hd, pos, max_ctx, kvf)
     per_head = udiv hd, 64:i64
     c0 = mul t, per_head
     jmp chunks(0:i64)
@@ -291,7 +295,7 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
   store:
     br is_q, done, to_cache
   to_cache:
-    call kv_store(stage, ctile, ccol, hd, is_k, kvf)
+    call kv_put(stage, t, kc, vc, nh, nkv, hd, pos, ctx_l, kvf, ring, is_k)
     jmp done
   done:
     free stage
@@ -556,17 +560,35 @@ fn moe_down(c:i64, experts:ptr, sel:ptr, wts:ptr, aq:ptr, adx:ptr, h:ptr, fe:i64
   done:
     ret
 
-# Where K or V head t (t >= nh; a q head gets an unused address) stores position p: the
-# tile of positions p - p mod 32 .. in its plane (head * max_ctx + p - p mod 32 positions of
-# kv_rb bytes in), and p mod 32, the position's column in it.
-fn kv_slot(t:i64, kc:ptr, vc:ptr, nh:i64, nkv:i64, hd:i64, p:i64, max_ctx:i64, kvf:i64)->(ptr, i64)
+# K (is_k) or V of position p for KV head t (t >= nh), src[0 .. hd] after RoPE, into the
+# layer's cache (kv_store at kv_slot's place): at slot p, or in a ring of `ring` slots at p
+# mod ring and again at p mod ring + ring (kv_ring).
+fn kv_put(src:ptr, t:i64, kc:ptr, vc:ptr, nh:i64, nkv:i64, hd:i64, p:i64, ctx_l:i64, kvf:i64, ring:i64, is_k:i32)
+  b0:
+    slot = call ring_slot(p, ring)
+    tile, col = call kv_slot(t, kc, vc, nh, nkv, hd, slot, ctx_l, kvf)
+    call kv_store(src, tile, col, hd, is_k, kvf)
+    has_ring = ne ring, 0:i64
+    br has_ring, mirror, done
+  mirror:
+    slot2 = add slot, ring
+    tile2, col2 = call kv_slot(t, kc, vc, nh, nkv, hd, slot2, ctx_l, kvf)
+    call kv_store(src, tile2, col2, hd, is_k, kvf)
+    ret
+  done:
+    ret
+
+# Where K or V head t (t >= nh; a q head gets an unused address) stores slot p: the tile of
+# slots p - p mod 32 .. in its plane (head * ctx_l + p - p mod 32 slots of kv_rb bytes in),
+# and p mod 32, the slot's column in it.
+fn kv_slot(t:i64, kc:ptr, vc:ptr, nh:i64, nkv:i64, hd:i64, p:i64, ctx_l:i64, kvf:i64)->(ptr, i64)
   b0:
     nhk = add nh, nkv
     is_k = lt t, nhk
     tk = sub t, nh
     tv = sub t, nhk
     kvh = select is_k, tk, tv
-    r0 = mul kvh, max_ctx
+    r0 = mul kvh, ctx_l
     col = and p, 31:i64
     p0 = sub p, col
     r1 = add r0, p0
@@ -744,7 +766,7 @@ inline fn attn_window(npos:i64, win:i64)->(i64, i64, i64)
 # Split s_lo + i of KV head g (task = g * nsp + i): positions max(256 s, lo) .. of the first
 # npos, for the group's query heads; records in `part`, head h's i-th at (h * (nsp + 1) + i)
 # * (hd + 2) f32, the last of a head's nsp + 1 for its sink (attn_out).
-fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, nsp:i64, scale:f32, lo:i64, s_lo:i64)
+fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i64, npos:i64, ctx_l:i64, kvf:i64, nsp:i64, scale:f32, lo:i64, s_lo:i64, ring:i64)
   b0:
     g = udiv task, nsp
     i = urem task, nsp
@@ -762,14 +784,16 @@ fn attn_task(task:i64, qbuf:ptr, kc:ptr, vc:ptr, part:ptr, nh:i64, nkv:i64, hd:i
     p1 = mul i, rec
     p2 = add p0, p1
     pg = add part, p2
-    call attn_part(g, s, qg, kc, vc, pg, group, hd, npos, max_ctx, kvf, scale, head_b, lo)
+    call attn_part(g, s, qg, kc, vc, pg, group, hd, npos, ctx_l, kvf, scale, head_b, lo, ring)
     ret
 
 # One split of attention (attn_split, or attn_split_q8 for an int8 cache) for KV head g:
 # positions max(256 s, lo) .. 256 s + 256 of the first npos (lo < npos), query heads at qg,
 # records from pg (head_b bytes per head). The cache is read from the tile of 32 positions
-# that holds the first one; attn_split leaves the positions before it out.
-fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, npos:i64, max_ctx:i64, kvf:i64, scale:f32, head_b:i64, lo:i64)
+# that holds the first one; attn_split leaves the positions before it out. In a ring (kv_ring)
+# the tile's slot is its position mod ring: the read spans at most ring slots, which the
+# ring's second copy keeps contiguous.
+fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, npos:i64, ctx_l:i64, kvf:i64, scale:f32, head_b:i64, lo:i64, ring:i64)
   b0:
     t0 = mul s, 256:i64
     t_end0 = add t0, 256:i64
@@ -778,8 +802,9 @@ fn attn_part(g:i64, s:i64, qg:ptr, kc:ptr, vc:ptr, pg:ptr, group:i64, hd:i64, np
     skip = and ta, 31:i64
     tb = sub ta, skip
     nt = sub t1, tb
-    g_rows = mul g, max_ctx
-    first = add g_rows, tb
+    g_rows = mul g, ctx_l
+    tb_slot = call ring_slot(tb, ring)
+    first = add g_rows, tb_slot
     rb = call kv_rb(hd, kvf)
     kv_off = mul first, rb
     kb = add kc, kv_off
@@ -968,8 +993,50 @@ fn glu(g:ptr, u:ptr, out:ptr, n:i64, act:i64)
 # and KV head, each token over the cache up to its own position (so tokens never see later
 # ones), with the same splits and merges as llama_decode's (attn_tok). A mixture of experts
 # runs on batches of up to 256 tokens, each expert's weights read once for the batch's
-# tokens that picked it (moe_ffn_n).
+# tokens that picked it (moe_ffn_n). A model with a ring in its cache (kv_ring) runs the
+# prompt in pieces of up to 256 tokens (prefill_part), whose K and V the ring holds next to
+# the windows that read them.
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
+  b0:
+    nl = ld cfg[1]:i64
+    ctx0 = ld cfg[7]:i64
+    ctx31 = add ctx0, 31:i64
+    max_ctx = and ctx31, -32:i64
+    jmp scan(0:i64, 0:i64)
+  scan(l:i64, rings:i64):
+    l_more = lt l, nl
+    br l_more, scan_body, split
+  scan_body:
+    slot0 = mul l, 15:i64
+    slot = add slot0, 19:i64
+    win = ld model[slot]:i64
+    ctx_l_, ring = call kv_ring(win, max_ctx)
+    has = ne ring, 0:i64
+    has64 = zext has:i64
+    rings2 = or rings, has64
+    l2 = add l, 1:i64
+    jmp scan(l2, rings2)
+  split:
+    any_ring = ne rings, 0:i64
+    piece = select any_ring, 256:i64, n
+    jmp parts(0:i64, 0:i64)
+  parts(done:i64, last:i64):
+    more = lt done, n
+    br more, part_body, finish
+  part_body:
+    left = sub n, done
+    m = min left, piece
+    t_off = mul done, 8:i64
+    toks = add tokens, t_off
+    p = add pos, done
+    next = call prefill_part(model, cfg, cache, toks, m, p, h, eps)
+    done2 = add done, m
+    jmp parts(done2, next)
+  finish:
+    ret last
+
+# llama_prefill on n tokens at once: every layer's passes over all of them.
+fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
     n_exp, n_used, gating, act = call load_moe(cfg)
@@ -1024,8 +1091,6 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     moe_buf = alloc moe_sz
     rb = call kv_rb(hd, kvf)
     kv_row = mul nkv, rb
-    kv_plane = mul max_ctx, kv_row
-    kv_layer = mul kv_plane, 2:i64
     heads_all0 = mul nkv, 2:i64
     heads_all = add nh, heads_all0
     dchunks = udiv d, 64:i64
@@ -1035,19 +1100,22 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     tiles = udiv tiles0, 8:i64
     a_tasks = mul tiles, nkv
     scale = call attn_scale(hd)
-    jmp layers(0:i64)
+    jmp layers(0:i64, 0:i64)
 
-  layers(l:i64):
+  layers(l:i64, kc_off:i64):
     l_more = lt l, nl
     br l_more, layer_body, final
   layer_body:
     attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
-    kc_off = mul l, kv_layer
+    ctx_l, ring = call kv_ring(win, max_ctx)
+    kv_plane0 = mul ctx_l, kv_row
     kc = add cache, kc_off
-    vc = add kc, kv_plane
+    vc = add kc, kv_plane0
+    kv_layer = mul kv_plane0, 2:i64
+    kc_next = add kc_off, kv_layer
     par n, norm_tok(hs, attn_norm, xn, xq, dx, d, eps, xs)
-    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, max_ctx, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps, qkv_b)
-    par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, max_ctx, kvf, scale, xs, n, win, sinks)
+    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps, qkv_b, ring)
+    par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, ctx_l, kvf, scale, xs, n, win, sinks, ring)
     par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d, o_b)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
     is_moe = ne router, 0:ptr
@@ -1076,7 +1144,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     jmp layer_next
   layer_next:
     l2 = add l, 1:i64
-    jmp layers(l2)
+    jmp layers(l2, kc_next)
 
   final:
     last = sub n, 1:i64
@@ -1124,7 +1192,7 @@ fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i6
 # qkv_head for n tokens: head t's 64-row chunks for every token (qmat_batch), each token's
 # rows written to its q row or a staging row, then the head's bias, norm (qk_norm) and RoPE
 # at its position and, for K and V, bf16 into its position's KV-cache slot.
-fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr)
+fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64)
   b0:
     w = vl f32
     hd4 = mul hd, 4:i64
@@ -1203,8 +1271,7 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
   store:
     br is_q, rope_next, to_cache
   to_cache:
-    ctile, ccol = call kv_slot(t, kc, vc, nh, nkv, hd, rp, max_ctx, kvf)
-    call kv_store(x, ctile, ccol, hd, is_k, kvf)
+    call kv_put(x, t, kc, vc, nh, nkv, hd, rp, ctx_l, kvf, ring, is_k)
     jmp rope_next
   rope_next:
     r2 = add r, 1:i64
@@ -1223,7 +1290,7 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
 # is read from memory once for the tile; attn_split computes each head's row on its own, so
 # a row's results do not depend on the heads beside it. Each token's remaining splits run on
 # their own. Writes the group's Q8 outputs into each token's activations.
-fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64, max_ctx:i64, kvf:i64, scale:f32, xs:i64, n:i64, win:i64, sinks:ptr)
+fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, scale:f32, xs:i64, n:i64, win:i64, sinks:ptr, ring:i64)
   b0:
     tile = udiv task, nkv
     g = urem task, nkv
@@ -1281,7 +1348,7 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     sp_rel = sub sp, base
     sp_off = mul sp_rel, rec
     pg = add part, sp_off
-    call attn_part(g, sp, qt, kc, vc, pg, rows, hd, npos0, max_ctx, kvf, scale, head_b, lo_last)
+    call attn_part(g, sp, qt, kc, vc, pg, rows, hd, npos0, ctx_l, kvf, scale, head_b, lo_last, ring)
     sp2 = add sp, 1:i64
     jmp shared_splits(sp2)
   # Token by token: its own splits, then the merge of each of its heads.
@@ -1317,7 +1384,7 @@ fn attn_tok(task:i64, qbuf:ptr, kc:ptr, vc:ptr, xq:ptr, dx:ptr, nh:i64, nkv:i64,
     tsp_rel = sub tsp, base
     tsp_off = mul tsp_rel, rec
     tpg = add t_part, tsp_off
-    call attn_part(g, tsp, t_q, kc, vc, tpg, group, hd, npos, max_ctx, kvf, scale, head_b, lo)
+    call attn_part(g, tsp, t_q, kc, vc, tpg, group, hd, npos, ctx_l, kvf, scale, head_b, lo, ring)
     jmp split_next
   split_next:
     tsp2 = add tsp, 1:i64
@@ -1843,6 +1910,33 @@ inline fn kv_rb(hd:i64, kvf:i64)->i64
     bf = shl hd, 1:i64
     rb = select is_q8, q8b, bf
     ret rb
+
+# The cache of a layer whose queries see the last win positions (0: all of them): its
+# positions per KV head, ctx_l, and its ring. With a window, when that is smaller than
+# max_ctx, a ring of R = win + 31 + 256 slots rounded up to 32 holds position p at slot p mod
+# R and again at p mod R + R (ctx_l = 2 R): a window read from its first tile (up to win + 31
+# positions) or a prefill's shared split (256) is then one run of slots, and a prefill piece
+# of up to 256 tokens (llama_prefill) writes its K and V without overwriting a position its
+# own windows read. Otherwise ctx_l = max_ctx and ring 0, slot p for position p.
+inline fn kv_ring(win:i64, max_ctx:i64)->(i64, i64)
+  b0:
+    r0 = add win, 318:i64
+    r = and r0, -32:i64
+    two = shl r, 1:i64
+    windowed = ne win, 0:i64
+    fits = lt two, max_ctx
+    use = and windowed, fits
+    ring = select use, r, 0:i64
+    ctx_l = select use, two, max_ctx
+    ret ctx_l, ring
+
+# Position p's slot: p mod ring, or p without a ring (0).
+inline fn ring_slot(p:i64, ring:i64)->i64
+  b0:
+    has = ne ring, 0:i64
+    rdiv = select has, ring, 9223372036854775807:i64
+    s = urem p, rdiv
+    ret s
 
 # The model table's global entries: embedding, final norm, LM head, RoPE cos and sin
 # tables.

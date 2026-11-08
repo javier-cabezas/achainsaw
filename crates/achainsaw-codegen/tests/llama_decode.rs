@@ -704,22 +704,46 @@ impl Model {
         }
     }
 
-    /// u16s in the kernel's KV cache: per layer K then V, each nkv x cache_ctx positions of
-    /// `cache_rb` bytes, with cache_ctx = max_ctx rounded up to tiles of 32 positions.
+    /// A layer's positions per KV head in the kernel's cache and its ring (`kv_ring`): with
+    /// a window, a ring of R = window + 31 + 256 slots rounded up to 32 held twice (2 R), when
+    /// that is less than max_ctx rounded up to tiles of 32 positions; else that and 0.
+    fn kv_ring(&self, l: usize) -> (usize, usize) {
+        let ctx = self.max_ctx.div_ceil(32) * 32;
+        let win = self.layers[l].window;
+        let ring = (win + 318) & !31;
+        if win > 0 && 2 * ring < ctx {
+            (2 * ring, ring)
+        } else {
+            (ctx, 0)
+        }
+    }
+
+    /// Byte offset of layer l in the kernel's KV cache.
+    fn cache_offset(&self, l: usize) -> usize {
+        (0..l)
+            .map(|i| 2 * self.nkv * self.kv_ring(i).0 * self.cache_rb())
+            .sum()
+    }
+
+    /// u16s in the kernel's KV cache: per layer K then V, each nkv x ctx_l slots of
+    /// `cache_rb` bytes (`kv_ring`).
     fn cache_len(&self) -> usize {
-        self.layers.len() * 2 * self.nkv * self.max_ctx.div_ceil(32) * 32 * self.cache_rb() / 2
+        self.cache_offset(self.layers.len()) / 2
     }
 
     /// Value e of KV head g at position pos of layer l in the kernel's cache, in K and in V.
     /// bf16: K in tiles of 32 positions, each [hd x 32], V [nkv][cache_ctx][hd]. int8: tiles
     /// of 32 positions for both, the values (K plus 128, [hd/4][32][4]; V [32][hd]) then 32
     /// f32 scales.
+    /// In a ring, position pos is at slot pos mod R (and again R slots on).
     fn cache_value(&self, cache: &[u16], l: usize, g: usize, pos: usize, e: usize) -> (f64, f64) {
-        let ctx = self.max_ctx.div_ceil(32) * 32;
+        let (ctx, ring) = self.kv_ring(l);
+        let slot = if ring > 0 { pos % ring } else { pos };
         let (hd, rb) = (self.hd, self.cache_rb());
         let plane = self.nkv * ctx * rb;
-        let tile = l * 2 * plane + (g * ctx + pos / 32 * 32) * rb;
-        let (vtile, col) = (tile + plane, pos % 32);
+        let tile = self.cache_offset(l) + (g * ctx + slot / 32 * 32) * rb;
+        let col = slot % 32;
+        let vtile = tile + plane;
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(cache.as_ptr() as *const u8, cache.len() * 2) };
         if self.kv_q8 {
@@ -1131,7 +1155,7 @@ fn llama_prefill_matches_decode_exactly() {
     // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
     // the prompt into prefill calls)
     type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 16] = [
+    let cases: [Case; 18] = [
         (false, false, false, &short, 8, &[&[6], &[1, 5]]),
         (true, false, false, &short, 8, &[&[6], &[1, 5]]),
         (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
@@ -1154,6 +1178,10 @@ fn llama_prefill_matches_decode_exactly() {
         // by expert, and a remainder), Qwen3-MoE's and gpt-oss's.
         (true, false, true, &long, 530, &[&[530], &[255, 2, 273]]),
         (false, true, false, &long, 530, &[&[300, 230]]),
+        // gpt-oss with a ring in its windowed layers (a 100-position window, context 1100:
+        // 416 slots held twice), which the prompt goes around; prefill in pieces of 256.
+        (true, false, false, &long, 1100, &[&[530], &[255, 2, 273]]),
+        (false, true, false, &long, 1100, &[&[530], &[37, 493]]),
     ];
     for (case, &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces)) in cases.iter().enumerate() {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
@@ -1166,6 +1194,7 @@ fn llama_prefill_matches_decode_exactly() {
         match case {
             10 => model = model.with_gpt_oss(3),
             15 => model = model.with_gpt_oss(200),
+            16 | 17 => model = model.with_gpt_oss(100),
             11 | 12 => model = model.with_gpt_oss(200),
             13 => model = model.with_gpt_oss(300),
             _ => {}
@@ -1255,21 +1284,29 @@ fn llama_long_context_int8_cache_matches_reference() {
 /// start inside a tile of 32 and span two splits, and sinks, QKV and O biases in both.
 #[test]
 fn gpt_oss_long_context_matches_reference() {
-    check_long_context_with(false, Some(300));
+    check_long_context_with(false, Some(300), 600);
+}
+
+/// The same with a 100-position window and a 1200-position context, so the windowed layer's
+/// cache is a ring of 416 slots held twice, which the 520-token prompt goes around.
+#[test]
+fn gpt_oss_ring_cache_matches_reference() {
+    check_long_context_with(false, Some(100), 1200);
+    check_long_context_with(true, Some(100), 1200);
 }
 
 fn check_long_context(kv_q8: bool) {
-    check_long_context_with(kv_q8, None);
+    check_long_context_with(kv_q8, None, 600);
 }
 
-fn check_long_context_with(kv_q8: bool, gpt_oss: Option<usize>) {
+fn check_long_context_with(kv_q8: bool, gpt_oss: Option<usize>, max_ctx: usize) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
     ))
     .unwrap();
     let module = parse_and_validate(&src).unwrap_or_else(|d| panic!("{d:?}"));
-    let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, 600, false);
+    let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, false);
     if let Some(window) = gpt_oss {
         model = model.with_gpt_oss(window);
     }
