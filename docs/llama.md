@@ -166,6 +166,30 @@ Speed at gpt-oss-20b's layer shapes (d 2880, 64 query heads over 8 KV heads of 6
 
 Decode runs at the memory's bandwidth on LLVM, 1.09x llama.cpp's rate. The LM head is half of the 1.29 GB at these 8 layers; with these formats the full 24 layers would read 2.6 GB per token. Prefill, with the tokens grouped by expert (see Qwen3-MoE; llama.cpp measured again alongside, 176 tokens/s), is 4.7x llama.cpp's. Before the grouping, when each token read its 4 experts' 0.42 GB on its own, it was 121 tokens/s on LLVM and 86.0 on Cranelift.
 
+**DeepSeek-style mixtures of experts (GLM-4.5, dots.llm1).** DeepSeek-V3's MoE also runs on ordinary attention in GLM-4.5 and dots.llm1, and the kernel runs both (`glm4moe` and `dots1` GGUF files):
+
+- **Dense layers first.** The model's first layers (`leading_dense_block_count`) have a dense MLP of their own width (cfg's `ffn`); the experts' width is cfg's 12th word.
+- **Shared experts.** Each MoE layer also runs a shared expert: a dense MLP on the same input, added after the routed experts.
+- **Sigmoid routing.** The router's logits become sigmoid probabilities. The experts are picked by probability plus a selection bias (`exp_probs_b`), weighted by the probabilities alone, renormalized, and scaled (`expert_weights_scale`, 2.5 in dots.llm1). These are cfg's gating modes 3 and 4 (4 without renormalizing) and its weight-scale word.
+- **GLM-4.5's attention.** It has QKV biases and rotates half of each head (cfg's rotary dimensions; the RoPE tables are that half's size).
+
+Group-limited routing (DeepSeek-V3's own `n_group`) is not supported, and neither is DeepSeek's MLA attention. The kernel matches an f64 reference with all of these on both backends (`deepseek_moe_matches_reference`), `llama_prefill` equals decoding bit for bit (including over a 530-token prompt), and synthetic `glm4moe` and `dots1` GGUFs match NumPy.
+
+Against llama.cpp, on tiny synthetic files (3 layers, 32 experts of which 4 are used, 5 seeds each):
+
+- **Routing forced.** With a selection bias of 10 on four experts, which forces the pick, or with all 32 experts used, `llama-simple` and the kernel generate the same greedy tokens until a near-tie (at most 0.8% of the logits' scale).
+- **Routing free.** Tokens part sooner, each time after a step where a router's 4th and 5th scores were 0.00004 to 0.004 apart. A sigmoid compresses logit differences by up to 4x, so the hidden state's usual difference from llama.cpp's (its f16 KV cache and f32 router; bf16 and Q8_0 here, and int8 activations) picks another expert at such ties.
+
+Speed at GLM-4.5-Air's layer shapes (d 4096, 96 query heads over 8 KV heads of 128, half of each rotated, 128 experts of 1408 of which 8 are used, a shared expert, a dense first layer of 10944, a 151552-token vocabulary), on a random Q4_0 file of the dense layer and 3 MoE layers (5.4 GB). Each run is a 512-token prompt then 64 generated, 8 threads, measured one after the other (two runs each; llama-bench's mean of three):
+
+| | Prefill | Decode (after the prompt) | weights read per token |
+|---|---|---|---|
+| AIR on LLVM | 746–796 tokens/s | 37.2–40.8 tokens/s | 1.25 GB at 46–51 GB/s |
+| AIR on Cranelift | 143 tokens/s | 35.8–36.8 tokens/s | 1.25 GB at 45 GB/s |
+| llama.cpp (build 6868a52, `llama-bench -t 8 -p 512`, `-n 64 -d 512`) | 311 tokens/s | 38.4 tokens/s | |
+
+On LLVM, prefill is 2.5x llama.cpp's and decode about the same, both reading at the memory's bandwidth. Here the LM head and the 96 query heads' attention are a large share of each token at 4 layers.
+
 **Q4 against Q8.** On a random model with the same shapes (`benchmark_decode.py --weights q8|q4`; d 2048, 16 layers, 32 query heads over 8 KV heads of 64, MLP 8192, vocabulary 128256), all Q8_0 or all Q4_0, 8 threads:
 
 | Weights | AIR on LLVM | AIR on Cranelift | PyTorch, weight-only kernels | NumPy, same data types |

@@ -416,6 +416,14 @@ class Mat:
         return y.sum(axis=0)
 
 
+def gu_order(f: int) -> npt.NDArray[np.intp]:
+    """The kernel's gate/up row order for an MLP f wide: chunks interleave, gate rows 64c..
+    then up rows 64c.. (of the gate rows then the up rows)."""
+    rows: npt.NDArray[np.intp] = np.arange(2 * f).reshape(2, f // 64, 64).transpose(
+        1, 0, 2).reshape(-1)
+    return rows
+
+
 def pad_rows(m: Mat, multiple: int = 64) -> Mat:
     """m in Q8_0 with zero rows after its own up to a multiple of `multiple` rows (a router
     whose experts are not a multiple of 64: the kernel computes logits 64 rows at a time and
@@ -500,6 +508,10 @@ class Layer(TypedDict):
     # gpt-oss's attention sink logit per query head, and the positions a query sees (0: all).
     sinks: F32 | None
     window: int
+    # DeepSeek-style MoE: a shared expert's gate/up and down (a dense MLP on the same input,
+    # added after the routed experts), and the routed experts' selection bias [experts].
+    shared: tuple[Mat, Mat] | None
+    sel_b: F32 | None
 
 
 def layer(attn_norm: F32, qkv: Mat | Parts, o: Mat, ffn_norm: F32,
@@ -508,12 +520,13 @@ def layer(attn_norm: F32, qkv: Mat | Parts, o: Mat, ffn_norm: F32,
           experts: list[tuple[Mat, Mat]] | None = None, qkv_b: F32 | None = None,
           o_b: F32 | None = None, router_b: F32 | None = None,
           expert_b: list[tuple[F32, F32]] | None = None, sinks: F32 | None = None,
-          window: int = 0) -> Layer:
+          window: int = 0, shared: tuple[Mat, Mat] | None = None,
+          sel_b: F32 | None = None) -> Layer:
     """A Layer, the parts a model does not have left out."""
     return Layer(attn_norm=attn_norm, qkv=qkv, o=o, ffn_norm=ffn_norm, gate_up=gate_up,
                  down=down, q_norm=q_norm, k_norm=k_norm, router=router, experts=experts,
                  qkv_b=qkv_b, o_b=o_b, router_b=router_b, expert_b=expert_b, sinks=sinks,
-                 window=window)
+                 window=window, shared=shared, sel_b=sel_b)
 
 
 # A layer's matrices.
@@ -617,21 +630,30 @@ class Model:
     def __init__(self, cfg: tuple[int, int, int, int, int, int, int, int], embd: F32,
                  norm_out: F32, lm: Mat, cos: F32, sin: F32, layers: list[Layer], eps: float,
                  numpy: bool = False, use_torch: bool = False, kv_q8: bool = False,
-                 moe: tuple[int, int, int] | None = None, act: int = 0) -> None:
+                 moe: tuple[int, int, int] | None = None, act: int = 0, expert_ffn: int = 0,
+                 rope_dims: int = 0, shared_ffn: int = 0, wscale: float = 1.0) -> None:
         d, nl, nh, nkv, hd, f, vocab, max_ctx = cfg
         # A mixture-of-experts model's experts, experts used per token and how their weights
         # are made (the kernel's gating: 0 softmax probabilities, 1 renormalized to sum to 1,
-        # 2 a softmax of the picked logits); f is then an expert's MLP width.
+        # 2 a softmax of the picked logits, 3 sigmoid probabilities picked with the selection
+        # bias and renormalized, 4 not renormalized), each expert expert_ffn wide (f if 0;
+        # f is the dense layers' MLP width).
         self.moe: tuple[int, int, int] | None = moe
         n_exp, n_used, gating = moe if moe is not None else (0, 0, 0)
+        fe: int = (expert_ffn or f) if moe is not None else 0
         # The MLP's activation: 0 SwiGLU, 1 gpt-oss's clamped SwiGLU.
         self.act: int = act
+        # The rotary dimensions of a head (0: all of hd), the shared experts' MLP width (0:
+        # none) and the routed experts' weight scale.
+        self.rd: int = rope_dims or hd
+        self.wscale: np.float32 = np.float32(wscale)
         # The kernel's cfg: the shapes, the KV cache's format (0 bf16, 1 int8), then the
-        # experts, the experts used, an expert's MLP width and the gating (0s if dense), and
-        # the activation.
+        # experts, the experts used, an expert's MLP width and the gating (0s if dense), the
+        # activation, the rotary dimensions, the shared experts' width and the weight scale
+        # (an f32's bits).
         self.cfg: npt.NDArray[np.int64] = np.array(
-            cfg + (int(kv_q8), n_exp, n_used, f if moe is not None else 0, int(gating), act),
-            dtype=np.int64)
+            cfg + (int(kv_q8), n_exp, n_used, fe, int(gating), act, self.rd, shared_ffn,
+                   int(self.wscale.view(np.uint32))), dtype=np.int64)
         self.kv_q8: bool = kv_q8
         self.d: int = d
         self.nh: int = nh
@@ -691,6 +713,9 @@ class Model:
                       opt(l["q_norm"]), opt(l["k_norm"]), opt_mat(l["router"]),
                       expert_table(l["experts"], l["expert_b"]), opt(l["qkv_b"]),
                       opt(l["o_b"]), opt(l["router_b"]), opt(l["sinks"]), l["window"]]
+            sh: tuple[Mat, Mat] | None = l["shared"]
+            words += [0, 0] if sh is None else [mat(sh[0]), mat(sh[1])]
+            words.append(opt(l["sel_b"]))
         self.table: npt.NDArray[np.uint64] = np.array(words, dtype=np.uint64)
 
     def matrices(self) -> list[Mat | Parts]:
@@ -700,6 +725,7 @@ class Model:
             out += [m for m in (l["qkv"], l["o"], l["gate_up"], l["down"], l["router"])
                     if m is not None]
             out += [m for pair in l["experts"] or [] for m in pair]
+            out += list(l["shared"] or ())
         return out
 
     @classmethod
@@ -765,27 +791,45 @@ class Model:
         m: dict[str, Any] = g.meta
         t: dict[str, Tensor] = g.tensors
         arch: str | None = m.get("general.architecture")
-        if arch not in ("llama", "qwen3", "qwen3moe", "gpt-oss"):
-            raise ValueError(f"unsupported architecture {arch!r} (llama, qwen3, qwen3moe and "
-                             "gpt-oss only)")
+        if arch not in ("llama", "qwen3", "qwen3moe", "gpt-oss", "glm4moe", "dots1"):
+            raise ValueError(f"unsupported architecture {arch!r} (llama, qwen3, qwen3moe, "
+                             "gpt-oss, glm4moe and dots1 only)")
         oss: bool = arch == "gpt-oss"
+        # DeepSeek-V3-style MoE (GLM-4.5, dots.llm1): leading dense layers, then shared
+        # experts and routed ones picked by sigmoid probabilities plus a selection bias.
+        ds: bool = arch in ("glm4moe", "dots1")
         a: str = f"{arch}."
+        if m.get(a + "expert_group_count", 1) > 1:
+            raise ValueError("group-limited expert routing is not supported")
         d: int = m[a + "embedding_length"]
-        nl: int = m[a + "block_count"]
+        # GLM-4.5's multi-token prediction layers come after the model's own (unused here).
+        nl: int = m[a + "block_count"] - m.get(a + "nextn_predict_layers", 0)
+        n_dense: int = m.get(a + "leading_dense_block_count", 0)
         nh: int = m[a + "attention.head_count"]
         nkv: int = m.get(a + "attention.head_count_kv", nh)
         hd: int = m.get(a + "attention.key_length", d // nh)
         n_exp: int = m.get(a + "expert_count", 0)
-        # A mixture-of-experts model's experts each have an MLP of their own width.
-        f: int = m[a + "expert_feed_forward_length"] if n_exp else m[a + "feed_forward_length"]
+        # A mixture-of-experts model's experts each have an MLP of their own width (fe); f is
+        # the dense layers' (the experts' when there are none).
+        fe: int = m[a + "expert_feed_forward_length"] if n_exp else 0
+        f: int = m[a + "feed_forward_length"] if not n_exp or n_dense else fe
         # Qwen3-MoE renormalizes the picked experts' probabilities; gpt-oss takes a softmax of
-        # their logits.
-        moe: tuple[int, int, int] | None = (n_exp, m[a + "expert_used_count"], 2 if oss else 1) \
+        # their logits; DeepSeek-style models take sigmoid probabilities (expert_gating_func
+        # 2), renormalized or not (expert_weights_norm), and scale them.
+        gating: int = 2 if oss else 1
+        if ds:
+            sigmoid: bool = m.get(a + "expert_gating_func", 2) == 2
+            norm_w: bool = bool(m.get(a + "expert_weights_norm", False))
+            gating = (3 if norm_w else 4) if sigmoid else (1 if norm_w else 0)
+        wscale: float = m.get(a + "expert_weights_scale", 1.0) if ds else 1.0
+        moe: tuple[int, int, int] | None = (n_exp, m[a + "expert_used_count"], gating) \
             if n_exp else None
         vocab: int = t["token_embd.weight"].rows
         rope_dims: int = m.get(a + "rope.dimension_count", hd)
-        if rope_dims != hd or m.get(a + "attention.value_length", hd) != hd:
-            raise ValueError("partial RoPE and differing K/V head sizes are not supported")
+        if m.get(a + "attention.value_length", hd) != hd:
+            raise ValueError("differing K/V head sizes are not supported")
+        if rope_dims > hd or rope_dims % 2:
+            raise ValueError(f"unsupported RoPE dimensions {rope_dims} of {hd}")
         ff: F32 | None = t["rope_freqs.weight"].dequantize()[0] \
             if "rope_freqs.weight" in t else None
         yarn: Yarn | None = None
@@ -794,7 +838,9 @@ class Model:
                         orig_ctx=m[a + "rope.scaling.original_context_length"],
                         beta_fast=m.get(a + "rope.scaling.yarn_beta_fast", 32.0),
                         beta_slow=m.get(a + "rope.scaling.yarn_beta_slow", 1.0))
-        cos, sin = rope_tables(max_ctx, hd, m.get(a + "rope.freq_base", 10000.0), ff, yarn)
+        # RoPE on the first rope_dims values of a head (GLM-4.5: half of it).
+        cos, sin = rope_tables(max_ctx, rope_dims, m.get(a + "rope.freq_base", 10000.0), ff,
+                               yarn)
         # gpt-oss: a window in the even layers (llama.cpp's default pattern of 2).
         window: int = m.get(a + "attention.sliding_window", 0) if oss else 0
 
@@ -824,20 +870,19 @@ class Model:
             q: Mat = Mat.from_tensor(t[p + "attn_q.weight"]).take(hf_rows(nh))
             k: Mat = Mat.from_tensor(t[p + "attn_k.weight"]).take(hf_rows(nkv))
             v: Mat = Mat.from_tensor(t[p + "attn_v.weight"])
-            # Gate/up chunks interleave: gate rows 64c.., then up rows 64c...
-            gu_rows: npt.NDArray[np.intp] = np.arange(2 * f).reshape(2, f // 64, 64).transpose(
-                1, 0, 2).reshape(-1)
             gate_up: Mat | None = None
             down: Mat | None = None
             router: Mat | None = None
             experts: list[tuple[Mat, Mat]] | None = None
             expert_b: list[tuple[F32, F32]] | None = None
-            if moe is None:
+            shared: tuple[Mat, Mat] | None = None
+            if moe is None or i < n_dense:
                 gate: Mat = Mat.from_tensor(t[p + "ffn_gate.weight"])
                 up: Mat = Mat.from_tensor(t[p + "ffn_up.weight"])
-                gate_up = Mat.concat([gate, up]).take(gu_rows)
+                gate_up = Mat.concat([gate, up]).take(gu_order(f))
                 down = Mat.from_tensor(t[p + "ffn_down.weight"])
             else:
+                gu_rows: npt.NDArray[np.intp] = gu_order(fe)
                 # [experts x expert_ffn x d] tensors (dims innermost first), one expert's
                 # rows after another's.
                 gates: Mat = Mat.from_tensor(t[p + "ffn_gate_exps.weight"])
@@ -845,7 +890,7 @@ class Model:
                 downs: Mat = Mat.from_tensor(t[p + "ffn_down_exps.weight"])
                 experts = []
                 for e in range(n_exp):
-                    er: npt.NDArray[np.intp] = np.arange(e * f, (e + 1) * f)
+                    er: npt.NDArray[np.intp] = np.arange(e * fe, (e + 1) * fe)
                     ed: npt.NDArray[np.intp] = np.arange(e * d, (e + 1) * d)
                     experts.append((Mat.concat([gates.take(er), ups.take(er)]).take(gu_rows),
                                     downs.take(ed)))
@@ -857,6 +902,11 @@ class Model:
                     db: F32 = t[p + "ffn_down_exps.bias"].dequantize()
                     expert_b = [(np.ascontiguousarray(np.concatenate([gb[e], ub[e]])[gu_rows]),
                                  np.ascontiguousarray(db[e])) for e in range(n_exp)]
+                if p + "ffn_gate_shexp.weight" in t:
+                    sg: Mat = Mat.from_tensor(t[p + "ffn_gate_shexp.weight"])
+                    su: Mat = Mat.from_tensor(t[p + "ffn_up_shexp.weight"])
+                    shared = (Mat.concat([sg, su]).take(gu_order(sg.rows)),
+                              Mat.from_tensor(t[p + "ffn_down_shexp.weight"]))
             qkv_b: F32 | None = None
             if p + "attn_q.bias" in t:
                 qb: F32 | None = vec(p + "attn_q.bias")
@@ -868,8 +918,9 @@ class Model:
                 attn_norm=norm(p + "attn_norm.weight"),
                 qkv=Parts.of([q, k, v]),
                 o=Mat.from_tensor(t[p + "attn_output.weight"]),
-                # gpt-oss names its MLP norm after attention's output.
-                ffn_norm=norm(p + ("post_attention_norm.weight" if oss else "ffn_norm.weight")),
+                # gpt-oss and GLM-4.5 name their MLP norm after attention's output.
+                ffn_norm=norm(p + ("post_attention_norm.weight" if oss or arch == "glm4moe"
+                                   else "ffn_norm.weight")),
                 gate_up=gate_up,
                 down=down,
                 router=router,
@@ -882,11 +933,14 @@ class Model:
                 expert_b=expert_b,
                 sinks=vec(p + "attn_sinks.weight"),
                 window=window if i % 2 == 0 else 0,
+                shared=shared,
+                sel_b=vec(p + "exp_probs_b.bias"),
             ))
         eps: float = m.get(a + "attention.layer_norm_rms_epsilon", 1e-5)
+        shared_ffn: int = next((sh[1].k for l in layers if (sh := l["shared"]) is not None), 0)
         model: Model = cls((d, nl, nh, nkv, hd, f, vocab, max_ctx), embd, norm(
             "output_norm.weight"), lm, cos, sin, layers, eps, numpy, use_torch, kv_q8, moe,
-            1 if oss else 0)
+            1 if oss else 0, fe, rope_dims, shared_ffn, wscale)
         model.formats = {}
         for n in MATS:
             fmts: set[str] = {mt.fmt for l in layers if (mt := l[n]) is not None}
@@ -997,12 +1051,13 @@ class Model:
         return y
 
     def rope(self, x: F32, pos: int) -> F32:
-        half: int = self.hd // 2
+        """RoPE (half-split) of the first rd values of each head; the rest as they are."""
+        half: int = self.rd // 2
         a: F32 = x[..., :half]
-        b: F32 = x[..., half:]
+        b: F32 = x[..., half:self.rd]
         c: F32 = self.cos[pos]
         s: F32 = self.sin[pos]
-        return np.concatenate([a * c - b * s, b * c + a * s], axis=-1)
+        return np.concatenate([a * c - b * s, b * c + a * s, x[..., self.rd:]], axis=-1)
 
     def numpy_cache(self) -> list[tuple[F32, F32]]:
         # f32 arrays holding bf16 (or int8 times scale) values, as the kernel's cache does.
@@ -1059,7 +1114,10 @@ class Model:
                 h = h + self.mlp(gate_up, down, xn)
             else:
                 h = h + self.moe_mlp(router, layer["experts"] or [], xn, layer["router_b"],
-                                     layer["expert_b"])
+                                     layer["expert_b"], layer["sel_b"])
+                sh: tuple[Mat, Mat] | None = layer["shared"]
+                if sh is not None:
+                    h = h + self.mlp(sh[0], sh[1], xn)
         logits: F32 = self.lm.matvec(self.norm(h, self.norm_out))
         # What the kernel leaves in `h`, for tests.
         self.last_h = h
@@ -1087,7 +1145,8 @@ class Model:
 
     def moe_mlp(self, router: Mat, experts: list[tuple[Mat, Mat]], xn: Floats,
                 router_b: F32 | None = None,
-                expert_b: list[tuple[F32, F32]] | None = None) -> F32:
+                expert_b: list[tuple[F32, F32]] | None = None,
+                sel_b: F32 | None = None) -> F32:
         """The kernel's mixture of experts: the experts with the largest softmax probabilities
         of the router's logits plus its bias (the first on ties), weighted by them
         (renormalized to sum to 1, or a softmax of the picked logits, if the model says so),
@@ -1097,14 +1156,24 @@ class Model:
         logits: F32 = router.matvec(xn)[:n_exp]
         if router_b is not None:
             logits = logits + router_b
-        e: Floats = np.exp(logits - np.max(logits))
-        p: Floats = e / e.sum()
-        picked: list[int] = [int(i) for i in np.argsort(-p, kind="stable")[:n_used]]
-        w: Floats = p[picked]
-        if gating == 2:
-            w = e[picked] / e[picked].sum()
-        elif gating == 1:
-            w = w / max(float(w.sum()), 2.0 ** -14)
+        if gating >= 3:
+            # Sigmoid probabilities, the experts picked by them plus the selection bias.
+            p: Floats = 1.0 / (1.0 + np.exp(-logits))
+            score: Floats = p if sel_b is None else p + sel_b
+            picked: list[int] = [int(i) for i in np.argsort(-score, kind="stable")[:n_used]]
+            w: Floats = p[picked]
+            if gating == 3:
+                w = w / max(float(w.sum()), 2.0 ** -14)
+        else:
+            e: Floats = np.exp(logits - np.max(logits))
+            p = e / e.sum()
+            picked = [int(i) for i in np.argsort(-p, kind="stable")[:n_used]]
+            w = p[picked]
+            if gating == 2:
+                w = e[picked] / e[picked].sum()
+            elif gating == 1:
+                w = w / max(float(w.sum()), 2.0 ** -14)
+        w = w * self.wscale
         out: F32 = np.zeros(self.d, np.float32)
         for wi, i in zip(w, picked):
             out = out + np.float32(wi) * self.mlp(experts[i][0], experts[i][1], xn,

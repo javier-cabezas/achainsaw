@@ -96,6 +96,8 @@ def chat_prompt(text: str, arch: str = "llama") -> str:
                 "OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: low\n\n# Valid channels: "
                 "analysis, commentary, final. Channel must be included for every message."
                 f"<|end|><|start|>user<|message|>{text}<|end|><|start|>assistant")
+    if arch not in ("llama", "qwen3", "qwen3moe"):
+        raise ValueError(f"no chat format for {arch!r} here; leave out --chat")
     if arch in ("qwen3", "qwen3moe"):
         return (f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
                 "<think>\n\n</think>\n\n")

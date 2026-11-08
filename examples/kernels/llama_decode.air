@@ -1,4 +1,5 @@
-# One decode step of a Llama-style model (Llama, Qwen3, Qwen3-MoE, gpt-oss) in a single
+# One decode step of a Llama-style model (Llama, Qwen3, Qwen3-MoE, gpt-oss, and
+# DeepSeek-V3-style mixtures of experts on ordinary attention: GLM-4.5, dots.llm1) in a single
 # call: token in, next token (greedy) out.
 #
 # Megakernel-style fusion for CPUs: every elementwise op runs inside the pass that produces
@@ -33,20 +34,23 @@
 # Shapes: d, ffn and vocab multiples of 64; head_dim a multiple of 64; heads a multiple of
 # kv_heads (grouped-query attention); pos < max_ctx.
 #
-# cfg (i64[14]): d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx, KV cache format
-# (0 bf16, 1 int8), then for a mixture-of-experts model the experts, the experts each token
-# uses, an expert's MLP width (ffn's place for its layers) and how the used experts' weights
-# are made (0 softmax probabilities, 1 those renormalized to sum to 1 (Qwen3-MoE), 2 a
-# softmax of the picked logits (gpt-oss); 0s for a dense model), then the MLP's activation
-# (0 SwiGLU, 1 gpt-oss's clamped SwiGLU)
+# cfg (i64[17]): d, layers, heads, kv_heads, head_dim, ffn (the dense layers' MLP width),
+# vocab, max_ctx, KV cache format (0 bf16, 1 int8), then for a mixture-of-experts model the
+# experts, the experts each token uses, an expert's MLP width and how the used experts are
+# picked and weighted (0 softmax probabilities, 1 those renormalized to sum to 1 (Qwen3-MoE),
+# 2 a softmax of the picked logits (gpt-oss), 3 sigmoid probabilities picked with a selection
+# bias and renormalized (GLM-4.5, dots.llm1), 4 the same not renormalized; 0s for a dense
+# model), then the MLP's activation (0 SwiGLU, 1 gpt-oss's clamped SwiGLU), the rotary
+# dimensions of a head (0 for all of head_dim; GLM-4.5 rotates half), the shared experts'
+# MLP width (0 for none) and the routed experts' weight scale (an f32 in the low 4 bytes)
 # model (table of 8-byte words): a matrix is a pointer to its parts, 4 words each: packed
 # weights, scales, format (0: Q8_0, 1: Q4_0, 2: Q6_K, 3: Q4_K, 4: Q5_K, 5: Q4_1, 6: IQ4_NL,
 # 7: MXFP4) and number of 64-row chunks (see qmat_chunk in the standard library). A vector
 # (norm weights, biases) is a pointer to f32s, 0 where the model has none.
 #   [0] token embedding f32 [vocab x d]   [1] final norm weight f32 [d]   [2] LM head
-#   [vocab x d]   [3] RoPE cos f32 [max_ctx x head_dim/2]   [4] RoPE sin (same shape; RoPE
-#   scaling such as YaRN is in the tables)
-#   then 15 per layer, at 5 + 15 * l:
+#   [vocab x d]   [3] RoPE cos f32 [max_ctx x rotary dims/2]   [4] RoPE sin (same shape;
+#   RoPE scaling such as YaRN is in the tables)
+#   then 18 per layer, at 5 + 18 * l:
 #   attention norm f32 [d]; QKV [(heads + 2 kv_heads) * head_dim x d] (rows: all q heads,
 #   then k heads, then v heads); O [d x heads * head_dim]; MLP norm f32 [d]; gate/up
 #   [2 ffn x d], chunks interleaved (gate rows 64c.., then up rows 64c..); down [d x ffn];
@@ -57,7 +61,11 @@
 #   layer); then gpt-oss's biases of QKV [(heads + 2 kv_heads) * head_dim], O [d] and the
 #   router [experts], its attention sinks f32 [heads] (a logit per query head that takes
 #   part in the softmax with no value), and the layer's attention window in positions (a
-#   query sees the last that many, itself included; 0 for all of them)
+#   query sees the last that many, itself included; 0 for all of them); then a
+#   DeepSeek-style layer's shared expert, gate/up [2 shared_ffn x d] and down [d x
+#   shared_ffn] (a dense MLP on the same input, added after the routed experts), and its
+#   routed experts' selection bias f32 [experts] (0s for none). A mixture-of-experts model's
+#   layers without a router are dense, ffn wide (GLM-4.5's and dots.llm1's first).
 # cache: per layer, K then V, each kv_heads x ctx x head_dim bf16 values, ctx = max_ctx
 # rounded up to a multiple of 32 (head-major, so a KV head's positions are contiguous): V is
 # [kv_heads x ctx x head_dim]; K is in tiles of 32 positions, [kv_heads x ctx / 32 x
@@ -99,9 +107,13 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     jmp embed(ei2)
 
   setup:
+    fe, rd, fs, wscale = call load_ext(cfg, hd)
     qd = mul nh, hd
     kmax0 = max d, qd
-    kmax = max kmax0, f
+    # the dense and shared MLPs' activations (one at a time), and any projection's input
+    fw = max f, fs
+    kmax1 = max kmax0, fw
+    kmax = max kmax1, fe
     xn = alloc d4
     qd4 = mul qd, 4:i64
     qbuf = alloc qd4
@@ -109,13 +121,13 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     nbmax = udiv kmax, 32:i64
     nb16 = mul nbmax, 16:i64
     dx = alloc nb16
-    aq = alloc f
-    nbf = udiv f, 32:i64
+    aq = alloc fw
+    nbf = udiv fw, 32:i64
     nbf16 = mul nbf, 16:i64
     adx = alloc nbf16
-    moe_sz = call moe_scratch(n_exp, n_used, f)
+    moe_sz = call moe_scratch(n_exp, n_used, fe)
     moe_buf = alloc moe_sz
-    half = udiv hd, 2:i64
+    half = udiv rd, 2:i64
     rope_row = mul half, 4:i64
     rope_off = mul pos, rope_row
     cos_r = add cos_t, rope_off
@@ -126,6 +138,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     heads_all = add nh, heads_all0
     dchunks = udiv d, 64:i64
     fchunks = udiv f, 64:i64
+    schunks = udiv fs, 64:i64
     # attention: splits of 256 positions, a record per query head and split (attn_split),
     # and one for its sink
     npos = add pos, 1:i64
@@ -145,6 +158,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     br l_more, layer_body, final
   layer_body:
     attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
+    m_sgu, m_sdn, sel_b = call layer_shared(model, l)
     # the layer's K and V planes: ctx_l positions per KV head (a ring for a window, kv_ring)
     ctx_l, ring = call kv_ring(win, max_ctx)
     kv_plane0 = mul ctx_l, kv_row
@@ -153,7 +167,7 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     kv_layer = mul kv_plane0, 2:i64
     kc_next = add kc_off, kv_layer
     call norm_quant(h, attn_norm, xn, xq, dx, d, eps)
-    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_r, sin_r, q_norm, k_norm, eps, qkv_b, ring)
+    par heads_all, qkv_head(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_r, sin_r, q_norm, k_norm, eps, qkv_b, ring, rd)
     # the splits of the layer's window (all positions without one)
     lo, s_lo, nsp = call attn_window(npos, win)
     a_tasks = mul nkv, nsp
@@ -164,7 +178,13 @@ fn llama_decode(model:ptr, cfg:ptr, cache:ptr, token:i64, pos:i64, h:ptr, eps:f3
     is_moe = ne router, 0:ptr
     br is_moe, moe_mlp, dense_mlp
   moe_mlp:
-    call moe_ffn(h, xq, dx, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act)
+    call moe_ffn(h, xq, dx, router, experts, d, n_exp, n_used, fe, gating, moe_buf, router_b, act, sel_b, wscale)
+    # a shared expert: a dense MLP of width fs on the same input, added after the routed ones
+    has_shared = ne m_sgu, 0:ptr
+    br has_shared, shared_mlp, layer_next
+  shared_mlp:
+    par schunks, gate_up(m_sgu, xq, dx, aq, adx, d, 0:ptr, act)
+    par dchunks, proj_add(m_sdn, aq, adx, h, fs, 0:ptr)
     jmp layer_next
   dense_mlp:
     par fchunks, gate_up(m_gu, xq, dx, aq, adx, d, 0:ptr, act)
@@ -259,9 +279,9 @@ fn norm_quant(h:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32)
 
 # Q, K or V head t: 64-row chunks of the QKV projection plus the head's rows of the bias when
 # the layer has one, then for q and k the head's RMSNorm when the layer has one (qk_norm) and
-# RoPE. A q head lands in the q buffer; a K or V head in
+# RoPE of its first rd values (GLM-4.5 rotates half of each head). A q head lands in the q buffer; a K or V head in
 # a staging row, rounded to bf16 into this position's slot of its KV-cache row after RoPE.
-fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64)
+fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_r:ptr, sin_r:ptr, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64, rd:i64)
   b0:
     hd4 = mul hd, 4:i64
     is_q = lt t, nh
@@ -290,7 +310,7 @@ fn qkv_head(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:
     br is_k, rotate, store
   rotate:
     call qk_norm(dst, is_q, q_norm, k_norm, hd, eps)
-    call rope_half(dst, hd, cos_r, sin_r)
+    call rope_half(dst, rd, cos_r, sin_r)
     jmp store
   store:
     br is_q, done, to_cache
@@ -352,10 +372,10 @@ fn qk_norm(x:ptr, is_q:i32, q_norm:ptr, k_norm:ptr, hd:i64, eps:f32)
 # projections and their bias in another (moe_down), which adds the experts' outputs, each
 # times its weight, in the order they were picked. scratch holds moe_scratch's bytes
 # (allocated once per call of llama_decode or llama_prefill).
-fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64)
+fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64, sel_b:ptr, wscale:f32)
   b0:
     logits, sel, wts, aq, adx = call moe_buffers(scratch, n_exp, n_used, fe)
-    call moe_route(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b)
+    call moe_route(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b, sel_b, wscale)
     fchunks = udiv fe, 64:i64
     tasks = mul n_used, fchunks
     par tasks, moe_gate_up(experts, sel, xq, dx, aq, adx, d, fe, act)
@@ -363,14 +383,15 @@ fn moe_ffn(h:ptr, xq:ptr, dx:ptr, router:ptr, experts:ptr, d:i64, n_exp:i64, n_u
     par dchunks, moe_down(experts, sel, wts, aq, adx, h, fe, n_used)
     ret
 
-# Bytes of moe_ffn's scratch buffer: the router's logits (n_exp rounded up to 64), the
+# Bytes of moe_ffn's scratch buffer: the router's logits and the scores it picks by (n_exp
+# rounded up to 64 each, moe_route), the
 # picked experts and their weights, and each picked expert's int8 activations and block
 # records (at least 64, so a dense model allocates something).
 inline fn moe_scratch(n_exp:i64, n_used:i64, fe:i64)->i64
   b0:
     ne63 = add n_exp, 63:i64
     ne_pad = and ne63, -64:i64
-    lg = mul ne_pad, 4:i64
+    lg = mul ne_pad, 8:i64
     sw = mul n_used, 12:i64
     a = mul n_used, fe
     a2 = mul a, 3:i64
@@ -386,7 +407,7 @@ inline fn moe_buffers(scratch:ptr, n_exp:i64, n_used:i64, fe:i64)->(ptr, ptr, pt
   b0:
     ne63 = add n_exp, 63:i64
     ne_pad = and ne63, -64:i64
-    lg = mul ne_pad, 4:i64
+    lg = mul ne_pad, 8:i64
     sel = add scratch, lg
     s8 = mul n_used, 8:i64
     wts = add sel, s8
@@ -396,18 +417,29 @@ inline fn moe_buffers(scratch:ptr, n_exp:i64, n_used:i64, fe:i64)->(ptr, ptr, pt
     adx = add aq, a
     ret scratch, sel, wts, aq, adx
 
-# The router: logits = router x (plus its bias, when the layer has one), softmax numerators
-# e_i = exp(logit_i - max), then the n_used largest (the first on ties), each one's weight
-# into wts and its index into sel, in that order. The weight, by `gating`: 0 the softmax
-# probability e_i / sum(e); 1 that, then divided by the picked ones' sum (at least 2^-14, as
-# llama.cpp clamps it; Qwen3-MoE); 2 the softmax of the picked logits, e_i over the picked
-# numerators' sum (gpt-oss).
-fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr)
+# The router: logits = router x (plus its bias, when the layer has one), then the n_used
+# experts with the largest scores (the first on ties), each one's weight into wts and its
+# index into sel, in that order. By `gating`, with softmax numerators e_i = exp(logit_i - max)
+# as the scores: 0 the weight is the softmax probability e_i / sum(e); 1 that, then divided
+# by the picked ones' sum (at least 2^-14, as llama.cpp clamps it; Qwen3-MoE); 2 the softmax
+# of the picked logits, e_i over the picked numerators' sum (gpt-oss). With sigmoid
+# probabilities p_i = 1 / (1 + exp(-logit_i)) (DeepSeek-V3's, GLM-4.5's, dots.llm1's): the
+# experts are picked by p_i plus the layer's selection bias (sel_b, when not 0) and weighted
+# by p_i, 3 divided by the picked ones' sum (clamped as in 1), 4 not. Every weight is then
+# multiplied by wscale (the routed experts' scale, 1 for most models). logits holds 2 rows of
+# n_exp rounded up to 64: the logits (then the scores or probabilities), and the sigmoid's
+# selection scores.
+fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr, sel_b:ptr, wscale:f32)
   b0:
     # The router has n_exp rows rounded up to 64 (zero rows past n_exp), whose logits only
     # fill the buffer: the softmax and the choice read the first n_exp.
     ne63 = add n_exp, 63:i64
     chunks = udiv ne63, 64:i64
+    ne_pad = mul chunks, 64:i64
+    sv_off = mul ne_pad, 4:i64
+    selv = add logits, sv_off
+    low = cst -340282346638528859811704183484516925440.0:f32
+    is_sig = uge gating, 3:i64
     jmp rows(0:i64)
   rows(c:i64):
     c_more = lt c, chunks
@@ -420,7 +452,11 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     jmp rows(c2)
   biased:
     call add_rows(logits, router_b, 0:i64, n_exp)
-    jmp max_loop(0:i64, -3.4e38:f32)
+    br is_sig, sigmoid, max_loop(0:i64, -3.4e38:f32)
+  # p = 1 / (1 + exp(-logit)) in place, and the selection scores p + sel_b.
+  sigmoid:
+    call sigmoid_scores(logits, selv, sel_b, n_exp)
+    jmp pick_start(selv, 1.0:f32)
   max_loop(i:i64, m:f32):
     i_more = lt i, n_exp
     br i_more, max_body, softmax
@@ -432,16 +468,20 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
   softmax:
     total = call exp_shift(logits, n_exp, m)
     over_picked = eq gating, 2:i64
-    denom = select over_picked, 1.0:f32, total
+    denom0 = select over_picked, 1.0:f32, total
+    jmp pick_start(logits, denom0)
+  # Scores in sb (the numerators themselves, or the sigmoid's selection scores); a weight is
+  # the picked expert's numerator or probability (logits[best]) over denom.
+  pick_start(sb:ptr, denom:f32):
     jmp pick(0:i64, 0.0:f32)
   pick(s:i64, wsum:f32):
     s_more = lt s, n_used
-    br s_more, scan(0:i64, 0:i64, -1.0:f32), renorm
+    br s_more, scan(0:i64, 0:i64, low), renorm
   scan(j:i64, best:i64, bv:f32):
     j_more = lt j, n_exp
     br j_more, scan_body, picked
   scan_body:
-    v = ld logits[j]:f32
+    v = ld sb[j]:f32
     better = gt v, bv
     best2 = select better, j, best
     bv2 = select better, v, bv
@@ -449,29 +489,67 @@ fn moe_route(router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_
     jmp scan(j2, best2, bv2)
   picked:
     st sel[s], best
-    wt = div bv, denom
+    num = ld logits[best]:f32
+    wt = div num, denom
     st wts[s], wt
-    # Taken: below every numerator (they are at least 0).
-    st logits[best], -1.0:f32
+    # Taken: below every score.
+    st sb[best], low
     wsum2 = add wsum, wt
     s2 = add s, 1:i64
     jmp pick(s2, wsum2)
   renorm:
-    no_norm = eq gating, 0:i64
-    br no_norm, done, norm_start
+    g0 = eq gating, 0:i64
+    g4 = eq gating, 4:i64
+    no_norm = or g0, g4
+    br no_norm, scale_loop(0:i64), norm_start
   norm_start:
     clamped = max wsum, 0.00006103515625:f32
     jmp norm_loop(0:i64)
   norm_loop(r:i64):
     r_more = lt r, n_used
-    br r_more, norm_body, done
+    br r_more, norm_body, scale_loop(0:i64)
   norm_body:
     wr = ld wts[r]:f32
     wn = div wr, clamped
     st wts[r], wn
     r2 = add r, 1:i64
     jmp norm_loop(r2)
+  scale_loop(q:i64):
+    q_more = lt q, n_used
+    br q_more, scale_body, done
+  scale_body:
+    wq = ld wts[q]:f32
+    ws = mul wq, wscale
+    st wts[q], ws
+    q2 = add q, 1:i64
+    jmp scale_loop(q2)
   done:
+    ret
+
+# Sigmoid probabilities 1 / (1 + exp(-x)) of the first n logits in place, and the selection
+# scores p + b into sv (b the layer's selection bias, or nothing when 0).
+fn sigmoid_scores(x:ptr, sv:ptr, b:ptr, n:i64)
+  b0:
+    w = vl f32
+    v_one = splat 1.0:f32:vx
+    v_zero = splat 0.0:f32:vx
+    jmp loop(0:i64)
+  loop(i:i64):
+    more = lt i, n
+    br more, body, bias
+  body:
+    rest = sub n, i
+    xv = ldm x[i]:vx, rest:f32
+    nx = vsub v_zero, xv:f32
+    e = vexp nx:f32
+    den = vadd e, v_one:f32
+    p = vdiv v_one, den:f32
+    stm x[i], p, rest:f32
+    stm sv[i], p, rest:f32
+    i2 = add i, w
+    jmp loop(i2)
+  bias:
+    call add_rows(sv, b, 0:i64, n)
     ret
 
 # Task t of an expert MLP: rows 64c..64c+63 of picked expert s (t = s * fe/64 + c), into
@@ -1007,7 +1085,7 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     l_more = lt l, nl
     br l_more, scan_body, split
   scan_body:
-    slot0 = mul l, 15:i64
+    slot0 = mul l, 18:i64
     slot = add slot0, 19:i64
     win = ld model[slot]:i64
     ctx_l_, ring = call kv_ring(win, max_ctx)
@@ -1040,6 +1118,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
     n_exp, n_used, gating, act = call load_moe(cfg)
+    fe, rd, fs, wscale = call load_ext(cfg, hd)
     embd, norm_out, lm, cos_t, sin_t = call model_globals(model)
     w = vl f32
     d4 = mul d, 4:i64
@@ -1074,7 +1153,9 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     qd = mul nh, hd
     kmax0 = max d, qd
     # xs: bytes per token in the int8 activation buffers (any projection's input fits).
-    xs = max kmax0, f
+    xs0 = max kmax0, f
+    xs1 = max xs0, fe
+    xs = max xs1, fs
     xn = alloc hs_sz
     qd4 = mul qd, 4:i64
     qb_sz = mul n, qd4
@@ -1087,7 +1168,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     adx = alloc dx_sz
     # mixtures of experts: batches of up to 256 tokens, grouped by expert (moe_ffn_n)
     moe_nb = min n, 256:i64
-    moe_sz = call moe_scratch_n(moe_nb, n_exp, n_used, f, d)
+    moe_sz = call moe_scratch_n(moe_nb, n_exp, n_used, fe, d)
     moe_buf = alloc moe_sz
     rb = call kv_rb(hd, kvf)
     kv_row = mul nkv, rb
@@ -1095,6 +1176,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     heads_all = add nh, heads_all0
     dchunks = udiv d, 64:i64
     fchunks = udiv f, 64:i64
+    schunks = udiv fs, 64:i64
     # attention: tiles of 8 tokens per KV head
     tiles0 = add n, 7:i64
     tiles = udiv tiles0, 8:i64
@@ -1107,6 +1189,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     br l_more, layer_body, final
   layer_body:
     attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win = call layer_weights(model, l)
+    m_sgu, m_sdn, sel_b = call layer_shared(model, l)
     ctx_l, ring = call kv_ring(win, max_ctx)
     kv_plane0 = mul ctx_l, kv_row
     kc = add cache, kc_off
@@ -1114,7 +1197,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     kv_layer = mul kv_plane0, 2:i64
     kc_next = add kc_off, kv_layer
     par n, norm_tok(hs, attn_norm, xn, xq, dx, d, eps, xs)
-    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps, qkv_b, ring)
+    par heads_all, qkv_head_n(m_qkv, xq, dx, qbuf, kc, vc, d, nh, nkv, hd, pos, ctx_l, kvf, cos_t, sin_t, n, xs, q_norm, k_norm, eps, qkv_b, ring, rd)
     par a_tasks, attn_tok(qbuf, kc, vc, xq, dx, nh, nkv, hd, pos, ctx_l, kvf, scale, xs, n, win, sinks, ring)
     par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d, o_b)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
@@ -1124,7 +1207,7 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
   # the batch's tokens that picked it, with llama_decode's results (moe_ffn_n).
   moe_batch(s:i64):
     s_more = lt s, n
-    br s_more, moe_body, layer_next
+    br s_more, moe_body, moe_shared
   moe_body:
     left = sub n, s
     nb = min left, moe_nb
@@ -1135,9 +1218,17 @@ fn prefill_part(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr
     ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
-    call moe_ffn_n(h_s, xq_s, dx_s, nb, xs, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act, moe_nb)
+    call moe_ffn_n(h_s, xq_s, dx_s, nb, xs, router, experts, d, n_exp, n_used, fe, gating, moe_buf, router_b, act, moe_nb, sel_b, wscale)
     s2 = add s, nb
     jmp moe_batch(s2)
+  # a shared expert after the routed ones, as llama_decode adds it
+  moe_shared:
+    has_shared = ne m_sgu, 0:ptr
+    br has_shared, shared_mlp, layer_next
+  shared_mlp:
+    par schunks, gate_up_n(m_sgu, xq, dx, aq, adx, d, n, xs, 0:ptr, act)
+    par dchunks, proj_add_n(m_sdn, aq, adx, hs, fs, n, xs, d, 0:ptr)
+    jmp layer_next
   dense_mlp:
     par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs, 0:ptr, act)
     par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d, 0:ptr)
@@ -1192,7 +1283,7 @@ fn norm_tok(s:i64, hs:ptr, wt:ptr, xn:ptr, xq:ptr, dx:ptr, d:i64, eps:f32, xs:i6
 # qkv_head for n tokens: head t's 64-row chunks for every token (qmat_batch), each token's
 # rows written to its q row or a staging row, then the head's bias, norm (qk_norm) and RoPE
 # at its position and, for K and V, bf16 into its position's KV-cache slot.
-fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64)
+fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, nh:i64, nkv:i64, hd:i64, pos:i64, ctx_l:i64, kvf:i64, cos_t:ptr, sin_t:ptr, n:i64, xs:i64, q_norm:ptr, k_norm:ptr, eps:f32, bias:ptr, ring:i64, rd:i64)
   b0:
     w = vl f32
     hd4 = mul hd, 4:i64
@@ -1203,7 +1294,7 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     q_off = mul t, hd4
     stage_sz = mul n, hd4
     stage = alloc stage_sz
-    half = udiv hd, 2:i64
+    half = udiv rd, 2:i64
     rope_row = mul half, 4:i64
     per_head = udiv hd, 64:i64
     c0 = mul t, per_head
@@ -1266,7 +1357,7 @@ fn qkv_head_n(t:i64, mat:ptr, xq:ptr, dx:ptr, qbuf:ptr, kc:ptr, vc:ptr, d:i64, n
     cos_r = add cos_t, rr
     sin_r = add sin_t, rr
     call qk_norm(x, is_q, q_norm, k_norm, hd, eps)
-    call rope_half(x, hd, cos_r, sin_r)
+    call rope_half(x, rd, cos_r, sin_r)
     jmp store
   store:
     br is_q, rope_next, to_cache
@@ -1517,10 +1608,10 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
 # row's results exactly qmat_chunk's; moe_gate_up_n, moe_down_n), and each token then adds
 # its experts' outputs times their weights in the order they were picked (moe_mix_n).
 # scratch holds moe_scratch_n's bytes for batches of up to nb_max tokens.
-fn moe_ffn_n(h:ptr, xq:ptr, dx:ptr, nb:i64, xs:i64, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64, nb_max:i64)
+fn moe_ffn_n(h:ptr, xq:ptr, dx:ptr, nb:i64, xs:i64, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64, nb_max:i64, sel_b:ptr, wscale:f32)
   b0:
     logits, sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout = call moe_buffers_n(scratch, nb_max, n_exp, n_used, fe, d)
-    par nb, moe_route_tok(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b, xs)
+    par nb, moe_route_tok(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b, xs, sel_b, wscale)
     call moe_group(sel, nb, n_used, n_exp, counts, offs, pairs)
     par n_exp, moe_gather(pairs, counts, offs, xq, dx, gx, gdx, xs, d, n_used)
     fchunks = udiv fe, 64:i64
@@ -1544,7 +1635,7 @@ inline fn moe_scratch_n(nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i64)->i64
     ret t
 
 # moe_ffn_n's buffers in its scratch, for nb tokens (byte offsets; the logits at 0): each
-# token's router logits (n_exp rounded up to 64), picked experts (i64) and their weights
+# token's router logits and selection scores (2 rows of n_exp rounded up to 64), picked experts (i64) and their weights
 # (f32); per expert its number of pairs and their first index (i64), and the pairs (token *
 # n_used + slot, i64) grouped by expert; the groups' gathered activations (d int8 and d / 2
 # record bytes per pair), their experts' int8 MLP activations (fe and fe / 2 bytes per
@@ -1553,7 +1644,7 @@ inline fn moe_offsets_n(nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i64)->(i64, i64
   b0:
     ne63 = add n_exp, 63:i64
     ne_pad = and ne63, -64:i64
-    lg_row = mul ne_pad, 4:i64
+    lg_row = mul ne_pad, 8:i64
     sel = mul nb, lg_row
     pn = mul nb, n_used
     p8 = mul pn, 8:i64
@@ -1595,12 +1686,13 @@ inline fn moe_buffers_n(scratch:ptr, nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i6
     dout = add scratch, o_dout
     ret scratch, sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout
 
-# Token s of a batch: moe_route on its activations into its rows of logits, sel and wts.
-fn moe_route_tok(s:i64, router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr, xs:i64)
+# Token s of a batch: moe_route on its activations into its rows of logits (2 rows of n_exp
+# rounded up to 64 per token), sel and wts.
+fn moe_route_tok(s:i64, router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr, xs:i64, sel_b:ptr, wscale:f32)
   b0:
     ne63 = add n_exp, 63:i64
     ne_pad = and ne63, -64:i64
-    lg_row = mul ne_pad, 4:i64
+    lg_row = mul ne_pad, 8:i64
     lg_off = mul s, lg_row
     lg = add logits, lg_off
     su = mul s, n_used
@@ -1613,7 +1705,7 @@ fn moe_route_tok(s:i64, router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr
     ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
-    call moe_route(router, xq_s, dx_s, lg, sel_s, wts_s, d, n_exp, n_used, gating, router_b)
+    call moe_route(router, xq_s, dx_s, lg, sel_s, wts_s, d, n_exp, n_used, gating, router_b, sel_b, wscale)
     ret
 
 # The nb tokens' picks grouped by expert: counts[e] pairs (token * n_used + slot) picked e,
@@ -1949,13 +2041,13 @@ inline fn model_globals(model:ptr)->(ptr, ptr, ptr, ptr, ptr)
     sin_t = ld model[4]:ptr
     ret embd, norm_out, lm, cos_t, sin_t
 
-# Layer l's entries (15 words at 5 + 15 l): its two norm weights, its QKV, O, gate/up and
+# Layer l's entries (the first 15 of its 18 words at 5 + 18 l; layer_shared reads the rest): its two norm weights, its QKV, O, gate/up and
 # down matrices, its q and k head norm weights (0 for none), a mixture-of-experts layer's
 # router and expert table (0 for a dense layer), its QKV, O and router biases and attention
 # sinks (0 for none), and its attention window in positions (0 for all of them).
 inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)
   b0:
-    slot0 = mul l, 15:i64
+    slot0 = mul l, 18:i64
     slot = add slot0, 5:i64
     lp_off = shl slot, 3:i64
     lp = add model, lp_off
@@ -1975,6 +2067,33 @@ inline fn layer_weights(model:ptr, l:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, p
     sinks = ld lp[13]:ptr
     win = ld lp[14]:i64
     ret attn_norm, m_qkv, m_o, ffn_norm, m_gu, m_dn, q_norm, k_norm, router, experts, qkv_b, o_b, router_b, sinks, win
+
+# cfg's words 11 and 14-16: an expert's MLP width, the rotary dimensions of a head (0 for
+# all hd; GLM-4.5 rotates half), the shared experts' MLP width (0 for none) and the routed
+# experts' weight scale (an f32 in the word's low 4 bytes).
+inline fn load_ext(cfg:ptr, hd:i64)->(i64, i64, i64, f32)
+  b0:
+    fe = ld cfg[11]:i64
+    rd0 = ld cfg[14]:i64
+    none = eq rd0, 0:i64
+    rd = select none, hd, rd0
+    fs = ld cfg[15]:i64
+    wscale = ld cfg[16:i64]:f32
+    ret fe, rd, fs, wscale
+
+# Layer l's DeepSeek-style entries (words 15-17 of its 18): its shared expert's gate/up and
+# down matrices (0 for none), and its routed experts' selection bias f32 [experts] (0 for
+# none).
+inline fn layer_shared(model:ptr, l:i64)->(ptr, ptr, ptr)
+  b0:
+    slot0 = mul l, 18:i64
+    slot = add slot0, 5:i64
+    lp_off = shl slot, 3:i64
+    lp = add model, lp_off
+    sgu = ld lp[15]:ptr
+    sdn = ld lp[16]:ptr
+    selb = ld lp[17]:ptr
+    ret sgu, sdn, selb
 
 # cfg's mixture-of-experts and MLP words: the experts, the experts each token uses, how
 # their weights are made (moe_route's gating: 0 softmax probabilities, 1 renormalized, 2 a
