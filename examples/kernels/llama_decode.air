@@ -966,7 +966,9 @@ fn glu(g:ptr, u:ptr, out:ptr, n:i64, act:i64)
 # the tokens, then `par` regions like llama_decode's, each projection task computing its rows
 # for every token (8 tokens per weight load). Attention runs one task per tile of 8 tokens
 # and KV head, each token over the cache up to its own position (so tokens never see later
-# ones), with the same splits and merges as llama_decode's (attn_tok).
+# ones), with the same splits and merges as llama_decode's (attn_tok). A mixture of experts
+# runs on batches of up to 256 tokens, each expert's weights read once for the batch's
+# tokens that picked it (moe_ffn_n).
 fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:ptr, eps:f32)->i64
   b0:
     d, nl, nh, nkv, hd, f, vocab, max_ctx, kvf = call load_cfg(cfg)
@@ -1016,7 +1018,9 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     dx_sz = udiv xq_sz, 2:i64
     dx = alloc dx_sz
     adx = alloc dx_sz
-    moe_sz = call moe_scratch(n_exp, n_used, f)
+    # mixtures of experts: batches of up to 256 tokens, grouped by expert (moe_ffn_n)
+    moe_nb = min n, 256:i64
+    moe_sz = call moe_scratch_n(moe_nb, n_exp, n_used, f, d)
     moe_buf = alloc moe_sz
     rb = call kv_rb(hd, kvf)
     kv_row = mul nkv, rb
@@ -1047,12 +1051,15 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     par dchunks, proj_add_n(m_o, xq, dx, hs, qd, n, xs, d, o_b)
     par n, norm_tok(hs, ffn_norm, xn, xq, dx, d, eps, xs)
     is_moe = ne router, 0:ptr
-    br is_moe, moe_tok(0:i64), dense_mlp
-  # Each token's experts on their own, as llama_decode runs them.
-  moe_tok(s:i64):
+    br is_moe, moe_batch(0:i64), dense_mlp
+  # The tokens' experts in batches of up to 256 tokens, each expert's weights read once for
+  # the batch's tokens that picked it, with llama_decode's results (moe_ffn_n).
+  moe_batch(s:i64):
     s_more = lt s, n
     br s_more, moe_body, layer_next
   moe_body:
+    left = sub n, s
+    nb = min left, moe_nb
     h_off = mul s, d4
     h_s = add hs, h_off
     x_off = mul s, xs
@@ -1060,9 +1067,9 @@ fn llama_prefill(model:ptr, cfg:ptr, cache:ptr, tokens:ptr, n:i64, pos:i64, h:pt
     ds = udiv xs, 2:i64
     d_off = mul s, ds
     dx_s = add dx, d_off
-    call moe_ffn(h_s, xq_s, dx_s, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act)
-    s2 = add s, 1:i64
-    jmp moe_tok(s2)
+    call moe_ffn_n(h_s, xq_s, dx_s, nb, xs, router, experts, d, n_exp, n_used, f, gating, moe_buf, router_b, act, moe_nb)
+    s2 = add s, nb
+    jmp moe_batch(s2)
   dense_mlp:
     par fchunks, gate_up_n(m_gu, xq, dx, aq, adx, d, n, xs, 0:ptr, act)
     par dchunks, proj_add_n(m_dn, aq, adx, hs, f, n, xs, d, 0:ptr)
@@ -1434,6 +1441,379 @@ fn gate_up_n(c:i64, mat:ptr, xq:ptr, dx:ptr, aq:ptr, adx:ptr, k:i64, n:i64, xs:i
   done:
     free u
     free g
+    ret
+
+# moe_ffn for nb tokens (xq, dx and h rows xs, xs / 2 and 4 d bytes apart) with each token's
+# results exactly moe_ffn's: every token is routed as llama_decode routes it (moe_route), the
+# (token, slot) pairs are grouped by expert (moe_group) and each group's activations gathered
+# (moe_gather), so each expert's gate/up and down rows run once for its group (qmat_batch, a
+# row's results exactly qmat_chunk's; moe_gate_up_n, moe_down_n), and each token then adds
+# its experts' outputs times their weights in the order they were picked (moe_mix_n).
+# scratch holds moe_scratch_n's bytes for batches of up to nb_max tokens.
+fn moe_ffn_n(h:ptr, xq:ptr, dx:ptr, nb:i64, xs:i64, router:ptr, experts:ptr, d:i64, n_exp:i64, n_used:i64, fe:i64, gating:i64, scratch:ptr, router_b:ptr, act:i64, nb_max:i64)
+  b0:
+    logits, sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout = call moe_buffers_n(scratch, nb_max, n_exp, n_used, fe, d)
+    par nb, moe_route_tok(router, xq, dx, logits, sel, wts, d, n_exp, n_used, gating, router_b, xs)
+    call moe_group(sel, nb, n_used, n_exp, counts, offs, pairs)
+    par n_exp, moe_gather(pairs, counts, offs, xq, dx, gx, gdx, xs, d, n_used)
+    fchunks = udiv fe, 64:i64
+    gu_tasks = mul n_exp, fchunks
+    par gu_tasks, moe_gate_up_n(experts, counts, offs, gx, gdx, ga, gadx, d, fe, act)
+    dchunks = udiv d, 64:i64
+    dn_tasks = mul n_exp, dchunks
+    par dn_tasks, moe_down_n(experts, counts, offs, pairs, ga, gadx, dout, d, fe)
+    par dchunks, moe_mix_n(h, dout, wts, nb, n_used, d)
+    ret
+
+# Bytes of moe_ffn_n's scratch for batches of up to nb tokens: moe_offsets_n's buffers.
+inline fn moe_scratch_n(nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i64)->i64
+  b0:
+    sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout = call moe_offsets_n(nb, n_exp, n_used, fe, d)
+    pn = mul nb, n_used
+    d4 = mul d, 4:i64
+    dout_b = mul pn, d4
+    end = add dout, dout_b
+    t = add end, 64:i64
+    ret t
+
+# moe_ffn_n's buffers in its scratch, for nb tokens (byte offsets; the logits at 0): each
+# token's router logits (n_exp rounded up to 64), picked experts (i64) and their weights
+# (f32); per expert its number of pairs and their first index (i64), and the pairs (token *
+# n_used + slot, i64) grouped by expert; the groups' gathered activations (d int8 and d / 2
+# record bytes per pair), their experts' int8 MLP activations (fe and fe / 2 bytes per
+# pair), and each pair's down projection (d f32, indexed by token * n_used + slot).
+inline fn moe_offsets_n(nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i64)->(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)
+  b0:
+    ne63 = add n_exp, 63:i64
+    ne_pad = and ne63, -64:i64
+    lg_row = mul ne_pad, 4:i64
+    sel = mul nb, lg_row
+    pn = mul nb, n_used
+    p8 = mul pn, 8:i64
+    wts = add sel, p8
+    p4 = mul pn, 4:i64
+    p4_7 = add p4, 7:i64
+    p4a = and p4_7, -8:i64
+    counts = add wts, p4a
+    e8 = mul n_exp, 8:i64
+    offs = add counts, e8
+    pairs = add offs, e8
+    gx = add pairs, p8
+    gx_b = mul pn, d
+    gdx = add gx, gx_b
+    gdx_b = udiv gx_b, 2:i64
+    ga = add gdx, gdx_b
+    ga_b = mul pn, fe
+    gadx = add ga, ga_b
+    gadx_b = udiv ga_b, 2:i64
+    dout0 = add gadx, gadx_b
+    # f32 rows, 16-byte aligned
+    dout15 = add dout0, 15:i64
+    dout = and dout15, -16:i64
+    ret sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout
+
+# moe_offsets_n's buffers as pointers into scratch.
+inline fn moe_buffers_n(scratch:ptr, nb:i64, n_exp:i64, n_used:i64, fe:i64, d:i64)->(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)
+  b0:
+    o_sel, o_wts, o_counts, o_offs, o_pairs, o_gx, o_gdx, o_ga, o_gadx, o_dout = call moe_offsets_n(nb, n_exp, n_used, fe, d)
+    sel = add scratch, o_sel
+    wts = add scratch, o_wts
+    counts = add scratch, o_counts
+    offs = add scratch, o_offs
+    pairs = add scratch, o_pairs
+    gx = add scratch, o_gx
+    gdx = add scratch, o_gdx
+    ga = add scratch, o_ga
+    gadx = add scratch, o_gadx
+    dout = add scratch, o_dout
+    ret scratch, sel, wts, counts, offs, pairs, gx, gdx, ga, gadx, dout
+
+# Token s of a batch: moe_route on its activations into its rows of logits, sel and wts.
+fn moe_route_tok(s:i64, router:ptr, xq:ptr, dx:ptr, logits:ptr, sel:ptr, wts:ptr, d:i64, n_exp:i64, n_used:i64, gating:i64, router_b:ptr, xs:i64)
+  b0:
+    ne63 = add n_exp, 63:i64
+    ne_pad = and ne63, -64:i64
+    lg_row = mul ne_pad, 4:i64
+    lg_off = mul s, lg_row
+    lg = add logits, lg_off
+    su = mul s, n_used
+    s8 = mul su, 8:i64
+    sel_s = add sel, s8
+    s4 = mul su, 4:i64
+    wts_s = add wts, s4
+    x_off = mul s, xs
+    xq_s = add xq, x_off
+    ds = udiv xs, 2:i64
+    d_off = mul s, ds
+    dx_s = add dx, d_off
+    call moe_route(router, xq_s, dx_s, lg, sel_s, wts_s, d, n_exp, n_used, gating, router_b)
+    ret
+
+# The nb tokens' picks grouped by expert: counts[e] pairs (token * n_used + slot) picked e,
+# at pairs[offs[e] ..], in token then slot order.
+fn moe_group(sel:ptr, nb:i64, n_used:i64, n_exp:i64, counts:ptr, offs:ptr, pairs:ptr)
+  b0:
+    pn = mul nb, n_used
+    jmp clear(0:i64)
+  clear(e:i64):
+    e_more = lt e, n_exp
+    br e_more, clear_body, count(0:i64)
+  clear_body:
+    st counts[e], 0:i64
+    e2 = add e, 1:i64
+    jmp clear(e2)
+  count(i:i64):
+    i_more = lt i, pn
+    br i_more, count_body, prefix(0:i64, 0:i64)
+  count_body:
+    x = ld sel[i]:i64
+    cx = ld counts[x]:i64
+    cx2 = add cx, 1:i64
+    st counts[x], cx2
+    i2 = add i, 1:i64
+    jmp count(i2)
+  # offs = the counts' exclusive prefix sums; counts then serve as each group's fill cursor
+  # (back to the counts once filled).
+  prefix(pe:i64, acc:i64):
+    pe_more = lt pe, n_exp
+    br pe_more, prefix_body, fill_start
+  prefix_body:
+    st offs[pe], acc
+    cp = ld counts[pe]:i64
+    acc2 = add acc, cp
+    st counts[pe], 0:i64
+    pe2 = add pe, 1:i64
+    jmp prefix(pe2, acc2)
+  fill_start:
+    jmp fill(0:i64)
+  fill(j:i64):
+    j_more = lt j, pn
+    br j_more, fill_body, done
+  fill_body:
+    y = ld sel[j]:i64
+    oy = ld offs[y]:i64
+    cy = ld counts[y]:i64
+    at = add oy, cy
+    st pairs[at], j
+    cy2 = add cy, 1:i64
+    st counts[y], cy2
+    j2 = add j, 1:i64
+    jmp fill(j2)
+  done:
+    ret
+
+# Expert e's group: each pair's token's int8 activations (d bytes from xq, xs apart) and
+# block records (d / 2 bytes from dx) into the group's rows of gx and gdx.
+fn moe_gather(e:i64, pairs:ptr, counts:ptr, offs:ptr, xq:ptr, dx:ptr, gx:ptr, gdx:ptr, xs:i64, d:i64, n_used:i64)
+  b0:
+    cnt = ld counts[e]:i64
+    off = ld offs[e]:i64
+    ds = udiv xs, 2:i64
+    d2 = udiv d, 2:i64
+    jmp loop(0:i64)
+  loop(p:i64):
+    more = lt p, cnt
+    br more, body, done
+  body:
+    at = add off, p
+    pr = ld pairs[at]:i64
+    tok = udiv pr, n_used
+    src_off = mul tok, xs
+    src = add xq, src_off
+    dst_off = mul at, d
+    dst = add gx, dst_off
+    call copy_f32(src, dst, d)
+    srd_off = mul tok, ds
+    srd = add dx, srd_off
+    dsd_off = mul at, d2
+    dsd = add gdx, dsd_off
+    call copy_f32(srd, dsd, d2)
+    p2 = add p, 1:i64
+    jmp loop(p2)
+  done:
+    ret
+
+# Task t of the grouped expert MLPs: rows 64c..64c+63 of expert e's gate/up (t = e * fe/64 +
+# c) for its group's tokens (qmat_batch on the gathered activations), their bias and the
+# activation, then Q8 quantization into the group's rows of ga/gadx, as gate_up does for
+# one token.
+fn moe_gate_up_n(t:i64, experts:ptr, counts:ptr, offs:ptr, gx:ptr, gdx:ptr, ga:ptr, gadx:ptr, d:i64, fe:i64, act:i64)
+  b0:
+    fchunks = udiv fe, 64:i64
+    e = udiv t, fchunks
+    c = urem t, fchunks
+    cnt = ld counts[e]:i64
+    none = eq cnt, 0:i64
+    br none, done, run
+  run:
+    off = ld offs[e]:i64
+    e4 = mul e, 4:i64
+    mat = ld experts[e4]:ptr
+    e42 = add e4, 2:i64
+    bias = ld experts[e42]:ptr
+    x_off = mul off, d
+    gx_e = add gx, x_off
+    d2 = udiv d, 2:i64
+    xd_off = mul off, d2
+    gdx_e = add gdx, xd_off
+    tmp_sz = mul cnt, 256:i64
+    g = alloc tmp_sz
+    u = alloc tmp_sz
+    a = stack 256
+    cg = mul c, 2:i64
+    cu = add cg, 1:i64
+    call qmat_batch(cg, mat, gx_e, gdx_e, g, d, cnt, d)
+    call qmat_batch(cu, mat, gx_e, gdx_e, u, d, cnt, d)
+    gb = mul cg, 64:i64
+    ub = mul cu, 64:i64
+    q_c = mul c, 64:i64
+    d_c = mul c, 32:i64
+    fe2 = udiv fe, 2:i64
+    jmp toks(0:i64)
+  toks(p:i64):
+    p_more = lt p, cnt
+    br p_more, tok_body, free_tmp
+  tok_body:
+    r_off = mul p, 256:i64
+    gs = add g, r_off
+    us = add u, r_off
+    call add_rows(gs, bias, gb, 64:i64)
+    call add_rows(us, bias, ub, 64:i64)
+    call glu(gs, us, a, 64:i64, act)
+    at = add off, p
+    aq_off0 = mul at, fe
+    aq_off = add aq_off0, q_c
+    aq_p = add ga, aq_off
+    ad_off0 = mul at, fe2
+    ad_off = add ad_off0, d_c
+    ad_p = add gadx, ad_off
+    call quantize_q8(a, aq_p, ad_p, 64:i64)
+    p2 = add p, 1:i64
+    jmp toks(p2)
+  free_tmp:
+    free u
+    free g
+    jmp done
+  done:
+    ret
+
+# Task t of the grouped down projections: rows 64c..64c+63 of expert e's down (t = e * d/64 +
+# c) for its group's tokens (qmat_batch on their MLP activations), plus its bias, into each
+# pair's row of dout.
+fn moe_down_n(t:i64, experts:ptr, counts:ptr, offs:ptr, pairs:ptr, ga:ptr, gadx:ptr, dout:ptr, d:i64, fe:i64)
+  b0:
+    dchunks = udiv d, 64:i64
+    e = udiv t, dchunks
+    c = urem t, dchunks
+    cnt = ld counts[e]:i64
+    none = eq cnt, 0:i64
+    br none, done, run
+  run:
+    off = ld offs[e]:i64
+    e4 = mul e, 4:i64
+    e41 = add e4, 1:i64
+    mat = ld experts[e41]:ptr
+    e43 = add e4, 3:i64
+    bias = ld experts[e43]:ptr
+    a_off = mul off, fe
+    ga_e = add ga, a_off
+    fe2 = udiv fe, 2:i64
+    ad_off = mul off, fe2
+    gadx_e = add gadx, ad_off
+    tmp_sz = mul cnt, 256:i64
+    tmp = alloc tmp_sz
+    call qmat_batch(c, mat, ga_e, gadx_e, tmp, fe, cnt, fe)
+    b_off = mul c, 64:i64
+    d4 = mul d, 4:i64
+    c_off = mul c, 256:i64
+    jmp toks(0:i64)
+  toks(p:i64):
+    p_more = lt p, cnt
+    br p_more, tok_body, free_tmp
+  tok_body:
+    r_off = mul p, 256:i64
+    row = add tmp, r_off
+    call add_rows(row, bias, b_off, 64:i64)
+    at = add off, p
+    pr = ld pairs[at]:i64
+    o_off0 = mul pr, d4
+    o_off = add o_off0, c_off
+    o = add dout, o_off
+    call copy_f32(row, o, 256:i64)
+    p2 = add p, 1:i64
+    jmp toks(p2)
+  free_tmp:
+    free tmp
+    jmp done
+  done:
+    ret
+
+# Rows 64c..64c+63 of each of the nb tokens' residual streams (4 d bytes apart) += the sum
+# over its picked experts, in the order they were picked, of each one's weight times its
+# down projection (dout's row of the pair), as moe_down adds them.
+fn moe_mix_n(c:i64, h:ptr, dout:ptr, wts:ptr, nb:i64, n_used:i64, d:i64)
+  b0:
+    w = vl f32
+    acc = stack 256
+    zero = splat 0.0:f32:vx
+    d4 = mul d, 4:i64
+    c_off = mul c, 256:i64
+    jmp toks(0:i64)
+  toks(s:i64):
+    s_more = lt s, nb
+    br s_more, clear(0:i64), done
+  clear(j:i64):
+    j_more = lt j, 64:i64
+    br j_more, clear_body, slots(0:i64)
+  clear_body:
+    j_rest = sub 64:i64, j
+    stm acc[j], zero, j_rest:f32
+    j2 = add j, w
+    jmp clear(j2)
+  slots(k:i64):
+    k_more = lt k, n_used
+    br k_more, slot_body, add_h(0:i64)
+  slot_body:
+    su = mul s, n_used
+    pr = add su, k
+    ws = ld wts[pr]:f32
+    vw = splat ws:vx
+    o_off0 = mul pr, d4
+    o_off = add o_off0, c_off
+    o = add dout, o_off
+    jmp mix(0:i64)
+  mix(m:i64):
+    m_more = lt m, 64:i64
+    br m_more, mix_body, slot_next
+  mix_body:
+    m_rest = sub 64:i64, m
+    tv = ldm o[m]:vx, m_rest:f32
+    av = ldm acc[m]:vx, m_rest:f32
+    nv = vfma tv, vw, av:f32
+    stm acc[m], nv, m_rest:f32
+    m2 = add m, w
+    jmp mix(m2)
+  slot_next:
+    k2 = add k, 1:i64
+    jmp slots(k2)
+  add_h(a:i64):
+    a_more = lt a, 64:i64
+    br a_more, add_body, tok_next
+  add_body:
+    a_rest = sub 64:i64, a
+    h_row0 = mul s, d4
+    h_row = add h, h_row0
+    hc = add h_row, c_off
+    acv = ldm acc[a]:vx, a_rest:f32
+    hv = ldm hc[a]:vx, a_rest:f32
+    sum = vadd hv, acv:f32
+    stm hc[a], sum, a_rest:f32
+    a2 = add a, w
+    jmp add_h(a2)
+  tok_next:
+    s2 = add s, 1:i64
+    jmp toks(s2)
+  done:
     ret
 
 # The 9 words of cfg: d, layers, heads, kv_heads, head_dim, ffn, vocab, max_ctx and the KV

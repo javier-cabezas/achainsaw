@@ -1131,7 +1131,7 @@ fn llama_prefill_matches_decode_exactly() {
     // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
     // the prompt into prefill calls)
     type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 14] = [
+    let cases: [Case; 16] = [
         (false, false, false, &short, 8, &[&[6], &[1, 5]]),
         (true, false, false, &short, 8, &[&[6], &[1, 5]]),
         (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
@@ -1150,17 +1150,22 @@ fn llama_prefill_matches_decode_exactly() {
         (false, true, false, &long, 530, &[&[530], &[255, 2, 273]]),
         (true, false, false, &long, 530, &[&[300, 230]]),
         (false, false, false, &long, 530, &[&[530], &[37, 493]]),
+        // Mixtures of experts over the long prompt (prefill's batches of 256 tokens grouped
+        // by expert, and a remainder), Qwen3-MoE's and gpt-oss's.
+        (true, false, true, &long, 530, &[&[530], &[255, 2, 273]]),
+        (false, true, false, &long, 530, &[&[300, 230]]),
     ];
     for (case, &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces)) in cases.iter().enumerate() {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         if qk_norm {
             model = model.with_qk_norm();
         }
-        if case == 8 || case == 9 || case == 10 {
-            model = model.with_moe(64, 4, case == 8, mixed);
+        if matches!(case, 8 | 9 | 10 | 14 | 15) {
+            model = model.with_moe(64, 4, case == 8 || case == 14, mixed);
         }
         match case {
             10 => model = model.with_gpt_oss(3),
+            15 => model = model.with_gpt_oss(200),
             11 | 12 => model = model.with_gpt_oss(200),
             13 => model = model.with_gpt_oss(300),
             _ => {}
