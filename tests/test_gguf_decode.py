@@ -668,7 +668,7 @@ class TestQwen3MoeGGUF(TestQwen3GGUF):
         m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
         e: dict[str, Floats] = self.expected
         self.assertEqual(m.moe, (EXPERTS, EXPERTS_USED, 1))
-        self.assertEqual(list(m.cfg[9:]), [EXPERTS, EXPERTS_USED, EXPERT_FFN, 1, 0])
+        self.assertEqual(list(m.cfg[9:14]), [EXPERTS, EXPERTS_USED, EXPERT_FFN, 1, 0])
         for i, layer in enumerate(m.layers):
             p: str = f"blk.{i}."
             self.assertIsNone(layer["gate_up"])
@@ -841,7 +841,7 @@ class TestGptOssGGUF(TestGGUFDecode):
         m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
         e: dict[str, Floats] = self.expected
         self.assertEqual(m.moe, (OSS_EXPERTS, OSS_USED, 2))
-        self.assertEqual(list(m.cfg[9:]), [OSS_EXPERTS, OSS_USED, OSS_FFN, 2, 1])
+        self.assertEqual(list(m.cfg[9:14]), [OSS_EXPERTS, OSS_USED, OSS_FFN, 2, 1])
         self.assertEqual([l["window"] for l in m.layers], [OSS_WINDOW, 0])
         self.assertEqual(m.formats["experts"], ["mx4"])
         self.assertEqual(m.lm.fmt, "q8")
@@ -934,6 +934,186 @@ class TestGptOssGGUF(TestGGUFDecode):
         ids: dict[str, int] = {t: i for i, t in enumerate(tok.tokens)}
         self.assertEqual(tok.encode("the cat"), [ord("t"), ids["he"], ids["Ġcat"]])
         self.assertEqual(tok.decode(tok.encode("the cat 42!")), "the cat 42!")
+
+# The tiny DeepSeek-style models: experts, experts used per token, an expert's and the dense
+# layer's MLP widths, and the rotary dimensions of GLM-4.5's heads (half of them).
+DS_EXPERTS: int = 32
+DS_USED: int = 4
+DS_FFN: int = 128
+DS_DENSE_FFN: int = 384
+DS_ROPE: int = HEAD_DIM // 2
+
+
+def ds_kv_heads(arch: str) -> int:
+    """KV heads of the tiny DeepSeek-style models: dots.llm1 is multi-head (llama.cpp gives
+    its K and V the query heads' size)."""
+    return HEADS if arch == "dots1" else KV_HEADS
+
+
+def deepseek_meta(arch: str, tokens: list[str], types: list[int],
+                  merges: list[str]) -> dict[str, tuple[int, Any]]:
+    """A tiny glm4moe or dots1 GGUF's metadata: one dense layer, then two of 32 experts (4
+    used) and a shared one, sigmoid routing renormalized and scaled by 2.5; GLM-4.5 rotates
+    half of each head."""
+    a: str = arch + "."
+    meta: dict[str, tuple[int, Any]] = {
+        "general.architecture": (8, arch),
+        "general.name": (8, f"tiny {arch}"),
+        a + "block_count": (4, 3),
+        a + "context_length": (4, 4096),
+        a + "embedding_length": (4, D),
+        a + "feed_forward_length": (4, DS_DENSE_FFN),
+        a + "expert_feed_forward_length": (4, DS_FFN),
+        a + "expert_count": (4, DS_EXPERTS),
+        a + "expert_used_count": (4, DS_USED),
+        a + "expert_shared_count": (4, 1),
+        a + "leading_dense_block_count": (4, 1),
+        a + "expert_weights_scale": (6, 2.5),
+        a + "expert_weights_norm": (7, True),
+        a + "expert_gating_func": (4, 2),
+        a + "attention.head_count": (4, HEADS),
+        a + "attention.head_count_kv": (4, ds_kv_heads(arch)),
+        a + "attention.key_length": (4, HEAD_DIM),
+        a + "attention.value_length": (4, HEAD_DIM),
+        a + "attention.layer_norm_rms_epsilon": (6, 1e-5),
+        a + "rope.freq_base": (6, 1000000.0),
+        a + "rope.dimension_count": (4, DS_ROPE if arch == "glm4moe" else HEAD_DIM),
+        "tokenizer.ggml.model": (8, "gpt2"),
+        "tokenizer.ggml.pre": (8, "glm4" if arch == "glm4moe" else "qwen2"),
+        "tokenizer.ggml.tokens": (9, (8, tokens)),
+        "tokenizer.ggml.token_type": (9, (5, types)),
+        "tokenizer.ggml.merges": (9, (8, merges)),
+        "tokenizer.ggml.bos_token_id": (4, tokens.index("<|begin_of_text|>")),
+        "tokenizer.ggml.eos_token_id": (4, tokens.index("<|end_of_text|>")),
+        "tokenizer.ggml.add_bos_token": (7, False),
+    }
+    return meta
+
+
+def deepseek_tensors(arch: str, rng: np.random.Generator, expected: dict[str, Floats],
+                     router_type: int = 0) -> list[tuple[str, list[int], int, U8]]:
+    """A tiny glm4moe or dots1 GGUF's tensors (their values into `expected`): Q8_0 attention
+    (GLM-4.5 with f32 QKV biases, dots.llm1 with q and k head norms), a Q4_0 dense MLP in layer
+    0, then f32 routers and selection biases, Q4_K gate/up and Q8_0 down experts as 3-D
+    tensors, and a Q4_0 shared expert; an untied Q8_0 LM head."""
+    tensors: list[tuple[str, list[int], int, U8]] = []
+
+    def add(name: str, t: int, rows: int, k: int, dims: list[int] | None = None,
+            **kw: Any) -> None:
+        raw, vals, *_ = ENCODERS[t](rng, rows, k, **kw)
+        expected[name] = vals.reshape(rows, k)
+        tensors.append((name, dims or ([k] if rows == 1 else [k, rows]), t, raw))
+
+    def uniform(lo: float, hi: float, *shape: int) -> Floats:
+        v: Floats = rng.uniform(lo, hi, shape)
+        return v
+
+    glm: bool = arch == "glm4moe"
+    add("token_embd.weight", 8, VOCAB, D)
+    add("output.weight", 8, VOCAB, D)
+    add("output_norm.weight", 0, 1, D)
+    for i in range(3):
+        p: str = f"blk.{i}."
+        add(p + "attn_norm.weight", 0, 1, D)
+        add(p + ("post_attention_norm.weight" if glm else "ffn_norm.weight"), 0, 1, D)
+        for name in ("attn_q", "attn_k", "attn_v", "attn_output"):
+            rows, k = SHAPES[name]
+            if name in ("attn_k", "attn_v"):
+                rows = ds_kv_heads(arch) * HEAD_DIM
+            add(f"{p}{name}.weight", 8, rows, k)
+            if glm and name != "attn_output":
+                add(f"{p}{name}.bias", 0, 1, rows, values=uniform(-0.3, 0.3, 1, rows))
+        if not glm:
+            for n in ("q", "k"):
+                add(p + f"attn_{n}_norm.weight", 0, 1, HEAD_DIM,
+                    values=rng.uniform(0.25, 0.5, (1, HEAD_DIM)))
+        if i == 0:
+            add(p + "ffn_gate.weight", 2, DS_DENSE_FFN, D)
+            add(p + "ffn_up.weight", 2, DS_DENSE_FFN, D)
+            add(p + "ffn_down.weight", 2, D, DS_DENSE_FFN)
+            continue
+        # The router's logits a few units apart, as a trained model's are (or a Q8_0 router,
+        # router_type 8, as the kernel keeps it), and selection biases about a probability's
+        # size.
+        if router_type == 8:
+            add(p + "ffn_gate_inp.weight", 8, DS_EXPERTS, D)
+        else:
+            add(p + "ffn_gate_inp.weight", 0, DS_EXPERTS, D,
+                values=rng.standard_normal((DS_EXPERTS, D)) * 4 / np.sqrt(D))
+        add(p + "exp_probs_b.bias", 0, 1, DS_EXPERTS, values=uniform(-0.2, 0.2, 1, DS_EXPERTS))
+        for name, t in (("gate", 12), ("up", 12)):
+            add(f"{p}ffn_{name}_exps.weight", t, DS_EXPERTS * DS_FFN, D,
+                dims=[D, DS_FFN, DS_EXPERTS])
+        add(p + "ffn_down_exps.weight", 8, DS_EXPERTS * D, DS_FFN,
+            dims=[DS_FFN, D, DS_EXPERTS])
+        add(p + "ffn_gate_shexp.weight", 2, DS_FFN, D)
+        add(p + "ffn_up_shexp.weight", 2, DS_FFN, D)
+        add(p + "ffn_down_shexp.weight", 2, D, DS_FFN)
+    return tensors
+
+
+class TestGlm4MoeGGUF(TestGGUFDecode):
+    """A tiny glm4moe GGUF (GLM-4.5's architecture): QKV biases, RoPE on half of each head, a
+    dense first layer, then shared and routed experts picked by sigmoid probabilities plus a
+    selection bias (deepseek_tensors). The kernel and prefill tests are inherited."""
+    arch: str = "glm4moe"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rng: np.random.Generator = np.random.default_rng(31)
+        tokens, types, merges = tiny_vocab()
+        cls.expected = {}
+        cls.k_codes = {}
+        tensors: list[tuple[str, list[int], int, U8]] = deepseek_tensors(cls.arch, rng,
+                                                                       cls.expected)
+        cls.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.path = os.path.join(cls.tmp.name, f"{cls.arch}.gguf")
+        write_gguf(cls.path, deepseek_meta(cls.arch, tokens, types, merges), tensors)
+        cls.gguf = GGUF(cls.path)
+
+    def test_loader_conversions(self) -> None:
+        m: Model = Model.from_gguf(self.gguf, max_ctx=8, numpy=True)
+        e: dict[str, Floats] = self.expected
+        glm: bool = self.arch == "glm4moe"
+        self.assertEqual(m.moe, (DS_EXPERTS, DS_USED, 3))
+        # cfg: the dense layer's MLP width, the experts' and the gating, then the rotary
+        # dimensions, the shared expert's width and the weight scale's f32 bits.
+        self.assertEqual(int(m.cfg[5]), DS_DENSE_FFN)
+        self.assertEqual(list(m.cfg[9:13]), [DS_EXPERTS, DS_USED, DS_FFN, 3])
+        self.assertEqual(list(m.cfg[14:16]), [DS_ROPE if glm else HEAD_DIM, DS_FFN])
+        self.assertEqual(int(m.cfg[16]), int(np.float32(2.5).view(np.uint32)))
+        self.assertEqual(m.cos.shape[1], (DS_ROPE if glm else HEAD_DIM) // 2)
+        l0, l1, l2 = m.layers
+        self.assertIsNone(l0["router"])
+        self.assertEqual(need(l0["gate_up"]).rows, 2 * DS_DENSE_FFN)
+        for i, layer in ((1, l1), (2, l2)):
+            p: str = f"blk.{i}."
+            sel_b: F32 | None = layer["sel_b"]
+            shared: tuple[Mat, Mat] | None = layer["shared"]
+            assert sel_b is not None and shared is not None
+            np.testing.assert_array_equal(sel_b, e[p + "exp_probs_b.bias"][0])
+            self.assertEqual((shared[0].rows, shared[1].k), (2 * DS_FFN, DS_FFN))
+            # Q4_0 shared down exactly as written.
+            dn: Mat = shared[1]
+            got: Floats = (dn.q_blocks * dn.s_blocks[:, :, None]).transpose(1, 0, 2).reshape(
+                dn.rows, -1)
+            np.testing.assert_array_equal(got, e[p + "ffn_down_shexp.weight"])
+            self.assertEqual(layer["qkv_b"] is not None, glm)
+            self.assertEqual(layer["q_norm"] is not None, not glm)
+        np.testing.assert_array_equal(l1["ffn_norm"], e["blk.1." + (
+            "post_attention_norm.weight" if glm else "ffn_norm.weight")][0])
+
+    def test_tokenizer(self) -> None:
+        tok: Tokenizer = Tokenizer(self.gguf)
+        ids: dict[str, int] = {t: i for i, t in enumerate(tok.tokens)}
+        self.assertEqual(tok.encode("the cat"), [ord("t"), ids["he"], ids["Ġcat"]])
+        self.assertEqual(tok.decode(tok.encode("the cat 42!")), "the cat 42!")
+
+
+class TestDots1GGUF(TestGlm4MoeGGUF):
+    """The same on a tiny dots1 GGUF (dots.llm1's architecture): q and k head norms instead of
+    QKV biases, RoPE on whole heads, Qwen's pre-tokenizer."""
+    arch: str = "dots1"
 
 class TestMxfp4(unittest.TestCase):
     def test_scales_outside_f16_become_q8(self) -> None:

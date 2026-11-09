@@ -337,14 +337,16 @@ _GPT4O_SPLIT: re.Pattern[str] = re.compile(
     r"|\s+(?!\S)"
     r"|\s+")
 
+# GLM-4.5's ("glm4", llama.cpp's CHATGLM4) is Llama 3's split, without its merge skipping.
 _SPLITS: dict[str, re.Pattern[str]] = {
-    "llama-bpe": _LLAMA3_SPLIT, "qwen2": _QWEN2_SPLIT, "gpt-4o": _GPT4O_SPLIT}
+    "llama-bpe": _LLAMA3_SPLIT, "qwen2": _QWEN2_SPLIT, "gpt-4o": _GPT4O_SPLIT,
+    "glm4": _LLAMA3_SPLIT, "glm5": _LLAMA3_SPLIT}
 
 
 class Tokenizer:
     """The byte-level BPE tokenizer of a GGUF file whose tokenizer.ggml.model is gpt2, with
-    Llama 3's pre-tokenizer (tokenizer.ggml.pre "llama-bpe", the default), Qwen's ("qwen2")
-    or GPT-4o's ("gpt-4o", gpt-oss's). Control tokens (`<|eot_id|>` and the like) in the text are encoded as
+    Llama 3's pre-tokenizer (tokenizer.ggml.pre "llama-bpe", the default), Qwen's ("qwen2"),
+    GPT-4o's ("gpt-4o", gpt-oss's) or GLM-4.5's ("glm4"). Control tokens (`<|eot_id|>` and the like) in the text are encoded as
     themselves. A BOS token is added only when the file says so
     (tokenizer.ggml.add_bos_token, true when absent)."""
 
@@ -359,8 +361,8 @@ class Tokenizer:
             tuple(m.split(" ", 1)): r for r, m in enumerate(meta["tokenizer.ggml.merges"])}
         pre: str = meta.get("tokenizer.ggml.pre", "llama-bpe")
         if pre not in _SPLITS:
-            raise ValueError(f"unsupported pre-tokenizer {pre!r} (llama-bpe, qwen2 and gpt-4o "
-                             "only)")
+            raise ValueError(f"unsupported pre-tokenizer {pre!r} (llama-bpe, qwen2, gpt-4o and "
+                             "glm4 only)")
         self.split: re.Pattern[str] = _SPLITS[pre]
         # llama.cpp skips the merges of words already in the vocabulary for Llama 3 only.
         self.ignore_merges: bool = pre == "llama-bpe"

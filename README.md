@@ -200,7 +200,8 @@ with the numbers for K-quant files, an int8 KV cache (14% faster decode at
 and 4B prefill 3.4x and 1.6x faster than llama.cpp, and decode 6% and 13%
 faster. It also runs mixtures of experts, Qwen3-MoE and gpt-oss (MXFP4 experts,
 attention sinks, sliding windows), which prefill 3.3x and 4.7x and decode 1.31x and 1.09x as fast
-as llama.cpp at their layer shapes.
+as llama.cpp at their layer shapes, and DeepSeek-style ones on ordinary
+attention (GLM-4.5, dots.llm1: shared experts, sigmoid routing).
 
 **Kernels against NumPy and PyTorch.** [`examples/kernels/`](examples/kernels)
 holds 22 kernels for LLM inference, vector search and more: quantized GEMV

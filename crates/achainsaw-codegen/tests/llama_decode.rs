@@ -394,6 +394,10 @@ struct Layer {
     o_b: Option<Vec<f32>>,
     sinks: Option<Vec<f32>>,
     window: usize,
+    /// DeepSeek-style MoE: a shared expert's gate/up and down (a dense MLP on the same input,
+    /// added after the routed experts), and the routed experts' selection bias.
+    shared: Option<(Matrix, Matrix)>,
+    sel_b: Option<Vec<f32>>,
 }
 
 /// A mixture-of-experts MLP: the router [experts x d] and its bias, and the experts.
@@ -423,10 +427,18 @@ struct Model {
     kv_q8: bool,
     /// A mixture-of-experts model's experts used per token and how their weights are made
     /// (moe_route's gating: 0 softmax probabilities, 1 renormalized, 2 a softmax of the picked
-    /// logits); f is then an expert's MLP width.
+    /// logits, 3 sigmoid probabilities picked with the selection bias and renormalized, 4 not
+    /// renormalized); f is then an expert's MLP width.
     moe: Option<(usize, usize)>,
     /// The MLP's activation: 0 SwiGLU, 1 gpt-oss's clamped SwiGLU.
     act: usize,
+    /// The dense layers' MLP width (cfg[5]; f unless a MoE model has dense layers), the
+    /// rotary dimensions of a head (0: all of hd), the shared experts' width (0: none) and the
+    /// routed experts' weight scale.
+    fd: usize,
+    rd: usize,
+    fs: usize,
+    wscale: f32,
     eps: f32,
     embd: Vec<f32>,
     norm_out: Vec<f32>,
@@ -497,6 +509,8 @@ impl Model {
                     o_b: None,
                     sinks: None,
                     window: 0,
+                    shared: None,
+                    sel_b: None,
                 }
             })
             .collect();
@@ -511,6 +525,10 @@ impl Model {
             kv_q8: false,
             moe: None,
             act: 0,
+            fd: f,
+            rd: 0,
+            fs: 0,
+            wscale: 1.0,
             eps: 1e-5,
             embd: rng.vec(vocab * d),
             norm_out,
@@ -585,6 +603,52 @@ impl Model {
         self
     }
 
+    /// The model (a mixture of experts) with DeepSeek-V3-style MoE on GLM-4.5's attention:
+    /// layer 0 a dense MLP twice an expert's width, the others a shared expert of width 192
+    /// and routed experts picked by sigmoid probabilities plus a selection bias, weighted by
+    /// the probabilities (renormalized if `norm`) times 2.5; QKV biases, and RoPE on the first
+    /// half of each head.
+    fn with_deepseek(mut self, norm: bool) -> Self {
+        let mut rng = Rng(83);
+        let (d, nh, nkv, hd, f) = (self.d, self.nh, self.nkv, self.hd, self.f);
+        let (fd, fs) = (2 * f, 192);
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            layer.qkv_b = Some((0..(nh + 2 * nkv) * hd).map(|_| 0.3 * rng.next()).collect());
+            if l == 0 {
+                layer.moe = None;
+                layer.gate_up = Matrix::random(&mut rng, &[2 * fd], d, &[Fmt::Q4]);
+                layer.down = Matrix::random(&mut rng, &[d], fd, &[Fmt::Q8]);
+                continue;
+            }
+            layer.shared = Some((
+                Matrix::random(&mut rng, &[2 * fs], d, &[Fmt::Q4K]),
+                Matrix::random(&mut rng, &[d], fs, &[Fmt::Q8]),
+            ));
+            let n_exp = layer.moe.as_ref().unwrap().experts.len();
+            // Biases about a probability's size, so they change which experts are picked.
+            layer.sel_b = Some((0..n_exp).map(|_| 0.2 * rng.next()).collect());
+        }
+        let (n_used, _) = self.moe.unwrap();
+        self.moe = Some((n_used, if norm { 3 } else { 4 }));
+        self.fd = fd;
+        self.fs = fs;
+        self.wscale = 2.5;
+        // RoPE tables for the first hd / 2 values of a head (base 10000).
+        self.rd = hd / 2;
+        let quarter = hd / 4;
+        let (mut cos, mut sin) = (Vec::new(), Vec::new());
+        for p in 0..self.max_ctx {
+            for j in 0..quarter {
+                let a = p as f64 * 10000f64.powf(-2.0 * j as f64 / self.rd as f64);
+                cos.push(a.cos() as f32);
+                sin.push(a.sin() as f32);
+            }
+        }
+        self.cos = cos;
+        self.sin = sin;
+        self
+    }
+
     /// The MLP of quantized input xn: gate/up rows (chunks of 64 interleaved) plus their
     /// bias, the activation (SwiGLU, or gpt-oss's clamped one), then down plus its bias.
     fn mlp(
@@ -596,8 +660,9 @@ impl Model {
     ) -> Vec<f64> {
         let mut gu = gate_up.matvec(xn);
         add_bias(&mut gu, biases.0);
-        let mut act = vec![0f32; self.f];
-        for c in 0..self.f / 64 {
+        let width = gu.len() / 2;
+        let mut act = vec![0f32; width];
+        for c in 0..width / 64 {
             for j in 0..64 {
                 let (g, u) = (gu[128 * c + j], gu[128 * c + 64 + j]);
                 act[64 * c + j] = if self.act == 1 {
@@ -616,22 +681,37 @@ impl Model {
     /// The experts with the largest softmax probabilities of the router's logits plus its
     /// bias (the first on ties), weighted by them (renormalized, or a softmax of the picked
     /// logits, if the model says so), added in that order.
-    fn moe_mlp(&self, moe: &Moe, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
+    fn moe_mlp(&self, moe: &Moe, sel_b: &Option<Vec<f32>>, xn: &(Vec<i8>, Vec<f32>)) -> Vec<f64> {
         let (n_used, gating) = self.moe.unwrap();
         let mut logits = moe.router.matvec(xn);
         add_bias(&mut logits, &moe.router_b);
-        let m = logits.iter().cloned().fold(f64::MIN, f64::max);
-        let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
-        let total: f64 = e.iter().sum();
-        let mut order: Vec<usize> = (0..e.len()).collect();
-        order.sort_by(|&a, &b| e[b].partial_cmp(&e[a]).unwrap());
+        logits.truncate(moe.experts.len());
+        // Each expert's score (what picks it) and its weight before normalization: softmax
+        // numerators and probabilities, or sigmoid probabilities plus the selection bias and
+        // the probabilities.
+        let (scores, w_all): (Vec<f64>, Vec<f64>) = if gating >= 3 {
+            let p: Vec<f64> = logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
+            let mut sc = p.clone();
+            add_bias(&mut sc, sel_b);
+            (sc, p)
+        } else {
+            let m = logits.iter().cloned().fold(f64::MIN, f64::max);
+            let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+            let total: f64 = e.iter().sum();
+            let p = e.iter().map(|x| x / total).collect();
+            (e, p)
+        };
+        let mut order: Vec<usize> = (0..scores.len()).collect();
+        order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
         let picked = &order[..n_used];
-        let mut w: Vec<f64> = picked.iter().map(|&i| e[i] / total).collect();
-        if gating > 0 {
-            // Renormalized, or (gating 2) the softmax of the picked logits: the same in f64.
+        let mut w: Vec<f64> = picked.iter().map(|&i| w_all[i]).collect();
+        if gating > 0 && gating != 4 {
+            // Renormalized: for gating 2 the softmax of the picked logits (the same in f64),
+            // for 3 the picked sigmoid probabilities.
             let sum = w.iter().sum::<f64>().max(2f64.powi(-14));
             w.iter_mut().for_each(|x| *x /= sum);
         }
+        w.iter_mut().for_each(|x| *x *= self.wscale as f64);
         let mut out = vec![0f64; self.d];
         for (&i, wi) in picked.iter().zip(w) {
             let ex = &moe.experts[i];
@@ -681,8 +761,9 @@ impl Model {
         quantize(&xn)
     }
 
+    /// RoPE of the first rd values of a head (all of it when rd is 0).
     fn rope(&self, x: &mut [f64], pos: usize) {
-        let half = self.hd / 2;
+        let half = if self.rd > 0 { self.rd } else { self.hd } / 2;
         for j in 0..half {
             let (c, s) = (
                 self.cos[pos * half + j] as f64,
@@ -843,10 +924,15 @@ impl Model {
             let xn = self.norm_quant(&h, &layer.ffn_norm);
             let out = match &layer.moe {
                 None => self.mlp(&layer.gate_up, &layer.down, (&None, &None), &xn),
-                Some(moe) => self.moe_mlp(moe, &xn),
+                Some(moe) => self.moe_mlp(moe, &layer.sel_b, &xn),
             };
             for (hv, ov) in h.iter_mut().zip(out) {
                 *hv += ov;
+            }
+            if let Some((gu, dn)) = &layer.shared {
+                for (hv, ov) in h.iter_mut().zip(self.mlp(gu, dn, (&None, &None), &xn)) {
+                    *hv += ov;
+                }
             }
         }
         let logits = self.lm.matvec(&self.norm_quant(&h, &self.norm_out));
@@ -905,9 +991,18 @@ impl Model {
                 opt(&l.sinks),
                 l.window,
             ]);
+            let (sgu, sdn) = match &l.shared {
+                Some((g, d)) => (mp(g, &mut keep), mp(d, &mut keep)),
+                None => (0, 0),
+            };
+            t.extend([sgu, sdn, opt(&l.sel_b)]);
         }
         let parts = keep;
-        let n_exp = self.layers[0].moe.as_ref().map_or(0, |m| m.experts.len());
+        let n_exp = self
+            .layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .map_or(0, |m| m.experts.len());
         let (n_used, gating) = self.moe.unwrap_or((0, 0));
         let cfg = [
             self.d,
@@ -915,7 +1010,7 @@ impl Model {
             self.nh,
             self.nkv,
             self.hd,
-            self.f,
+            self.fd,
             self.vocab,
             self.max_ctx,
             self.kv_q8 as usize,
@@ -924,6 +1019,9 @@ impl Model {
             if self.moe.is_some() { self.f } else { 0 },
             gating,
             self.act,
+            self.rd,
+            self.fs,
+            self.wscale.to_bits() as usize,
         ]
         .map(|v| v as i64)
         .to_vec();
@@ -957,6 +1055,16 @@ fn llama_decode_matches_reference() {
 fn qwen3_moe_matches_reference() {
     check_decode_moe(true, false, true, Some((64, 4, true)), None);
     check_decode_moe(false, true, true, Some((64, 8, false)), None);
+}
+
+/// DeepSeek-V3-style MoE on GLM-4.5's attention (`Model::with_deepseek`): a dense first
+/// layer of its own width, then shared experts and sigmoid routing with a selection bias,
+/// renormalized (GLM-4.5, dots.llm1) or not and scaled by 2.5, with QKV biases and RoPE on
+/// half of each head; mixed formats with either cache, the second with q and k head norms.
+#[test]
+fn deepseek_moe_matches_reference() {
+    check_decode_variant(true, false, false, Some((64, 4, false)), None, Some(true));
+    check_decode_variant(false, true, true, Some((64, 4, false)), None, Some(false));
 }
 
 /// gpt-oss: QKV and O biases, attention sinks, a 3-position window in the even layers (the
@@ -1005,6 +1113,18 @@ fn check_decode_moe(
     moe: Option<(usize, usize, bool)>,
     gpt_oss: Option<usize>,
 ) {
+    check_decode_variant(mixed, kv_q8, qk_norm, moe, gpt_oss, None);
+}
+
+/// check_decode_moe, and with `deepseek` (renormalized or not) `Model::with_deepseek`.
+fn check_decode_variant(
+    mixed: bool,
+    kv_q8: bool,
+    qk_norm: bool,
+    moe: Option<(usize, usize, bool)>,
+    gpt_oss: Option<usize>,
+    deepseek: Option<bool>,
+) {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/kernels/llama_decode.air"
@@ -1021,6 +1141,9 @@ fn check_decode_moe(
     }
     if let Some(window) = gpt_oss {
         model = model.with_gpt_oss(window);
+    }
+    if let Some(norm) = deepseek {
+        model = model.with_deepseek(norm);
     }
     model.kv_q8 = kv_q8;
     let (table, cfg, _parts) = model.tables();
@@ -1045,6 +1168,11 @@ fn check_decode_moe(
         } else {
             level
         };
+        let level = if deepseek.is_some() {
+            level + " deepseek"
+        } else {
+            level
+        };
         let decode: Decode =
             unsafe { std::mem::transmute(engine.get_fn_ptr("llama_decode").unwrap()) };
         // As `Model::cache_value` reads it.
@@ -1066,8 +1194,16 @@ fn check_decode_moe(
             let (ref_h, logits) = model.step(&mut ref_cache, token, pos);
             let scale = ref_h.iter().fold(0f64, |a, v| a.max(v.abs()));
             // An int8 rounding step landing apart moves h by up to a few 1e-3 of its scale;
-            // each used expert rounds its own SwiGLU output, so a mixture has more of them.
-            let tol = if moe.is_some() { 1e-2 } else { 2e-3 };
+            // each used expert rounds its own SwiGLU output, so a mixture has more of them,
+            // and DeepSeek-style weights (times 2.5) and shared experts weigh such a step
+            // more: one lands 1.06% apart at one position with the int8 cache.
+            let tol = if deepseek.is_some() {
+                2e-2
+            } else if moe.is_some() {
+                1e-2
+            } else {
+                2e-3
+            };
             for (i, (&got, &want)) in h.iter().zip(&ref_h).enumerate() {
                 assert!(
                     (got as f64 - want).abs() <= tol * scale,
@@ -1155,7 +1291,7 @@ fn llama_prefill_matches_decode_exactly() {
     // (mixed formats, int8 cache, q and k head norms, prompt, context length, ways to split
     // the prompt into prefill calls)
     type Case<'a> = (bool, bool, bool, &'a [i64], usize, &'a [&'a [usize]]);
-    let cases: [Case; 18] = [
+    let cases: [Case; 20] = [
         (false, false, false, &short, 8, &[&[6], &[1, 5]]),
         (true, false, false, &short, 8, &[&[6], &[1, 5]]),
         (false, false, false, &long, 530, &[&[530], &[255, 2, 273]]),
@@ -1182,14 +1318,20 @@ fn llama_prefill_matches_decode_exactly() {
         // 416 slots held twice), which the prompt goes around; prefill in pieces of 256.
         (true, false, false, &long, 1100, &[&[530], &[255, 2, 273]]),
         (false, true, false, &long, 1100, &[&[530], &[37, 493]]),
+        // DeepSeek-style MoE (Model::with_deepseek), short and over the long prompt.
+        (true, false, false, &short, 8, &[&[6], &[1, 5]]),
+        (false, true, true, &long, 530, &[&[530], &[255, 2, 273]]),
     ];
     for (case, &(mixed, kv_q8, qk_norm, prompt, max_ctx, all_pieces)) in cases.iter().enumerate() {
         let mut model = Model::random(128, 2, 4, 2, 64, 256, 512, max_ctx, mixed);
         if qk_norm {
             model = model.with_qk_norm();
         }
-        if matches!(case, 8 | 9 | 10 | 14 | 15) {
+        if matches!(case, 8 | 9 | 10 | 14 | 15 | 18 | 19) {
             model = model.with_moe(64, 4, case == 8 || case == 14, mixed);
+        }
+        if case >= 18 {
+            model = model.with_deepseek(case == 18);
         }
         match case {
             10 => model = model.with_gpt_oss(3),
