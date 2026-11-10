@@ -4,14 +4,20 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Native code generation for achainsaw's AIR: a Cranelift JIT and AOT backend, the sandbox and the parallel runtime"
+readme = "README.md"
+keywords = ["compiler", "jit", "cranelift", "simd", "ai-agents"]
+categories = ["compilers"]
 
 [features]
 # Optional LLVM backend (`Backend::Llvm`); needs LLVM 22 (set LLVM_SYS_221_PREFIX).
 llvm = ["dep:achainsaw-llvm", "achainsaw-llvm/llvm"]
 
 [dependencies]
-achainsaw-ir = { path = "../achainsaw-ir" }
-achainsaw-llvm = { path = "../achainsaw-llvm", optional = true }
+achainsaw-ir = { workspace = true }
+achainsaw-llvm = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true }
 cranelift-frontend = { workspace = true }
 cranelift-module = { workspace = true }

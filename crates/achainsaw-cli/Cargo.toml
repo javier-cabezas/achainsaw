@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A compiler for the code AI agents write: a flat SSA language with JSON diagnostics, compiled to sandboxed native code, with an MCP server"
+readme = "../../README.md"
+keywords = ["compiler", "mcp", "jit", "ai-agents", "llm"]
+categories = ["compilers", "command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "achainsaw"
@@ -14,8 +20,8 @@ path = "src/main.rs"
 llvm = ["achainsaw-codegen/llvm"]
 
 [dependencies]
-achainsaw-ir = { path = "../achainsaw-ir" }
-achainsaw-codegen = { path = "../achainsaw-codegen" }
+achainsaw-ir = { workspace = true }
+achainsaw-codegen = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -5,14 +5,17 @@ build-backend = "maturin"
 [project]
 name = "achainsaw"
 version = "0.1.0"
-description = "A compact, deterministic, agent-native intermediate representation and JIT compiler"
+description = "A compiler for the code AI agents write: a flat SSA language with JSON diagnostics, compiled to sandboxed native code, with an MCP server"
 readme = "README.md"
 authors = [
-    { name = "Javier Cabezas", email = "javier-cabezas@users.noreply.github.com" }
+    { name = "Javier Cabezas", email = "8437757+javier-cabezas@users.noreply.github.com" }
 ]
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
+keywords = ["compiler", "jit", "ssa", "mcp", "ai-agents"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -20,13 +23,27 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Compilers",
 ]
+
+[project.urls]
+Homepage = "https://github.com/javier-cabezas/achainsaw"
+Repository = "https://github.com/javier-cabezas/achainsaw"
+Documentation = "https://github.com/javier-cabezas/achainsaw/tree/main/docs"
+Changelog = "https://github.com/javier-cabezas/achainsaw/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "crates/achainsaw-py/Cargo.toml"
 module-name = "achainsaw"
 features = ["pyo3/extension-module"]
+# The source package needs the crates, not the llama.cpp submodule (performance comparisons
+# only) or local build output.
+exclude = [
+    { path = "third_party/**/*", format = "sdist" },
+    { path = "target/**/*", format = "sdist" },
+    { path = "benchmarks/agents/**/*", format = "sdist" },
+]
 
 [tool.mypy]
 python_version = "3.11"

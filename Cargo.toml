@@ -11,10 +11,16 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["achainsaw authors"]
+authors = ["Javier Cabezas <8437757+javier-cabezas@users.noreply.github.com>"]
 license = "Apache-2.0"
+repository = "https://github.com/javier-cabezas/achainsaw"
+homepage = "https://github.com/javier-cabezas/achainsaw"
 
 [workspace.dependencies]
+# The workspace's own crates, with the version crates.io needs alongside the path.
+achainsaw-ir = { path = "crates/achainsaw-ir", version = "0.1.0" }
+achainsaw-codegen = { path = "crates/achainsaw-codegen", version = "0.1.0" }
+achainsaw-llvm = { path = "crates/achainsaw-llvm", version = "0.1.0" }
 cranelift-codegen = "0.136.2"
 cranelift-frontend = "0.136.2"
 cranelift-module = "0.136.2"
