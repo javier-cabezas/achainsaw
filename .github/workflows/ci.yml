@@ -146,9 +146,11 @@ jobs:
             amd64) pool=http://archive.ubuntu.com/ubuntu/pool/universe/q/qemu ;;
             arm64) pool=http://ports.ubuntu.com/ubuntu-ports/pool/universe/q/qemu ;;
           esac
-          ver=$(curl -fsSL "$pool/" | grep -oE "qemu-user_10\.[^\"_]*_${arch}\.deb" \
+          # The archive sometimes resets connections: retry each download.
+          get="curl -fsSL --retry 5 --retry-all-errors --retry-delay 5"
+          ver=$($get "$pool/" | grep -oE "qemu-user_10\.[^\"_]*_${arch}\.deb" \
             | sed -E "s/qemu-user_(.*)_${arch}\.deb/\1/" | sort -uV | tail -1)
-          curl -fsSL -o /tmp/qemu-user.deb "$pool/qemu-user_${ver}_${arch}.deb"
+          $get -o /tmp/qemu-user.deb "$pool/qemu-user_${ver}_${arch}.deb"
           dpkg-deb -x /tmp/qemu-user.deb /tmp/qemu
           /tmp/qemu/usr/bin/qemu-aarch64 --version
           echo "QEMU=/tmp/qemu/usr/bin/qemu-aarch64" >> "$GITHUB_ENV"
