@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       cases:
-        description: 'Cases per backend'
+        description: 'Cases on Cranelift (LLVM runs 3000)'
         default: '30000'
 
 permissions:
@@ -67,10 +67,13 @@ jobs:
           ACHAINSAW_FUZZ_SEED=$seed cargo test --release -p achainsaw $features \
             fuzz -- --nocapture
 
-      - name: Upload the crashing input
+      # The last case run (a crash's input) and each caught failure's report with its input.
+      - name: Upload the failing inputs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-case-${{ matrix.backend }}-${{ matrix.os }}
-          path: ${{ runner.temp }}/achainsaw-fuzz-case.air
+          path: |
+            ${{ runner.temp }}/achainsaw-fuzz-case.air
+            ${{ runner.temp }}/achainsaw-fuzz-failure-*.txt
           if-no-files-found: ignore

@@ -10,7 +10,9 @@
 //! `ACHAINSAW_FUZZ_CASES` sets the number of cases (default 400) and `ACHAINSAW_FUZZ_SEED`
 //! the seed (default 1), so a longer run is `ACHAINSAW_FUZZ_CASES=100000 cargo test --release
 //! -p achainsaw fuzz`. Each case is written to `achainsaw-fuzz-case.air` in the temporary
-//! directory before it runs, so a crash leaves its input there.
+//! directory before it runs, so a crash leaves its input there; a failure the test catches
+//! (a panic, a rejected round trip) is also written there, with its input, as
+//! `achainsaw-fuzz-failure-N.txt`.
 
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -166,7 +168,12 @@ fn mutate(rng: &mut Rng, text: &str, vocab: &[String]) -> String {
                     continue;
                 }
                 let t = rng.below(toks.len());
-                toks[t] = if toks[t].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                let number = toks[t]
+                    .trim_start_matches('-')
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
+                toks[t] = if number {
                     EDGES[rng.below(EDGES.len())].to_string()
                 } else {
                     vocab[rng.below(vocab.len())].clone()
@@ -325,6 +332,9 @@ fn exercise(rng: &mut Rng, code: &str, failures: &mut Vec<String>, stats: &mut S
     // air_check also takes, are not text to assemble).
     let is_bytecode = b64_decode(code.trim()).is_ok_and(|b| b.starts_with(b"\x00AIR"));
     if is_bytecode {
+        guarded(failures, "air_disassemble", code, || {
+            handle_air_disassemble(&json!({ "binary_base64": code.trim() }))
+        });
     } else if let Some(asm) = guarded(failures, "air_assemble", code, || {
         handle_air_assemble(&json!({ "code": code }))
     }) {
@@ -340,7 +350,10 @@ fn exercise(rng: &mut Rng, code: &str, failures: &mut Vec<String>, stats: &mut S
                     .ok()
                     .and_then(|v| v["code"].as_str().map(str::to_string))
                     .unwrap_or_default();
-                if !is_ok(&dis) || !is_ok(&handle_air_check(&json!({ "code": back }))) {
+                let again = guarded(failures, "air_check (round trip)", &back, || {
+                    handle_air_check(&json!({ "code": back }))
+                });
+                if !is_ok(&dis) || again.is_some_and(|v| !is_ok(&v)) {
                     failures.push(format!(
                         "AIRB round trip rejected an accepted program\n--- input ---\n{code}\n--- back ---\n{back}"
                     ));
@@ -450,6 +463,14 @@ fn fuzz_mcp_tools() {
         if failures.len() >= 5 {
             break;
         }
+    }
+    // Each failure's report (with its input) beside the case file, for the workflow to upload:
+    // the case file itself holds the last case run, which is a crash's input only.
+    for (i, f) in failures.iter().enumerate() {
+        let _ = std::fs::write(
+            std::env::temp_dir().join(format!("achainsaw-fuzz-failure-{i}.txt")),
+            f,
+        );
     }
     eprintln!(
         "fuzz: {} examples and {cases} cases (seed {seed}): {} accepted, {} air_run calls",
