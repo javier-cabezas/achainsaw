@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The AIR language of achainsaw: lexer, parser, validator with JSON diagnostics, optimizer, AIRB bytecode and the AIR standard library"
+readme = "README.md"
+keywords = ["compiler", "ir", "ssa", "ai-agents", "jit"]
+categories = ["compilers", "parser-implementations"]
 
 [dependencies]
 serde = { workspace = true }

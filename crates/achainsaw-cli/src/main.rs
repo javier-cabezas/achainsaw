@@ -18,8 +18,11 @@ use std::time::Instant;
 mod mcp;
 
 #[derive(ClapParser)]
-#[command(name = "achainsaw")]
-#[command(about = "High-performance agent-native toolchain & JIT compiler", long_about = None)]
+#[command(name = "achainsaw", version)]
+#[command(
+    about = "A compiler for the code AI agents write: AIR to sandboxed native code, with an MCP server",
+    long_about = None
+)]
 struct Cli {
     /// Cap the vector ISA used for code generation (sse, avx, avx2, avx512, amx, neon, sve,
     /// sve2, sme). Overrides ACHAINSAW_MAX_ISA.

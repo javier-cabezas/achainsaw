@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+# Published to PyPI as the `achainsaw` wheel (pyproject.toml), not to crates.io.
+publish = false
 
 [lib]
 name = "achainsaw"
@@ -15,8 +18,8 @@ test = false
 llvm = ["achainsaw-codegen/llvm"]
 
 [dependencies]
-achainsaw-ir = { path = "../achainsaw-ir" }
-achainsaw-codegen = { path = "../achainsaw-codegen" }
+achainsaw-ir = { workspace = true }
+achainsaw-codegen = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
