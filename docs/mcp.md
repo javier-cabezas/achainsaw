@@ -25,7 +25,7 @@ claude
 
 To make the tools available in every project, register an installed binary at user scope instead:
 ```bash
-cargo install --path crates/achainsaw-cli
+cargo install achainsaw    # or a binary from the releases page
 claude mcp add --scope user achainsaw -- achainsaw mcp
 ```
 

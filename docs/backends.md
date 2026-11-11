@@ -16,6 +16,7 @@ Pick one with `--backend` on `run`, `bench` and `build`, the `ACHAINSAW_BACKEND`
 # Build with the LLVM backend (needs LLVM 22, e.g. apt install llvm-22-dev)
 export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 cargo build --release -p achainsaw --features llvm
+# or, without a checkout: cargo install achainsaw --features llvm
 
 achainsaw --backend llvm run examples/fibonacci.air --func fib --args 30
 achainsaw --backend llvm build examples/kernels/gemv_f32.air --target-cpu znver4 --shared
