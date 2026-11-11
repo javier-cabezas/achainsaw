@@ -14,6 +14,8 @@ achainsaw mcp
 - **`air_target`**: Reports the host's vector features (AVX/AVX2/AVX-512/AMX, NEON/SVE/SME), the active ISA cap, and each backend's vector width (see [CPU features and ISA targeting](cli.md#cpu-features-and-isa-targeting-achainsaw-cpu)).
 - **`air_std`**: Lists the standard library's functions with their signatures and documentation, or returns one's AIR source by name.
 
+A tool that fails inside the server (a bug) answers with an `ERR_INTERNAL` diagnostic and the server keeps serving; please report it with the input. The tools are fuzzed with mutated programs and bytecode (`fuzz_mcp_tools` in `crates/achainsaw-cli/src/mcp_fuzz.rs`): every input gets a result or a diagnostic, and running one never crashes the process.
+
 The `initialize` response includes server `instructions`, a compact AIR syntax primer that MCP clients inject into the model's context. That lets an agent write valid AIR on the first attempt without other documentation.
 
 ## Claude Code

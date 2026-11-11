@@ -1,0 +1,76 @@
+name: Fuzz
+
+# A long run of fuzz_mcp_tools (crates/achainsaw-cli/src/mcp_fuzz.rs) on both backends, with
+# a new seed each run: mutated example programs and bytecode through the MCP tools, each
+# accepted one run under the sandbox. The regular test suite runs a few hundred cases; this
+# runs many more weekly or by hand, and uploads the input of a crash.
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: 'Cases per backend'
+        default: '30000'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz MCP tools (${{ matrix.backend }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: cranelift
+          - os: ubuntu-latest
+            backend: llvm
+          - os: ubuntu-24.04-arm
+            backend: llvm
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      ACHAINSAW_BACKEND: ${{ matrix.backend }}
+      # LLVM compiles take longer, so it runs a tenth as many cases.
+      ACHAINSAW_FUZZ_CASES: ${{ matrix.backend == 'llvm' && '3000' || inputs.cases || '30000' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install LLVM 22
+        if: matrix.backend == 'llvm'
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev libzstd-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fuzz
+        shell: bash
+        env:
+          # Where the test leaves the input of a crash (std::env::temp_dir).
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          seed=$(( $(date +%s) / 86400 * 7 + ${{ strategy.job-index }} ))
+          echo "seed $seed, $ACHAINSAW_FUZZ_CASES cases on $ACHAINSAW_BACKEND"
+          features=""
+          if [ "$ACHAINSAW_BACKEND" = llvm ]; then features="--features llvm"; fi
+          ACHAINSAW_FUZZ_SEED=$seed cargo test --release -p achainsaw $features \
+            fuzz -- --nocapture
+
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-case-${{ matrix.backend }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/achainsaw-fuzz-case.air
+          if-no-files-found: ignore
