@@ -4,7 +4,13 @@ For AI agent orchestrators (LangGraph, AutoGen, CrewAI, DSPy), `achainsaw` provi
 
 ## Installation
 
-From GitHub (needs a Rust toolchain; builds the Cranelift backend):
+From PyPI (Python 3.11 or later; wheels for Linux, macOS and Windows on x86-64 and AArch64, with the Cranelift backend):
+
+```bash
+pip install achainsaw
+```
+
+From GitHub's main branch (needs a Rust toolchain):
 
 ```bash
 pip install git+https://github.com/javier-cabezas/achainsaw.git

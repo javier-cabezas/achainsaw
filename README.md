@@ -57,23 +57,29 @@ $ achainsaw run examples/agent/sum_squares.air --func sum_squares --args 1000000
 
 ## Quick start
 
-You need a Rust toolchain ([rustup](https://rustup.rs)). Build achainsaw and
-run an example:
+achainsaw is at 0.1, its first release: AIR, its AIRB bytecode and the Rust
+and Python APIs may still change between minor versions (each change is in
+[CHANGELOG.md](CHANGELOG.md)).
+
+Install the command-line tool and MCP server from crates.io (with a Rust
+toolchain, [rustup](https://rustup.rs)), or download a binary for Linux,
+macOS or Windows from the [releases](https://github.com/javier-cabezas/achainsaw/releases):
+
+```sh
+cargo install achainsaw
+```
+
+Then run an example from a checkout:
 
 ```sh
 git clone https://github.com/javier-cabezas/achainsaw.git
 cd achainsaw
-cargo build --release -p achainsaw
-target/release/achainsaw run examples/agent/sum_squares.air --func sum_squares --args 10
+achainsaw run examples/agent/sum_squares.air --func sum_squares --args 10
 ```
 
-Or install only the binary, without cloning:
-`cargo install --git https://github.com/javier-cabezas/achainsaw achainsaw`.
-
-**In Claude Code**, install the binary and register its MCP server:
+**In Claude Code**, register the MCP server:
 
 ```sh
-cargo install --path crates/achainsaw-cli
 claude mcp add --scope user achainsaw -- achainsaw mcp
 ```
 
@@ -84,14 +90,19 @@ instructions teach the model AIR, so it needs no other documentation. Inside
 this repository, Claude Code finds the server through [`.mcp.json`](.mcp.json).
 [docs/mcp.md](docs/mcp.md) covers Claude Desktop and the seven tools.
 
-**In Python**, install the package (it builds with Rust):
+**In Python** (3.11 or later; wheels for Linux, macOS and Windows on x86-64
+and AArch64):
 
 ```sh
-pip install git+https://github.com/javier-cabezas/achainsaw.git
+pip install achainsaw
 ```
 
-That builds the Cranelift backend; [docs/python.md](docs/python.md#installation)
-adds LLVM.
+The packages and binaries use the Cranelift backend. The LLVM backend, which
+uses the CPU's full vector width and which the performance numbers here and
+in [docs/llama.md](docs/llama.md) and [docs/kernels.md](docs/kernels.md) are
+measured on, needs a build from source with LLVM 22: see
+[docs/backends.md](docs/backends.md#choosing-a-backend---backend) and
+[docs/python.md](docs/python.md#installation).
 
 ## See it work
 
@@ -343,7 +354,8 @@ to be written by models, and read by people when they need to.
 **Is the sandbox a security boundary?** It's built to contain a model's
 mistakes: out-of-bounds accesses, runaway loops, unbounded recursion, bad
 `free`s. It hasn't been audited against hostile code, so run untrusted code
-in a container or VM too.
+in a container or VM too. [SECURITY.md](SECURITY.md) lists what it checks and
+how to report a way around it.
 
 **Which CPUs and systems?** x86-64 (SSE through AVX-512 and AMX) and AArch64
 (NEON, SVE, SME), on Linux, macOS and Windows. The LLVM backend needs LLVM 22

@@ -268,6 +268,27 @@ fn execute_ir_on_this_thread(
     }))
 }
 
+/// Runs a tool, answering a panic inside it with an `ERR_INTERNAL` diagnostic instead of ending
+/// the server (and every other request of the session) with it. Each call builds its own
+/// engine, so nothing a panicking call held is reused.
+fn guard_tool(name: &str, run: impl FnOnce() -> Value) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".to_string());
+            json_tool_error(json!({
+                "status": "error",
+                "error_code": "ERR_INTERNAL",
+                "message": format!("internal error in {name}: {msg} (please report it with the input)"),
+            }))
+        }
+    }
+}
+
 fn json_tool_result(val: Value) -> Value {
     json!({
         "content": [
@@ -767,7 +788,7 @@ pub fn run_mcp_server() -> Result<()> {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
 
-                let tool_res = match name {
+                let tool_res = guard_tool(name, || match name {
                     "air_check" => handle_air_check(&arguments),
                     "air_run" => handle_air_run(&arguments),
                     "air_assemble" => handle_air_assemble(&arguments),
@@ -776,7 +797,7 @@ pub fn run_mcp_server() -> Result<()> {
                     "air_target" => handle_air_target(&arguments),
                     "air_std" => handle_air_std(&arguments),
                     unknown => error_response(&format!("Unknown tool: '{unknown}'")),
-                };
+                });
 
                 json!({
                     "jsonrpc": "2.0",
@@ -807,8 +828,24 @@ pub fn run_mcp_server() -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "mcp_fuzz.rs"]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_tool_answers_with_an_internal_error() {
+        let res = guard_tool("air_check", || panic!("boom"));
+        assert_eq!(res["isError"], true);
+        let payload: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["error_code"], "ERR_INTERNAL");
+        assert!(payload["message"].as_str().unwrap().contains("boom"));
+        let ok = guard_tool("air_target", || handle_air_target(&json!({})));
+        assert_eq!(ok["isError"], false);
+    }
 
     #[test]
     fn test_base64_roundtrip() {

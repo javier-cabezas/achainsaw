@@ -50,6 +50,16 @@ cargo test --workspace --features $FEATURES
 ACHAINSAW_BACKEND=llvm cargo test --workspace --features $FEATURES
 ```
 
+**Fuzzing.** `fuzz_mcp_tools` (in `cargo test`) feeds the MCP tools mutations of every
+example program and its bytecode, and runs what validates under the sandbox: no input may
+panic a tool or crash the process. `ACHAINSAW_FUZZ_CASES` and `ACHAINSAW_FUZZ_SEED` set a
+longer run, and a crashing input is left in `achainsaw-fuzz-case.air` in the temporary
+directory:
+
+```sh
+ACHAINSAW_FUZZ_CASES=100000 ACHAINSAW_FUZZ_SEED=7 cargo test --release -p achainsaw fuzz
+```
+
 **Lower ISA levels** run on the same machine with `--isa avx2` (or `sse`,
 `avx`, `neon`, ...) or `ACHAINSAW_MAX_ISA`. SVE and SME code runs under QEMU
 with `tools/qemu-aarch64/run.sh`, and CI's arm64 job runs the vector tests at
