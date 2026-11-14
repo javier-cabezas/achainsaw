@@ -118,5 +118,22 @@ label.
   detail, with the pitfalls we've hit. It's written for AI assistants, and
   it's the best map of the code for people too.
 
+## Releasing
+
+1. Set the new version in `Cargo.toml` (`[workspace.package]` and the three
+   `achainsaw-*` entries of `[workspace.dependencies]`) and in `pyproject.toml`,
+   run `cargo build` to update `Cargo.lock`, and give the version's
+   `CHANGELOG.md` entry its date.
+2. Check the crates package: `cargo publish --workspace --exclude achainsaw-py
+   --dry-run`.
+3. Run the release workflow by hand (Actions → Release → Run workflow) on the
+   branch: it builds every binary, wheel and the source package and tests them
+   on Linux, macOS and Windows without publishing.
+4. Once that branch is merged, tag `main` and push the tag (`git tag v0.1.0 &&
+   git push origin v0.1.0`). The workflow checks the tag against the versions,
+   then publishes the GitHub release, the wheels and source package to PyPI
+   (trusted publishing from the `pypi` environment) and the crates to
+   crates.io (the `CARGO_REGISTRY_TOKEN` secret).
+
 By contributing, you agree that your contributions are licensed under the
 [Apache License, Version 2.0](LICENSE).
